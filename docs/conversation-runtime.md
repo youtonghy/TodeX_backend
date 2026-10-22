@@ -417,13 +417,14 @@ partial replay approvals, legacy gaps, usage snapshots and status rendering.
 | Provider | Product permission modes | Plan mode |
 | --- | --- | --- |
 | Codex | ask: workspace sandbox + user review; auto: workspace sandbox + native auto_review; full-access: no sandbox + never approve | Native collaborationMode, independent of permission mode |
-| Claude Code | default / auto / bypassPermissions; runtime eligibility may restrict auto | Native plan permission mode; not an OS sandbox |
+| Claude Code | ask: default; accept-edits: acceptEdits (in-workspace edits auto-allowed, everything else asks); auto: auto; full-access: bypassPermissions. Settings (`disableAutoMode`, `disableBypassPermissionsMode`) or runtime eligibility may refuse auto or full access | Native plan permission mode; not an OS sandbox |
 | Pi | Fixed full-access; RPC has no built-in tool approval or sandbox | Unsupported |
 | Grok | Fixed ask through ACP metadata and permission callbacks | Unsupported |
 | DeepSeek Harness | ask: each ACP permission request is forwarded; auto / full-access: approved client-side (dsh offers one-shot options only) | Unsupported (no ACP modes) |
 | Generic ACP | Fixed ask; native permission requests are forwarded | Unsupported until a profile advertises an integrated mode |
 
-Prompt requests accept optional `permissionMode` (`ask`, `auto`, `full-access`) and
+Prompt requests accept optional `permissionMode` (`ask`, `auto`, `full-access`, and
+`accept-edits` where a provider advertises it — only Claude Code does) and
 `workMode` (`implement`, `plan`). The advertised permissionConfig includes `modes`,
 `defaultMode`, and `supportsPlan`. `defaultMode` is `auto` wherever a provider
 advertises it; Devin, Grok and generic ACP default to `ask`, and Pi to

@@ -52,8 +52,10 @@ const MAX_TITLE_CHARS: usize = 200;
 /// How long a call whose parent turn was stopped while it started waits for
 /// its cancelled child turn to end.
 const STOPPED_CALL_WAIT: Duration = Duration::from_secs(30);
-/// Permission modes from least to most permissive.
-const MODE_ORDER: [&str; 3] = ["ask", "auto", "full-access"];
+/// Permission modes from least to most permissive. `accept-edits` (Claude
+/// Code only) lets file edits through without asking and asks for the rest,
+/// so it sits between `ask` and `auto`.
+const MODE_ORDER: [&str; 4] = ["ask", "accept-edits", "auto", "full-access"];
 
 pub(super) fn routes(state: &AppState) -> Router<AppState> {
     let tools = AgentsTools {
@@ -1418,6 +1420,25 @@ mod tests {
         );
         assert_eq!(
             inherited_mode(ProviderKind::Pi, "ask").unwrap_err().code(),
+            "UNAUTHORIZED"
+        );
+        // Only Claude Code offers accept-edits; others step down to ask.
+        assert_eq!(
+            inherited_mode(ProviderKind::ClaudeCode, "accept-edits").unwrap(),
+            "accept-edits"
+        );
+        assert_eq!(
+            inherited_mode(ProviderKind::Codex, "accept-edits").unwrap(),
+            "ask"
+        );
+        assert_eq!(
+            inherited_mode(ProviderKind::ClaudeCode, "auto").unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            inherited_mode(ProviderKind::Pi, "accept-edits")
+                .unwrap_err()
+                .code(),
             "UNAUTHORIZED"
         );
     }

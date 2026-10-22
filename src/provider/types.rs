@@ -623,6 +623,7 @@ pub fn resolve_execution_config(
                     "plan"
                 } else {
                     match mode {
+                        "accept-edits" => "acceptEdits",
                         "auto" => "auto",
                         "full-access" => "bypassPermissions",
                         _ => "default",
@@ -2081,6 +2082,7 @@ mod tests {
         assert_eq!(full.sandbox_mode.as_deref(), Some("danger-full-access"));
         for (mode, native) in [
             ("ask", "default"),
+            ("accept-edits", "acceptEdits"),
             ("auto", "auto"),
             ("full-access", "bypassPermissions"),
         ] {
@@ -2111,6 +2113,16 @@ mod tests {
         assert!(config(ProviderKind::Devin, "full-access", "implement").is_ok());
         let auto = config(ProviderKind::Antigravity, "auto", "implement").unwrap();
         assert_eq!(auto.permission_mode, "auto");
+        // `accept-edits` is Claude Code's alone; nobody else maps it.
+        for provider in ProviderKind::ALL
+            .into_iter()
+            .filter(|provider| *provider != ProviderKind::ClaudeCode)
+        {
+            assert!(
+                config(provider, "accept-edits", "implement").is_err(),
+                "{provider:?}"
+            );
+        }
         for provider in [ProviderKind::Acp, ProviderKind::GrokBuild] {
             assert!(config(provider, "ask", "implement").is_ok());
             assert!(config(provider, "auto", "implement").is_err());
@@ -2122,7 +2134,7 @@ mod tests {
     #[test]
     fn legacy_read_only_cannot_be_silently_replaced_by_new_modes() {
         for provider in [ProviderKind::Codex, ProviderKind::ClaudeCode] {
-            for mode in ["ask", "auto", "full-access"] {
+            for mode in ["ask", "accept-edits", "auto", "full-access"] {
                 assert!(resolve_execution_config(
                     provider,
                     Some(mode),

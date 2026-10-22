@@ -188,6 +188,7 @@
       "permissionConfig": {
         "modes": [
           "ask",
+          "accept-edits",
           "auto",
           "full-access"
         ],
@@ -208,7 +209,7 @@
           "danger-full-access"
         ],
         "enforcement": "agent-policy",
-        "description": "Claude default / auto / bypassPermissions and independent plan mode; not an operating-system sandbox. Legacy combinations remain validated."
+        "description": "Claude default / acceptEdits / auto / bypassPermissions and independent plan mode; not an operating-system sandbox. Legacy combinations remain validated."
       },
       "nativeFork": true,
       "nativeCompact": false,

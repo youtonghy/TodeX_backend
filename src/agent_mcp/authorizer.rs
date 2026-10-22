@@ -67,6 +67,10 @@ impl ToolMode {
         }
         match permission_mode {
             "auto" | "full-access" => Self::Unrestricted,
+            // `accept-edits` only lets the provider's own file edits through;
+            // TodeX's tools (ssh, browser, computer) are not edits, so they
+            // ask as in `ask`.
+            "accept-edits" => Self::Ask,
             // `ask`, and anything unknown, asks.
             _ => Self::Ask,
         }
@@ -628,6 +632,10 @@ mod tests {
         assert_eq!(ToolMode::from_turn("full-access", "plan"), ToolMode::Plan);
         assert_eq!(ToolMode::from_turn("ask", "implement"), ToolMode::Ask);
         assert_eq!(ToolMode::from_turn("bogus", "implement"), ToolMode::Ask);
+        assert_eq!(
+            ToolMode::from_turn("accept-edits", "implement"),
+            ToolMode::Ask
+        );
         assert_eq!(
             ToolMode::from_turn("auto", "implement"),
             ToolMode::Unrestricted

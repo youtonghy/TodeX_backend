@@ -120,6 +120,7 @@ fn permission_mapping_matches_golden() {
     let modes = [
         None,
         Some("ask"),
+        Some("accept-edits"),
         Some("auto"),
         Some("full-access"),
         Some("bogus"),

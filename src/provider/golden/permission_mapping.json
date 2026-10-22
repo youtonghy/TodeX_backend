@@ -60,6 +60,30 @@
     "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "unsupported capability: acp does not support Plan mode"
     },
+    "mode=accept-edits work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
     "mode=auto work=- profile=- sandbox=- approval=-": {
       "error": "unsupported capability: acp does not support permission mode auto"
     },
@@ -242,6 +266,30 @@
     "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
     },
+    "mode=accept-edits work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: codex does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: codex does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: codex does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: codex does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: codex does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: codex does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: codex does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: codex does not support permission mode accept-edits"
+    },
     "mode=auto work=- profile=- sandbox=- approval=-": {
       "permissionMode": "auto",
       "workMode": "implement",
@@ -392,6 +440,30 @@
       "error": "unsupported capability: pi does not support Plan mode"
     },
     "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=accept-edits work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "unsupported capability: pi does not support Plan mode"
     },
     "mode=auto work=- profile=- sandbox=- approval=-": {
@@ -558,6 +630,42 @@
     "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "unsupported capability: Claude stream-json does not support this permission combination"
     },
+    "mode=accept-edits work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "accept-edits",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": "acceptEdits",
+      "source": "validated-provider-controls"
+    },
+    "mode=accept-edits work=- profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=accept-edits work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=accept-edits work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "accept-edits",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": "plan",
+      "source": "validated-provider-controls"
+    },
+    "mode=accept-edits work=plan profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
     "mode=auto work=- profile=- sandbox=- approval=-": {
       "permissionMode": "auto",
       "workMode": "implement",
@@ -716,6 +824,30 @@
     "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "unsupported capability: grok-build does not support Plan mode"
     },
+    "mode=accept-edits work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
     "mode=auto work=- profile=- sandbox=- approval=-": {
       "error": "unsupported capability: grok-build does not support permission mode auto"
     },
@@ -861,6 +993,30 @@
     },
     "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=accept-edits work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not support permission mode accept-edits"
     },
     "mode=auto work=- profile=- sandbox=- approval=-": {
       "permissionMode": "ask",
@@ -1032,6 +1188,30 @@
     "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
     },
+    "mode=accept-edits work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not support permission mode accept-edits"
+    },
     "mode=auto work=- profile=- sandbox=- approval=-": {
       "permissionMode": "auto",
       "workMode": "implement",
@@ -1202,6 +1382,30 @@
     "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
     },
+    "mode=accept-edits work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not support permission mode accept-edits"
+    },
     "mode=auto work=- profile=- sandbox=- approval=-": {
       "permissionMode": "auto",
       "workMode": "implement",
@@ -1358,6 +1562,30 @@
       "error": "unsupported capability: deepseek-harness does not support Plan mode"
     },
     "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=accept-edits work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not support permission mode accept-edits"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=accept-edits work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "unsupported capability: deepseek-harness does not support Plan mode"
     },
     "mode=auto work=- profile=- sandbox=- approval=-": {
