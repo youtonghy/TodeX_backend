@@ -6384,6 +6384,46 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn a_permission_claude_withdraws_is_closed_and_never_answered() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-permission-withdrawn").await;
+        fs::write(root.join("permission-withdrawn"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        let request = wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "permission.requested"
+        })
+        .await;
+        fs::write(root.join("withdraw"), "").unwrap();
+        let resolved = wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "permission.resolved"
+                && event.payload["permissionId"] == request.payload["permissionId"]
+        })
+        .await;
+        assert_eq!(resolved.payload["outcome"], "cancelled");
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|event| event.event_type == "turn.completed"
+                    && event.payload["turnId"] == turn_id),
+            "{history:?}"
+        );
+        assert!(!supervisor.permissions.has_pending(&manifest.id));
+        let stdin = fs::read_to_string(root.join("stdin.log")).unwrap();
+        assert!(!stdin.contains("perm-w"), "{stdin}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_tool_mode_lasts_only_while_a_turn_runs() {
@@ -7617,10 +7657,18 @@ elif [ -f "$(dirname "$0")/mode-settings" ]; then
   done
 else
   while IFS= read -r line; do
+    if [ -f "$(dirname "$0")/permission-withdrawn" ]; then
+      printf '%s\n' "$line" >> "$(dirname "$0")/stdin.log"
+    fi
     case "$line" in
       *'"subtype":"initialize"'*)
         printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
         continue
+        ;;
+      *'"type":"control_response"'*)
+        if [ -f "$(dirname "$0")/permission-withdrawn" ]; then
+          continue
+        fi
         ;;
     esac
     if [ -f "$(dirname "$0")/silent-turn" ]; then
@@ -7657,6 +7705,17 @@ else
           printf '{"type":"result","subtype":"success","is_error":true,"session_id":"claude-native","result":"not allowed"}\n'
           ;;
       esac
+      continue
+    fi
+    if [ -f "$(dirname "$0")/permission-withdrawn" ]; then
+      # Claude withdraws the prompt (an interrupt while it was open) and
+      # goes on; it reads nothing more for it.
+      printf '{"type":"control_request","request_id":"perm-w","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}\n'
+      while [ ! -f "$(dirname "$0")/withdraw" ]; do sleep 0.02; done
+      printf '{"type":"control_cancel_request","request_id":"perm-w"}\n'
+      sleep 0.3
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"claude fixture"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"ok"}\n'
       continue
     fi
     if [ -f "$(dirname "$0")/permission-drain" ]; then

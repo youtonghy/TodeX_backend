@@ -111,6 +111,18 @@ optional and canonical aliases are recomputed when old journals are replayed.
   stdout, so an open prompt cannot fill the pipe and freeze the provider —
   including its async subagents. `control_response` frames are matched by
   `request_id`, and a turn that ends first resolves the prompt as cancelled.
+  Every Claude `control_request` gets exactly one answer: `can_use_tool`
+  succeeds or fails with the user's decision; any other subtype in a turn
+  gets `subtype: "error"` ("control request is not supported by TodeX");
+  one read during `initialize` gets "TodeX session is starting" and one
+  between turns "TodeX session is idle". A `control_cancel_request` (Claude
+  sends it for an open `can_use_tool` when interrupted) closes that prompt
+  as cancelled, and the withdrawn request is not answered.
+- TodeX registers no SDK hook callbacks (`initialize` sends `hooks: null`),
+  so Claude never sends `hook_callback`. Command hooks configured in
+  Claude's `settings.json` layers still run inside Claude Code as usual,
+  and a PreToolUse hook or `permissions.deny` can block a tool even under
+  `bypassPermissions`.
 - Payloads larger than the append budget (1 MiB − 16 KiB serialized) are
   truncated, not rejected; redaction runs first. The largest strings (over
   512 bytes) are cut on a UTF-8 boundary and end with `…[truncated N bytes]`

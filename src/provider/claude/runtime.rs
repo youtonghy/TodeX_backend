@@ -1167,7 +1167,9 @@ mod tests {
     /// task that finishes once a `finish-bg` file appears, after which Claude
     /// starts an invocation of its own (as Claude Code 2.1.299 does). A
     /// `reported-mode` file sets initialize's `current_permission_mode` and
-    /// an `init-mode` file each turn's `init` frame mode. User
+    /// an `init-mode` file each turn's `init` frame mode; with an
+    /// `early-request` file a permission request precedes the initialize
+    /// response, which waits for its answer. User
     /// lines are replayed, as with `--replay-user-messages`. Every launch's argv and every
     /// stdin line are logged; a launch while another process of the same
     /// session still runs is logged to `overlap.log`.
@@ -1192,6 +1194,11 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$dir/wire.jsonl"
   case "$line" in
     *'"subtype":"initialize"'*)
+      if [ -f "$dir/early-request" ]; then
+        printf '{"type":"control_request","request_id":"early-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}\n'
+        IFS= read -r reply
+        printf '%s\n' "$reply" >> "$dir/wire.jsonl"
+      fi
       if [ -f "$dir/reported-mode" ]; then
         printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{"commands":[{"name":"review","description":"Review"}],"current_permission_mode":"%s"}}}\n' "$(cat "$dir/reported-mode")"
       else
@@ -1559,6 +1566,32 @@ done
             .unwrap_or_else(|| panic!("{history:?}"));
         assert_eq!(event.payload["metadata"]["settingsSource"], "localSettings");
         assert_eq!(event.payload["metadata"]["cause"], "settings");
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_control_request_during_initialize_is_refused() {
+        let fixture = Fixture::new().await;
+        std::fs::write(fixture.root.join("early-request"), "").unwrap();
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let result = fixture.turn(&sessions, &manifest, "first").await;
+        assert!(!result.cancelled);
+        let wire = fixture.wire();
+        let reply = wire
+            .lines()
+            .find(|line| line.contains("early-1"))
+            .unwrap_or_else(|| panic!("{wire}"));
+        let reply: Value = serde_json::from_str(reply).unwrap();
+        assert_eq!(
+            reply,
+            json!({ "type": "control_response", "response": {
+                "subtype": "error",
+                "request_id": "early-1",
+                "error": "TodeX session is starting",
+            } })
+        );
         sessions.stop_all().await;
         cleanup(&fixture.root);
     }

@@ -2373,6 +2373,9 @@ async fn initialize_claude(
                 )
                 .await);
             }
+            if answer_early_control_request(process, &message).await? {
+                continue;
+            }
             if message.get("type").and_then(Value::as_str) == Some("control_response")
                 && message
                     .pointer("/response/request_id")
@@ -2445,7 +2448,35 @@ async fn probe_settings(
         if let Some(sources) = permission_mode::settings_probe_answer(&message) {
             return Some(sources);
         }
+        answer_early_control_request(process, &message).await.ok()?;
     }
+}
+
+/// Refuses a `control_request` Claude sends before any turn owns the
+/// session (during `initialize`): unanswered, Claude would wait on it.
+/// Returns whether `message` was one.
+async fn answer_early_control_request(
+    process: &mut JsonLineProcess,
+    message: &Value,
+) -> Result<bool, AppError> {
+    if message.get("type").and_then(Value::as_str) != Some("control_request") {
+        return Ok(false);
+    }
+    let Some(request_id) = message.get("request_id").and_then(Value::as_str) else {
+        tracing::warn!("Claude control request is missing request_id");
+        return Ok(true);
+    };
+    process
+        .send(&json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "error",
+                "request_id": request_id,
+                "error": "TodeX session is starting",
+            }
+        }))
+        .await?;
+    Ok(true)
 }
 
 /// The initialize response carries the session's slash-command catalog —
@@ -2642,6 +2673,7 @@ async fn run_claude_turn(
     // closes, which resolves any prompt still waiting, and the closed
     // response channel drops the answer.
     let (response_tx, mut response_rx) = mpsc::unbounded_channel::<Value>();
+    let open_requests = OpenRequests::default();
     // Whether this turn already reported Claude replacing `auto`.
     let mut auto_fallback = AutoFallback::Active;
     // Model from this invocation's `init` frame, for that report.
@@ -2828,8 +2860,16 @@ async fn run_claude_turn(
                     message,
                     sink,
                     cancel,
+                    &open_requests,
                     &context.manifest.workspace,
                 );
+            }
+            // Claude withdrew a request it is no longer waiting on (an
+            // interrupt while `can_use_tool` was open): close its prompt.
+            Some("control_cancel_request") => {
+                if let Some(request_id) = message.get("request_id").and_then(Value::as_str) {
+                    open_requests.withdraw(request_id);
+                }
             }
             Some("system") => {
                 if message.get("subtype").and_then(Value::as_str) == Some("session_state_changed") {
@@ -4092,17 +4132,58 @@ impl AutoFallback {
     }
 }
 
+/// The control requests a turn is answering, by `request_id`. Claude sends
+/// `control_cancel_request` for one it stopped waiting on; withdrawing it
+/// closes its prompt like a cancelled turn does and drops the answer.
+#[derive(Clone, Default)]
+struct OpenRequests(Arc<std::sync::Mutex<HashMap<String, Arc<watch::Sender<bool>>>>>);
+
+impl OpenRequests {
+    fn open(&self, request_id: &str) -> watch::Receiver<bool> {
+        let (sender, receiver) = watch::channel(false);
+        self.0
+            .lock()
+            .expect("Claude open requests lock")
+            .insert(request_id.to_owned(), Arc::new(sender));
+        receiver
+    }
+
+    fn withdraw(&self, request_id: &str) {
+        let sender = self
+            .0
+            .lock()
+            .expect("Claude open requests lock")
+            .remove(request_id);
+        if let Some(sender) = sender {
+            sender.send_replace(true);
+        }
+    }
+
+    /// Done with `request_id`; false when Claude withdrew it, so the answer
+    /// must not be sent.
+    fn close(&self, request_id: &str) -> bool {
+        self.0
+            .lock()
+            .expect("Claude open requests lock")
+            .remove(request_id)
+            .is_some()
+    }
+}
+
 /// Answers a control request from a detached task so the read loop keeps
 /// draining stdout while `can_use_tool` waits on the user. Claude matches the
 /// `control_response` by `request_id`, so reply order does not matter. If the
 /// turn ends first, the closed cancel channel resolves the prompt as
 /// cancelled; the closed response channel then drops the answer, which is
-/// safe because the turn's process is already being torn down.
+/// safe because the turn's process is already being torn down. A request
+/// Claude withdraws ([`OpenRequests`]) is resolved the same way and never
+/// answered.
 fn spawn_control_request(
     responses: &mpsc::UnboundedSender<Value>,
     message: Value,
     sink: &DriverEventSink,
     cancel: &watch::Receiver<bool>,
+    open_requests: &OpenRequests,
     cwd: &Path,
 ) {
     let request_id = message
@@ -4113,23 +4194,46 @@ fn spawn_control_request(
     let request = message.get("request").cloned().unwrap_or(Value::Null);
     let responses = responses.clone();
     let sink = sink.clone();
-    let mut cancel = cancel.clone();
+    let mut turn_cancel = cancel.clone();
+    let open_requests = open_requests.clone();
     let cwd = cwd.to_path_buf();
+    // Opened before the read loop goes on, so a withdrawal right behind the
+    // request finds it.
+    let opened = request_id
+        .as_deref()
+        .map(|request_id| open_requests.open(request_id));
     tokio::spawn(async move {
-        let Some(request_id) = request_id else {
+        let (Some(request_id), Some(mut cancel)) = (request_id, opened) else {
             // Without an id the request cannot be answered at all; keep the
             // turn alive and log instead of failing it over a malformed frame.
             tracing::warn!("Claude control request is missing request_id");
             return;
         };
-        let outcome = match request.get("subtype").and_then(Value::as_str) {
-            Some("can_use_tool") => {
-                tool_permission_response(&request_id, &request, &sink, &mut cancel, &cwd).await
+        let outcome = async {
+            match request.get("subtype").and_then(Value::as_str) {
+                Some("can_use_tool") => {
+                    tool_permission_response(&request_id, &request, &sink, &mut cancel, &cwd).await
+                }
+                _ => Err(AppError::Unsupported(
+                    "control request is not supported by TodeX".to_owned(),
+                )),
             }
-            _ => Err(AppError::Unsupported(
-                "control request is not supported by TodeX".to_owned(),
-            )),
         };
+        tokio::pin!(outcome);
+        // The turn ending (its cancel channel changing or closing) cancels
+        // this request too; after that only the prompt is awaited, and its
+        // answer goes to a closed channel.
+        let (outcome, turn_ended) = tokio::select! {
+            outcome = &mut outcome => (outcome, false),
+            _ = turn_cancel.changed() => {
+                open_requests.withdraw(&request_id);
+                (outcome.await, true)
+            }
+        };
+        if !open_requests.close(&request_id) && !turn_ended {
+            tracing::debug!(request_id, "Claude withdrew the control request");
+            return;
+        }
         let response = match outcome {
             Ok(response) => json!({
                 "subtype": "success",
