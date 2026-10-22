@@ -80,6 +80,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 
 mod permission_mode;
 mod runtime;
+mod session_rules;
 mod session_work;
 
 /// Slash-command catalogs captured from each process's `initialize` control
@@ -997,6 +998,67 @@ mod tests {
     use crate::provider::types::{
         DriverPrompt, DriverPromptContent, PermissionDecision, PermissionOutcome,
     };
+
+    #[test]
+    fn allow_for_session_is_offered_and_answered_with_a_session_rule() {
+        use super::{claude_tool_options, claude_tool_response, session_rules::session_rule};
+        let ids = |options: serde_json::Value| {
+            options
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|option| option["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(claude_tool_options(true)),
+            ["allow_once", "allow_always", "reject_once"]
+        );
+        assert_eq!(
+            ids(claude_tool_options(false)),
+            ["allow_once", "reject_once"]
+        );
+
+        let request = json!({
+            "subtype": "can_use_tool",
+            "tool_name": "Bash",
+            "input": { "command": "cargo test" },
+            // Never echoed back: it would write .claude/settings.local.json.
+            "permission_suggestions": [{ "type": "addRules", "destination": "localSettings" }],
+        });
+        let decide = |outcome| PermissionDecision {
+            outcome,
+            option_id: None,
+            data: None,
+        };
+        let rule = session_rule(&request, Path::new("/work"));
+        assert_eq!(
+            claude_tool_response(
+                &request,
+                rule.clone(),
+                &decide(PermissionOutcome::AllowAlways)
+            ),
+            json!({
+                "behavior": "allow",
+                "updatedInput": { "command": "cargo test" },
+                "updatedPermissions": [{
+                    "type": "addRules",
+                    "rules": [{ "toolName": "Bash", "ruleContent": "cargo test" }],
+                    "behavior": "allow",
+                    "destination": "session",
+                }],
+            })
+        );
+        assert_eq!(
+            claude_tool_response(&request, rule, &decide(PermissionOutcome::AllowOnce)),
+            json!({ "behavior": "allow", "updatedInput": { "command": "cargo test" } })
+        );
+        assert_eq!(
+            claude_tool_response(&request, None, &decide(PermissionOutcome::RejectOnce))
+                ["behavior"],
+            "deny"
+        );
+    }
 
     #[test]
     fn model_discovery_requires_https_except_on_loopback() {
@@ -2761,7 +2823,13 @@ async fn run_claude_turn(
                 }
             }
             Some("control_request") => {
-                spawn_control_request(&response_tx, message, sink, cancel);
+                spawn_control_request(
+                    &response_tx,
+                    message,
+                    sink,
+                    cancel,
+                    &context.manifest.workspace,
+                );
             }
             Some("system") => {
                 if message.get("subtype").and_then(Value::as_str) == Some("session_state_changed") {
@@ -4035,6 +4103,7 @@ fn spawn_control_request(
     message: Value,
     sink: &DriverEventSink,
     cancel: &watch::Receiver<bool>,
+    cwd: &Path,
 ) {
     let request_id = message
         .get("request_id")
@@ -4045,6 +4114,7 @@ fn spawn_control_request(
     let responses = responses.clone();
     let sink = sink.clone();
     let mut cancel = cancel.clone();
+    let cwd = cwd.to_path_buf();
     tokio::spawn(async move {
         let Some(request_id) = request_id else {
             // Without an id the request cannot be answered at all; keep the
@@ -4054,7 +4124,7 @@ fn spawn_control_request(
         };
         let outcome = match request.get("subtype").and_then(Value::as_str) {
             Some("can_use_tool") => {
-                tool_permission_response(&request_id, &request, &sink, &mut cancel).await
+                tool_permission_response(&request_id, &request, &sink, &mut cancel, &cwd).await
             }
             _ => Err(AppError::Unsupported(
                 "control request is not supported by TodeX".to_owned(),
@@ -4088,12 +4158,14 @@ fn spawn_control_request(
 
 /// Waits for the user's decision and builds the `can_use_tool` response body.
 /// Errors mean the prompt itself failed (cancelled, expired, or journal
-/// write), not that the user denied the tool.
+/// write), not that the user denied the tool. `cwd` is Claude's working
+/// directory, which relative file paths in the request refer to.
 async fn tool_permission_response(
     request_id: &str,
     request: &Value,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
+    cwd: &Path,
 ) -> Result<Value, AppError> {
     let tool_name = request
         .get("tool_name")
@@ -4119,34 +4191,63 @@ async fn tool_permission_response(
         }
     }
 
+    let rule = session_rules::session_rule(request, cwd);
     let decision = sink
         .request_permission(
             request_id.to_owned(),
             "tool",
             format!("Allow Claude tool {tool_name}?"),
             claude_permission_details(request),
-            json!([
-                { "id": "allow_once", "kind": "allow_once", "name": "Allow once" },
-                { "id": "reject_once", "kind": "reject_once", "name": "Reject" }
-            ]),
+            claude_tool_options(rule.is_some()),
             cancel,
         )
         .await?;
-    Ok(match decision.outcome {
-        PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways => {
-            json!({
-                "behavior": "allow",
-                "updatedInput": request.get("input").cloned().unwrap_or_else(|| json!({})),
-            })
-        }
-        PermissionOutcome::RejectOnce
-        | PermissionOutcome::RejectAlways
-        | PermissionOutcome::Answer
-        | PermissionOutcome::AbortTurn => json!({
+    Ok(claude_tool_response(request, rule, &decision))
+}
+
+/// The options of a Claude tool approval; "Allow for session" only when a
+/// session rule can cover a repeat of the request.
+fn claude_tool_options(session_rule: bool) -> Value {
+    let mut options =
+        vec![json!({ "id": "allow_once", "kind": "allow_once", "name": "Allow once" })];
+    if session_rule {
+        options.push(
+            json!({ "id": "allow_always", "kind": "allow_always", "name": "Allow for session" }),
+        );
+    }
+    options.push(json!({ "id": "reject_once", "kind": "reject_once", "name": "Reject" }));
+    Value::Array(options)
+}
+
+/// The `can_use_tool` response for `decision`. Allowing for the session adds
+/// `rule` (see [`session_rules`]) to the running process only.
+fn claude_tool_response(
+    request: &Value,
+    rule: Option<Value>,
+    decision: &PermissionDecision,
+) -> Value {
+    let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
+    match (decision.outcome, rule) {
+        (PermissionOutcome::AllowAlways, Some(rule)) => json!({
+            "behavior": "allow",
+            "updatedInput": input,
+            "updatedPermissions": [session_rules::session_permission_update(rule)],
+        }),
+        (PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways, _) => json!({
+            "behavior": "allow",
+            "updatedInput": input,
+        }),
+        (
+            PermissionOutcome::RejectOnce
+            | PermissionOutcome::RejectAlways
+            | PermissionOutcome::Answer
+            | PermissionOutcome::AbortTurn,
+            _,
+        ) => json!({
             "behavior": "deny",
             "message": "User rejected this tool request",
         }),
-    })
+    }
 }
 
 /// Lift the parts a person needs to judge a `can_use_tool` request to the
