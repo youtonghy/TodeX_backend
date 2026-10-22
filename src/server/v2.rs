@@ -531,6 +531,7 @@ pub(super) async fn version(
         version: crate::version::APP_VERSION,
         paths,
         history_encryption: HISTORY_ENCRYPTION_VERSION,
+        terminal_replay: crate::local_terminal::TERMINAL_REPLAY_VERSION,
     })
 }
 
@@ -3114,7 +3115,7 @@ async fn handle_socket(
                 )
                 .await
                 {
-                    if let Ok(value) = serde_json::to_value(websocket::direct_error_event(error)) {
+                    if let Ok(value) = serde_json::to_value(error) {
                         if queue_frame(&outgoing_tx, value).await.is_err() {
                             break;
                         }
@@ -4325,6 +4326,10 @@ pub(super) struct VersionResponse {
     /// with `historyEncryption` on `/v2/ws` and history requests.
     #[serde(rename = "historyEncryption")]
     history_encryption: u8,
+    /// Terminal output carries a per-terminal `seq` and `terminal.attach`
+    /// replays the retained tail; absent on backends that predate it.
+    #[serde(rename = "terminalReplay")]
+    terminal_replay: u8,
 }
 
 #[derive(Debug, Serialize)]

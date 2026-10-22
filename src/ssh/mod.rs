@@ -2416,6 +2416,7 @@ exit 0
             rows: None,
             cols: None,
             command: Some(command),
+            shell_integration: false,
         };
         assert!(!format!("{options:?}").contains("hunter2"));
         let target = crate::server::protocol::TerminalSshTarget {

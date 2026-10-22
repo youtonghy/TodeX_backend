@@ -42,6 +42,7 @@ mod remote_fs;
 mod secure_fs;
 mod server;
 mod server_runner;
+mod shell_integration;
 mod ssh;
 mod transport_crypto;
 mod tui;

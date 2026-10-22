@@ -177,7 +177,8 @@ impl AppState {
             crate::agent_calls::AgentCalls::new(&config.data_dir, conversations.clone());
         conversations.recover_all().await?;
         agent_calls.start().await;
-        let local_terminals = LocalTerminalManager::new(events.clone());
+        let local_terminals = LocalTerminalManager::new(events.clone())
+            .with_shell_integration_root(config.data_dir.clone());
         let pairing_keys = PairingKeyStore::load(&config.data_dir).await?;
         let device_auth = DeviceAuthenticator::new(devices.clone());
         // Pairing reads the same key store and configured protocol as the

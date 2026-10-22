@@ -401,6 +401,10 @@ pub enum ClientMessageKind {
     TerminalResize(TerminalResizeRequest),
     #[serde(rename = "terminal.status")]
     TerminalStatus(TerminalStatusRequest),
+    #[serde(rename = "terminal.attach")]
+    TerminalAttach(TerminalAttachRequest),
+    #[serde(rename = "terminal.clear")]
+    TerminalClear(TerminalClearRequest),
     #[serde(rename = "codex.thread.start")]
     CodexThreadStart(CodexLifecycleRequest),
     #[serde(rename = "codex.turn.start")]
@@ -626,6 +630,9 @@ pub struct TerminalStartRequest {
     /// Connect to a configured SSH host instead of starting a local shell.
     #[serde(default)]
     pub ssh: Option<TerminalSshTarget>,
+    /// Load the TodeX shell integration into a local bash, zsh or fish.
+    #[serde(default)]
+    pub shell_integration: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -675,6 +682,27 @@ pub struct TerminalResizeRequest {
     pub rows: Option<u16>,
     #[serde(default)]
     pub cols: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalAttachRequest {
+    pub terminal_id: String,
+    pub tenant_id: String,
+    /// Last output `seq` the client holds; absent for the whole retained tail.
+    #[serde(default)]
+    pub since: Option<u64>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalClearRequest {
+    pub terminal_id: String,
+    pub tenant_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1173,6 +1201,32 @@ mod tests {
             ClientMessageKind::TerminalStop(payload) => assert!(payload.force),
             other => panic!("unexpected message kind: {other:?}"),
         }
+
+        let attach = parse_message(json!({
+            "id": "terminal-attach-1",
+            "type": "terminal.attach",
+            "payload": {
+                "terminalId": "term-1",
+                "tenantId": "local",
+                "since": 42,
+                "rows": 30
+            }
+        }));
+        match attach.kind {
+            ClientMessageKind::TerminalAttach(payload) => {
+                assert_eq!(payload.since, Some(42));
+                assert_eq!(payload.rows, Some(30));
+                assert_eq!(payload.cols, None);
+            }
+            other => panic!("unexpected message kind: {other:?}"),
+        }
+
+        let clear = parse_message(json!({
+            "id": "terminal-clear-1",
+            "type": "terminal.clear",
+            "payload": { "terminalId": "term-1", "tenantId": "local" }
+        }));
+        assert!(matches!(clear.kind, ClientMessageKind::TerminalClear(_)));
     }
 
     #[test]

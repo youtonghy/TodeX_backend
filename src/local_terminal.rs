@@ -1,9 +1,10 @@
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        mpsc as std_mpsc, Arc, Mutex,
     },
     time::Duration,
 };
@@ -12,7 +13,7 @@ use dashmap::DashMap;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use serde_json::json;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -22,7 +23,25 @@ use crate::{
     ssh::TerminalCommand,
 };
 
-const TERMINAL_OUTPUT_BUFFER_SIZE: usize = 8192;
+const TERMINAL_READ_BUFFER_SIZE: usize = 64 * 1024;
+/// Largest `terminal.output` batch: a flood becomes a few large events while
+/// an interactive echo still goes out on its own, at once.
+const TERMINAL_OUTPUT_BATCH_LIMIT: usize = 256 * 1024;
+/// Reads waiting to be published; a full queue holds the PTY reader back.
+const TERMINAL_READ_QUEUE: usize = 64;
+/// Output arriving this soon after the previous batch counts as a stream
+/// (a program printing): its next batch waits briefly for more. Interactive
+/// echoes come far apart and go out at once.
+const TERMINAL_STREAMING_GAP: Duration = Duration::from_millis(10);
+/// How long a streaming batch gathers further reads, as Ghostty's read
+/// thread does.
+const TERMINAL_BATCH_WINDOW: Duration = Duration::from_millis(4);
+/// Output kept per terminal for `terminal.attach`.
+const TERMINAL_REPLAY_LIMIT: usize = 2 * 1024 * 1024;
+const TERMINAL_INPUT_QUEUE: usize = 256;
+/// Advertised as `terminalReplay` by `GET /v2/version`: output carries a
+/// per-terminal `seq`, and `terminal.attach` / `terminal.clear` exist.
+pub const TERMINAL_REPLAY_VERSION: u8 = 1;
 /// How long `terminal.exited` waits for the reader to reach end of output.
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
@@ -32,6 +51,10 @@ const DEFAULT_TERMINAL_COLS: u16 = 80;
 pub struct LocalTerminalManager {
     sessions: Arc<DashMap<String, TerminalHandle>>,
     events: EventBus,
+    /// Where shell integration scripts are installed (the data directory);
+    /// unset, terminals never get the integration.
+    shell_integration_root: Option<PathBuf>,
+    shell_integration_dir: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
 }
 
 #[derive(Clone)]
@@ -48,6 +71,59 @@ struct TerminalHandle {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     stop_requested: Arc<AtomicBool>,
     size: Arc<RwLock<TerminalSize>>,
+    replay: Arc<AsyncMutex<TerminalReplay>>,
+}
+
+/// The retained tail of a terminal's output, in published batches. Its lock
+/// is held while a batch is published, so a snapshot taken under it is
+/// exactly the output published before it.
+#[derive(Default)]
+struct TerminalReplay {
+    chunks: VecDeque<(u64, String)>,
+    bytes: usize,
+    last_seq: u64,
+}
+
+impl TerminalReplay {
+    fn push(&mut self, data: String) -> u64 {
+        self.last_seq += 1;
+        self.bytes += data.len();
+        self.chunks.push_back((self.last_seq, data));
+        while self.bytes > TERMINAL_REPLAY_LIMIT && self.chunks.len() > 1 {
+            if let Some((_, dropped)) = self.chunks.pop_front() {
+                self.bytes -= dropped.len();
+            }
+        }
+        self.last_seq
+    }
+
+    /// Output published after `since`, or with `reset` everything retained
+    /// when `since` is absent or no longer covered by the retained tail.
+    fn since(&self, since: Option<u64>) -> (bool, String) {
+        let first = self
+            .chunks
+            .front()
+            .map_or(self.last_seq + 1, |(seq, _)| *seq);
+        match since {
+            Some(since) if since <= self.last_seq && since + 1 >= first => (
+                false,
+                self.chunks
+                    .iter()
+                    .filter(|(seq, _)| *seq > since)
+                    .map(|(_, data)| data.as_str())
+                    .collect(),
+            ),
+            _ => (
+                true,
+                self.chunks.iter().map(|(_, data)| data.as_str()).collect(),
+            ),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.bytes = 0;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -81,6 +157,9 @@ pub struct TerminalStartOptions {
     /// Runs this program (with its own complete environment) instead of a
     /// shell; `cwd` is then ignored in favour of the command's directory.
     pub command: Option<TerminalCommand>,
+    /// Load the bash/zsh/fish integration (prompt marks, working directory)
+    /// into a local shell; ignored for commands and other shells.
+    pub shell_integration: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +188,24 @@ pub struct TerminalResizeOptions {
 }
 
 #[derive(Clone, Debug)]
+pub struct TerminalAttachOptions {
+    pub request_id: String,
+    pub terminal_id: String,
+    pub tenant_id: String,
+    /// Last `seq` the client has; absent to get everything retained.
+    pub since: Option<u64>,
+    pub rows: Option<u16>,
+    pub cols: Option<u16>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalClearOptions {
+    pub request_id: String,
+    pub terminal_id: String,
+    pub tenant_id: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct TerminalStatusOptions {
     pub request_id: String,
     pub tenant_id: String,
@@ -121,7 +218,29 @@ impl LocalTerminalManager {
         Self {
             sessions: Arc::new(DashMap::new()),
             events,
+            shell_integration_root: None,
+            shell_integration_dir: Arc::default(),
         }
+    }
+
+    pub fn with_shell_integration_root(mut self, root: PathBuf) -> Self {
+        self.shell_integration_root = Some(root);
+        self
+    }
+
+    /// The installed integration scripts, written on first use. A failed
+    /// install is logged once and leaves terminals without the integration.
+    async fn shell_integration_dir(&self) -> Option<PathBuf> {
+        let root = self.shell_integration_root.as_ref()?;
+        self.shell_integration_dir
+            .get_or_init(|| async {
+                crate::shell_integration::install(root)
+                    .await
+                    .inspect_err(|error| warn!(%error, "failed to install shell integration"))
+                    .ok()
+            })
+            .await
+            .clone()
     }
 
     pub fn session_ids(
@@ -201,6 +320,13 @@ impl LocalTerminalManager {
             for (key, value) in &launch.env {
                 command.env(key, value);
             }
+        } else {
+            crate::shell_integration::clean_environment(&mut command);
+            if options.shell_integration {
+                if let Some(dir) = self.shell_integration_dir().await {
+                    crate::shell_integration::apply(&mut command, &shell, &dir);
+                }
+            }
         }
         command.cwd(&cwd);
         command.env("TERM", "xterm-256color");
@@ -225,8 +351,9 @@ impl LocalTerminalManager {
         let stop_requested = Arc::new(AtomicBool::new(false));
         drop(pair.slave);
 
-        let (input_tx, input_rx) = mpsc::channel::<String>(64);
+        let (input_tx, input_rx) = mpsc::channel::<String>(TERMINAL_INPUT_QUEUE);
         let size_state = Arc::new(RwLock::new(size));
+        let replay = Arc::new(AsyncMutex::new(TerminalReplay::default()));
         let handle = TerminalHandle {
             tenant_id: options.tenant_id.clone(),
             workspace_id: options.workspace_id.clone(),
@@ -243,6 +370,7 @@ impl LocalTerminalManager {
             master,
             stop_requested: stop_requested.clone(),
             size: size_state.clone(),
+            replay: replay.clone(),
         };
         self.sessions.insert(terminal_id.clone(), handle.clone());
 
@@ -258,11 +386,20 @@ impl LocalTerminalManager {
                 input_runtime,
             )
         });
+        let (reads_tx, reads_rx) = std_mpsc::sync_channel::<Vec<u8>>(TERMINAL_READ_QUEUE);
+        let reader_events = self.events.clone();
+        let reader_runtime = tokio::runtime::Handle::current();
+        let reader_info = TerminalEventInfo::from_handle(&terminal_id, &handle);
+        tokio::task::spawn_blocking(move || {
+            read_terminal_output(reader, reads_tx, reader_events, reader_info, reader_runtime)
+        });
         let output_events = self.events.clone();
         let output_runtime = tokio::runtime::Handle::current();
         let output_info = TerminalEventInfo::from_handle(&terminal_id, &handle);
+        // Ends once the reader has hit end of output and everything it read
+        // is published.
         let output_task = tokio::task::spawn_blocking(move || {
-            read_terminal_output(reader, output_events, output_info, output_runtime)
+            publish_terminal_output(reads_rx, replay, output_events, output_info, output_runtime)
         });
 
         let sessions = self.sessions.clone();
@@ -355,12 +492,20 @@ impl LocalTerminalManager {
 
     pub async fn input(&self, options: TerminalInputOptions) -> Result<(), AppError> {
         let handle = self.authorized_handle(&options.terminal_id, &options.tenant_id)?;
+        // Never wait for room: a program that stops reading its input must
+        // not hold up the rest of the connection's commands.
         handle
             .input_tx
-            .send(options.data.clone())
-            .await
-            .map_err(|_| {
-                AppError::InvalidRequest("terminal input channel is closed".to_string())
+            .try_send(options.data.clone())
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => AppError::InvalidRequest(format!(
+                    "terminal {} is not reading its input; input dropped",
+                    options.terminal_id
+                )),
+                mpsc::error::TrySendError::Closed(_) => AppError::InvalidRequest(format!(
+                    "terminal {} input channel is closed",
+                    options.terminal_id
+                )),
             })?;
         self.events
             .publish(EventRecord::new(
@@ -457,6 +602,108 @@ impl LocalTerminalManager {
                     "rows": next_size.rows,
                     "cols": next_size.cols,
                     "lifecycleState": "running",
+                }),
+            ))
+            .await;
+        Ok(())
+    }
+
+    /// Re-joins a terminal: resizes it to the client's view first (so the
+    /// program redraws for it), then publishes `terminal.attached` with the
+    /// output after `since`. A terminal that is not running answers with
+    /// `running: false` instead of an error, so clients can start it.
+    pub async fn attach(&self, options: TerminalAttachOptions) -> Result<(), AppError> {
+        let handle = match self.sessions.get(&options.terminal_id) {
+            Some(entry) => entry.value().clone(),
+            None => {
+                self.events
+                    .publish(EventRecord::new(
+                        "terminal.attached",
+                        None,
+                        None,
+                        Some(options.terminal_id.clone()),
+                        json!({
+                            "requestId": options.request_id,
+                            "terminalId": options.terminal_id,
+                            "tenantId": options.tenant_id,
+                            "running": false,
+                        }),
+                    ))
+                    .await;
+                return Ok(());
+            }
+        };
+        if handle.tenant_id != options.tenant_id {
+            return Err(AppError::Unauthorized("tenant mismatch".to_string()));
+        }
+        if options.rows.is_some() || options.cols.is_some() {
+            let current = *handle.size.read().await;
+            let rows = options.rows.map(|rows| rows.clamp(8, 200));
+            let cols = options.cols.map(|cols| cols.clamp(20, 400));
+            if rows.is_some_and(|rows| rows != current.rows)
+                || cols.is_some_and(|cols| cols != current.cols)
+            {
+                self.resize(TerminalResizeOptions {
+                    request_id: options.request_id.clone(),
+                    terminal_id: options.terminal_id.clone(),
+                    tenant_id: options.tenant_id.clone(),
+                    rows,
+                    cols,
+                })
+                .await?;
+            }
+        }
+        let size = *handle.size.read().await;
+        // Published under the replay lock: batches up to `seq` went out
+        // before this event, later ones follow it.
+        let replay = handle.replay.lock().await;
+        let (reset, data) = replay.since(options.since);
+        self.events
+            .publish(EventRecord::new(
+                "terminal.attached",
+                handle.workspace_id.clone(),
+                None,
+                Some(options.terminal_id.clone()),
+                json!({
+                    "requestId": options.request_id,
+                    "terminalId": options.terminal_id,
+                    "tenantId": options.tenant_id,
+                    "workspaceId": handle.workspace_id,
+                    "running": true,
+                    "reset": reset,
+                    "seq": replay.last_seq,
+                    "data": data,
+                    "cwd": handle.cwd,
+                    "shell": handle.shell,
+                    "pid": handle.pid,
+                    "rows": size.rows,
+                    "cols": size.cols,
+                    "startedAt": handle.started_at,
+                    "lifecycleState": "running",
+                    "ssh": handle.ssh_host.as_ref().map(|host| json!({ "host": host })),
+                }),
+            ))
+            .await;
+        Ok(())
+    }
+
+    /// Drops the retained output, so a later attach does not bring back what
+    /// the user cleared. Output keeps its `seq` numbering.
+    pub async fn clear(&self, options: TerminalClearOptions) -> Result<(), AppError> {
+        let handle = self.authorized_handle(&options.terminal_id, &options.tenant_id)?;
+        let mut replay = handle.replay.lock().await;
+        replay.clear();
+        self.events
+            .publish(EventRecord::new(
+                "terminal.cleared",
+                handle.workspace_id.clone(),
+                None,
+                Some(options.terminal_id.clone()),
+                json!({
+                    "requestId": options.request_id,
+                    "terminalId": options.terminal_id,
+                    "tenantId": options.tenant_id,
+                    "seq": replay.last_seq,
                 }),
             ))
             .await;
@@ -582,12 +829,12 @@ fn write_terminal_input(
 
 fn read_terminal_output(
     mut reader: Box<dyn Read + Send>,
+    reads: std_mpsc::SyncSender<Vec<u8>>,
     events: EventBus,
     info: TerminalEventInfo,
     runtime: tokio::runtime::Handle,
 ) {
-    let mut buffer = vec![0_u8; TERMINAL_OUTPUT_BUFFER_SIZE];
-    let mut pending_utf8 = Vec::new();
+    let mut buffer = vec![0_u8; TERMINAL_READ_BUFFER_SIZE];
     loop {
         let read = match reader.read(&mut buffer) {
             Ok(0) => break,
@@ -602,15 +849,52 @@ fn read_terminal_output(
                 break;
             }
         };
-        let data = decode_terminal_output(&mut pending_utf8, &buffer[..read], false);
+        if reads.send(buffer[..read].to_vec()).is_err() {
+            break;
+        }
+    }
+}
+
+/// Publishes what the reader read, merging reads that queued up meanwhile
+/// (or, while output streams, arrive within `TERMINAL_BATCH_WINDOW`) into one
+/// `terminal.output` of up to `TERMINAL_OUTPUT_BATCH_LIMIT`.
+fn publish_terminal_output(
+    reads: std_mpsc::Receiver<Vec<u8>>,
+    replay: Arc<AsyncMutex<TerminalReplay>>,
+    events: EventBus,
+    info: TerminalEventInfo,
+    runtime: tokio::runtime::Handle,
+) {
+    let mut pending_utf8 = Vec::new();
+    let mut last_batch: Option<std::time::Instant> = None;
+    while let Ok(mut batch) = reads.recv() {
+        let now = std::time::Instant::now();
+        let streaming =
+            last_batch.is_some_and(|last| now.duration_since(last) < TERMINAL_STREAMING_GAP);
+        let deadline = now + TERMINAL_BATCH_WINDOW;
+        while batch.len() < TERMINAL_OUTPUT_BATCH_LIMIT {
+            let more = match reads.try_recv() {
+                Ok(more) => Some(more),
+                Err(std_mpsc::TryRecvError::Empty) if streaming => deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .and_then(|left| reads.recv_timeout(left).ok()),
+                Err(_) => None,
+            };
+            match more {
+                Some(more) => batch.extend_from_slice(&more),
+                None => break,
+            }
+        }
+        last_batch = Some(std::time::Instant::now());
+        let data = decode_terminal_output(&mut pending_utf8, &batch, false);
         if !data.is_empty() {
-            publish_terminal_output(&events, &info, &runtime, data);
+            publish_terminal_output_batch(&events, &info, &runtime, &replay, data);
         }
     }
 
     let trailing = decode_terminal_output(&mut pending_utf8, &[], true);
     if !trailing.is_empty() {
-        publish_terminal_output(&events, &info, &runtime, trailing);
+        publish_terminal_output_batch(&events, &info, &runtime, &replay, trailing);
     }
 }
 
@@ -655,12 +939,15 @@ pub(crate) fn decode_terminal_output(pending: &mut Vec<u8>, chunk: &[u8], flush:
     output
 }
 
-fn publish_terminal_output(
+fn publish_terminal_output_batch(
     events: &EventBus,
     info: &TerminalEventInfo,
     runtime: &tokio::runtime::Handle,
+    replay: &AsyncMutex<TerminalReplay>,
     data: String,
 ) {
+    let mut replay = replay.blocking_lock();
+    let seq = replay.push(data.clone());
     runtime.block_on(events.publish(EventRecord::new(
         "terminal.output",
         info.workspace_id.clone(),
@@ -677,6 +964,7 @@ fn publish_terminal_output(
             "data": data,
             "encoding": "utf8",
             "pty": true,
+            "seq": seq,
         }),
     )));
 }
@@ -781,6 +1069,7 @@ mod tests {
                 rows: Some(31),
                 cols: Some(97),
                 command: None,
+                shell_integration: false,
             })
             .await
             .unwrap();
@@ -856,6 +1145,7 @@ mod tests {
                     cwd: cwd.clone(),
                     ssh_host: "web".to_string(),
                 }),
+                shell_integration: false,
             })
             .await
             .unwrap();
@@ -908,6 +1198,7 @@ mod tests {
                     cwd: cwd.clone(),
                     ssh_host: "web".to_string(),
                 }),
+                shell_integration: false,
             })
             .await
             .unwrap();
@@ -961,6 +1252,7 @@ mod tests {
                 rows: Some(24),
                 cols: Some(80),
                 command: None,
+                shell_integration: false,
             })
             .await
             .unwrap();
@@ -1020,6 +1312,313 @@ mod tests {
         assert!(saw_exit, "terminal should publish an exit event");
 
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn replay_keeps_the_tail_and_answers_since() {
+        let mut replay = TerminalReplay::default();
+        assert_eq!(replay.since(None), (true, String::new()));
+        assert_eq!(replay.since(Some(0)), (false, String::new()));
+        assert_eq!(replay.push("a".into()), 1);
+        assert_eq!(replay.push("b".into()), 2);
+        assert_eq!(replay.since(Some(1)), (false, "b".to_string()));
+        assert_eq!(replay.since(Some(2)), (false, String::new()));
+        // A client ahead of this terminal (e.g. a restarted backend) resets.
+        assert_eq!(replay.since(Some(9)), (true, "ab".to_string()));
+
+        let big = "x".repeat(TERMINAL_REPLAY_LIMIT);
+        replay.push(big.clone());
+        assert_eq!(
+            replay.chunks.len(),
+            1,
+            "older batches give way to the limit"
+        );
+        assert_eq!(replay.since(Some(1)), (true, big.clone()));
+        assert_eq!(replay.since(Some(2)), (false, big));
+
+        replay.clear();
+        assert_eq!(replay.since(Some(3)), (false, String::new()));
+        assert_eq!(replay.since(Some(1)), (true, String::new()));
+        assert_eq!(replay.push("c".into()), 4);
+    }
+
+    #[tokio::test]
+    async fn attach_replays_retained_output_after_since() {
+        let events = EventBus::new(256);
+        let mut rx = events.subscribe();
+        let manager = LocalTerminalManager::new(events);
+        let cwd = make_temp_workspace("terminal-attach");
+        let terminal_id = "term-attach".to_string();
+        manager
+            .start(TerminalStartOptions {
+                request_id: "start".to_string(),
+                terminal_id: Some(terminal_id.clone()),
+                tenant_id: "local".to_string(),
+                workspace_id: None,
+                cwd: cwd.display().to_string(),
+                shell: Some("/bin/sh".to_string()),
+                rows: Some(24),
+                cols: Some(80),
+                command: None,
+                shell_integration: false,
+            })
+            .await
+            .unwrap();
+        manager
+            .input(TerminalInputOptions {
+                request_id: "input".to_string(),
+                terminal_id: terminal_id.clone(),
+                tenant_id: "local".to_string(),
+                data: "printf '__AT%s__' TACH\n".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut output = String::new();
+        let mut last_seq = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output.contains("__ATTACH__") {
+                let event = rx.recv().await.unwrap();
+                if event.event_type == "terminal.output" {
+                    let seq = event.payload["seq"].as_u64().unwrap();
+                    assert_eq!(seq, last_seq + 1, "seq counts every batch");
+                    last_seq = seq;
+                    output.push_str(&payload_text(&event.payload, "data"));
+                }
+            }
+        })
+        .await
+        .expect("marker output");
+
+        let attach = |since: Option<u64>| TerminalAttachOptions {
+            request_id: "attach".to_string(),
+            terminal_id: terminal_id.clone(),
+            tenant_id: "local".to_string(),
+            since,
+            rows: None,
+            cols: None,
+        };
+        manager.attach(attach(None)).await.unwrap();
+        let attached = next_attached(&mut rx).await;
+        assert_eq!(attached["running"], true);
+        assert_eq!(attached["reset"], true);
+        assert!(attached["seq"].as_u64().unwrap() >= last_seq);
+        assert!(payload_text(&attached, "data").contains("__ATTACH__"));
+
+        let seq = attached["seq"].as_u64().unwrap();
+        manager.attach(attach(Some(seq))).await.unwrap();
+        let attached = next_attached(&mut rx).await;
+        assert_eq!(attached["reset"], false);
+        assert_eq!(payload_text(&attached, "data"), "");
+
+        manager
+            .clear(TerminalClearOptions {
+                request_id: "clear".to_string(),
+                terminal_id: terminal_id.clone(),
+                tenant_id: "local".to_string(),
+            })
+            .await
+            .unwrap();
+        manager.attach(attach(Some(0))).await.unwrap();
+        let attached = next_attached(&mut rx).await;
+        assert_eq!(attached["reset"], true);
+        assert!(!payload_text(&attached, "data").contains("__ATTACH__"));
+
+        manager
+            .stop(TerminalStopOptions {
+                request_id: "stop".to_string(),
+                terminal_id: terminal_id.clone(),
+                tenant_id: "local".to_string(),
+                force: true,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rx.recv().await.unwrap().event_type != "terminal.exited" {}
+        })
+        .await
+        .expect("exit");
+        manager.attach(attach(Some(seq))).await.unwrap();
+        let attached = next_attached(&mut rx).await;
+        assert_eq!(attached["running"], false);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn shell_integration_marks_prompts_and_commands() {
+        let root = make_temp_workspace("terminal-shell-integration");
+        for shell in ["bash", "zsh", "fish"] {
+            let Some(real) = std::env::var_os("PATH").and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(shell))
+                    .find(|candidate| candidate.is_file())
+            }) else {
+                eprintln!("skipping {shell}: not installed");
+                continue;
+            };
+            // A wrapper under the shell's own name gives it an empty home, so
+            // the developer's rc files stay out of the test.
+            let home = root.join(format!("home-{shell}"));
+            fs::create_dir_all(&home).unwrap();
+            let bin = root.join(format!("bin-{shell}"));
+            fs::create_dir_all(&bin).unwrap();
+            let path = bin.join(shell);
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nHOME='{home}' XDG_CONFIG_HOME='{home}/.config' exec '{real}' \"$@\"\n",
+                    home = home.display(),
+                    real = real.display()
+                ),
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let events = EventBus::new(256);
+            let mut rx = events.subscribe();
+            let manager =
+                LocalTerminalManager::new(events).with_shell_integration_root(root.clone());
+            let terminal_id = format!("term-integration-{shell}");
+            manager
+                .start(TerminalStartOptions {
+                    request_id: "start".to_string(),
+                    terminal_id: Some(terminal_id.clone()),
+                    tenant_id: "local".to_string(),
+                    workspace_id: None,
+                    cwd: root.display().to_string(),
+                    shell: Some(path.display().to_string()),
+                    rows: Some(24),
+                    cols: Some(80),
+                    command: None,
+                    shell_integration: true,
+                })
+                .await
+                .unwrap();
+            let mut output = String::new();
+            let mut sent = false;
+            let mut answered = 0;
+            let done = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = rx.recv().await.unwrap();
+                    if event.event_type != "terminal.output" {
+                        continue;
+                    }
+                    output.push_str(&payload_text(&event.payload, "data"));
+                    // fish 4 waits for the terminal to answer its device
+                    // attribute and cursor queries before it reads input.
+                    let queries =
+                        output.matches("\x1b[0c").count() + output.matches("\x1b[6n").count();
+                    while answered < queries {
+                        answered += 1;
+                        manager
+                            .input(TerminalInputOptions {
+                                request_id: "reply".to_string(),
+                                terminal_id: terminal_id.clone(),
+                                tenant_id: "local".to_string(),
+                                data: "\x1b[1;1R\x1b[?62;22c".to_string(),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    if !sent && output.contains("\x1b]133;A") {
+                        sent = true;
+                        manager
+                            .input(TerminalInputOptions {
+                                request_id: "input".to_string(),
+                                terminal_id: terminal_id.clone(),
+                                tenant_id: "local".to_string(),
+                                data: "false\r".to_string(),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    if output.contains("\x1b]133;D;1") {
+                        break;
+                    }
+                }
+            })
+            .await;
+            manager
+                .stop(TerminalStopOptions {
+                    request_id: "stop".to_string(),
+                    terminal_id,
+                    tenant_id: "local".to_string(),
+                    force: true,
+                })
+                .await
+                .unwrap();
+            assert!(
+                done.is_ok(),
+                "{shell}: no command-finished mark in {output:?}"
+            );
+            assert!(output.contains("\x1b]133;C"), "{shell}: {output:?}");
+            assert!(output.contains("\x1b]7;"), "{shell}: {output:?}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn streaming_output_is_published_in_few_batches() {
+        let events = EventBus::new(8192);
+        let mut rx = events.subscribe();
+        let manager = LocalTerminalManager::new(events);
+        let cwd = make_temp_workspace("terminal-batching");
+        // `seq` writes line by line to the TTY, the case batching is for.
+        manager
+            .start(TerminalStartOptions {
+                request_id: "start".to_string(),
+                terminal_id: Some("term-batching".to_string()),
+                tenant_id: "local".to_string(),
+                workspace_id: None,
+                cwd: cwd.display().to_string(),
+                shell: None,
+                rows: None,
+                cols: None,
+                command: Some(TerminalCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".into(), "seq 1 200000".into()],
+                    env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+                    cwd: cwd.clone(),
+                    ssh_host: "local".to_string(),
+                }),
+                shell_integration: false,
+            })
+            .await
+            .unwrap();
+        let mut batches = 0;
+        let mut output = String::new();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let event = rx.recv().await.unwrap();
+                match event.event_type.as_str() {
+                    "terminal.output" => {
+                        batches += 1;
+                        output.push_str(&payload_text(&event.payload, "data"));
+                    }
+                    "terminal.exited" => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("exit");
+        assert!(output.contains("200000"), "all output arrives");
+        // About 1.3 MB: thousands of reads, a few hundred batches at most.
+        assert!(batches < 1000, "{batches} batches");
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    async fn next_attached(
+        rx: &mut tokio::sync::broadcast::Receiver<Arc<crate::event::PublishedEvent>>,
+    ) -> Value {
+        loop {
+            let event = rx.recv().await.unwrap();
+            if event.event_type == "terminal.attached" {
+                return event.payload.clone();
+            }
+        }
     }
 
     fn payload_text(payload: &Value, key: &str) -> String {

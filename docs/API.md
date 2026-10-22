@@ -829,7 +829,7 @@ ok
 GET /v2/version
 ```
 
-该端点与 `/health` 一样不需要认证，供 daemon 自检、客户端连接卡片轮询和客户端版本一致性检测（开发构建 `DEV0.0.0`/`0.0.0` 不参与比较）。匿名调用只返回 `name`、`version`、`historyEncryption`；`data_dir`、`workspace_root`、`workspace_roots` 仅在请求带有效设备签名（与其他接口相同的签名方式）时返回，`enable_auth = false` 时仅在请求满足上述本地 `Host`/`Origin` 条件时返回。签名无效或 nonce 重放不会报错，只按匿名处理，便于配对前探测。
+该端点与 `/health` 一样不需要认证，供 daemon 自检、客户端连接卡片轮询和客户端版本一致性检测（开发构建 `DEV0.0.0`/`0.0.0` 不参与比较）。匿名调用只返回 `name`、`version`、`historyEncryption`、`terminalReplay`；`data_dir`、`workspace_root`、`workspace_roots` 仅在请求带有效设备签名（与其他接口相同的签名方式）时返回，`enable_auth = false` 时仅在请求满足上述本地 `Host`/`Origin` 条件时返回。签名无效或 nonce 重放不会报错，只按匿名处理，便于配对前探测。
 
 响应字段：
 
@@ -842,6 +842,7 @@ GET /v2/version
 | `workspace_roots` | string[] | 全部已配置的 workspace 根目录（仅鉴权后） |
 | `scratch_workspace_root` | string | 无工作区对话目录的父目录 `$DATA_DIR/workspace`（仅鉴权后）；不在 `workspace_roots` 中，客户端可在首次创建这类对话前用它做模型/命令发现 |
 | `historyEncryption` | number | 后端支持的历史加密版本（当前 `1`），见「历史加密密钥」 |
+| `terminalReplay` | number | 终端输出序号与 `terminal.attach` / `terminal.clear` 的协议版本（当前 `1`），见「终端」；旧后端没有该字段 |
 
 ## Workspace 缓存同步
 
@@ -1466,6 +1467,46 @@ TUI 配对二维码只携带后端地址（`{"kind":"todex-pairing-link","versio
   "payload": { "sessionCursors": { "cdxs_local_1": 100 } }
 }
 ```
+
+## 终端（`terminal.*`）
+
+交互式终端运行在 daemon 的 PTY 中，不随 WebSocket 断开而结束；任何一条带 `terminalId` 的 `terminal.*` 命令都会让当前连接开始接收该终端的事件。所有命令都需要 `tenantId`，并写入终端审计（见上文 `audit-terminal.jsonl`）。
+
+| 命令 | payload | 说明 |
+|---|---|---|
+| `terminal.start` | `terminalId?`、`cwd`、`shell?`、`rows?`、`cols?`、`workspaceId?`、`ssh?` | 启动 shell（或 SSH，见「SSH 终端」）。`terminalId` 已在运行时报错。行列限制在 8–200 × 20–400。 |
+| `terminal.input` | `terminalId`、`data` | 写入 PTY。输入队列（256 条）已满时不等待，直接返回错误，提示程序没有读取输入。 |
+| `terminal.resize` | `terminalId`、`rows?`、`cols?` | 调整 PTY 窗口。 |
+| `terminal.stop` | `terminalId`、`force?` | `force` 杀进程，否则向 shell 写入 `exit`。 |
+| `terminal.status` | `terminalId?`、`workspaceId?` | 返回 `terminal.status { terminalId, terminals: [...] }`，只列仍在运行的终端；客户端据此把没有列出的 `terminalId` 视为已结束。 |
+| `terminal.attach` | `terminalId`、`since?`、`rows?`、`cols?` | 重新接入终端，见下文。 |
+| `terminal.clear` | `terminalId` | 丢弃 daemon 保留的输出（之后的 attach 不再回放），发布 `terminal.cleared { terminalId, seq }`。 |
+
+事件：`terminal.started`、`terminal.output`、`terminal.input.accepted`、`terminal.resized`、`terminal.stopping`、`terminal.exited`、`terminal.error`、`terminal.status`、`terminal.attached`、`terminal.cleared`。终端命令失败时返回的 `error` 事件带 `pane_id` = `terminalId`，payload 额外带 `requestId` 与 `terminalId`（`terminal.start` 未给 id、`terminal.status` 未指定终端时除外）。
+
+**输出合批与序号。** PTY 以 64 KiB 读取；已排队的读取合并为一条 `terminal.output`（单条最多 256 KiB）。距上一批不到 10 ms 又有输出时视为持续输出，再等待最多 4 ms 收集后续读取；间隔更长的输出（交互回显）立即发出，所以大量输出只产生少量事件。每条 `terminal.output` 带 `seq`：同一终端从 1 开始逐条加一。
+
+**保留与 `terminal.attach`。** daemon 为每个运行中的终端保留最近约 2 MiB 输出（按整批淘汰，终端退出后释放）。`terminal.attach` 先按 `rows`/`cols` 调整窗口（尺寸变化时会先发 `terminal.resized`），再发布：
+
+```json
+{
+  "type": "terminal.attached",
+  "pane_id": "term_1",
+  "payload": {
+    "requestId": "attach-1", "terminalId": "term_1", "running": true,
+    "reset": false, "seq": 120, "data": "…",
+    "cwd": "/repo", "shell": "/bin/zsh", "pid": 4242, "rows": 30, "cols": 100,
+    "startedAt": 1792540000000, "lifecycleState": "running", "ssh": null
+  }
+}
+```
+
+- `since` 仍在保留范围内时 `reset: false`，`data` 是 `seq` 在 `(since, seq]` 之间的输出；`since` 缺省、早于保留范围或大于当前 `seq` 时 `reset: true`，`data` 是全部保留输出，客户端应先清空终端再写入。
+- `terminal.attached` 在保留锁内发布：`seq` 及之前的批次都在它之前发出，之后的批次都在它之后，客户端按 `seq` 去重即可无缝衔接。
+- 终端未运行时返回 `{ terminalId, requestId, running: false }` 而不是错误，客户端据此启动新终端。
+- 连接落后导致事件流 `EVENT_STREAM_LAGGED` 时，终端输出不会自动补发；客户端应对仍在运行的终端用最后的 `seq` 再次 attach。看到 `seq` 不连续时同理。
+
+`GET /v2/version` 返回 `terminalReplay: 1` 表示支持上述 `seq`、`terminal.attach` 与 `terminal.clear`；旧 daemon 没有该字段，客户端应回退到 `terminal.status` + `terminal.start`。
 
 ## codex.local 请求
 

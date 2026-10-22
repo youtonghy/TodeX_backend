@@ -14,8 +14,8 @@ use crate::{
     error::AppError,
     event::{EventRecord, PublishedEvent},
     local_terminal::{
-        TerminalInputOptions, TerminalResizeOptions, TerminalStartOptions, TerminalStatusOptions,
-        TerminalStopOptions,
+        TerminalAttachOptions, TerminalClearOptions, TerminalInputOptions, TerminalResizeOptions,
+        TerminalStartOptions, TerminalStatusOptions, TerminalStopOptions,
     },
     server::protocol::{
         ClientMessage, ClientMessageKind, CodexCloudTaskApplyRequest, CodexCloudTaskCreateRequest,
@@ -76,16 +76,73 @@ struct LegacyScopeRegistration {
     terminals: Vec<String>,
 }
 
+/// Errors come back as the `error` event to send: for terminal commands it
+/// names the request and terminal (`requestId`, `terminalId`, `pane_id`), so
+/// clients can tell which terminal failed.
 pub(super) async fn dispatch_scoped_client_message(
     frame: serde_json::Value,
     state: &AppState,
     auth: Option<&AuthContext>,
     event_scope: &tokio::sync::RwLock<LegacyEventScope>,
-) -> Result<(), AppError> {
+) -> Result<(), Box<ServerEvent>> {
     let mut message = serde_json::from_value::<ClientMessage>(frame).map_err(|err| {
-        AppError::InvalidRequest(format!("failed to parse client message: {err}"))
+        Box::new(direct_error_event(AppError::InvalidRequest(format!(
+            "failed to parse client message: {err}"
+        ))))
     })?;
     ensure_terminal_start_id(&mut message);
+    let context = terminal_error_context(&message);
+    dispatch_parsed_scoped_message(message, state, auth, event_scope)
+        .await
+        .map_err(|error| {
+            Box::new(match context {
+                Some((request_id, terminal_id)) => {
+                    ServerEvent::from(terminal_command_error_event(error, request_id, terminal_id))
+                }
+                None => direct_error_event(error),
+            })
+        })
+}
+
+fn terminal_error_context(message: &ClientMessage) -> Option<(String, String)> {
+    let terminal_id = match &message.kind {
+        ClientMessageKind::TerminalStart(payload) => payload.terminal_id.clone()?,
+        ClientMessageKind::TerminalInput(payload) => payload.terminal_id.clone(),
+        ClientMessageKind::TerminalStop(payload) => payload.terminal_id.clone(),
+        ClientMessageKind::TerminalResize(payload) => payload.terminal_id.clone(),
+        ClientMessageKind::TerminalStatus(payload) => payload.terminal_id.clone()?,
+        ClientMessageKind::TerminalAttach(payload) => payload.terminal_id.clone(),
+        ClientMessageKind::TerminalClear(payload) => payload.terminal_id.clone(),
+        _ => return None,
+    };
+    Some((message.id.clone(), terminal_id))
+}
+
+fn terminal_command_error_event(
+    error: AppError,
+    request_id: String,
+    terminal_id: String,
+) -> EventRecord {
+    EventRecord::new(
+        "error",
+        None,
+        None,
+        Some(terminal_id.clone()),
+        json!({
+            "code": error.code(),
+            "message": error.to_string(),
+            "requestId": request_id,
+            "terminalId": terminal_id,
+        }),
+    )
+}
+
+async fn dispatch_parsed_scoped_message(
+    message: ClientMessage,
+    state: &AppState,
+    auth: Option<&AuthContext>,
+    event_scope: &tokio::sync::RwLock<LegacyEventScope>,
+) -> Result<(), AppError> {
     let mut candidate = legacy_scope_candidate(&message);
     if matches!(
         &message.kind,
@@ -197,6 +254,12 @@ fn legacy_scope_candidate(message: &ClientMessage) -> LegacyScopeCandidate {
         }
         ClientMessageKind::TerminalStatus(payload) => {
             terminal(&payload.tenant_id, payload.terminal_id.as_deref())
+        }
+        ClientMessageKind::TerminalAttach(payload) => {
+            terminal(&payload.tenant_id, Some(&payload.terminal_id))
+        }
+        ClientMessageKind::TerminalClear(payload) => {
+            terminal(&payload.tenant_id, Some(&payload.terminal_id))
         }
         ClientMessageKind::CodexThreadStart(payload)
         | ClientMessageKind::CodexTurnStart(payload)
@@ -407,6 +470,18 @@ pub(super) async fn forward_legacy_event(
     outgoing: &tokio::sync::mpsc::Sender<Outbound>,
     event: Arc<PublishedEvent>,
 ) -> Result<(), AppError> {
+    // Terminal events only need the visibility check: send them without
+    // holding the scope, so a slow socket never holds up this connection's
+    // commands, which register scopes under the same lock.
+    if event.event_type.starts_with("terminal.") {
+        if !legacy_event_is_visible(&event, &*event_scope.read().await) {
+            return Ok(());
+        }
+        return outgoing
+            .send(Outbound::Text(legacy_wire_text(&event)?))
+            .await
+            .map_err(|_| AppError::StreamClosed);
+    }
     let mut scope = event_scope.write().await;
     if !legacy_event_is_visible(&event, &scope) {
         return Ok(());
@@ -1042,6 +1117,7 @@ async fn dispatch(
                     rows: payload.rows,
                     cols: payload.cols,
                     command,
+                    shell_integration: payload.shell_integration,
                 })
                 .await?;
             // A failed start dropped the password file above; a running ssh
@@ -1124,6 +1200,45 @@ async fn dispatch(
                     tenant_id: payload.tenant_id,
                     workspace_id: payload.workspace_id,
                     terminal_id: payload.terminal_id,
+                })
+                .await?;
+        }
+        ClientMessageKind::TerminalAttach(payload) => {
+            authorize_terminal_request(
+                &message.id,
+                &payload.tenant_id,
+                "terminal.attach",
+                auth,
+                state,
+            )
+            .await?;
+            state
+                .local_terminals
+                .attach(TerminalAttachOptions {
+                    request_id: message.id,
+                    terminal_id: payload.terminal_id,
+                    tenant_id: payload.tenant_id,
+                    since: payload.since,
+                    rows: payload.rows,
+                    cols: payload.cols,
+                })
+                .await?;
+        }
+        ClientMessageKind::TerminalClear(payload) => {
+            authorize_terminal_request(
+                &message.id,
+                &payload.tenant_id,
+                "terminal.clear",
+                auth,
+                state,
+            )
+            .await?;
+            state
+                .local_terminals
+                .clear(TerminalClearOptions {
+                    request_id: message.id,
+                    terminal_id: payload.terminal_id,
+                    tenant_id: payload.tenant_id,
                 })
                 .await?;
         }
@@ -2045,6 +2160,59 @@ mod tests {
             self.sent.lock().await.push(message);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_command_errors_name_the_terminal_and_attach_reports_missing_ones() {
+        let state = test_state().await;
+        let mut rx = state.events.subscribe();
+        let scope = tokio::sync::RwLock::new(LegacyEventScope::default());
+        let auth = AuthContext {
+            principal_id: "device".to_owned(),
+            tenant_id: "local".to_owned(),
+            token_id: "device".to_owned(),
+        };
+
+        let error = super::dispatch_scoped_client_message(
+            json!({
+                "id": "input-missing",
+                "type": "terminal.input",
+                "payload": { "terminalId": "term-missing", "tenantId": "local", "data": "x" }
+            }),
+            &state,
+            Some(&auth),
+            &scope,
+        )
+        .await
+        .unwrap_err();
+        let error = serde_json::to_value(error).unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["pane_id"], "term-missing");
+        assert_eq!(error["payload"]["terminalId"], "term-missing");
+        assert_eq!(error["payload"]["requestId"], "input-missing");
+        assert_eq!(error["payload"]["code"], "INVALID_REQUEST");
+
+        super::dispatch_scoped_client_message(
+            json!({
+                "id": "attach-missing",
+                "type": "terminal.attach",
+                "payload": { "terminalId": "term-missing", "tenantId": "local", "since": 3 }
+            }),
+            &state,
+            Some(&auth),
+            &scope,
+        )
+        .await
+        .unwrap();
+        let attached = loop {
+            let event = rx.recv().await.unwrap();
+            if event.event_type == "terminal.attached" {
+                break event;
+            }
+        };
+        assert_eq!(attached.payload["running"], false);
+        assert_eq!(attached.payload["requestId"], "attach-missing");
+        assert!(legacy_event_is_visible(&attached, &*scope.read().await));
     }
 
     #[tokio::test]
