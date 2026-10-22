@@ -532,6 +532,7 @@ pub(super) async fn version(
         paths,
         history_encryption: HISTORY_ENCRYPTION_VERSION,
         terminal_replay: crate::local_terminal::TERMINAL_REPLAY_VERSION,
+        terminal_snapshot: crate::local_terminal::TERMINAL_SNAPSHOT_VERSION,
     })
 }
 
@@ -4330,6 +4331,9 @@ pub(super) struct VersionResponse {
     /// replays the retained tail; absent on backends that predate it.
     #[serde(rename = "terminalReplay")]
     terminal_replay: u8,
+    /// Attach sends a screen snapshot when it cannot continue from `since`.
+    #[serde(rename = "terminalSnapshot")]
+    terminal_snapshot: u8,
 }
 
 #[derive(Debug, Serialize)]

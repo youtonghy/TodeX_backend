@@ -829,7 +829,7 @@ ok
 GET /v2/version
 ```
 
-该端点与 `/health` 一样不需要认证，供 daemon 自检、客户端连接卡片轮询和客户端版本一致性检测（开发构建 `DEV0.0.0`/`0.0.0` 不参与比较）。匿名调用只返回 `name`、`version`、`historyEncryption`、`terminalReplay`；`data_dir`、`workspace_root`、`workspace_roots` 仅在请求带有效设备签名（与其他接口相同的签名方式）时返回，`enable_auth = false` 时仅在请求满足上述本地 `Host`/`Origin` 条件时返回。签名无效或 nonce 重放不会报错，只按匿名处理，便于配对前探测。
+该端点与 `/health` 一样不需要认证，供 daemon 自检、客户端连接卡片轮询和客户端版本一致性检测（开发构建 `DEV0.0.0`/`0.0.0` 不参与比较）。匿名调用只返回 `name`、`version`、`historyEncryption`、`terminalReplay`、`terminalSnapshot`；`data_dir`、`workspace_root`、`workspace_roots` 仅在请求带有效设备签名（与其他接口相同的签名方式）时返回，`enable_auth = false` 时仅在请求满足上述本地 `Host`/`Origin` 条件时返回。签名无效或 nonce 重放不会报错，只按匿名处理，便于配对前探测。
 
 响应字段：
 
@@ -843,6 +843,7 @@ GET /v2/version
 | `scratch_workspace_root` | string | 无工作区对话目录的父目录 `$DATA_DIR/workspace`（仅鉴权后）；不在 `workspace_roots` 中，客户端可在首次创建这类对话前用它做模型/命令发现 |
 | `historyEncryption` | number | 后端支持的历史加密版本（当前 `1`），见「历史加密密钥」 |
 | `terminalReplay` | number | 终端输出序号与 `terminal.attach` / `terminal.clear` 的协议版本（当前 `1`），见「终端」；旧后端没有该字段 |
+| `terminalSnapshot` | number | `terminal.attach` 无法衔接时发送屏幕快照（当前 `1`），见「终端」；旧后端没有该字段 |
 
 ## Workspace 缓存同步
 
@@ -1503,19 +1504,21 @@ TUI 配对二维码只携带后端地址（`{"kind":"todex-pairing-link","versio
   "pane_id": "term_1",
   "payload": {
     "requestId": "attach-1", "terminalId": "term_1", "running": true,
-    "reset": false, "seq": 120, "data": "…",
+    "reset": false, "snapshot": false, "seq": 120, "data": "…",
     "cwd": "/repo", "shell": "/bin/zsh", "pid": 4242, "rows": 30, "cols": 100,
     "startedAt": 1792540000000, "lifecycleState": "running", "ssh": null
   }
 }
 ```
 
-- `since` 仍在保留范围内时 `reset: false`，`data` 是 `seq` 在 `(since, seq]` 之间的输出；`since` 缺省、早于保留范围或大于当前 `seq` 时 `reset: true`，`data` 是全部保留输出，客户端应先清空终端再写入。
+- `since` 仍在保留范围内时 `reset: false`，`data` 是 `seq` 在 `(since, seq]` 之间的输出。
+- `since` 缺省、早于保留范围或大于当前 `seq` 时 `reset: true`，客户端应先清空终端再写入 `data`：daemon 为每个终端维护一份无头终端镜像（`alacritty_terminal`），此时 `data` 是当前屏幕的快照、`snapshot: true`——主屏与最近 2000 行滚动历史、使用中的备用屏、光标位置与形状、当前样式、滚动区域、模式（应用光标/小键盘、插入、鼠标跟踪与 1005/1006 编码、焦点上报、bracketed paste、自动换行、光标显隐）、Kitty 键盘标志与标题，按 attach 后的行列生成；不含鼠标编码 1015/1016 与快照之前的 OSC 133 标记。镜像从不回应程序的查询。设置环境变量 `TODEX_AGENTD_TERMINAL_SNAPSHOT=0` 时不建镜像，`data` 退回全部保留输出、`snapshot: false`。
+- `terminal.clear` 同时让镜像只保留光标所在行（置顶）并丢弃滚动历史，与客户端的清屏一致。
 - `terminal.attached` 在保留锁内发布：`seq` 及之前的批次都在它之前发出，之后的批次都在它之后，客户端按 `seq` 去重即可无缝衔接。
 - 终端未运行时返回 `{ terminalId, requestId, running: false }` 而不是错误，客户端据此启动新终端。
 - 连接落后导致事件流 `EVENT_STREAM_LAGGED` 时，终端输出不会自动补发；客户端应对仍在运行的终端用最后的 `seq` 再次 attach。看到 `seq` 不连续时同理。
 
-`GET /v2/version` 返回 `terminalReplay: 1` 表示支持上述 `seq`、`terminal.attach` 与 `terminal.clear`；旧 daemon 没有该字段，客户端应回退到 `terminal.status` + `terminal.start`。
+`GET /v2/version` 返回 `terminalReplay: 1` 表示支持上述 `seq`、`terminal.attach` 与 `terminal.clear`，`terminalSnapshot: 1` 表示无法衔接时发送屏幕快照；旧 daemon 没有该字段，客户端应回退到 `terminal.status` + `terminal.start`。
 
 ## codex.local 请求
 

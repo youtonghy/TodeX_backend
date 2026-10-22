@@ -21,6 +21,7 @@ use crate::{
     error::AppError,
     event::{EventBus, EventRecord},
     ssh::TerminalCommand,
+    terminal_mirror::{snapshots_enabled, TerminalMirror},
 };
 
 const TERMINAL_READ_BUFFER_SIZE: usize = 64 * 1024;
@@ -42,6 +43,9 @@ const TERMINAL_INPUT_QUEUE: usize = 256;
 /// Advertised as `terminalReplay` by `GET /v2/version`: output carries a
 /// per-terminal `seq`, and `terminal.attach` / `terminal.clear` exist.
 pub const TERMINAL_REPLAY_VERSION: u8 = 1;
+/// Advertised as `terminalSnapshot`: an attach that cannot continue from the
+/// client's `seq` gets the screen as a snapshot (`snapshot: true`).
+pub const TERMINAL_SNAPSHOT_VERSION: u8 = 1;
 /// How long `terminal.exited` waits for the reader to reach end of output.
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
@@ -82,9 +86,29 @@ struct TerminalReplay {
     chunks: VecDeque<(u64, String)>,
     bytes: usize,
     last_seq: u64,
+    /// The screen the published output produced; absent when snapshots are
+    /// turned off.
+    mirror: Option<TerminalMirror>,
 }
 
 impl TerminalReplay {
+    fn new(size: TerminalSize) -> Self {
+        Self {
+            mirror: snapshots_enabled().then(|| TerminalMirror::new(size.rows, size.cols)),
+            ..Self::default()
+        }
+    }
+
+    /// What a client that cannot continue from `since` starts from: the
+    /// screen snapshot when there is a mirror, else the retained output.
+    fn attach_data(&mut self, since: Option<u64>) -> (bool, bool, String) {
+        let (reset, data) = self.since(since);
+        match (reset, self.mirror.as_mut()) {
+            (true, Some(mirror)) => (true, true, mirror.snapshot()),
+            _ => (reset, false, data),
+        }
+    }
+
     fn push(&mut self, data: String) -> u64 {
         self.last_seq += 1;
         self.bytes += data.len();
@@ -353,7 +377,7 @@ impl LocalTerminalManager {
 
         let (input_tx, input_rx) = mpsc::channel::<String>(TERMINAL_INPUT_QUEUE);
         let size_state = Arc::new(RwLock::new(size));
-        let replay = Arc::new(AsyncMutex::new(TerminalReplay::default()));
+        let replay = Arc::new(AsyncMutex::new(TerminalReplay::new(size)));
         let handle = TerminalHandle {
             tenant_id: options.tenant_id.clone(),
             workspace_id: options.workspace_id.clone(),
@@ -588,6 +612,9 @@ impl LocalTerminalManager {
             .map_err(pty_error("failed to resize terminal PTY"))?;
         *size = next_size;
         drop(size);
+        if let Some(mirror) = handle.replay.lock().await.mirror.as_mut() {
+            mirror.resize(next_size.rows, next_size.cols);
+        }
 
         self.events
             .publish(EventRecord::new(
@@ -656,8 +683,8 @@ impl LocalTerminalManager {
         let size = *handle.size.read().await;
         // Published under the replay lock: batches up to `seq` went out
         // before this event, later ones follow it.
-        let replay = handle.replay.lock().await;
-        let (reset, data) = replay.since(options.since);
+        let mut replay = handle.replay.lock().await;
+        let (reset, snapshot, data) = replay.attach_data(options.since);
         self.events
             .publish(EventRecord::new(
                 "terminal.attached",
@@ -671,6 +698,7 @@ impl LocalTerminalManager {
                     "workspaceId": handle.workspace_id,
                     "running": true,
                     "reset": reset,
+                    "snapshot": snapshot,
                     "seq": replay.last_seq,
                     "data": data,
                     "cwd": handle.cwd,
@@ -693,6 +721,9 @@ impl LocalTerminalManager {
         let handle = self.authorized_handle(&options.terminal_id, &options.tenant_id)?;
         let mut replay = handle.replay.lock().await;
         replay.clear();
+        if let Some(mirror) = replay.mirror.as_mut() {
+            mirror.clear();
+        }
         self.events
             .publish(EventRecord::new(
                 "terminal.cleared",
@@ -947,6 +978,9 @@ fn publish_terminal_output_batch(
     data: String,
 ) {
     let mut replay = replay.blocking_lock();
+    if let Some(mirror) = replay.mirror.as_mut() {
+        mirror.advance(data.as_bytes());
+    }
     let seq = replay.push(data.clone());
     runtime.block_on(events.publish(EventRecord::new(
         "terminal.output",
@@ -1369,7 +1403,7 @@ mod tests {
                 request_id: "input".to_string(),
                 terminal_id: terminal_id.clone(),
                 tenant_id: "local".to_string(),
-                data: "printf '__AT%s__' TACH\n".to_string(),
+                data: "printf '__AT%s__\\n' TACH\n".to_string(),
             })
             .await
             .unwrap();
@@ -1402,6 +1436,7 @@ mod tests {
         let attached = next_attached(&mut rx).await;
         assert_eq!(attached["running"], true);
         assert_eq!(attached["reset"], true);
+        assert_eq!(attached["snapshot"], snapshots_enabled());
         assert!(attached["seq"].as_u64().unwrap() >= last_seq);
         assert!(payload_text(&attached, "data").contains("__ATTACH__"));
 
