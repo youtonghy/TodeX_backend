@@ -684,3 +684,23 @@ fn every_category_on_stays_fast() {
         "256 KiB with every category took {warm:?}"
     );
 }
+
+#[test]
+fn redacted_values_keep_the_original_text_and_label() {
+    let redacted = all("DB_PASSWORD=Zq8x7Lk9w\nvisa 4111 1111 1111 1111\n");
+    assert_eq!(
+        redacted.values,
+        [
+            RedactedValue {
+                category: Category::Credential,
+                label: "credential".to_owned(),
+                text: "Zq8x7Lk9w".to_owned(),
+            },
+            RedactedValue {
+                category: Category::BankCard,
+                label: "bank_card ****1111".to_owned(),
+                text: "4111 1111 1111 1111".to_owned(),
+            },
+        ]
+    );
+}

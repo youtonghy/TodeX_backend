@@ -1006,6 +1006,40 @@ impl ExecOutcome {
     }
 }
 
+/// Hidden values listed in `ssh.exec.completed` so the user's view can mask
+/// them: at most this many, and this many bytes of text in all. They are
+/// already in that view's `ssh.exec.output` events; the agent never gets them.
+const HIDDEN_VALUES_LIMIT: usize = 256;
+const HIDDEN_VALUES_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct HiddenValues {
+    values: Vec<Value>,
+    seen: std::collections::BTreeSet<(&'static str, String)>,
+    bytes: usize,
+}
+
+impl HiddenValues {
+    /// Adds each value once per stream while it fits; the rest is dropped.
+    fn extend(&mut self, stream: &'static str, values: Vec<privacy_filter::RedactedValue>) {
+        for value in values {
+            if self.values.len() >= HIDDEN_VALUES_LIMIT
+                || self.bytes + value.text.len() > HIDDEN_VALUES_BYTES
+                || !self.seen.insert((stream, value.text.clone()))
+            {
+                continue;
+            }
+            self.bytes += value.text.len();
+            self.values.push(json!({
+                "stream": stream,
+                "category": value.category,
+                "label": value.label,
+                "text": value.text,
+            }));
+        }
+    }
+}
+
 /// The result of an ssh run that exited; `login_hint` replaces the usual
 /// hint when a login was tried and did not happen. Output is redacted with
 /// `filter` before the agent sees it; the counts go to `completed`.
@@ -1023,18 +1057,23 @@ fn finished_result(
     completed["exitCode"] = json!(exit_code);
     completed["truncated"] = json!(output.truncated);
     let mut redactions = std::collections::BTreeMap::<_, usize>::new();
-    let mut filtered = |text: String| match filter {
+    let mut hidden = HiddenValues::default();
+    let mut filtered = |text: String, stream: &'static str| match filter {
         Some(filter) => {
             let redacted = filter.redact(&text);
             for (category, count) in redacted.counts {
                 *redactions.entry(category).or_default() += count;
             }
+            hidden.extend(stream, redacted.values);
             redacted.text
         }
         None => text,
     };
-    let stdout = filtered(String::from_utf8_lossy(&output.stdout).into_owned());
-    let stderr = filtered(raw_stderr.clone());
+    let stdout = filtered(
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        "stdout",
+    );
+    let stderr = filtered(raw_stderr.clone(), "stderr");
     let (mut body, failed) = match exit_code {
         Some(code) if local || code != SSH_ERROR_STATUS => (
             json!({
@@ -1078,6 +1117,7 @@ fn finished_result(
         body["redacted"] = json!(true);
         body["note"] = json!(REDACTION_NOTE);
         completed["redactions"] = json!(redactions);
+        completed["redactedValues"] = json!(hidden.values);
     }
     if failed {
         CallToolResult::structured_error(body)
@@ -1626,6 +1666,33 @@ exit 3
         client.cancel().await.unwrap();
     }
 
+    #[test]
+    fn hidden_values_are_unique_per_stream_and_bounded() {
+        let value = |text: &str| privacy_filter::RedactedValue {
+            category: privacy_filter::Category::Credential,
+            label: "credential".to_owned(),
+            text: text.to_owned(),
+        };
+        let mut hidden = HiddenValues::default();
+        hidden.extend("stdout", vec![value("a1"), value("a1"), value("b2")]);
+        hidden.extend("stderr", vec![value("a1")]);
+        assert_eq!(hidden.values.len(), 3);
+        hidden.extend(
+            "stdout",
+            vec![value(&"x".repeat(HIDDEN_VALUES_BYTES)), value("c3")],
+        );
+        assert_eq!(
+            hidden.values.len(),
+            4,
+            "an oversized value is skipped, later ones fit"
+        );
+        let many = (0..HIDDEN_VALUES_LIMIT)
+            .map(|index| value(&format!("v{index}")))
+            .collect();
+        hidden.extend("stdout", many);
+        assert_eq!(hidden.values.len(), HIDDEN_VALUES_LIMIT);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn exec_output_reaches_the_agent_redacted() {
         let harness = harness().await;
@@ -1645,6 +1712,10 @@ exit 3
         );
         assert_eq!(output["redacted"], true);
         assert!(output["note"].as_str().unwrap().contains("privacy filter"));
+        assert!(output.get("redactedValues").is_none());
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("Zq8x7Lk9w"));
 
         // Off: the agent gets the output as printed.
         harness
@@ -1680,6 +1751,16 @@ exit 3
             completed[0]["redactions"],
             json!({ "credential": 1, "bankCard": 1, "proxyCredential": 1 })
         );
+        // The user's view gets the hidden values to mask; the agent never does.
+        assert_eq!(
+            completed[0]["redactedValues"],
+            json!([
+                { "stream": "stdout", "category": "credential", "label": "credential", "text": "Zq8x7Lk9w" },
+                { "stream": "stdout", "category": "bankCard", "label": "bank_card ****1111", "text": "4111 1111 1111 1111" },
+                { "stream": "stdout", "category": "proxyCredential", "label": "uuid", "text": "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d" },
+            ])
+        );
+        assert!(completed[1].get("redactedValues").is_none());
         assert!(completed[1].get("redactions").is_none());
         let first = &completed[0]["execId"];
         let live: String = history

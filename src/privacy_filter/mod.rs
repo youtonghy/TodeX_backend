@@ -239,11 +239,22 @@ impl AgentOutputFilter {
     }
 }
 
-/// Redacted text and how many values of each category it hid.
+/// Redacted text, how many values of each category it hid, and the hidden
+/// values themselves in order.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Redacted {
     pub text: String,
     pub counts: BTreeMap<Category, usize>,
+    pub values: Vec<RedactedValue>,
+}
+
+/// One hidden value: what it was taken for and the original text.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RedactedValue {
+    pub category: Category,
+    /// The placeholder's label, as in `[REDACTED:<label>]`.
+    pub label: String,
+    pub text: String,
 }
 
 /// One value to hide: the byte range and what replaces it.
@@ -316,6 +327,15 @@ fn apply(text: &str, mut findings: Vec<Finding>) -> Redacted {
         output.push_str(&finding.replacement);
         copied = finding.end;
         *redacted.counts.entry(finding.category).or_default() += 1;
+        let label = finding
+            .replacement
+            .trim_start_matches("[REDACTED:")
+            .trim_end_matches(']');
+        redacted.values.push(RedactedValue {
+            category: finding.category,
+            label: label.to_owned(),
+            text: text[finding.start..finding.end].to_owned(),
+        });
     }
     output.push_str(&text[copied..]);
     redacted.text = output;
