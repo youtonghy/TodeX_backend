@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::app_state::AppState;
 use crate::error::AppError;
-use crate::privacy_filter::AgentOutputFilter;
+use crate::privacy_filter::{AgentOutputFilter, AgentOutputFilterUpdate};
 use crate::ssh::forward::ForwardInput;
 use crate::ssh::ip_pool::{AssignmentInput, AssignmentUpdate, PoolConfigInput};
 use crate::ssh::keys::{KeyGenerateRequest, KeyImportRequest};
@@ -474,14 +474,23 @@ async fn set_agent_output_filter(
     body: Bytes,
 ) -> Result<Json<AgentOutputFilter>, AppError> {
     require_auth(&state, &headers)?;
-    let filter: AgentOutputFilter = serde_json::from_slice(&body).map_err(|_| {
+    let update: AgentOutputFilterUpdate = serde_json::from_slice(&body).map_err(|_| {
         AppError::InvalidRequest(
-            "invalid agent output filter: expected { enabled, categories: { privateKey, \
-             publicKey, credential, bankCard, idCard } }, all booleans"
+            "invalid agent output filter: expected { enabled, categories: { <category>: bool, … }, \
+             customKeys? } with known categories only"
                 .to_owned(),
         )
     })?;
-    Ok(Json(state.ssh.set_agent_output_filter(filter).await?))
+    Ok(Json(
+        state
+            .ssh
+            .update_agent_output_filter(|current| {
+                update.apply(current).map_err(|error| {
+                    AppError::InvalidRequest(format!("invalid agent output filter: {error}"))
+                })
+            })
+            .await?,
+    ))
 }
 
 async fn get_agent_local(

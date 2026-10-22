@@ -1,20 +1,15 @@
 use super::*;
 
+/// The default categories: what most users run with.
 fn all(text: &str) -> Redacted {
-    redact(text, &Categories::ALL)
+    redact(text, &Categories::DEFAULT)
 }
 
 fn only(category: Category) -> Categories {
-    Categories {
-        private_key: category == Category::PrivateKey,
-        public_key: category == Category::PublicKey,
-        credential: category == Category::Credential,
-        bank_card: category == Category::BankCard,
-        id_card: category == Category::IdCard,
-    }
+    Categories::only(category)
 }
 
-/// Text that must come through untouched.
+/// Text that must come through untouched by the default categories.
 fn assert_clean(text: &str) {
     let redacted = all(text);
     assert_eq!(redacted.text, text, "unexpected redaction");
@@ -210,7 +205,7 @@ fn public_keys_keep_algorithm_and_comment() {
     // Off: public keys pass through.
     let off = Categories {
         public_key: false,
-        ..Categories::ALL
+        ..Categories::DEFAULT
     };
     assert_eq!(redact(cert, &off).text, cert);
 }
@@ -329,5 +324,363 @@ fn a_large_output_redacts_quickly() {
         warm < std::time::Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 1 }),
         "256 KiB took {warm:?} (first run {:?})",
         started.elapsed() - warm
+    );
+}
+
+// ------------------------------------------------- leak report fixtures
+
+/// An OpenClash `mihomo.yaml` with the shapes the leak report found
+/// (all values fake).
+const MIHOMO: &str = r#"mixed-port: 7890
+bind-address: "*"
+external-controller: 0.0.0.0:9090
+authentication:
+- Clash:a1b2c3d4
+proxy-providers:
+  机场订阅:
+    type: http
+    url: https://ping.ytoo.online/pingouo/8f3a9c2d1e4b5f6a7c8d9e0f1a2b3c4d
+    interval: 86400
+rule-providers:
+  cn:
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geo/geosite/cn.mrs
+proxies:
+- name: PP-LAX
+  type: vless
+  server: 140.235.228.222
+  port: 443
+  uuid: 0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
+  encryption: mlkem768x25519plus.native.0rtt.QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLz0=
+- name: AWS-SG
+  type: vless
+  server: 18.138.55.187
+  uuid: 1b2c3d4e-5f6a-7b8c-9d0e-1f2a3b4c5d6e
+  reality-opts:
+    public-key: Zq3xL9vK2mN8pR4tW7yB1cE5fH6jA0sD3gU9iO2lQ4w
+    short-id: 1a2b3c4d5e6f7a8b
+- name: Home
+  type: wireguard
+  server: 192.168.88.1
+  ip: 10.66.0.2
+  public-key: Ab4Cd8Ef2Gh6Ij0Kl4Mn8Op2Qr6St0Uv4Wx8Yz2Ab4=
+"#;
+
+#[test]
+fn the_leak_report_values_are_redacted_by_default() {
+    let redacted = all(MIHOMO);
+    for leaked in [
+        "Clash:a1b2c3d4",
+        "8f3a9c2d1e4b5f6a7c8d9e0f1a2b3c4d",
+        "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
+        "1b2c3d4e-5f6a-7b8c-9d0e-1f2a3b4c5d6e",
+        "1a2b3c4d5e6f7a8b",
+    ] {
+        assert!(
+            !redacted.text.contains(leaked),
+            "{leaked} leaked:\n{}",
+            redacted.text
+        );
+    }
+    assert!(redacted
+        .text
+        .contains("authentication:\n- [REDACTED:credential]\n"));
+    assert!(redacted
+        .text
+        .contains("url: https://ping.ytoo.online/pingouo/[REDACTED:subscription-token]\n"));
+    assert!(redacted.text.contains("  uuid: [REDACTED:uuid]\n"));
+    assert!(redacted
+        .text
+        .contains("    short-id: [REDACTED:short-id]\n"));
+    // What the report calls fine to show: public keys, addresses, public
+    // rule-set URLs, ports and names. The long `encryption` value is
+    // public key material, left to the high-entropy option.
+    for kept in [
+        "public-key: Zq3xL9vK2mN8pR4tW7yB1cE5fH6jA0sD3gU9iO2lQ4w",
+        "public-key: Ab4Cd8Ef2Gh6Ij0Kl4Mn8Op2Qr6St0Uv4Wx8Yz2Ab4=",
+        "server: 140.235.228.222",
+        "ip: 10.66.0.2",
+        "external-controller: 0.0.0.0:9090",
+        "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geo/geosite/cn.mrs",
+        "encryption: mlkem768x25519plus.native.0rtt.QUJD",
+        "- name: PP-LAX",
+    ] {
+        assert!(
+            redacted.text.contains(kept),
+            "{kept} hidden:\n{}",
+            redacted.text
+        );
+    }
+    assert_eq!(redacted.counts.get(&Category::Credential), Some(&1));
+    assert_eq!(redacted.counts.get(&Category::ProxyCredential), Some(&4));
+
+    // Everything on: the long base64 and the public addresses go too.
+    let strict = redact(MIHOMO, &Categories::ALL);
+    assert!(strict
+        .text
+        .contains("encryption: mlkem768x25519plus.native.0rtt.[REDACTED:high-entropy]\n"));
+    assert!(strict.text.contains("server: [REDACTED:public-ip]\n"));
+    assert!(strict.text.contains("server: 192.168.88.1\n"));
+}
+
+#[test]
+fn secret_lists_flow_lists_and_new_key_names() {
+    let redacted = all(
+        "authentication:\n  # users\n  - \"admin:Pa55w0rd\"\n  - guest:Zx81yy # tmp\nport: 80\n",
+    );
+    assert_eq!(
+        redacted.text,
+        "authentication:\n  # users\n  - \"[REDACTED:credential]\"\n  - [REDACTED:credential] # tmp\nport: 80\n"
+    );
+    let redacted = all("{\"authentication\": [\"a:Secr3tx\", \"b:Other9y\"], \"port\": 1}\n");
+    assert_eq!(
+        redacted.text,
+        "{\"authentication\": [\"[REDACTED:credential]\", \"[REDACTED:credential]\"], \"port\": 1}\n"
+    );
+    let redacted =
+        all("PresharedKey = Kq9xLm2Vb7Ns4Rt1Wy8Zc3Df6Gh0Jk5\npsk: hunter2x\nauth: s3cret-v4l\n");
+    assert!(!redacted.text.contains("Kq9xLm2Vb7"), "{}", redacted.text);
+    assert!(redacted
+        .text
+        .ends_with("psk: [REDACTED:credential]\nauth: [REDACTED:credential]\n"));
+    // A list of mappings, metadata lists and auth scheme names stay.
+    assert_clean("secrets:\n- name: db\n  mountPath: /run/secrets\n");
+    assert_clean("skip-auth-prefixes:\n- 127.0.0.1/8\n");
+    assert_clean("auth: basic\nauth: none\nauthor: Jane\n");
+    assert_clean("token_types: [access, refresh]\n");
+}
+
+#[test]
+fn url_query_secrets_and_basic_credentials() {
+    let redacted =
+        all("GET https://api.example.com/v1/items?page=2&access_token=Zq8x7Lk9Wm2&sort=asc\n");
+    assert_eq!(
+        redacted.text,
+        "GET https://api.example.com/v1/items?page=2&access_token=[REDACTED:url-secret]&sort=asc\n"
+    );
+    // `Basic` with base64 of user:password, also outside a header.
+    let redacted = all("sent Basic YWRtaW46czNjcmV0UGFzcw== to proxy\n");
+    assert_eq!(redacted.text, "sent Basic [REDACTED:basic-auth] to proxy\n");
+    assert_clean("uses Basic authentication over TLS\n");
+    assert_clean("https://example.com/search?q=rust&page=2\n");
+}
+
+#[test]
+fn proxy_share_links_and_xray_ids() {
+    let uuid = "2c3d4e5f-6a7b-8c9d-0e1f-2a3b4c5d6e7f";
+    let redacted = all(&format!(
+        "vless://{uuid}@193.177.220.211:443?security=reality&pbk=Zq3xL9vK2mN8&sid=9f8e7d6c5b4a3210#GH-SYD\n"
+    ));
+    assert_eq!(
+        redacted.text,
+        "vless://[REDACTED:share-link]@193.177.220.211:443?security=reality&pbk=Zq3xL9vK2mN8&sid=[REDACTED:share-link]#GH-SYD\n"
+    );
+    let redacted = all("vmess://eyJhZGQiOiIxLjIuMy40IiwiaWQiOiJhYmMifQ==\nss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#node\n");
+    assert_eq!(
+        redacted.text,
+        "vmess://[REDACTED:share-link]\nss://[REDACTED:share-link]@1.2.3.4:8388#node\n"
+    );
+    // Xray users, only in output that looks like a proxy config.
+    let xray = format!("{{\"outbounds\": [{{\"protocol\": \"vless\", \"settings\": {{\"vnext\": [{{\"users\": [{{\"id\": \"{uuid}\"}}]}}]}}}}]}}\n");
+    assert!(!all(&xray).text.contains(uuid), "{}", all(&xray).text);
+    assert_clean(&format!("{{\"id\": \"{uuid}\", \"status\": \"done\"}}\n"));
+    assert_clean("\"decryption\": \"none\",\n");
+}
+
+#[test]
+fn proxy_rules_leave_system_uuids_alone() {
+    assert_clean("UUID=7d1e2a5c-9b3f-4e8a-a1c2-5f6e7d8c9b0a / ext4 defaults 0 1\n");
+    assert_clean("/dev/sda1: UUID=\"7d1e2a5c-9b3f-4e8a-a1c2-5f6e7d8c9b0a\" TYPE=\"ext4\"\n");
+    assert_clean("connection.uuid:                        7d1e2a5c-9b3f-4e8a-a1c2-5f6e7d8c9b0a\n");
+    assert_clean("UUID:            7d1e2a5c-9b3f-4e8a-a1c2-5f6e7d8c9b0a\n");
+    // A token-like path outside a proxy config is only the aggressive
+    // option's business.
+    assert_clean(
+        "https://github.com/rust-lang/rust/commit/3f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39\n",
+    );
+}
+
+#[test]
+fn aggressive_categories_each_switch_on_alone() {
+    let cases: [(Category, &str, &str); 7] = [
+        (
+            Category::UrlToken,
+            "see https://example.com/share/Ab3dE6gH9kLm2Np5Qr8tUv?x=1\n",
+            "see https://example.com/share/[REDACTED:url-token]?x=1\n",
+        ),
+        (
+            Category::HighEntropy,
+            "blob 3f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39 end\n",
+            "blob [REDACTED:high-entropy] end\n",
+        ),
+        (
+            Category::Uuid,
+            "request 123e4567-e89b-12d3-a456-426614174000 done\n",
+            "request [REDACTED:uuid] done\n",
+        ),
+        (
+            Category::Email,
+            "Author: Jane Doe <jane.doe@example.com>\n",
+            "Author: Jane Doe <[REDACTED:email]>\n",
+        ),
+        (
+            Category::Phone,
+            "手机号 13800138000，备用 +86 139-1234-5678\n",
+            "手机号 [REDACTED:phone]，备用 [REDACTED:phone]\n",
+        ),
+        (
+            Category::PublicIp,
+            "from 8.8.8.8 and 2001:4860:4860::8888 via 10.0.0.1, 100.64.0.1, fe80::1\n",
+            "from [REDACTED:public-ip] and [REDACTED:public-ip] via 10.0.0.1, 100.64.0.1, fe80::1\n",
+        ),
+        (
+            Category::ProxyCredential,
+            "uuid: 123e4567-e89b-12d3-a456-426614174000\n",
+            "uuid: [REDACTED:uuid]\n",
+        ),
+    ];
+    for (category, text, expected) in cases {
+        assert_eq!(redact(text, &only(category)).text, expected, "{category:?}");
+        if category != Category::ProxyCredential {
+            assert_clean(text);
+        }
+    }
+}
+
+#[test]
+fn aggressive_categories_still_skip_obvious_non_matches() {
+    let strict = |text: &str| redact(text, &Categories::ALL).text;
+    // Low-entropy runs, version numbers with more parts, times, MACs,
+    // longer numbers and words.
+    for text in [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        "version 1.2.3.4.5\n",
+        "at 10:00:00 mac aa:bb:cc:dd:ee:ff\n",
+        "order 138001380001234\n",
+        "/usr/lib/x86_64-linux-gnu/libstdc++.so.6\n",
+    ] {
+        assert_eq!(strict(text), text);
+    }
+}
+
+#[test]
+fn custom_keys_hide_their_values_in_any_case() {
+    let keys = ["router_pin".to_owned(), "x-team-code".to_owned()];
+    let redacted = redact_with(
+        "ROUTER_PIN=8812\n\"x-team-code\": \"alpha\"\nrouter_pins: 3\n",
+        &Categories::DEFAULT,
+        &keys,
+    );
+    assert_eq!(
+        redacted.text,
+        "ROUTER_PIN=[REDACTED:custom-key]\n\"x-team-code\": \"[REDACTED:custom-key]\"\nrouter_pins: 3\n"
+    );
+    assert_eq!(redacted.counts.get(&Category::Credential), Some(&2));
+    // Custom keys work with every category off.
+    let filter = AgentOutputFilter {
+        enabled: true,
+        categories: Categories::only(Category::Credential),
+        custom_keys: keys.to_vec(),
+    };
+    let none = AgentOutputFilter {
+        categories: Categories {
+            credential: false,
+            ..filter.categories
+        },
+        ..filter.clone()
+    };
+    assert!(none.active().is_some());
+    assert_eq!(
+        none.redact("router_pin: 1234\n").text,
+        "router_pin: [REDACTED:custom-key]\n"
+    );
+}
+
+#[test]
+fn updates_merge_missing_fields_and_validate_custom_keys() {
+    let current = AgentOutputFilter {
+        enabled: true,
+        categories: Categories {
+            uuid: true,
+            ..Categories::DEFAULT
+        },
+        custom_keys: vec!["pin".to_owned()],
+    };
+    // A client that only knows the first five categories.
+    let old_client: AgentOutputFilterUpdate = serde_json::from_value(serde_json::json!({
+        "enabled": true,
+        "categories": {
+            "privateKey": true, "publicKey": false, "credential": true,
+            "bankCard": true, "idCard": true,
+        },
+    }))
+    .unwrap();
+    let next = old_client.apply(&current).unwrap();
+    assert!(!next.categories.public_key);
+    assert!(next.categories.uuid, "an old client reset a newer switch");
+    assert_eq!(next.custom_keys, ["pin"]);
+
+    let keys = |keys: serde_json::Value| {
+        serde_json::from_value::<AgentOutputFilterUpdate>(serde_json::json!({
+            "enabled": true, "categories": {}, "customKeys": keys,
+        }))
+        .unwrap()
+        .apply(&current)
+    };
+    assert_eq!(
+        keys(serde_json::json!(["a", "A", "b.c"]))
+            .unwrap()
+            .custom_keys,
+        ["a", "b.c"]
+    );
+    assert!(keys(serde_json::json!(["has space"])).is_err());
+    assert!(keys(serde_json::json!([""])).is_err());
+    assert!(keys(serde_json::json!(vec!["k"; CUSTOM_KEYS_LIMIT + 1])).is_err());
+    assert!(
+        serde_json::from_value::<AgentOutputFilterUpdate>(serde_json::json!({
+            "enabled": true, "categories": { "future": true },
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn stored_settings_default_new_categories_by_kind() {
+    // Saved before the new categories existed.
+    let stored = AgentOutputFilter::from_stored(serde_json::json!({
+        "enabled": true,
+        "categories": {
+            "privateKey": true, "publicKey": false, "credential": true,
+            "bankCard": true, "idCard": true,
+        },
+    }));
+    assert!(!stored.categories.public_key);
+    assert!(stored.categories.proxy_credential);
+    assert!(!stored.categories.url_token && !stored.categories.email);
+    let stored = AgentOutputFilter::from_stored(serde_json::json!({
+        "enabled": true,
+        "categories": { "email": true, "uuid": "yes" },
+        "customKeys": ["ok", 3, "bad key"],
+    }));
+    assert!(stored.categories.email);
+    assert!(!stored.categories.uuid);
+    assert_eq!(stored.custom_keys, ["ok"]);
+}
+
+#[test]
+fn every_category_on_stays_fast() {
+    let line = "2026-10-20T10:00:00Z INFO GET https://api.example.com/v1/items/Ab3dE6gH9kLm2Np5Qr8tUv from 8.8.8.8 uuid: 123e4567-e89b-12d3-a456-426614174000 user=jane@example.com\n";
+    let text = format!("proxies:\n{}", line.repeat(256 * 1024 / line.len()));
+    let filter = AgentOutputFilter {
+        enabled: true,
+        categories: Categories::ALL,
+        custom_keys: vec!["pin".to_owned(), "code".to_owned()],
+    };
+    let _ = filter.redact(&text);
+    let started = std::time::Instant::now();
+    let _ = filter.redact(&text);
+    let warm = started.elapsed();
+    assert!(
+        warm < std::time::Duration::from_secs(if cfg!(debug_assertions) { 10 } else { 2 }),
+        "256 KiB with every category took {warm:?}"
     );
 }

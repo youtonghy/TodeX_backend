@@ -5339,16 +5339,21 @@ mod tests {
             "enabled": true,
             "categories": {
                 "privateKey": true, "publicKey": true, "credential": true,
-                "bankCard": true, "idCard": true,
+                "bankCard": true, "idCard": true, "proxyCredential": true,
+                "urlToken": false, "highEntropy": false, "uuid": false,
+                "email": false, "phone": false, "publicIp": false,
             },
+            "customKeys": [],
         });
         assert_eq!(
-            serde_json::from_slice::<Value>(&to_bytes(filter.into_body(), 1024).await.unwrap())
+            serde_json::from_slice::<Value>(&to_bytes(filter.into_body(), 4096).await.unwrap())
                 .unwrap(),
             all_on
         );
         let mut changed = all_on.clone();
         changed["categories"]["publicKey"] = json!(false);
+        changed["categories"]["uuid"] = json!(true);
+        changed["customKeys"] = json!(["router_pin"]);
         let saved = app
             .clone()
             .oneshot(signed_request(
@@ -5364,9 +5369,35 @@ mod tests {
             serde_json::from_slice(&std::fs::read(root.join("data/ssh/store.json")).unwrap())
                 .unwrap();
         assert_eq!(store["agentOutputFilter"], changed);
+        // A client that predates the newer switches keeps them as saved.
+        let old_client = json!({
+            "enabled": true,
+            "categories": {
+                "privateKey": true, "publicKey": true, "credential": true,
+                "bankCard": true, "idCard": true,
+            },
+        });
+        let merged = app
+            .clone()
+            .oneshot(signed_request(
+                &device,
+                "PUT",
+                "/v2/ssh/agent-output-filter",
+                &old_client.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(merged.status(), StatusCode::OK);
+        let merged: Value =
+            serde_json::from_slice(&to_bytes(merged.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(merged["categories"]["publicKey"], true);
+        assert_eq!(merged["categories"]["uuid"], true);
+        assert_eq!(merged["customKeys"], json!(["router_pin"]));
         for invalid in [
             r#"{"enabled":true}"#.to_owned(),
             json!({ "enabled": true, "categories": all_on["categories"], "extra": 1 }).to_string(),
+            json!({ "enabled": true, "categories": { "future": true } }).to_string(),
+            json!({ "enabled": true, "categories": {}, "customKeys": ["has space"] }).to_string(),
         ] {
             let rejected = app
                 .clone()

@@ -47,7 +47,7 @@ use crate::{
         OutputStream,
     },
     local_terminal::{decode_terminal_output, default_shell},
-    privacy_filter::{self, Categories},
+    privacy_filter::{self, AgentOutputFilter, Categories},
     provider::ConversationSupervisor,
     ssh::{
         classify_failure, is_agent_local_alias,
@@ -233,7 +233,7 @@ fn prepare_exec(arguments: Value) -> Result<Prepared<SshCall>, String> {
 }
 
 /// Standard input as shown to the approver and journaled with the prompt:
-/// keys and credentials are redacted (whatever the agent output filter is
+/// keys, credentials and proxy node credentials are redacted (whatever the agent output filter is
 /// set to, as the preview is stored with the conversation).
 fn redact_stdin_preview(text: &str) -> String {
     const PREVIEW: Categories = Categories {
@@ -242,6 +242,13 @@ fn redact_stdin_preview(text: &str) -> String {
         credential: true,
         bank_card: false,
         id_card: false,
+        proxy_credential: true,
+        url_token: false,
+        high_entropy: false,
+        uuid: false,
+        email: false,
+        phone: false,
+        public_ip: false,
     };
     privacy_filter::redact(text, &PREVIEW).text
 }
@@ -307,8 +314,9 @@ fn registry_of_tools() -> ToolRegistry<SshTools, SshCall> {
                  stdout and stderr are each capped at 256 KiB (truncated=true when cut). Unavailable \
                  in Plan mode; in ask mode the user approves each call and command and stdin are each limited \
                  to 4096 bytes (upload a longer script to the host as a file first, then run it). \
-                 The user's privacy filter may replace keys, passwords, tokens, card and ID numbers in the \
-                 output with [REDACTED:<kind>] placeholders (redacted=true). The host `Local`, when \
+                 The user's privacy filter may replace keys, passwords, tokens, proxy credentials, \
+                 card and ID numbers (and other values the user chose) in the output with \
+                 [REDACTED:<kind>] placeholders (redacted=true). The host `Local`, when \
                  ssh_list_hosts lists it, is the machine running TodeX: the command runs in the user's \
                  login shell, and cwd defaults to the conversation workspace.",
                 schema(json!({
@@ -943,14 +951,14 @@ const SSH_ERROR_STATUS: i32 = 255;
 
 impl ExecOutcome {
     /// The tool result and the `ssh.exec.completed` payload.
-    /// `filter`: the categories redacted from output the agent receives.
+    /// `filter`: what is redacted from output the agent receives.
     /// `local`: ran on the [`AGENT_LOCAL_HOST`], where every exit status is
     /// the command's own.
     fn into_result(
         self,
         host: &str,
         duration_ms: u64,
-        filter: Option<&Categories>,
+        filter: Option<&AgentOutputFilter>,
         local: bool,
     ) -> (CallToolResult, Value) {
         let mut completed = json!({ "host": host, "durationMs": duration_ms, "truncated": false });
@@ -1006,7 +1014,7 @@ fn finished_result(
     login_hint: Option<String>,
     host: &str,
     duration_ms: u64,
-    filter: Option<&Categories>,
+    filter: Option<&AgentOutputFilter>,
     local: bool,
     completed: &mut Value,
 ) -> CallToolResult {
@@ -1016,8 +1024,8 @@ fn finished_result(
     completed["truncated"] = json!(output.truncated);
     let mut redactions = std::collections::BTreeMap::<_, usize>::new();
     let mut filtered = |text: String| match filter {
-        Some(categories) => {
-            let redacted = privacy_filter::redact(&text, categories);
+        Some(filter) => {
+            let redacted = filter.redact(&text);
             for (category, count) in redacted.counts {
                 *redactions.entry(category).or_default() += count;
             }
@@ -1080,7 +1088,8 @@ fn finished_result(
 
 /// Tells the agent what the placeholders in a redacted result are.
 const REDACTION_NOTE: &str = "The user's TodeX privacy filter replaced sensitive values in this \
-    output (keys, passwords, tokens, card or ID numbers) with [REDACTED:<kind>] placeholders. \
+    output (keys, passwords, tokens, proxy credentials, card or ID numbers, or other values the user \
+    chose to hide) with [REDACTED:<kind>] placeholders. \
     They are not the real content. Do not try to recover or work around them; if the task needs \
     such a value, ask the user to handle that step.";
 
@@ -1621,7 +1630,7 @@ exit 3
     async fn exec_output_reaches_the_agent_redacted() {
         let harness = harness().await;
         let client = bridged_client(&harness).await;
-        let stdin = "DB_PASSWORD=Zq8x7Lk9w\ncard 4111 1111 1111 1111\n";
+        let stdin = "DB_PASSWORD=Zq8x7Lk9w\ncard 4111 1111 1111 1111\n  uuid: 0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d\n";
 
         let result = call(
             &client,
@@ -1632,7 +1641,7 @@ exit 3
         let output = structured(&result);
         assert_eq!(
             output["stdout"],
-            "ran:cat\nDB_PASSWORD=[REDACTED:credential]\ncard [REDACTED:bank_card ****1111]\n"
+            "ran:cat\nDB_PASSWORD=[REDACTED:credential]\ncard [REDACTED:bank_card ****1111]\n  uuid: [REDACTED:uuid]\n"
         );
         assert_eq!(output["redacted"], true);
         assert!(output["note"].as_str().unwrap().contains("privacy filter"));
@@ -1669,7 +1678,7 @@ exit 3
             .collect();
         assert_eq!(
             completed[0]["redactions"],
-            json!({ "credential": 1, "bankCard": 1 })
+            json!({ "credential": 1, "bankCard": 1, "proxyCredential": 1 })
         );
         assert!(completed[1].get("redactions").is_none());
         let first = &completed[0]["execId"];

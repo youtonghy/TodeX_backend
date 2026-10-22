@@ -1197,15 +1197,27 @@ impl SshService {
     }
 
     pub async fn agent_output_filter(&self) -> AgentOutputFilter {
-        self.inner.store.read().await.agent_output_filter
+        self.inner.store.read().await.agent_output_filter.clone()
     }
 
     /// Applies from the next `ssh_exec` result on.
+    #[cfg(test)]
     pub async fn set_agent_output_filter(
         &self,
         filter: AgentOutputFilter,
     ) -> Result<AgentOutputFilter, AppError> {
+        self.update_agent_output_filter(|_| Ok(filter)).await
+    }
+
+    /// Saves `update` applied to the current setting, under one lock so a
+    /// partial update merges with what is saved. Applies from the next
+    /// `ssh_exec` result on.
+    pub async fn update_agent_output_filter(
+        &self,
+        update: impl FnOnce(&AgentOutputFilter) -> Result<AgentOutputFilter, AppError>,
+    ) -> Result<AgentOutputFilter, AppError> {
         let mut store = self.inner.store.write().await;
+        let filter = update(&store.agent_output_filter)?;
         if store.agent_output_filter != filter {
             let next = SshStore {
                 agent_output_filter: filter,
@@ -1213,7 +1225,7 @@ impl SshService {
             };
             self.save(&mut store, next).await?;
         }
-        Ok(store.agent_output_filter)
+        Ok(store.agent_output_filter.clone())
     }
 
     pub async fn agent_local(&self) -> AgentLocal {

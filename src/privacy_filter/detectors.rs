@@ -2,11 +2,19 @@
 //! credentials, and numbers that must pass a checksum (cards with Luhn and
 //! issuer ranges, IBAN with MOD 97, Chinese resident IDs with their check
 //! digit). A pattern without a checksum only counts next to a context word.
+//! Proxy node credentials and the aggressive, off-by-default categories
+//! live in [`proxy`] and [`aggressive`].
+
+mod aggressive;
+mod keyed;
+mod proxy;
 
 use std::sync::OnceLock;
 
+use base64::Engine as _;
 use regex::bytes::{Regex, RegexBuilder};
 
+use self::keyed::{KeyedRule, Target};
 use super::{gitleaks::is_placeholder, Categories, Category, Finding};
 
 fn regex(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
@@ -18,7 +26,12 @@ fn regex(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
     })
 }
 
-pub(super) fn find(text: &str, categories: &Categories, findings: &mut Vec<Finding>) {
+pub(super) fn find(
+    text: &str,
+    categories: &Categories,
+    custom_keys: &[String],
+    findings: &mut Vec<Finding>,
+) {
     let bytes = text.as_bytes();
     if categories.private_key || categories.public_key {
         armored_blocks(bytes, categories, findings);
@@ -36,10 +49,19 @@ pub(super) fn find(text: &str, categories: &Categories, findings: &mut Vec<Findi
     if categories.credential {
         secret_assignments(bytes, findings);
         url_credentials(bytes, findings);
+        url_query_secrets(bytes, findings);
         bearer_tokens(bytes, findings);
+        basic_credentials(bytes, findings);
         prefixed_tokens(bytes, findings);
         password_hashes(bytes, findings);
     }
+    if !custom_keys.is_empty() {
+        custom_key_values(bytes, custom_keys, findings);
+    }
+    if categories.proxy_credential {
+        proxy::find(bytes, findings);
+    }
+    aggressive::find(bytes, categories, findings);
 }
 
 // ---------------------------------------------------------------- keys
@@ -182,49 +204,97 @@ fn openssh_public_keys(bytes: &[u8], findings: &mut Vec<Finding>) {
 
 // ---------------------------------------------------------- credentials
 
-/// `password=…`, `"api_key": "…"`, `export DB_SECRET=…`, `密码：…`: the value
-/// after a key that names a secret.
+/// Key names that hold a secret: anything containing a secret word, plus a
+/// few whole names (`auth`, mihomo's `authentication` list) that would match
+/// too much as a part (`author`, `oauth_url`).
+const SECRET_KEY: &str = r"[A-Za-z0-9_.-]*(?:passw(?:or)?d|passphrase|secret|token|api[_.-]?key|private[_.-]?key|access[_.-]?key|credential|authorization|auth[_.-]?(?:key|token)|session[_.-]?key|pre[_.-]?shared[_.-]?key|psk)[A-Za-z0-9_.-]*|auth|authentication|basic[_.-]?auth|htpasswd|密码|口令|密钥|私钥|令牌";
+
+/// `password=…`, `"api_key": "…"`, `export DB_SECRET=…`, `密码：…`, and
+/// lists under such a key (`authentication:` then `- user:pass`): the
+/// values after a key that names a secret.
 fn secret_assignments(bytes: &[u8], findings: &mut Vec<Finding>) {
-    static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
-    static IGNORED_KEY: OnceLock<Regex> = OnceLock::new();
-    let assignment = regex(
-        &ASSIGNMENT,
-        r#"(?i)(?:^|[^A-Za-z0-9_.-])["']?((?:[A-Za-z0-9_.-]*(?:passw(?:or)?d|passphrase|secret|token|api[_.-]?key|private[_.-]?key|access[_.-]?key|credential|authorization|auth[_.-]?(?:key|token)|session[_.-]?key)[A-Za-z0-9_.-]*)|密码|口令|密钥|私钥|令牌)["']?[ \t]*(?:=>|:=|=|:|：)[ \t]*(?:(?:bearer|basic|token)[ \t]+)?(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s"',;}\]]+))"#,
+    static RULE: OnceLock<KeyedRule> = OnceLock::new();
+    let rule = RULE.get_or_init(|| KeyedRule::new(SECRET_KEY, true, "=>|:=|=|:|："));
+    rule.find(
+        bytes,
+        &Target {
+            category: Category::Credential,
+            label: |_| "credential",
+            skip_key: is_metadata_key,
+            accept: is_credential_value,
+        },
+        findings,
     );
-    // Keys that hold metadata about a secret, not the secret.
+}
+
+/// Keys that hold metadata about a secret, not the secret.
+fn is_metadata_key(key: &[u8]) -> bool {
+    static IGNORED_KEY: OnceLock<Regex> = OnceLock::new();
     let ignored_key = regex(
         &IGNORED_KEY,
-        r"(?i)(?:^|[_.-])(?:type|file|path|dir|url|uri|endpoint|id|name|length|len|size|count|expires?|expires[_.-]?(?:at|in)|expiry|ttl|limit|max|min|used|enabled|required|header|prefix|field|env|ref|hash[_.-]?alg|alg|algorithm|kind|format|policy|version|mode|store)$|^(?:max|min)[_.-]|csrf|^public[_.-]?|tokens$|tokenizer|tokenize",
+        r"(?i)(?:^|[_.-])(?:types?|files?|paths?|dirs?|urls?|uris?|endpoints?|ids?|names?|length|len|size|count|expires?|expires[_.-]?(?:at|in)|expiry|ttl|limit|max|min|used|enabled|required|header|prefix|field|env|ref|hash[_.-]?alg|alg|algorithm|kind|format|policy|version|mode|store)$|^(?:max|min)[_.-]|csrf|^public[_.-]?|tokens$|tokenizer|tokenize",
     );
-    for captures in assignment.captures_iter(bytes) {
-        let (Some(key), Some(value)) = (
-            captures.get(1),
-            captures
-                .get(2)
-                .or_else(|| captures.get(3))
-                .or_else(|| captures.get(4)),
-        ) else {
-            continue;
-        };
-        if key.as_bytes().is_ascii() && ignored_key.is_match(key.as_bytes()) {
-            continue;
-        }
-        let value_bytes = trim_ascii(value.as_bytes());
-        // An armored key in a value is left to the block detector.
-        if !is_secret_value(value_bytes) || contains(value_bytes, b"-----BEGIN ") {
-            continue;
-        }
-        findings.push(Finding::new(
-            value.start(),
-            value.end(),
-            Category::Credential,
-            "credential",
-        ));
-    }
+    key.is_ascii() && ignored_key.is_match(key)
+}
+
+/// A secret value, but not an armored key (left to the block detector) or
+/// the name of an auth scheme (`auth: basic`, pg_hba's `md5`).
+fn is_credential_value(value: &[u8]) -> bool {
+    const SCHEMES: &[&str] = &[
+        "basic",
+        "bearer",
+        "digest",
+        "password",
+        "token",
+        "oauth",
+        "oauth2",
+        "jwt",
+        "apikey",
+        "api_key",
+        "publickey",
+        "plain",
+        "md5",
+        "scram-sha-256",
+        "trust",
+        "peer",
+        "ident",
+    ];
+    let lowered = value.to_ascii_lowercase();
+    is_secret_value(value)
+        && !contains(value, b"-----BEGIN ")
+        && !SCHEMES.iter().any(|scheme| lowered == scheme.as_bytes())
+}
+
+/// The values of the user's own key names, matched whole and in any case.
+fn custom_key_values(bytes: &[u8], keys: &[String], findings: &mut Vec<Finding>) {
+    let pattern = keys
+        .iter()
+        .map(|key| regex::escape(key))
+        .collect::<Vec<_>>()
+        .join("|");
+    KeyedRule::new(&pattern, true, "=>|:=|=|:|：").find(
+        bytes,
+        &Target {
+            category: Category::Credential,
+            label: |_| "custom-key",
+            skip_key: |_| false,
+            // The user named the key: short PINs count too.
+            accept: is_given_value,
+        },
+        findings,
+    );
 }
 
 /// Not empty, not a placeholder and not a small number or flag.
 fn is_secret_value(value: &[u8]) -> bool {
+    value.len() >= 3
+        && !(value.len() < 8 && value.iter().all(u8::is_ascii_digit))
+        && is_given_value(value)
+}
+
+/// Not empty, a placeholder, a reference to a value kept elsewhere or a
+/// word standing for no value.
+fn is_given_value(value: &[u8]) -> bool {
     const NOT_SECRETS: &[&str] = &[
         "null",
         "none",
@@ -244,10 +314,7 @@ fn is_secret_value(value: &[u8]) -> bool {
         "empty",
         "unset",
     ];
-    if value.len() < 3 {
-        return false;
-    }
-    if value.len() < 8 && value.iter().all(u8::is_ascii_digit) {
+    if value.is_empty() {
         return false;
     }
     let lowered = value.to_ascii_lowercase();
@@ -305,6 +372,56 @@ fn bearer_tokens(bytes: &[u8], findings: &mut Vec<Finding>) {
             token.end(),
             Category::Credential,
             "bearer-token",
+        ));
+    }
+}
+
+/// Secrets in a URL query (`?token=…`, `&sig=…`, presigned
+/// `X-Amz-Signature`): the value up to the next `&`.
+fn url_query_secrets(bytes: &[u8], findings: &mut Vec<Finding>) {
+    static QUERY: OnceLock<Regex> = OnceLock::new();
+    let query = regex(
+        &QUERY,
+        r#"(?i)[?&](?:access_token|refresh_token|id_token|token|api[_-]?key|key|sig|signature|auth|secret|password|passwd|x-amz-signature|x-amz-security-token|x-goog-signature)=([^&#\s"'<>]+)"#,
+    );
+    for captures in query.captures_iter(bytes) {
+        let Some(value) = captures.get(1) else {
+            continue;
+        };
+        if !is_secret_value(value.as_bytes()) {
+            continue;
+        }
+        findings.push(Finding::new(
+            value.start(),
+            value.end(),
+            Category::Credential,
+            "url-secret",
+        ));
+    }
+}
+
+/// `Basic <base64 of user:password>` anywhere: only when it decodes to
+/// printable text with a colon, so `Basic authentication` stays.
+fn basic_credentials(bytes: &[u8], findings: &mut Vec<Finding>) {
+    static BASIC: OnceLock<Regex> = OnceLock::new();
+    let basic = regex(&BASIC, r"(?i)\bbasic[ \t]+([A-Za-z0-9+/]{6,}={0,2})");
+    for captures in basic.captures_iter(bytes) {
+        let Some(encoded) = captures.get(1) else {
+            continue;
+        };
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes())
+        else {
+            continue;
+        };
+        let printable = decoded.iter().all(|byte| (0x20..0x7f).contains(byte));
+        if !printable || !decoded.contains(&b':') || decoded.len() < 3 {
+            continue;
+        }
+        findings.push(Finding::new(
+            encoded.start(),
+            encoded.end(),
+            Category::Credential,
+            "basic-auth",
         ));
     }
 }
