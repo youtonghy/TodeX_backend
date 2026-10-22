@@ -78,6 +78,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     },
 };
 
+mod permission_mode;
 mod runtime;
 mod session_work;
 
@@ -561,9 +562,9 @@ impl ProviderDriver for ClaudeDriver {
         // The sender must outlive initialize: `cancel.changed()` resolves as
         // soon as every sender drops and would masquerade as a cancellation.
         let (_cancel, mut receiver) = watch::channel(false);
-        let commands = initialize_claude(&mut process, &mut receiver).await;
+        let commands = initialize_claude(&mut process, &mut receiver, None).await;
         process.terminate().await;
-        commands
+        commands.map(|(commands, _)| commands)
     }
 
     fn supports_native_fork(&self) -> bool {
@@ -770,16 +771,19 @@ async fn spawn_claude(
 }
 
 /// Completes the `initialize` handshake of a process from [`spawn_claude`],
-/// recording the session's slash-command catalog. On failure the caller
-/// stops the process, so whoever owns the conversation knows when it is gone.
+/// recording the session's slash-command catalog, and returns what the
+/// process reported about its permission mode (`expected_mode` is the one it
+/// was launched with). On failure the caller stops the process, so whoever
+/// owns the conversation knows when it is gone.
 async fn initialize_session(
     process: &mut JsonLineProcess,
     catalogs: &Catalogs,
     context: &DriverContext,
     runtime_id: String,
+    expected_mode: Option<&str>,
     cancel: &mut watch::Receiver<bool>,
-) -> Result<(), AppError> {
-    let commands = initialize_claude(process, cancel).await?;
+) -> Result<permission_mode::ModeReport, AppError> {
+    let (commands, report) = initialize_claude(process, cancel, expected_mode).await?;
     catalogs.lock().await.insert(
         context.manifest.id.clone(),
         ProviderSessionCommands {
@@ -787,7 +791,7 @@ async fn initialize_session(
             runtime_id,
         },
     );
-    Ok(())
+    Ok(report)
 }
 
 /// Whether the transcript at `path` can back a `--resume`: the file must
@@ -966,9 +970,17 @@ mod tests {
                 "{expected:?} {actual}"
             );
         }
-        let event = super::auto_mode_unavailable_event(None);
+        assert!(auto_mode_fell_back(Some("auto"), "acceptEdits"));
+        let event = super::auto_mode_unavailable_event(None, "ask", None);
         assert_eq!(event["providerMethod"], "auto_mode_unavailable");
         assert!(event["metadata"]["model"].is_null());
+        assert_eq!(event["metadata"]["cause"], "unavailable");
+        assert!(event["metadata"]["settingsSource"].is_null());
+        let event =
+            super::auto_mode_unavailable_event(Some("m"), "accept-edits", Some("userSettings"));
+        assert_eq!(event["metadata"]["cause"], "settings");
+        assert_eq!(event["metadata"]["settingsSource"], "userSettings");
+        assert_eq!(event["metadata"]["activeMode"], "accept-edits");
     }
 
     use super::{
@@ -2263,10 +2275,15 @@ fn claude_result_error(message: &Value) -> Option<String> {
 // Protocol reference: anthropics/claude-agent-sdk-python, _internal/query.py.
 // Use the same initialize exchange as the official Agent SDK before sending
 // a user turn. A rejected/unsupported control channel must fail before tools run.
+//
+// `expected_mode` is the requested `--permission-mode`: when the response
+// reports another one in place of bypass or auto, a `get_settings` probe
+// finds the settings layer that disabled it (see [`permission_mode`]).
 async fn initialize_claude(
     process: &mut JsonLineProcess,
     cancel: &mut watch::Receiver<bool>,
-) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+    expected_mode: Option<&str>,
+) -> Result<(Vec<ProviderCommandDescriptor>, permission_mode::ModeReport), AppError> {
     process
         .send(&json!({
             "type": "control_request",
@@ -2303,7 +2320,14 @@ async fn initialize_claude(
                 return if message.pointer("/response/subtype").and_then(Value::as_str)
                     == Some("success")
                 {
-                    Ok(claude_command_catalog(&message))
+                    let report = permission_mode::ModeReport {
+                        reported: message
+                            .pointer("/response/response/current_permission_mode")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        settings: None,
+                    };
+                    Ok((claude_command_catalog(&message), report))
                 } else {
                     Err(AppError::ProviderUnavailable(format!(
                         "Claude Code initialization rejected: {}",
@@ -2316,11 +2340,49 @@ async fn initialize_claude(
             }
         }
     };
-    tokio::select! {
+    let (commands, mut report) = tokio::select! {
         result = tokio::time::timeout(super::process::control_timeout()?, initialize) => {
-            result.map_err(|_| AppError::ProviderUnavailable("Claude Code initialization timed out".to_owned()))?
+            result.map_err(|_| AppError::ProviderUnavailable("Claude Code initialization timed out".to_owned()))??
         }
-        _ = cancel.changed() => Err(AppError::InvalidRequest("Claude Code initialization cancelled".to_owned())),
+        _ = cancel.changed() => return Err(AppError::InvalidRequest("Claude Code initialization cancelled".to_owned())),
+    };
+    let refused = report
+        .reported
+        .as_deref()
+        .is_some_and(|reported| permission_mode::needs_settings_probe(expected_mode, reported));
+    if refused {
+        // Only explains the refusal, so it never fails the start: an
+        // unanswered or failed probe just names no settings layer.
+        report.settings = Some(
+            tokio::select! {
+                sources = tokio::time::timeout(SETTINGS_PROBE_TIMEOUT, probe_settings(process)) => {
+                    sources.ok().flatten()
+                }
+                _ = cancel.changed() => return Err(AppError::InvalidRequest("Claude Code initialization cancelled".to_owned())),
+            }
+            .unwrap_or_default(),
+        );
+    }
+    Ok((commands, report))
+}
+
+/// How long start-up waits on the `get_settings` probe.
+const SETTINGS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Sends `get_settings` and reads until its answer; `None` when the process
+/// ends first or the request cannot be sent.
+async fn probe_settings(
+    process: &mut JsonLineProcess,
+) -> Option<permission_mode::DisablingSources> {
+    if let Err(error) = process.send(&permission_mode::settings_probe()).await {
+        tracing::debug!(%error, "could not ask Claude Code for its settings");
+        return None;
+    }
+    loop {
+        let message = process.read().await.ok()??;
+        if let Some(sources) = permission_mode::settings_probe_answer(&message) {
+            return Some(sources);
+        }
     }
 }
 
@@ -2412,6 +2474,7 @@ enum TurnStart {
 async fn run_claude_turn(
     process: &mut JsonLineProcess,
     usage_ledger: &mut ClaudeUsageLedger,
+    mode: &mut permission_mode::ModeReport,
     context: DriverContext,
     prompt: DriverPrompt,
     requested_session_id: String,
@@ -2431,7 +2494,14 @@ async fn run_claude_turn(
         prompt.sandbox_mode.as_deref(),
         prompt.approval_policy.as_deref(),
     )?;
-    let expected_mode = execution.provider_mode;
+    let expected_mode = execution.provider_mode.clone();
+    // Start-up already showed Claude refusing full access: fail before the
+    // prompt reaches the model.
+    if let Some(reported) = mode.reported.as_deref() {
+        if permission_mode::bypass_mode_refused(expected_mode.as_deref(), reported) {
+            return Err(bypass_refused(sink, reported, mode.bypass_source()).await);
+        }
+    }
     let user_message = json!({
         "type": "user",
         "session_id": requested_session_id,
@@ -2510,6 +2580,10 @@ async fn run_claude_turn(
     // closes, which resolves any prompt still waiting, and the closed
     // response channel drops the answer.
     let (response_tx, mut response_rx) = mpsc::unbounded_channel::<Value>();
+    // Whether this turn already reported Claude replacing `auto`.
+    let mut auto_fallback = AutoFallback::Active;
+    // Model from this invocation's `init` frame, for that report.
+    let mut init_model: Option<String> = None;
     let result = loop {
         let message = tokio::select! {
             message = process.read_frame() => sink.provider_frame(message?).await?,
@@ -2728,25 +2802,65 @@ async fn run_claude_turn(
                             }
                         }
                     }
+                    init_model = message
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
                     if let Some(actual) = message.get("permissionMode").and_then(Value::as_str) {
-                        if auto_mode_fell_back(expected_mode.as_deref(), actual) {
-                            // Claude Code quietly runs in `default` when the
-                            // model or account has no auto mode. It then
+                        let expected = expected_mode.as_deref();
+                        if permission_mode::bypass_mode_refused(expected, actual) {
+                            return Err(bypass_refused(sink, actual, mode.bypass_source()).await);
+                        } else if auto_mode_fell_back(expected, actual) {
+                            // Claude Code quietly runs in another mode when
+                            // the model or account has no auto mode, or a
+                            // settings layer disables it. That mode still
                             // asks through `can_use_tool`, i.e. TodeX's own
-                            // approval, so the turn continues as `ask`.
-                            if let Some(mode) = &context.handles.mode {
-                                mode.downgrade_to_ask(&execution.work_mode);
-                            }
-                            sink.emit(
-                                "provider.event",
-                                auto_mode_unavailable_event(message.get("model")),
-                            )
-                            .await?;
-                        } else if expected_mode.as_deref() != Some(actual) {
-                            return Err(AppError::ProviderUnavailable(format!(
-                                "Claude Code did not activate requested permission mode '{}'; reported '{}'. Check model, account and organization permissions.",
-                                expected_mode.as_deref().unwrap_or("default"), actual
-                            )));
+                            // approval, so the turn continues.
+                            auto_fallback
+                                .report(
+                                    process,
+                                    sink,
+                                    mode,
+                                    &context.handles,
+                                    &execution.work_mode,
+                                    init_model.as_deref(),
+                                    actual,
+                                )
+                                .await?;
+                        } else if expected != Some(actual) {
+                            return Err(AppError::ProviderUnavailable(
+                                permission_mode::mode_mismatch_reason(
+                                    expected,
+                                    actual,
+                                    mode.auto_source(),
+                                ),
+                            ));
+                        }
+                    }
+                }
+                // Claude changes its mode mid-turn with a `status` frame:
+                // a settings layer can drop `auto` after `init` reported it.
+                // `plan` comes and goes with EnterPlanMode/ExitPlanMode.
+                if message.get("subtype").and_then(Value::as_str) == Some("status") {
+                    if let Some(actual) = message.get("permissionMode").and_then(Value::as_str) {
+                        let expected = expected_mode.as_deref();
+                        if actual != "plan"
+                            && permission_mode::bypass_mode_refused(expected, actual)
+                        {
+                            return Err(bypass_refused(sink, actual, mode.bypass_source()).await);
+                        }
+                        if auto_mode_fell_back(expected, actual) {
+                            auto_fallback
+                                .report(
+                                    process,
+                                    sink,
+                                    mode,
+                                    &context.handles,
+                                    &execution.work_mode,
+                                    init_model.as_deref(),
+                                    actual,
+                                )
+                                .await?;
                         }
                     }
                 }
@@ -2769,7 +2883,12 @@ async fn run_claude_turn(
                 )
                 .await?;
             }
-            Some("control_response") => {}
+            Some("control_response") => {
+                if let Some(sources) = permission_mode::settings_probe_answer(&message) {
+                    mode.settings = Some(sources);
+                    auto_fallback.probe_answered(sink, mode).await?;
+                }
+            }
             Some("rate_limit_event") => {
                 if let Some(quota) = claude_quota_event(&message) {
                     if let Some(until) = claude_frame_limit_reset(&quota) {
@@ -2788,6 +2907,8 @@ async fn run_claude_turn(
             None => {}
         }
     };
+    // The settings probe went unanswered: report without a source.
+    auto_fallback.probe_answered(sink, mode).await?;
     // Work Claude did on its own may end without visible output.
     if !saw_output && !adopt {
         return Err(AppError::ProviderUnavailable(
@@ -3783,26 +3904,124 @@ async fn handle_stream_event(
     Ok(())
 }
 
-/// Claude Code reports `default` instead of the requested `auto` when the
-/// model (for example Haiku through a non-first-party API) or the account
-/// does not offer auto mode.
+/// Claude Code runs another mode in place of the requested `auto` and the
+/// turn continues: `default` when the model (for example Haiku through a
+/// non-first-party API) or the account does not offer auto mode, or the
+/// settings' `defaultMode` when `permissions.disableAutoMode` turns it off.
+/// See [`permission_mode::auto_fallback_mode`] for the modes that qualify.
 fn auto_mode_fell_back(expected: Option<&str>, actual: &str) -> bool {
-    expected == Some("auto") && actual == "default"
+    expected == Some("auto") && permission_mode::auto_fallback_mode(actual).is_some()
 }
 
 /// The `provider.event` recorded when [`auto_mode_fell_back`]; same shape as
-/// Antigravity's `auto_mode_unavailable`.
-fn auto_mode_unavailable_event(model: Option<&Value>) -> Value {
+/// Antigravity's `auto_mode_unavailable`, plus the `cause` and the
+/// `settingsSource` that disabled auto mode (`null` when none did or it is
+/// unknown).
+fn auto_mode_unavailable_event(model: Option<&str>, active: &str, source: Option<&str>) -> Value {
+    let reason = match source {
+        Some(source) => format!(
+            "Claude Code settings ({source}) disable auto mode (permissions.disableAutoMode)"
+        ),
+        None => "Claude Code did not enable auto mode for this model or account".to_owned(),
+    };
     json!({
         "provider": "claude-code",
         "providerMethod": "auto_mode_unavailable",
         "metadata": {
             "requestedMode": "auto",
-            "activeMode": "ask",
-            "model": model.and_then(Value::as_str),
-            "reason": "Claude Code did not enable auto mode for this model or account",
+            "activeMode": active,
+            "model": model,
+            "reason": reason,
+            "cause": if source.is_some() { "settings" } else { "unavailable" },
+            "settingsSource": source,
         },
     })
+}
+
+/// Records `bypass_mode_disabled` and returns the error that fails the turn.
+async fn bypass_refused(sink: &DriverEventSink, actual: &str, source: Option<&str>) -> AppError {
+    if let Err(error) = sink
+        .emit(
+            "provider.event",
+            permission_mode::bypass_mode_disabled_event(actual, source),
+        )
+        .await
+    {
+        return error;
+    }
+    AppError::ProviderUnavailable(permission_mode::bypass_refused_reason(source, actual))
+}
+
+/// Whether a turn that asked for `auto` reported Claude running another mode.
+enum AutoFallback {
+    Active,
+    /// Waiting on the `get_settings` probe before reporting.
+    Probing {
+        model: Option<String>,
+        active: &'static str,
+    },
+    Reported,
+}
+
+impl AutoFallback {
+    /// Claude runs `actual` in place of `auto`: TodeX's own tools ask from
+    /// now on, and the turn reports it once. Without a settings layer known
+    /// yet, a `get_settings` probe goes out first and the report waits for
+    /// its answer ([`Self::probe_answered`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn report(
+        &mut self,
+        process: &mut JsonLineProcess,
+        sink: &DriverEventSink,
+        mode: &permission_mode::ModeReport,
+        handles: &super::types::TurnHandles,
+        work_mode: &str,
+        model: Option<&str>,
+        actual: &str,
+    ) -> Result<(), AppError> {
+        if !matches!(self, Self::Active) {
+            return Ok(());
+        }
+        let active = permission_mode::auto_fallback_mode(actual).unwrap_or("ask");
+        if let Some(handle) = &handles.mode {
+            handle.downgrade_to_ask(work_mode);
+        }
+        if mode.can_probe() {
+            process.send(&permission_mode::settings_probe()).await?;
+            *self = Self::Probing {
+                model: model.map(str::to_owned),
+                active,
+            };
+            return Ok(());
+        }
+        *self = Self::Reported;
+        sink.emit(
+            "provider.event",
+            auto_mode_unavailable_event(model, active, mode.auto_source()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Reports a fallback that waited on the settings probe.
+    async fn probe_answered(
+        &mut self,
+        sink: &DriverEventSink,
+        mode: &permission_mode::ModeReport,
+    ) -> Result<(), AppError> {
+        if !matches!(self, Self::Probing { .. }) {
+            return Ok(());
+        }
+        let Self::Probing { model, active } = std::mem::replace(self, Self::Reported) else {
+            return Ok(());
+        };
+        sink.emit(
+            "provider.event",
+            auto_mode_unavailable_event(model.as_deref(), active, mode.auto_source()),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 /// Answers a control request from a detached task so the read loop keeps

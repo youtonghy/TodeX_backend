@@ -535,6 +535,8 @@ struct Live {
     /// From the last turn: how to open a turn for work Claude starts on its
     /// own, and the launch settings that turn reports.
     provider_work: Option<(ProviderWorkHandle, DriverPrompt)>,
+    /// What the process reported about its permission mode at start-up.
+    mode: super::permission_mode::ModeReport,
 }
 
 impl Live {
@@ -545,6 +547,7 @@ impl Live {
             usage: Default::default(),
             work: SessionWork::default(),
             provider_work: None,
+            mode: Default::default(),
         }
     }
 
@@ -759,14 +762,17 @@ async fn worker(
                         // stopped by this worker, which stays in the table
                         // until it has exited.
                         let started = live.insert(Live::new(process, key));
-                        super::initialize_session(
+                        let expected = started.key.permission_mode.clone();
+                        started.mode = super::initialize_session(
                             &mut started.process,
                             &launcher.catalogs,
                             &context,
                             runtime_id,
+                            expected.as_deref(),
                             &mut cancel,
                         )
-                        .await
+                        .await?;
+                        Ok::<(), AppError>(())
                     } => started,
                     _ = shutdown.changed() => {
                         let _ = reply.send(Err(AppError::TurnCancelled));
@@ -863,11 +869,13 @@ async fn worker(
                     let (process, runtime_id) =
                         super::spawn_claude(&launcher.binary, &context, &prompt).await?;
                     let started = live.insert(Live::new(process, key));
-                    super::initialize_session(
+                    let expected = started.key.permission_mode.clone();
+                    started.mode = super::initialize_session(
                         &mut started.process,
                         &launcher.catalogs,
                         &context,
                         runtime_id,
+                        expected.as_deref(),
                         &mut cancel,
                     )
                     .await?;
@@ -882,6 +890,7 @@ async fn worker(
                 super::run_claude_turn(
                     &mut started.process,
                     &mut started.usage,
+                    &mut started.mode,
                     context,
                     prompt,
                     session_id.clone(),
@@ -1092,14 +1101,24 @@ async fn run_once(
     if *cancel.borrow() {
         return Ok(cancelled_before_start(session_id));
     }
+    let expected = super::super::types::resolve_execution_config(
+        context.manifest.provider,
+        prompt.permission_mode.as_deref(),
+        prompt.work_mode.as_deref(),
+        prompt.permission_profile.as_deref(),
+        prompt.sandbox_mode.as_deref(),
+        prompt.approval_policy.as_deref(),
+    )?
+    .provider_mode;
     let (mut process, runtime_id) =
         super::spawn_claude(&launcher.binary, &context, &prompt).await?;
     let result = async {
-        super::initialize_session(
+        let mut mode = super::initialize_session(
             &mut process,
             &launcher.catalogs,
             &context,
             runtime_id,
+            expected.as_deref(),
             &mut cancel,
         )
         .await?;
@@ -1110,6 +1129,7 @@ async fn run_once(
         super::run_claude_turn(
             &mut process,
             &mut super::ClaudeUsageLedger::default(),
+            &mut mode,
             context,
             prompt,
             session_id.clone(),
@@ -1145,7 +1165,9 @@ mod tests {
     /// SIGTERM take a moment, `late-permission` / `late-output` follow the
     /// turn with a frame while no turn runs, `background` leaves a background
     /// task that finishes once a `finish-bg` file appears, after which Claude
-    /// starts an invocation of its own (as Claude Code 2.1.299 does). User
+    /// starts an invocation of its own (as Claude Code 2.1.299 does). A
+    /// `reported-mode` file sets initialize's `current_permission_mode` and
+    /// an `init-mode` file each turn's `init` frame mode. User
     /// lines are replayed, as with `--replay-user-messages`. Every launch's argv and every
     /// stdin line are logged; a launch while another process of the same
     /// session still runs is logged to `overlap.log`.
@@ -1170,7 +1192,14 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$dir/wire.jsonl"
   case "$line" in
     *'"subtype":"initialize"'*)
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{"commands":[{"name":"review","description":"Review"}]}}}\n'
+      if [ -f "$dir/reported-mode" ]; then
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{"commands":[{"name":"review","description":"Review"}],"current_permission_mode":"%s"}}}\n' "$(cat "$dir/reported-mode")"
+      else
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{"commands":[{"name":"review","description":"Review"}]}}}\n'
+      fi
+      continue ;;
+    *'"subtype":"get_settings"'*)
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-get-settings","response":{"sources":[{"source":"localSettings","settings":{"permissions":{"disableAutoMode":"disable"}}}]}}}\n'
       continue ;;
     *'"subtype":"interrupt"'*)
       if [ "$mode" = interruptible ]; then
@@ -1186,6 +1215,9 @@ while IFS= read -r line; do
   esac
   printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
   printf '%s\n' "$line"
+  if [ -f "$dir/init-mode" ]; then
+    printf '{"type":"system","subtype":"init","permissionMode":"%s","model":"claude-fake"}\n' "$(cat "$dir/init-mode")"
+  fi
   case "$line" in *slow-exit*) slow_exit=1 ;; esac
   case "$line" in *slow-interrupt*) slow=1 ;; esac
   case "$line" in
@@ -1494,6 +1526,39 @@ done
         let wire = fixture.wire();
         assert_eq!(wire.matches(r#""subtype":"initialize""#).count(), 1);
         assert_eq!(wire.matches(r#""type":"user""#).count(), 1);
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_prewarmed_process_explains_the_mode_claude_refused_to_its_turn() {
+        let fixture = Fixture::new().await;
+        std::fs::write(fixture.root.join("reported-mode"), "default").unwrap();
+        std::fs::write(fixture.root.join("init-mode"), "default").unwrap();
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        assert_eq!(
+            fixture.prewarm(&sessions, &manifest).await.unwrap(),
+            ProviderPrewarm::Warmed
+        );
+        // Asked once, at start-up: the turn reuses what the probe found.
+        let result = fixture.turn(&sessions, &manifest, "first").await;
+        assert!(!result.cancelled);
+        assert_eq!(fixture.launches().len(), 1);
+        assert_eq!(
+            fixture
+                .wire()
+                .matches(r#""subtype":"get_settings""#)
+                .count(),
+            1
+        );
+        let history = fixture.store.complete_history(&manifest.id).await.unwrap();
+        let event = history
+            .iter()
+            .find(|event| event.payload["providerMethod"] == "auto_mode_unavailable")
+            .unwrap_or_else(|| panic!("{history:?}"));
+        assert_eq!(event.payload["metadata"]["settingsSource"], "localSettings");
+        assert_eq!(event.payload["metadata"]["cause"], "settings");
         sessions.stop_all().await;
         cleanup(&fixture.root);
     }

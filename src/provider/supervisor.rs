@@ -5989,6 +5989,8 @@ mod tests {
                     "activeMode": "ask",
                     "model": "claude-haiku-fixture",
                     "reason": "Claude Code did not enable auto mode for this model or account",
+                    "cause": "unavailable",
+                    "settingsSource": null,
                 },
                 "turnId": turn_id,
             })
@@ -6030,6 +6032,158 @@ mod tests {
             .iter()
             .any(|event| event.payload["providerMethod"] == "auto_mode_unavailable"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Runs one Claude turn in `mode` against the `mode-settings` fixture
+    /// (see `write_provider_fixture`) and returns the history and stdin.
+    async fn claude_mode_settings_turn(
+        label: &str,
+        marker: &str,
+        mode: &str,
+    ) -> (Vec<ConversationEvent>, String) {
+        let (root, store, supervisor, workspace) = control_fixture(label).await;
+        fs::write(root.join("mode-settings"), marker).unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        supervisor
+            .prompt_owned(
+                "local",
+                &manifest.id,
+                ConversationPrompt {
+                    client_request_id: None,
+                    text: "hello".to_owned(),
+                    model: None,
+                    reasoning_effort: None,
+                    skills: Vec::new(),
+                    content: Vec::new(),
+                    permission_mode: Some(mode.to_owned()),
+                    work_mode: None,
+                    permission_profile: None,
+                    sandbox_mode: None,
+                    approval_policy: None,
+                },
+            )
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let stdin = fs::read_to_string(root.join("stdin.log")).unwrap_or_default();
+        fs::remove_dir_all(root).unwrap();
+        (history, stdin)
+    }
+
+    fn provider_events<'a>(
+        history: &'a [ConversationEvent],
+        method: &str,
+    ) -> Vec<&'a ConversationEvent> {
+        history
+            .iter()
+            .filter(|event| {
+                event.event_type == "provider.event" && event.payload["providerMethod"] == method
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn claude_refusing_full_access_names_the_settings_layer_and_fails() {
+        let (history, stdin) = claude_mode_settings_turn(
+            "todex-claude-bypass-refused",
+            "auto auto - projectSettings",
+            "full-access",
+        )
+        .await;
+        let reason = "Claude Code settings (projectSettings) disable full access (permissions.disableBypassPermissionsMode). Turn that setting off in CLI settings to use full access.";
+        let events = provider_events(&history, "bypass_mode_disabled");
+        assert_eq!(events.len(), 1, "{history:?}");
+        assert_eq!(
+            events[0].payload["metadata"],
+            json!({
+                "requestedMode": "full-access",
+                "reportedMode": "auto",
+                "settingsSource": "projectSettings",
+                "reason": reason,
+            })
+        );
+        assert!(
+            history.iter().any(|event| event.event_type == "turn.failed"
+                && event.payload.to_string().contains(reason)),
+            "{history:?}"
+        );
+        // Never downgraded: the prompt does not reach the model at all.
+        assert!(stdin.contains(r#""subtype":"get_settings""#), "{stdin}");
+        assert!(!stdin.contains(r#""type":"user""#), "{stdin}");
+        assert!(provider_events(&history, "auto_mode_unavailable").is_empty());
+    }
+
+    #[tokio::test]
+    async fn claude_auto_disabled_by_settings_continues_in_the_mode_it_fell_back_to() {
+        let (history, _) = claude_mode_settings_turn(
+            "todex-claude-auto-settings",
+            "acceptEdits acceptEdits - localSettings",
+            "auto",
+        )
+        .await;
+        let events = provider_events(&history, "auto_mode_unavailable");
+        assert_eq!(events.len(), 1, "{history:?}");
+        assert_eq!(
+            events[0].payload["metadata"],
+            json!({
+                "requestedMode": "auto",
+                "activeMode": "accept-edits",
+                "model": "claude-fixture",
+                "reason": "Claude Code settings (localSettings) disable auto mode (permissions.disableAutoMode)",
+                "cause": "settings",
+                "settingsSource": "localSettings",
+            })
+        );
+        assert!(
+            history
+                .iter()
+                .any(|event| event.event_type == "turn.completed"),
+            "{history:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_dropping_auto_mid_turn_reports_it_once_with_its_settings_layer() {
+        let (history, stdin) = claude_mode_settings_turn(
+            "todex-claude-auto-status",
+            "auto auto default policySettings",
+            "auto",
+        )
+        .await;
+        let events = provider_events(&history, "auto_mode_unavailable");
+        assert_eq!(events.len(), 1, "{history:?}");
+        assert_eq!(events[0].payload["metadata"]["activeMode"], "ask");
+        assert_eq!(events[0].payload["metadata"]["cause"], "settings");
+        assert_eq!(
+            events[0].payload["metadata"]["settingsSource"],
+            "policySettings"
+        );
+        assert_eq!(stdin.matches(r#""subtype":"get_settings""#).count(), 1);
+        assert!(
+            history
+                .iter()
+                .any(|event| event.event_type == "turn.completed"),
+            "{history:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_auto_disabled_into_plan_fails_the_turn_naming_the_layer() {
+        let (history, _) =
+            claude_mode_settings_turn("todex-claude-auto-plan", "plan plan - userSettings", "auto")
+                .await;
+        assert!(
+            history.iter().any(|event| event.event_type == "turn.failed"
+                && event.payload.to_string().contains(
+                    "Claude Code settings (userSettings) disable auto mode (permissions.disableAutoMode) and it fell back to 'plan'"
+                )),
+            "{history:?}"
+        );
+        assert!(provider_events(&history, "auto_mode_unavailable").is_empty());
     }
 
     #[tokio::test]
@@ -7429,6 +7583,37 @@ elif [ -f "$(dirname "$0")/peer-handback" ]; then
       printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"fixture hand-back"}\n'
       printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
     ) &
+  done
+elif [ -f "$(dirname "$0")/mode-settings" ]; then
+  # Claude replacing a requested permission mode. The marker holds the mode
+  # initialize reports, the init frame's mode, a mid-turn status frame's
+  # mode (or -), and the settings layer get_settings names.
+  read -r reported init_mode status_mode layer < "$(dirname "$0")/mode-settings"
+  settings_answer() {
+    printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-get-settings","response":{"effective":{},"sources":[{"source":"userSettings","settings":{"permissions":{"defaultMode":"auto"}}},{"source":"%s","settings":{"permissions":{"disableAutoMode":"disable","disableBypassPermissionsMode":"disable"}}}]}}}\n' "$layer"
+  }
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$(dirname "$0")/stdin.log"
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{"current_permission_mode":"%s"}}}\n' "$reported"
+        continue
+        ;;
+      *'"subtype":"get_settings"'*)
+        settings_answer
+        continue
+        ;;
+    esac
+    printf '{"type":"system","subtype":"init","permissionMode":"%s","model":"claude-fixture"}\n' "$init_mode"
+    if [ "$status_mode" != "-" ]; then
+      printf '{"type":"system","subtype":"status","permissionMode":"%s"}\n' "$status_mode"
+      # The turn asks for the settings before it reports the change.
+      IFS= read -r probe
+      printf '%s\n' "$probe" >> "$(dirname "$0")/stdin.log"
+      settings_answer
+    fi
+    printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"claude fixture"}}}\n'
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"ok"}\n'
   done
 else
   while IFS= read -r line; do
