@@ -192,9 +192,12 @@ impl KanbanTaskStore {
         let incoming = normalize_tasks(tasks, owner_id)?;
         let now = now_millis();
         let mut current = self.inner.write().await;
+        // Merge into a copy: a rejected or unwritten merge leaves the
+        // in-memory snapshot (every tenant's tasks) as it was.
         let mut by_id = current
             .tasks
-            .drain(..)
+            .iter()
+            .cloned()
             .map(|task| ((task.tenant_id.clone(), task.id.clone()), task))
             .collect::<HashMap<_, _>>();
         for task in incoming {
@@ -770,6 +773,11 @@ mod tests {
         store.merge_owned("local", batch).await.unwrap();
         let overflow = task("task-overflow", "overflow", 10_000);
         assert!(store.merge_owned("local", vec![overflow]).await.is_err());
+        // A rejected merge keeps every task, in memory and on disk.
+        assert_eq!(
+            store.snapshot_owned("local").await.tasks.len(),
+            KANBAN_TASK_LIMIT_PER_TENANT
+        );
 
         // The limit applies per tenant, not globally.
         store
@@ -777,6 +785,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.snapshot_owned("other").await.tasks.len(), 1);
+        let reloaded = KanbanTaskStore::new(root.clone()).await.unwrap();
+        assert_eq!(
+            reloaded.snapshot_owned("local").await.tasks.len(),
+            KANBAN_TASK_LIMIT_PER_TENANT
+        );
         let _ = fs::remove_dir_all(root);
     }
 
