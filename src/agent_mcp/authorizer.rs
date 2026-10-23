@@ -554,6 +554,7 @@ impl Authorizer<'_> {
     /// The gate for a tool with side effects, by the conversation's
     /// permission mode: refused in Plan, approved like a provider tool in
     /// ask mode, free otherwise. Returns the approving device, if one did.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn allow_side_effect(
         &self,
         conversation_id: &str,

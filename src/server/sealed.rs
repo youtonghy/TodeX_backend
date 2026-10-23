@@ -239,7 +239,7 @@ async fn sealed(State(sealed): State<SealedState>, request: Request) -> Response
     };
     let response = match opened {
         Opened::Forward(inner, permit) => {
-            let response = match sealed.api.oneshot(inner).await {
+            let response = match sealed.api.oneshot(*inner).await {
                 Ok(response) => response,
                 Err(infallible) => match infallible {},
             };
@@ -262,8 +262,9 @@ async fn sealed(State(sealed): State<SealedState>, request: Request) -> Response
 
 /// What an opened tunnel request turns into.
 enum Opened {
-    /// The complete inner request, holding a permit from its pool.
-    Forward(Request, TunnelPermit),
+    /// The complete inner request, holding a permit from its pool (boxed:
+    /// the request head dwarfs the error).
+    Forward(Box<Request>, TunnelPermit),
     /// The request was refused without running it (by the inner head
     /// alone, no free permit, or a stalled body); the error is sealed like
     /// any inner response.
@@ -478,7 +479,7 @@ async fn open_request(
     // Reuse the allocation for the body.
     plaintext.drain(..head_end);
     let request = inner_request(inner, plaintext, &parts.extensions);
-    Ok((Opened::Forward(request, permit), down))
+    Ok((Opened::Forward(Box::new(request), permit), down))
 }
 
 /// Method, target and forwarded headers of the inner request.
