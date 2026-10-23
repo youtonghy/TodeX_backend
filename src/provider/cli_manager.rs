@@ -221,8 +221,9 @@ fn binary_in_dirs(program: &str, dirs: &[std::path::PathBuf]) -> bool {
 /// The `managedBy` value of CLIs shipped with the container image.
 pub const MANAGED_BY_IMAGE: &str = "image";
 
-/// A fixed installer invocation: `curl -fsSL <url> | <shell> -s`. Nothing in
-/// it comes from the request, so the shell never sees user input.
+/// A fixed installer invocation: `curl -fsSL <url> | <shell> -s`, fetched
+/// over HTTPS only (redirects included). Nothing in it comes from the
+/// request, so the shell never sees user input.
 struct InstallScript {
     url: &'static str,
     shell: &'static str,
@@ -700,7 +701,12 @@ pub async fn run_install(
             provider.name()
         ))
     })?;
-    let command = format!("curl -fsSL '{}' | {} -s", script.url, script.shell);
+    // `-L` follows redirects; keep every hop on HTTPS so a redirect cannot
+    // downgrade the script the shell runs to plain HTTP.
+    let command = format!(
+        "curl --proto '=https' --proto-redir '=https' -fsSL '{}' | {} -s",
+        script.url, script.shell
+    );
     let mut spec = CommandSpec::new("bash", &config.data_dir);
     // pipefail: a failed download must not look like an empty, successful script.
     spec.args = vec![
