@@ -4811,6 +4811,8 @@ dependencies = [
  "global-hotkey",
  "hkdf",
  "hmac",
+ "hyper",
+ "hyper-util",
  "iana-time-zone",
  "if-addrs",
  "jpeg-encoder",

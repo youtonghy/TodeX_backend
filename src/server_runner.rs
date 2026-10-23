@@ -66,6 +66,119 @@ async fn drain_listener(
     }
 }
 
+/// Longest time a client may take to send a request's headers; also how
+/// long an idle keep-alive connection may wait for its next request. Before
+/// this, hyper's default had no timer behind it, so a peer that never
+/// finished its headers held a connection for good.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Connections a listener serves at once; more wait in the kernel's accept
+/// queue until one closes.
+const MAX_CONNECTIONS: usize = 1024;
+
+/// What one listener allows its connections.
+#[derive(Clone, Copy, Debug)]
+struct ConnectionLimits {
+    header_read_timeout: std::time::Duration,
+    max_connections: usize,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self {
+            header_read_timeout: HEADER_READ_TIMEOUT,
+            max_connections: MAX_CONNECTIONS,
+        }
+    }
+}
+
+/// `axum::serve` with `ConnectInfo<SocketAddr>`, plus [`ConnectionLimits`].
+/// HTTP/1 with upgrades (WebSockets). After `shutdown` it stops
+/// accepting and waits for open connections to finish; the connection tasks
+/// belong to this future, so aborting it closes them too.
+async fn serve_listener(
+    listener: TcpListener,
+    app: axum::Router,
+    limits: ConnectionLimits,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
+    use axum::extract::connect_info::ConnectInfo;
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::service::TowerToHyperService;
+    use tower::ServiceExt;
+
+    // HTTP/1 only, like `axum::serve` with axum's default features.
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout);
+    // Tells open connections to finish their current request and close.
+    let (closing, _) = tokio::sync::watch::channel(false);
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let mut connections = tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
+    loop {
+        let permit = tokio::select! {
+            () = &mut shutdown => break,
+            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+            permit = std::sync::Arc::clone(&permits).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        let (stream, remote) = tokio::select! {
+            () = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    // As `axum::serve`: a failed handshake is the peer's
+                    // problem; anything else (out of descriptors) backs off.
+                    if !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                    ) {
+                        tracing::warn!(error = %error, "accepting a connection failed");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    continue;
+                }
+            },
+        };
+        let _ = stream.set_nodelay(true);
+        let service = app.clone().map_request(
+            move |mut request: axum::http::Request<hyper::body::Incoming>| {
+                request.extensions_mut().insert(ConnectInfo(remote));
+                request
+            },
+        );
+        let connection = builder
+            .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
+            .with_upgrades();
+        let mut close = closing.subscribe();
+        connections.spawn(async move {
+            tokio::pin!(connection);
+            let result = tokio::select! {
+                result = connection.as_mut() => result,
+                () = async {
+                    // Drop the guard `wait_for` returns before awaiting on.
+                    let _ = close.wait_for(|closing| *closing).await.map(drop);
+                } => {
+                    connection.as_mut().graceful_shutdown();
+                    connection.await
+                }
+            };
+            if let Err(error) = result {
+                tracing::debug!(error = %error, "connection ended with an error");
+            }
+            drop(permit);
+        });
+    }
+    drop(listener);
+    let _ = closing.send(true);
+    while connections.join_next().await.is_some() {}
+}
+
 /// `<data_dir>/daemon.lock`, locked for a server's lifetime.
 const DATA_DIR_LOCK_FILE: &str = "daemon.lock";
 
@@ -224,15 +337,11 @@ impl ManagedServer {
         let (exited_tx, exited) = watch::channel(());
         let handle = tokio::spawn(async move {
             let _exited = exited_tx;
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async {
+            serve_listener(listener, app, ConnectionLimits::default(), async {
                 let _ = shutdown_rx.await;
             })
-            .await
-            .context("server failed")
+            .await;
+            Ok(())
         });
         let api = match api_listener {
             Some(listener) => {
@@ -250,15 +359,11 @@ impl ManagedServer {
                 let app = server::api_router(state.clone());
                 let (api_shutdown_tx, api_shutdown_rx) = oneshot::channel();
                 let handle = tokio::spawn(async move {
-                    axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .with_graceful_shutdown(async {
+                    serve_listener(listener, app, ConnectionLimits::default(), async {
                         let _ = api_shutdown_rx.await;
                     })
-                    .await
-                    .context("API server failed")
+                    .await;
+                    Ok(())
                 });
                 Some(ApiListener {
                     addr: api_addr,
@@ -461,8 +566,8 @@ mod tests {
     use std::{env, fs};
 
     use super::{
-        drain_listener, plaintext_listener_needs_warning, ManagedServer, ProviderProcessTracking,
-        LISTENER_DRAIN_TIMEOUT,
+        drain_listener, plaintext_listener_needs_warning, serve_listener, ConnectionLimits,
+        ManagedServer, ProviderProcessTracking, LISTENER_DRAIN_TIMEOUT,
     };
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use anyhow::Result;
@@ -483,6 +588,62 @@ mod tests {
             assert!(plaintext_listener_needs_warning(false, host), "{host}");
             assert!(!plaintext_listener_needs_warning(true, host), "{host}");
         }
+    }
+
+    #[tokio::test]
+    async fn silent_connections_time_out_and_waiting_ones_are_served_after() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+        let limits = ConnectionLimits {
+            header_read_timeout: std::time::Duration::from_millis(300),
+            max_connections: 1,
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_listener(listener, app, limits, async {
+            let _ = stopped.await;
+        }));
+
+        // Starts a request and never finishes its headers.
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        silent
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let mut waiting = tokio::net::TcpStream::connect(addr).await.unwrap();
+        waiting
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            waiting.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Served only once the silent one gave up its slot.
+        assert!(response.ends_with("ok"), "{response}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        let mut rest = Vec::new();
+        // EOF or a reset: either way the server closed it.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            silent.read_to_end(&mut rest),
+        )
+        .await
+        .expect("the silent connection is closed");
+
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
