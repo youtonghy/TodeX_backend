@@ -3304,10 +3304,12 @@ pub(super) fn devin_session_mode(prompt: &DriverPrompt) -> Option<&'static str> 
     // commands and is the only mode that surfaces approval requests, so both
     // `ask` and a stale `auto` selection resolve to it. Devin's own `ask` mode
     // is read-only Q&A, which is not what manual approval means here.
+    // Restated on every turn, also without a mode (the `ask` default): a
+    // resident session otherwise stays in the `bypass` an earlier
+    // `full-access` turn set.
     match prompt.permission_mode.as_deref() {
-        Some("ask") | Some("auto") => Some("accept-edits"),
         Some("full-access") => Some("bypass"),
-        _ => None,
+        _ => Some("accept-edits"),
     }
 }
 
@@ -3567,8 +3569,11 @@ mod tests {
         assert_eq!(devin_session_mode(&prompt), Some("accept-edits"));
         prompt.permission_mode = Some("full-access".to_owned());
         assert_eq!(devin_session_mode(&prompt), Some("bypass"));
+        // A turn without a mode does not inherit the previous turn's bypass.
         prompt.permission_mode = None;
-        assert_eq!(devin_session_mode(&prompt), None);
+        assert_eq!(devin_session_mode(&prompt), Some("accept-edits"));
+        prompt.permission_mode = Some("accept-edits".to_owned());
+        assert_eq!(devin_session_mode(&prompt), Some("accept-edits"));
         prompt.permission_mode = Some("auto".to_owned());
         prompt.work_mode = Some("plan".to_owned());
         assert_eq!(devin_session_mode(&prompt), Some("plan"));
