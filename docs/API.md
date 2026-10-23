@@ -708,7 +708,7 @@ daemon 按文件修改时间重新加载 key，修改无需重启就会生效。
 
 **scope：**
 - workspace 必须是位于 `workspace_roots` 内的已有目录，否则返回 403 `WORKSPACE_PATH_OUTSIDE_ROOT` 或 404 `WORKSPACE_PATH_NOT_FOUND`。
-- Agent 或 workspace 超出 scope 时返回 403 `UNAUTHORIZED`。`scopes.workspaces` 省略时（scope 为全部），key 可使用 `workspace_roots` 内的任意目录。
+- Agent 或 workspace 超出 scope 时返回 403 `UNAUTHORIZED`；在已有会话上发起 turn 时按 key 当前的 scope 重新检查会话的 workspace，因此收窄 `scopes` 后，scope 外会话的新 turn 同样返回 403，正在运行的 scope 外 turn（agent 或 workspace 越界）在 `PATCH` 返回前、或 key 由其他进程修改后约 10 秒内被取消。`scopes.workspaces` 省略时（scope 为全部），key 可使用 `workspace_roots` 内的任意目录。
 - 全局范围（见上文）与 key 的 scope 同时生效：Agent、模型或思考强度不被允许时同样返回 403 `UNAUTHORIZED`。
 
 **能力限制：**

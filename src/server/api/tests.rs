@@ -514,3 +514,73 @@ async fn standing_policies_answer_only_their_keys_conversations() {
         assert!(policy.decide(&device.id, &options, false).await.is_none());
     }
 }
+
+#[tokio::test]
+async fn narrowing_a_key_scope_ends_and_refuses_turns_outside_it() {
+    let fixture = fixture().await;
+    let (record, key) = fixture.workspace_key();
+    let (status, manifest) = fixture
+        .call(
+            "POST",
+            "/api/v1/conversations",
+            Some(&key),
+            Some(json!({ "agent": "antigravity", "workspace": fixture.workspace })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = manifest["id"].as_str().unwrap().to_owned();
+    let (status, _) = fixture
+        .call(
+            "POST",
+            &format!("/api/v1/conversations/{id}/turns"),
+            Some(&key),
+            Some(json!({ "text": "HANG" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let other = fixture.root.join("workspaces/other");
+    fs::create_dir_all(&other).unwrap();
+    fixture
+        .state
+        .api_keys
+        .update(
+            &record.id,
+            crate::api_keys::ApiKeyUpdate {
+                scopes: Some(ApiKeyScopes {
+                    agents: None,
+                    workspaces: Some(vec![fs::canonicalize(&other).unwrap()]),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    cancel_unauthorized_key_turns(&fixture.state).await;
+    let mut stopped = false;
+    for _ in 0..250 {
+        let manifest = fixture.state.conversations.get(&id).await.unwrap();
+        if !matches!(
+            manifest.status,
+            crate::conversation::ConversationStatus::Running
+                | crate::conversation::ConversationStatus::WaitingPermission
+        ) && !fixture.state.conversations.has_active_turns()
+        {
+            stopped = true;
+            break;
+        }
+        // The turn may not have reached `Running` before the sweep.
+        cancel_unauthorized_key_turns(&fixture.state).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(stopped, "the turn outside the narrowed scope keeps running");
+
+    let (status, body) = fixture
+        .call(
+            "POST",
+            &format!("/api/v1/conversations/{id}/turns"),
+            Some(&key),
+            Some(json!({ "text": "hello" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}

@@ -283,6 +283,7 @@ pub(crate) async fn start_turn<C: Caller + ?Sized>(
         .get_owned(&owner, conversation_id)
         .await?;
     ensure_agent(state, caller, manifest.provider)?;
+    caller.check_workspace(&manifest.workspace)?;
     let prompt = prepare_prompt(state, manifest.provider, &manifest.workspace, input).await?;
     let (model, reasoning_effort) = (prompt.model.clone(), prompt.reasoning_effort.clone());
     let events = if follow {

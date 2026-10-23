@@ -126,14 +126,17 @@ async fn present_manifest(
     value
 }
 
-/// Cancels the running turns of every key that is revoked or expired: a
-/// key that stops being active must not keep an agent working for it.
-pub(crate) async fn cancel_inactive_key_turns(state: &AppState) {
+/// Cancels the running turns a key may no longer run: every turn of a key
+/// that is revoked or expired, and the turns of an active key whose
+/// conversation's workspace or agent fell outside its scopes (narrowed by
+/// `PATCH /v2/api-keys/{id}` or by another process).
+pub(crate) async fn cancel_unauthorized_key_turns(state: &AppState) {
     let Ok(keys) = state.api_keys.list() else {
         return;
     };
     let now = crate::api_keys::unix_ms();
-    for key in keys.iter().filter(|key| !key.is_active(now)) {
+    for key in &keys {
+        let active = key.is_active(now);
         let owner = key.owner_id();
         let Ok(manifests) = state.conversations.list_owned(&owner).await else {
             continue;
@@ -143,7 +146,9 @@ pub(crate) async fn cancel_inactive_key_turns(state: &AppState) {
                 manifest.status,
                 crate::conversation::ConversationStatus::Running
                     | crate::conversation::ConversationStatus::WaitingPermission
-            )
+            ) && !(active
+                && key.scopes.allows_agent(manifest.provider)
+                && key.scopes.allows_workspace(&manifest.workspace))
         }) {
             if let Err(error) = state
                 .conversations
@@ -153,21 +158,21 @@ pub(crate) async fn cancel_inactive_key_turns(state: &AppState) {
                 tracing::warn!(
                     conversation_id = %manifest.id,
                     error = %error,
-                    "could not cancel the turn of an inactive API key"
+                    "could not cancel the turn of an inactive or narrowed API key"
                 );
             }
         }
     }
 }
 
-/// Every few seconds: keys that expire, or are revoked by another process,
-/// reach the daemon only through `api-keys.json`.
+/// Every few seconds: keys that expire, or are revoked or narrowed by
+/// another process, reach the daemon only through `api-keys.json`.
 pub(crate) fn spawn_revocation_watch(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             ticker.tick().await;
-            cancel_inactive_key_turns(&state).await;
+            cancel_unauthorized_key_turns(&state).await;
         }
     })
 }

@@ -74,6 +74,8 @@ async fn update_key(
 ) -> Result<Json<Value>, AppError> {
     require_auth(&state, &headers)?;
     let record = state.api_keys.update(&id, update)?;
+    // Narrowed scopes end the turns now outside them.
+    super::api::cancel_unauthorized_key_turns(&state).await;
     Ok(Json(record.summary()))
 }
 
@@ -87,7 +89,7 @@ async fn revoke_key(
         return Err(AppError::NotFound("api key".to_owned()));
     }
     let revoked = state.api_keys.revoke(&id)?;
-    super::api::cancel_inactive_key_turns(&state).await;
+    super::api::cancel_unauthorized_key_turns(&state).await;
     Ok(Json(json!({ "id": id, "revoked": revoked })))
 }
 

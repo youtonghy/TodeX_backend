@@ -7,7 +7,10 @@
 //! children as the parent conversation's owner, is fixed to the parent's
 //! workspace, and reads a plaintext tap instead of decrypting.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use zeroize::Zeroizing;
@@ -39,6 +42,13 @@ pub(crate) trait Caller: Send + Sync {
         state: &AppState,
         requested: Option<&str>,
     ) -> Result<PathBuf, AppError>;
+
+    /// Whether this caller may still run a turn in an existing conversation
+    /// whose (canonical) workspace is `workspace`: its scope may have
+    /// narrowed since the conversation was created.
+    fn check_workspace(&self, _workspace: &Path) -> Result<(), AppError> {
+        Ok(())
+    }
 
     /// `conversation_id`'s events after sequence `after`. Subscribed before
     /// a prompt from the conversation's `last_sequence`, it starts with the
@@ -101,6 +111,16 @@ impl Caller for ApiKeyCaller {
     }
 
     /// The path must be inside a workspace root and the key's scope.
+    fn check_workspace(&self, workspace: &Path) -> Result<(), AppError> {
+        if self.record.scopes.allows_workspace(workspace) {
+            Ok(())
+        } else {
+            Err(AppError::Unauthorized(
+                "workspace is outside this API key's scope".to_owned(),
+            ))
+        }
+    }
+
     fn authorize_workspace(
         &self,
         state: &AppState,
