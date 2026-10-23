@@ -2414,6 +2414,8 @@ impl BundleReader {
 struct BundleEntry {
     path: String,
     contents: Vec<u8>,
+    /// Applied as the file mode on Unix; Windows has no executable bit.
+    #[cfg_attr(not(unix), allow(dead_code))]
     executable: bool,
 }
 
@@ -3697,6 +3699,8 @@ mod tests {
             Path::new("/home/u/.codex/skills/a/b/SKILL.md")
         ));
     }
+    // Checks file modes and symlinks, which are Unix-only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn skill_bundles_round_trip_and_replace_the_whole_directory() {
         use std::os::unix::fs::PermissionsExt;

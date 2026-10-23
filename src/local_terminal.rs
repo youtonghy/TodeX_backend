@@ -1491,6 +1491,25 @@ mod tests {
                 eprintln!("skipping {shell}: not installed");
                 continue;
             };
+            // todex.bash marks commands only on bash 4.4+ (PS0); macOS ships
+            // bash 3.2, which keeps just the rc file.
+            if shell == "bash" {
+                let version = std::process::Command::new(&real)
+                    .args(["-c", "echo $((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1]))"])
+                    .output()
+                    .ok()
+                    .and_then(|out| {
+                        String::from_utf8_lossy(&out.stdout)
+                            .trim()
+                            .parse::<u32>()
+                            .ok()
+                    })
+                    .unwrap_or(0);
+                if version < 404 {
+                    eprintln!("skipping bash: {} has no shell integration", real.display());
+                    continue;
+                }
+            }
             // A wrapper under the shell's own name gives it an empty home, so
             // the developer's rc files stay out of the test.
             let home = root.join(format!("home-{shell}"));
