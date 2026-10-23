@@ -335,6 +335,12 @@ mod platform {
         quoted
     }
 
+    /// [`systemd_quote`] for `ExecStart=`, which also expands `$VAR` and
+    /// `${VAR}` (even inside quotes); `$$` is a literal `$`.
+    pub(super) fn systemd_exec_quote(value: &str) -> String {
+        systemd_quote(value).replace('$', "$$")
+    }
+
     pub(super) fn unit_text(
         executable: &Path,
         args: &[String],
@@ -348,10 +354,13 @@ mod platform {
                 systemd_quote(&format!("PATH={path_env}"))
             ));
         }
-        let mut exec = systemd_quote(&executable.to_string_lossy());
+        // Like the launchd plist and the Run value, the unit itself names
+        // the `daemon-run` subcommand ahead of its arguments.
+        let mut exec = systemd_exec_quote(&executable.to_string_lossy());
+        exec.push_str(" \"daemon-run\"");
         for arg in args {
             exec.push(' ');
-            exec.push_str(&systemd_quote(arg));
+            exec.push_str(&systemd_exec_quote(arg));
         }
         unit.push_str(&format!(
             "ExecStart={exec}\nRestart=on-failure\nRestartSec=3\nSyslogIdentifier=todex-agentd\n\n\
@@ -490,14 +499,12 @@ mod tests {
 
         let unit = platform::unit_text(
             Path::new("/opt/todex agent/todex-agentd"),
-            &[
-                "daemon-run".to_owned(),
-                "--data-dir".to_owned(),
-                "/d dir".to_owned(),
-            ],
+            &["--data-dir".to_owned(), "/d $dir".to_owned()],
             Some("/bin".to_owned()),
         );
-        assert!(unit.contains("ExecStart=\"/opt/todex agent/todex-agentd\" \"daemon-run\""));
+        assert!(unit.contains(
+            "ExecStart=\"/opt/todex agent/todex-agentd\" \"daemon-run\" \"--data-dir\" \"/d $$dir\"\n"
+        ));
         assert!(unit.contains("Environment=\"PATH=/bin\""));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
