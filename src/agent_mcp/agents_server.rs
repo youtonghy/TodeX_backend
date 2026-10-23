@@ -195,6 +195,7 @@ fn approval_text(text: &str) -> String {
 fn prepare_list(arguments: Value) -> Result<Prepared<AgentsCall>, String> {
     let _: ListArgs = parse("agents_list", arguments)?;
     Ok(Prepared {
+        escapes_sandbox: false,
         call: AgentsCall::List,
         summary: "list agents".to_owned(),
         input: json!({}),
@@ -217,6 +218,7 @@ fn prepare_run(arguments: Value) -> Result<Prepared<AgentsCall>, String> {
         "text": approval_text(&args.text),
     });
     Ok(Prepared {
+        escapes_sandbox: false,
         summary: format!("start a {} conversation", profile(agent).display_name),
         input,
         call: AgentsCall::Run(RunCall {
@@ -240,6 +242,7 @@ fn prepare_turn(arguments: Value) -> Result<Prepared<AgentsCall>, String> {
         "text": approval_text(&args.text),
     });
     Ok(Prepared {
+        escapes_sandbox: false,
         summary: "continue an agent call".to_owned(),
         input,
         call: AgentsCall::Turn(TurnCall {
@@ -255,6 +258,7 @@ fn prepare_turn(arguments: Value) -> Result<Prepared<AgentsCall>, String> {
 fn prepare_wait(arguments: Value) -> Result<Prepared<AgentsCall>, String> {
     let args: WaitArgs = parse("agent_wait", arguments)?;
     Ok(Prepared {
+        escapes_sandbox: false,
         summary: "wait for an agent call".to_owned(),
         input: json!({ "conversationId": args.conversation_id, "turnId": args.turn_id }),
         call: AgentsCall::Wait {
@@ -268,6 +272,7 @@ fn prepare_wait(arguments: Value) -> Result<Prepared<AgentsCall>, String> {
 fn prepare_cancel(arguments: Value) -> Result<Prepared<AgentsCall>, String> {
     let args: CancelArgs = parse("agent_cancel", arguments)?;
     Ok(Prepared {
+        escapes_sandbox: false,
         summary: "cancel an agent call".to_owned(),
         input: json!({ "conversationId": args.conversation_id, "turnId": args.turn_id }),
         call: AgentsCall::Cancel {

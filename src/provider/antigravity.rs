@@ -1810,7 +1810,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
         }
 
         #[tokio::test]
-        async fn bridged_native_auto_keeps_todex_tools_unrestricted() {
+        async fn bridged_native_auto_keeps_todex_tools_in_auto() {
             use crate::agent_mcp::ToolMode;
             let fixture = Fixture::with_bridge().await;
             fixture
@@ -1822,7 +1822,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
             assert_eq!(launch[mode + 1], "auto");
             assert_eq!(fixture.last_auto_hint(), "1");
-            assert_eq!(fixture.tool_mode(), Some(ToolMode::Unrestricted));
+            assert_eq!(fixture.tool_mode(), Some(ToolMode::Auto));
         }
 
         #[tokio::test]

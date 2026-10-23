@@ -187,6 +187,7 @@ enum SshCall {
 fn prepare_list_hosts(arguments: Value) -> Result<Prepared<SshCall>, String> {
     let _: ListHostsArgs = parse("ssh_list_hosts", arguments)?;
     Ok(Prepared {
+        escapes_sandbox: false,
         call: SshCall::ListHosts,
         summary: "list SSH hosts".to_owned(),
         input: json!({}),
@@ -226,6 +227,8 @@ fn prepare_exec(arguments: Value) -> Result<Prepared<SshCall>, String> {
         input["stdinPreview"] = json!(preview);
     }
     Ok(Prepared {
+        // The TodeX machine itself: outside any sandbox the provider runs in.
+        escapes_sandbox: crate::ssh::is_agent_local_alias(&request.host),
         summary: format!("run `{command}` on {}", request.host),
         input,
         call: SshCall::Exec(request),
@@ -387,7 +390,14 @@ impl ServerHandler for SshTools {
         if request.name == "ssh_exec" {
             let caller = registry::caller(&context)?;
             let mode = self.mcp.inner.authorizer.tool_mode(&caller.conversation_id);
-            if mode == ToolMode::Ask {
+            // `auto` approves commands on the TodeX machine per call too.
+            let local = request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("host"))
+                .and_then(Value::as_str)
+                .is_some_and(crate::ssh::is_agent_local_alias);
+            if mode == ToolMode::Ask || (mode == ToolMode::Auto && local) {
                 if let Some(message) = ask_mode_exec_refusal(request.arguments.as_ref()) {
                     return Ok(tool_error(message).into());
                 }
@@ -2017,6 +2027,105 @@ exit 3
         assert!(!history
             .iter()
             .any(|event| event.event_type == "ssh.exec.started"));
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_mode_asks_before_running_on_the_todex_machine() {
+        use crate::provider::{PermissionDecision, PermissionOutcome};
+
+        let harness = harness().await;
+        let client = std::sync::Arc::new(bridged_client(&harness).await);
+        harness
+            .state
+            .ssh
+            .set_agent_local(crate::ssh::AgentLocal { enabled: true })
+            .await
+            .unwrap();
+        harness
+            .state
+            .agent_mcp
+            .record_turn_mode(&harness.conversation_id, "auto", "implement");
+        let requested = |history: &[crate::conversation::ConversationEvent]| {
+            history
+                .iter()
+                .filter(|event| event.event_type == "permission.requested")
+                .map(|event| event.payload.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A remote host the user allowed for agents runs without a prompt.
+        let remote = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "web", "command": "ls" }),
+        )
+        .await;
+        assert_eq!(remote.is_error, Some(false), "{remote:?}");
+        let history = harness
+            .state
+            .conversations
+            .history_for_tests(&harness.conversation_id)
+            .await;
+        assert!(requested(&history).is_empty());
+
+        // The TodeX machine is outside the provider's sandbox: asked per
+        // call, with the ask-mode limits on what can be reviewed.
+        let long = format!("echo {}", "x".repeat(EVENT_COMMAND_LIMIT));
+        let refused = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "Local", "command": long }),
+        )
+        .await;
+        assert_eq!(refused.is_error, Some(true));
+        let local = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                call(
+                    &client,
+                    "ssh_exec",
+                    json!({ "host": "Local", "command": "pwd" }),
+                )
+                .await
+            })
+        };
+        let mut asked = None;
+        for _ in 0..200 {
+            let history = harness
+                .state
+                .conversations
+                .history_for_tests(&harness.conversation_id)
+                .await;
+            if let Some(payload) = requested(&history).pop() {
+                asked = Some(payload);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let asked = asked.expect("ssh_exec on Local asks in auto mode");
+        assert_eq!(asked["details"]["tool_name"], "mcp__todex_ssh__ssh_exec");
+        harness
+            .state
+            .conversations
+            .resolve_permission_owned(
+                "local",
+                "dev_phone",
+                &harness.conversation_id,
+                asked["permissionId"].as_str().unwrap(),
+                PermissionDecision {
+                    outcome: PermissionOutcome::AllowOnce,
+                    option_id: Some("allow_once".to_owned()),
+                    data: None,
+                },
+            )
+            .await
+            .unwrap();
+        let ran = local.await.unwrap();
+        assert_eq!(ran.is_error, Some(false), "{ran:?}");
+        let Ok(client) = std::sync::Arc::try_unwrap(client) else {
+            panic!("the call task still holds the client");
+        };
         client.cancel().await.unwrap();
     }
 

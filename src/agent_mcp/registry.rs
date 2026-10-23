@@ -144,6 +144,9 @@ pub(super) struct Prepared<C> {
     pub summary: String,
     /// The arguments shown in an approval, with secrets left out.
     pub input: Value,
+    /// Acts outside the sandbox the provider may run its own tools in (a
+    /// command on the TodeX machine): approved per call even in `auto`.
+    pub escapes_sandbox: bool,
 }
 
 /// Everything a handler gets besides its call.
@@ -258,6 +261,7 @@ impl<S: ToolHost<Call = C>, C: Send + 'static> ToolRegistry<S, C> {
                     name,
                     &prepared.summary,
                     prepared.input,
+                    prepared.escapes_sandbox,
                     &cancel,
                 )
                 .await

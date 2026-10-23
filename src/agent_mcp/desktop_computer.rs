@@ -255,6 +255,7 @@ pub(super) fn validate(name: &str, arguments: Value) -> Result<ComputerCall, Str
 fn computer(name: &str, arguments: Value) -> Result<Prepared<DesktopCall>, String> {
     let call = validate(name, arguments)?;
     Ok(Prepared {
+        escapes_sandbox: false,
         summary: call.summary.clone(),
         input: json!({ "action": call.summary }),
         call: DesktopCall::Computer(call),

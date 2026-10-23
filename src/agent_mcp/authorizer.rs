@@ -55,7 +55,11 @@ pub(crate) enum ToolMode {
     Plan,
     /// Manual approval: each call is approved like a provider tool.
     Ask,
-    /// `auto` / `full-access`: no extra approval.
+    /// `auto`: no extra approval, except for calls that act outside the
+    /// provider's own sandbox (a command on the TodeX machine), which are
+    /// approved as in [`ToolMode::Ask`].
+    Auto,
+    /// `full-access`: no extra approval.
     Unrestricted,
 }
 
@@ -66,7 +70,8 @@ impl ToolMode {
             return Self::Plan;
         }
         match permission_mode {
-            "auto" | "full-access" => Self::Unrestricted,
+            "auto" => Self::Auto,
+            "full-access" => Self::Unrestricted,
             // `accept-edits` only lets the provider's own file edits through;
             // TodeX's tools (ssh, browser, computer) are not edits, so they
             // ask as in `ask`.
@@ -556,10 +561,12 @@ impl Authorizer<'_> {
         tool: &str,
         summary: &str,
         input: Value,
+        escapes_sandbox: bool,
         cancel: &CancelSignal,
     ) -> Result<Option<String>, Denied> {
         match self.state.tool_mode(conversation_id) {
             ToolMode::Unrestricted => Ok(None),
+            ToolMode::Auto if !escapes_sandbox => Ok(None),
             ToolMode::Plan => Err(Denied::new(
                 "PLAN_MODE",
                 format!(
@@ -567,7 +574,7 @@ impl Authorizer<'_> {
                      mode. Read-only tools still work; describe the step in your plan instead."
                 ),
             )),
-            ToolMode::Ask => {
+            ToolMode::Ask | ToolMode::Auto => {
                 let qualified = format!("{server}.{tool}");
                 let always = |state: &AuthorizerState| {
                     locked(&state.always)
@@ -636,10 +643,7 @@ mod tests {
             ToolMode::from_turn("accept-edits", "implement"),
             ToolMode::Ask
         );
-        assert_eq!(
-            ToolMode::from_turn("auto", "implement"),
-            ToolMode::Unrestricted
-        );
+        assert_eq!(ToolMode::from_turn("auto", "implement"), ToolMode::Auto);
         assert_eq!(
             ToolMode::from_turn("full-access", "implement"),
             ToolMode::Unrestricted
