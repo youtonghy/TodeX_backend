@@ -178,7 +178,12 @@ response):
 - The inner head must be decrypted within 30 s of the request start; else a
   plain `400 TRANSPORT_CRYPTO_FAILED`.
 - The outer body may pause at most 30 s between chunks. Before the inner
-  head: plain `400`; after it: sealed inner `408 REQUEST_TIMEOUT`.
+  head: plain `400`; after it: sealed inner `408 REQUEST_TIMEOUT`. The whole
+  inner body must also arrive within 60 s of admission (sealed inner `408`),
+  however steadily it trickles in.
+- One device id may hold at most 8 of the credentialed permits at once; a
+  further request for it is answered at once with the sealed inner `503
+  TRANSPORT_BUSY` below, whatever the pool has free.
 - Admitted requests wait at most 10 s for a permit (32 for routes that need
   a device credential, a separate 4 for the public routes). Past that:
   sealed inner `503` `{"code":"TRANSPORT_BUSY",...}` with inner header
@@ -387,9 +392,11 @@ name, a tampered name, and valid and invalid device names).
     auth. Requests that pass this check share 32 permits for buffering and
     handling the inner request, public routes a separate 4; extra ones wait
     up to 10 s (then `503 TRANSPORT_BUSY`). A permit is released once the
-    inner handler has produced its response head. The 30 s head deadline
-    and the 30 s gap limit between outer body chunks bound how long a slow
-    peer holds a connection or a permit.
+    inner handler has produced its response head. The 30 s head deadline,
+    the 30 s gap limit between outer body chunks and the 60 s limit for the
+    whole inner body bound how long a slow peer holds a connection or a
+    permit; at most 8 of the 32 go to one device id, which is known to be
+    registered but not yet verified here.
   - Inner headers kept: `content-type`, `accept`, `x-todex-device-id`,
     `x-todex-auth-ts`, `x-todex-auth-nonce`, `x-todex-auth-sig` (names are
     matched case-insensitively). `Host` and `Origin` are taken from the outer

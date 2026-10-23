@@ -24,7 +24,7 @@ use crate::{
     server::websocket::AuthContext,
 };
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes, HttpBody},
     extract::{Request, State},
     http::{
         header::{HeaderName, HOST, ORIGIN},
@@ -40,8 +40,9 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::Semaphore;
 
 pub(crate) const HEADER_DEVICE_ID: &str = "x-todex-device-id";
 pub(crate) const HEADER_TIMESTAMP: &str = "x-todex-auth-ts";
@@ -67,6 +68,79 @@ pub(crate) const MAX_CLOCK_SKEW_SECS: u64 = 300;
 /// Bodies are buffered once for hashing. Matches the largest route-level body
 /// limit in the v2 router (workspace file writes are ~12 MiB).
 pub(crate) const MAX_AUTH_BODY: usize = 32 * 1024 * 1024;
+/// Bytes of request bodies buffered before their signature is checked, over
+/// all requests at once. The signature covers the body, so it is read first;
+/// a peer that only knows a paired device's id could otherwise make the
+/// daemon hold `MAX_AUTH_BODY` per connection.
+const UNVERIFIED_BODY_BUDGET: usize = 256 * 1024 * 1024;
+/// Longest wait for room in that budget; then `503 TRANSPORT_BUSY`.
+const UNVERIFIED_BODY_WAIT: Duration = Duration::from_secs(10);
+/// Longest time to receive a body before its signature is checked; then
+/// `408 REQUEST_TIMEOUT`.
+const UNVERIFIED_BODY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The shared budget for request bodies not yet verified.
+#[derive(Clone)]
+pub(crate) struct UnverifiedBodies {
+    bytes: Arc<Semaphore>,
+    wait: Duration,
+    deadline: Duration,
+}
+
+impl Default for UnverifiedBodies {
+    fn default() -> Self {
+        Self::new(
+            UNVERIFIED_BODY_BUDGET,
+            UNVERIFIED_BODY_WAIT,
+            UNVERIFIED_BODY_DEADLINE,
+        )
+    }
+}
+
+impl UnverifiedBodies {
+    pub(crate) fn new(bytes: usize, wait: Duration, deadline: Duration) -> Self {
+        Self {
+            bytes: Arc::new(Semaphore::new(bytes)),
+            wait,
+            deadline,
+        }
+    }
+
+    /// Reads `body` (at most [`MAX_AUTH_BODY`]) within the budget: room for
+    /// its declared length (or the maximum, when unknown) is held while it
+    /// is read. GET and HEAD requests, WebSocket upgrades included, carry no
+    /// body.
+    pub(crate) async fn read(&self, method: &Method, body: Body) -> Result<Bytes, AppError> {
+        let hint = body.size_hint();
+        if matches!(*method, Method::GET | Method::HEAD) && hint.upper() != Some(0) {
+            return Err(AppError::InvalidRequest(
+                "GET and HEAD requests must not carry a body".to_owned(),
+            ));
+        }
+        if hint.lower() > MAX_AUTH_BODY as u64 {
+            return Err(AppError::PayloadTooLarge(
+                "request body is too large".to_owned(),
+            ));
+        }
+        let reserve = hint.upper().map_or(MAX_AUTH_BODY, |upper| {
+            upper.min(MAX_AUTH_BODY as u64) as usize
+        });
+        let _held = if reserve == 0 {
+            None
+        } else {
+            let acquire = Arc::clone(&self.bytes).acquire_many_owned(reserve as u32);
+            match tokio::time::timeout(self.wait, acquire).await {
+                Ok(Ok(permit)) => Some(permit),
+                Ok(Err(_)) | Err(_) => return Err(AppError::TransportBusy),
+            }
+        };
+        tokio::time::timeout(self.deadline, to_bytes(body, MAX_AUTH_BODY))
+            .await
+            .map_err(|_| AppError::RequestTimeout)?
+            .map_err(|_| AppError::InvalidRequest("request body is too large".to_owned()))
+    }
+}
+
 /// Claimed nonces one device may hold within the window; more answers that
 /// device `429 RATE_LIMITED` without affecting others.
 const NONCE_DEVICE_LIMIT: usize = 8_192;
@@ -136,6 +210,7 @@ pub(crate) struct DeviceAuthenticator {
     /// Unix seconds when this daemon started; earlier credentials are
     /// refused because the nonce cache does not survive a restart.
     boot_secs: u64,
+    unverified_bodies: UnverifiedBodies,
 }
 
 impl DeviceAuthenticator {
@@ -144,7 +219,18 @@ impl DeviceAuthenticator {
             registry,
             seen: Arc::new(Mutex::new(NonceCache::default())),
             boot_secs: unix_secs(),
+            unverified_bodies: UnverifiedBodies::default(),
         }
+    }
+
+    /// Reads a body before its signature can be checked; see
+    /// [`UnverifiedBodies::read`].
+    pub(crate) async fn read_unverified_body(
+        &self,
+        method: &Method,
+        body: Body,
+    ) -> Result<Bytes, AppError> {
+        self.unverified_bodies.read(method, body).await
     }
 
     /// Whether `device_id` is still paired: the registry is reloaded when
@@ -314,9 +400,10 @@ pub(crate) async fn device_auth_middleware(
     let pending = state
         .device_auth
         .check_credential(&parts.headers, parts.uri.query())?;
-    let bytes = to_bytes(body, MAX_AUTH_BODY)
-        .await
-        .map_err(|_| AppError::InvalidRequest("request body is too large".to_owned()))?;
+    let bytes = state
+        .device_auth
+        .read_unverified_body(&parts.method, body)
+        .await?;
     let auth = pending.verify(
         &state.device_auth,
         &parts.method,
@@ -441,6 +528,16 @@ impl Credential {
             signature: from_headers(QUERY_SIGNATURE, HEADER_SIGNATURE)?,
         })
     }
+}
+
+/// The device id a request's credential names (header or query), before
+/// anything is verified.
+pub(crate) fn claimed_device_id(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
+    headers
+        .get(HEADER_DEVICE_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| query_value(query, QUERY_DEVICE_ID))
 }
 
 fn query_value(query: Option<&str>, key: &str) -> Option<String> {
@@ -664,6 +761,60 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn unverified_bodies_are_bounded_in_size_room_and_time() {
+        use axum::body::Body;
+        use futures_util::StreamExt;
+
+        let bodies =
+            UnverifiedBodies::new(1024, Duration::from_millis(50), Duration::from_millis(100));
+        // A GET (WebSocket upgrades included) carries nothing.
+        assert!(bodies
+            .read(&Method::GET, Body::empty())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            bodies.read(&Method::GET, Body::from("x")).await,
+            Err(AppError::InvalidRequest(_))
+        ));
+        assert_eq!(
+            bodies.read(&Method::POST, Body::from("abc")).await.unwrap(),
+            "abc"
+        );
+        assert!(matches!(
+            bodies
+                .read(&Method::POST, Body::from(vec![0_u8; MAX_AUTH_BODY + 1]))
+                .await,
+            Err(AppError::PayloadTooLarge(_))
+        ));
+        // An unknown length reserves the maximum, more than this budget.
+        let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"abc"),
+        )]);
+        assert!(matches!(
+            bodies.read(&Method::POST, Body::from_stream(stream)).await,
+            Err(AppError::TransportBusy)
+        ));
+
+        // A body that never ends times out and gives its room back.
+        let bodies = UnverifiedBodies::new(
+            2 * MAX_AUTH_BODY,
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+        );
+        let stalled = futures_util::stream::iter([Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"abc"),
+        )])
+        .chain(futures_util::stream::pending());
+        assert!(matches!(
+            bodies.read(&Method::POST, Body::from_stream(stalled)).await,
+            Err(AppError::RequestTimeout)
+        ));
+        assert_eq!(bodies.bytes.available_permits(), 2 * MAX_AUTH_BODY);
+    }
+
     use super::*;
     use ed25519_dalek::Signer;
 

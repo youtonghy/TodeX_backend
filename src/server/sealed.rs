@@ -8,6 +8,7 @@
 //! problem with the outer request answers a plain
 //! `400 TRANSPORT_CRYPTO_FAILED` without detail; an outer request without
 //! `X-Todex-Sealed-Revision: 2` answers a plain `426` before its body is read.
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,6 +76,14 @@ pub(crate) struct TunnelLimits {
     pub idle_timeout: Duration,
     /// Longest wait for a permit; then sealed inner `503 TRANSPORT_BUSY`.
     pub permit_wait: Duration,
+    /// From admission until the whole inner body arrived; then sealed inner
+    /// `408 REQUEST_TIMEOUT`. Bounds a holder that trickles its body.
+    pub body_deadline: Duration,
+    /// Credentialed permits one device id may hold at once; another request
+    /// for it is sealed inner `503 TRANSPORT_BUSY` at once. The id is only
+    /// known to be paired here, not verified, so this keeps one id from
+    /// taking every permit.
+    pub per_device_permits: usize,
 }
 
 impl Default for TunnelLimits {
@@ -83,6 +92,8 @@ impl Default for TunnelLimits {
             head_deadline: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
             permit_wait: Duration::from_secs(10),
+            body_deadline: Duration::from_secs(60),
+            per_device_permits: 8,
         }
     }
 }
@@ -126,6 +137,54 @@ struct SealedState {
     limits: TunnelLimits,
     authenticated_permits: Arc<Semaphore>,
     public_permits: Arc<Semaphore>,
+    /// Credentialed permits held per claimed device id.
+    device_permits: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+}
+
+/// One device id's share of the credentialed permits, released on drop.
+struct DevicePermit {
+    held: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    device_id: String,
+}
+
+impl DevicePermit {
+    fn try_take(
+        held: &Arc<std::sync::Mutex<HashMap<String, usize>>>,
+        device_id: String,
+        limit: usize,
+    ) -> Option<Self> {
+        let mut map = held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = map.entry(device_id.clone()).or_default();
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            held: Arc::clone(held),
+            device_id,
+        })
+    }
+}
+
+impl Drop for DevicePermit {
+    fn drop(&mut self) {
+        let mut map = self
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = map.get_mut(&self.device_id) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.device_id);
+            }
+        }
+    }
+}
+
+/// What an admitted inner request holds until its response head.
+struct TunnelPermit {
+    _pool: OwnedSemaphorePermit,
+    _device: Option<DevicePermit>,
 }
 
 pub(super) fn routes(api: Router, state: AppState) -> Router {
@@ -154,6 +213,7 @@ pub(super) fn routes_with_limits(
             limits,
             authenticated_permits,
             public_permits,
+            device_permits: Arc::default(),
         })
 }
 
@@ -203,7 +263,7 @@ async fn sealed(State(sealed): State<SealedState>, request: Request) -> Response
 /// What an opened tunnel request turns into.
 enum Opened {
     /// The complete inner request, holding a permit from its pool.
-    Forward(Request, OwnedSemaphorePermit),
+    Forward(Request, TunnelPermit),
     /// The request was refused without running it (by the inner head
     /// alone, no free permit, or a stalled body); the error is sealed like
     /// any inner response.
@@ -326,7 +386,8 @@ async fn open_request(
     let mut received = 0_usize;
     let mut plaintext = Vec::new();
     // Set once the inner head is decrypted and admitted.
-    let mut admitted: Option<(InnerParts, usize, usize, OwnedSemaphorePermit)> = None;
+    let mut admitted: Option<(InnerParts, usize, usize, TunnelPermit)> = None;
+    let mut body_deadline = None;
     let mut stream = body.into_data_stream();
     loop {
         if admitted.is_none() {
@@ -336,6 +397,23 @@ async fn open_request(
                     Ok(admission) => admission,
                     // Stop reading: the rest of the outer body is dropped.
                     Err(error) => return Ok((Opened::Rejected(error), down)),
+                };
+                // Before waiting for the pool, so one id never queues for
+                // more permits than its share.
+                let device = if admission.public || !state.config.security.enable_auth {
+                    None
+                } else {
+                    let device_id =
+                        device_auth::claimed_device_id(&inner.headers, inner.uri.query())
+                            .unwrap_or_default();
+                    match DevicePermit::try_take(
+                        &sealed.device_permits,
+                        device_id,
+                        limits.per_device_permits,
+                    ) {
+                        Some(device) => Some(device),
+                        None => return Ok((Opened::Rejected(AppError::TransportBusy), down)),
+                    }
                 };
                 let pool = if admission.public {
                     &sealed.public_permits
@@ -353,7 +431,16 @@ async fn open_request(
                     // Nothing ran and no signature nonce was claimed.
                     Err(_) => return Ok((Opened::Rejected(AppError::TransportBusy), down)),
                 };
-                admitted = Some((inner, head_end, admission.body_limit, permit));
+                admitted = Some((
+                    inner,
+                    head_end,
+                    admission.body_limit,
+                    TunnelPermit {
+                        _pool: permit,
+                        _device: device,
+                    },
+                ));
+                body_deadline = Some(Instant::now() + limits.body_deadline);
             }
         }
         if let Some((_, head_end, body_limit, _)) = &admitted {
@@ -362,8 +449,8 @@ async fn open_request(
             }
         }
         let idle_deadline = Instant::now() + limits.idle_timeout;
-        let deadline = if admitted.is_some() {
-            idle_deadline
+        let deadline = if let Some(body_deadline) = body_deadline {
+            idle_deadline.min(body_deadline)
         } else {
             idle_deadline.min(head_deadline)
         };

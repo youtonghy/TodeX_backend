@@ -1294,6 +1294,7 @@ async fn tunnel_admission_bounds_time_and_keeps_public_and_signed_pools_apart() 
         // until the waiter gives up.
         idle_timeout: Duration::from_millis(800),
         permit_wait: Duration::from_millis(200),
+        ..super::sealed::TunnelLimits::default()
     };
     let signed_pool = Arc::new(tokio::sync::Semaphore::new(1));
     let public_pool = Arc::new(tokio::sync::Semaphore::new(super::sealed::PUBLIC_PERMITS));
@@ -1519,4 +1520,116 @@ async fn sealed_tunnel_carries_browser_proxy_answers() {
         .collect();
     assert_eq!(cookies, ["a=1", "b=2"]);
     assert_eq!(opened.body, b"gone");
+}
+
+#[tokio::test]
+async fn tunnel_limits_permits_per_device_and_the_time_to_send_a_body() {
+    let server = TestServer::start(PairingEncryption::X25519).await;
+    let keys = server.state.pairing_keys.current().unwrap();
+    let protocol = EncryptionProtocol::X25519;
+    let device = TestDevice::new(41);
+    device.enroll(&server.root.join("data"));
+    let other = TestDevice::new(42);
+    other.enroll(&server.root.join("data"));
+    let api = Router::new().route("/probe", any(probe));
+    let limits = super::sealed::TunnelLimits {
+        // Longer than the body deadline: the drip below never goes idle.
+        idle_timeout: Duration::from_secs(5),
+        body_deadline: Duration::from_millis(400),
+        per_device_permits: 1,
+        ..super::sealed::TunnelLimits::default()
+    };
+    let signed_pool = Arc::new(tokio::sync::Semaphore::new(4));
+    let app = super::sealed::routes_with_limits(
+        api,
+        server.state.clone(),
+        limits,
+        signed_pool.clone(),
+        Arc::new(tokio::sync::Semaphore::new(super::sealed::PUBLIC_PERMITS)),
+    );
+    let peer: SocketAddr = "192.0.2.22:7001".parse().unwrap();
+    let send = |sealed: &SealedRequest, body: Body| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v2/sealed")
+            .extension(ConnectInfo(peer));
+        for (name, value) in &sealed.headers {
+            request = request.header(*name, value);
+        }
+        app.clone().oneshot(request.body(body).unwrap())
+    };
+    let open = |response: Response, down: RestKeys| async move {
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        open_response(down, &bytes)
+    };
+    let large = vec![b'x'; 100_000];
+
+    // The head, then the rest of the body one byte every 50 ms: never idle,
+    // never complete.
+    let holder = seal_request(
+        &keys,
+        protocol,
+        &signed_inner(&device, "PUT", "/probe", &large),
+    );
+    let head = first_record(&holder);
+    let rest = holder.body[head.len()..].to_vec();
+    let drip = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from(head))]).chain(
+        futures_util::stream::iter(rest).then(|byte| async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<_, std::io::Error>(Bytes::from(vec![byte]))
+        }),
+    );
+    let started = std::time::Instant::now();
+    let held = tokio::spawn(send(&holder, Body::from_stream(drip)));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while signed_pool.available_permits() == 4 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // The same device id is at its share: refused at once, although the
+    // pool has room. Another device is unaffected.
+    let busy = seal_request(
+        &keys,
+        protocol,
+        &signed_inner(&device, "POST", "/probe", b"a"),
+    );
+    let opened = open(
+        send(&busy, Body::from(busy.body.clone())).await.unwrap(),
+        busy.down,
+    )
+    .await;
+    assert_eq!(opened.status, 503);
+    let error: Value = serde_json::from_slice(&opened.body).unwrap();
+    assert_eq!(error["code"], "TRANSPORT_BUSY");
+    let fine = seal_request(
+        &keys,
+        protocol,
+        &signed_inner(&other, "POST", "/probe", b"b"),
+    );
+    let opened = open(
+        send(&fine, Body::from(fine.body.clone())).await.unwrap(),
+        fine.down,
+    )
+    .await;
+    assert_eq!(opened.status, 200);
+
+    // The trickling holder runs out of time to send its body.
+    let opened = open(held.await.unwrap().unwrap(), holder.down).await;
+    assert_eq!(opened.status, 408);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let again = seal_request(
+        &keys,
+        protocol,
+        &signed_inner(&device, "POST", "/probe", b"c"),
+    );
+    let opened = open(
+        send(&again, Body::from(again.body.clone())).await.unwrap(),
+        again.down,
+    )
+    .await;
+    assert_eq!(opened.status, 200);
 }
