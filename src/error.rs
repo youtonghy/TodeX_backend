@@ -117,6 +117,10 @@ pub enum AppError {
     StorageLow(String),
     #[error("provider unavailable: {0}")]
     ProviderUnavailable(String),
+    /// The CLI ships with the container image (`managedBy: "image"`); TodeX
+    /// neither installs nor upgrades it. Update the image instead.
+    #[error("CLI is managed by the container image: {0}")]
+    CliManagedByImage(String),
     #[error("remote authentication failed: {0}")]
     RemoteAuthFailed(String),
     #[error("remote host key is not verified: {0}")]
@@ -182,6 +186,7 @@ impl AppError {
             Self::HistoryReadOnly => "HISTORY_READ_ONLY",
             Self::StorageLow(_) => "STORAGE_LOW",
             Self::ProviderUnavailable(_) => "PROVIDER_UNAVAILABLE",
+            Self::CliManagedByImage(_) => "CLI_MANAGED_BY_IMAGE",
             Self::RemoteAuthFailed(_) => "REMOTE_AUTH_FAILED",
             Self::RemoteHostKeyUnverified(_) => "REMOTE_HOST_KEY_UNVERIFIED",
             Self::RemoteUnreachable(_) => "REMOTE_UNREACHABLE",
@@ -228,7 +233,9 @@ impl IntoResponse for AppError {
             }
             Self::TransportCryptoFailed => StatusCode::BAD_REQUEST,
             Self::HistoryAccessRevoked => StatusCode::FORBIDDEN,
-            Self::HistoryKeyRequired | Self::HistoryReadOnly => StatusCode::CONFLICT,
+            Self::HistoryKeyRequired | Self::HistoryReadOnly | Self::CliManagedByImage(_) => {
+                StatusCode::CONFLICT
+            }
             Self::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             // Not 401: clients treat that as a failed device signature.
             Self::RemoteAuthFailed(_) | Self::RemoteHostKeyUnverified(_) => StatusCode::FORBIDDEN,
@@ -272,10 +279,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn history_write_refusals_are_conflicts() {
+    fn history_write_and_image_cli_refusals_are_conflicts() {
         for (error, code) in [
             (AppError::HistoryKeyRequired, "HISTORY_KEY_REQUIRED"),
             (AppError::HistoryReadOnly, "HISTORY_READ_ONLY"),
+            (
+                AppError::CliManagedByImage("Codex".to_owned()),
+                "CLI_MANAGED_BY_IMAGE",
+            ),
         ] {
             assert_eq!(error.code(), code);
             assert_eq!(error.into_response().status(), StatusCode::CONFLICT);

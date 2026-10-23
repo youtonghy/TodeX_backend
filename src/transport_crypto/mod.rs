@@ -250,12 +250,16 @@ pub(crate) fn transport_fingerprint(public_key: &[u8]) -> Option<String> {
 /// credential: importing it fills the server address and starts device
 /// verification, which delivers the transport key authenticated by the
 /// verification code.
+/// `server.advertise_url`, when set, replaces the guessed address.
 pub(crate) fn pairing_link_json(config: &Config, port: u16) -> Result<String, AppError> {
-    let advertise_host = pairing_advertise_host(&config.host);
+    let server_url = match &config.deployment.advertise_url {
+        Some(url) => url.clone(),
+        None => format!("http://{}:{port}", pairing_advertise_host(&config.host)),
+    };
     Ok(serde_json::to_string(&PairingLinkPayload {
         kind: "todex-pairing-link",
         version: PAIRING_LINK_VERSION,
-        server_url: format!("http://{advertise_host}:{port}"),
+        server_url,
     })?)
 }
 
@@ -645,6 +649,16 @@ mod tests {
         assert!(value.get("pairingUrl").is_none());
     }
 
+    #[test]
+    fn pairing_link_uses_the_advertised_url() {
+        let mut config = test_config();
+        config.host = "0.0.0.0".to_owned();
+        config.deployment.advertise_url = Some("https://todex.example:8443".to_owned());
+        let link = pairing_link_json(&config, 7345).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&link).unwrap();
+        assert_eq!(value["serverUrl"], "https://todex.example:8443");
+    }
+
     #[tokio::test]
     async fn pairing_keys_persist_across_restarts() {
         let data_dir = unique_tmp_dir("todex-pairing-keys-persist");
@@ -890,6 +904,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         }
     }
 

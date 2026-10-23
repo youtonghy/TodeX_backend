@@ -1591,6 +1591,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         }
     }
 

@@ -84,6 +84,7 @@ impl Harness {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         });
         let mut store = ConversationStore::new(config.data_dir.clone())
             .await

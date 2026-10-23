@@ -3858,6 +3858,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         });
         let mut store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -4763,6 +4764,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -6825,6 +6827,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -7094,6 +7097,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -7290,6 +7294,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -7357,6 +7362,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         });
         let store = ConversationStore::new(data_dir.clone()).await.unwrap();
         let supervisor =
@@ -8006,6 +8012,7 @@ done
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await

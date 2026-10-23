@@ -117,9 +117,18 @@ pub fn enabled() -> bool {
 }
 
 /// Automatic updates at launch and in a running daemon; `update` stays manual.
+/// Off in a container deployment, whatever `TODEX_AUTO_UPDATE` says: the
+/// image is the update unit there.
 pub fn auto_update_enabled() -> bool {
-    enabled() && std::env::var("TODEX_AUTO_UPDATE").as_deref() != Ok("0")
+    enabled()
+        && std::env::var("TODEX_AUTO_UPDATE").as_deref() != Ok("0")
+        && !crate::config::container_deployment()
 }
+
+/// Message for an install refused because the container image owns the binary.
+pub const MANAGED_BY_IMAGE_MESSAGE: &str = "todex-agentd is managed by the container image; \
+     nothing was changed. Update the image instead (for example `todexc upgrade`, or pull \
+     the new image and recreate the container).";
 
 fn asset_url<'a>(release: &'a Release, name: &str) -> Result<&'a str> {
     let expected = format!(
@@ -371,6 +380,9 @@ pub async fn run(check_only: bool) -> Result<UpdateStatus> {
 /// the daemon first. Returns the installed version, or `None` when already
 /// current.
 pub async fn install_latest() -> Result<Option<String>> {
+    if crate::config::container_deployment() {
+        anyhow::bail!(MANAGED_BY_IMAGE_MESSAGE);
+    }
     let status = run(false).await?;
     Ok(status.latest_version.filter(|_| status.installed))
 }

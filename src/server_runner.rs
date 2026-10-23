@@ -137,6 +137,11 @@ impl ManagedServer {
             workspace_roots = ?config.workspace_roots,
             "todex-agentd listening"
         );
+        // The advertised address comes first: inside a container the
+        // interface addresses below are not reachable from clients.
+        if let Some(url) = &config.deployment.advertise_url {
+            info!(url = %url, "advertised client connect address");
+        }
         match listen_addrs::connect_addresses(&config.host) {
             Ok(addresses) => {
                 for address in addresses {
@@ -533,6 +538,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         };
 
         let server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
@@ -614,6 +620,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         };
 
         let mut server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
@@ -693,6 +700,7 @@ mod tests {
                 enable_tls: true,
             },
             api: Default::default(),
+            deployment: Default::default(),
         };
         assert!(
             ManagedServer::start(config, ProviderProcessTracking::Disabled)

@@ -66,6 +66,7 @@ fn golden_config(root: &Path, executable: Option<&str>) -> Config {
             enable_tls: false,
         },
         api: Default::default(),
+        deployment: Default::default(),
     }
 }
 

@@ -1,3 +1,4 @@
+mod admin_cli;
 mod agent_browser;
 mod agent_calls;
 mod agent_desktop;
@@ -94,6 +95,21 @@ enum Command {
     },
     #[command(about = "Show the backend repository, version, and update status")]
     About,
+    #[command(about = "List, approve or reject device pairing requests without the TUI")]
+    Pair {
+        #[command(subcommand)]
+        command: admin_cli::PairCommand,
+    },
+    #[command(about = "List or revoke paired devices without the TUI")]
+    Devices {
+        #[command(subcommand)]
+        command: admin_cli::DevicesCommand,
+    },
+    #[command(about = "Install Agent CLIs")]
+    Providers {
+        #[command(subcommand)]
+        command: admin_cli::ProvidersCommand,
+    },
     #[command(about = "Manage the agent browser's Chromium")]
     Browser {
         #[command(subcommand)]
@@ -239,9 +255,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             agent_browser::install_cli(&config.data_dir).await
         }
         Command::Update { check, args } => {
-            if !check && update::enabled() {
+            if !check {
                 let config = Config::load_read_only(args)?;
-                if daemon::recover(&config)?.is_some() {
+                // The container image is the update unit: change nothing.
+                if config.deployment.kind == config::Deployment::Container {
+                    println!("{}", update::MANAGED_BY_IMAGE_MESSAGE);
+                    return Ok(());
+                }
+                if update::enabled() && daemon::recover(&config)?.is_some() {
                     anyhow::bail!(
                         "stop the daemon before installing an update (or use daemon restart)"
                     );
@@ -257,6 +278,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&update::about().await)?);
             Ok(())
         }
+        Command::Pair { command } => exit_on_failure(admin_cli::pair(command)),
+        Command::Devices { command } => exit_on_failure(admin_cli::devices(command)),
+        Command::Providers { command } => exit_on_failure(admin_cli::providers(command).await),
         Command::DaemonRun(args) => {
             init_serve_logging();
             daemon_run(args).await
@@ -292,6 +316,15 @@ async fn doctor_command(command: DoctorCommand) -> anyhow::Result<()> {
                 anyhow::bail!("one or more provider checks failed");
             }
         }
+    }
+    Ok(())
+}
+
+/// Admin commands report their own exit codes (2: not found, 3: wrong user).
+fn exit_on_failure(result: Result<(), admin_cli::CommandFailure>) -> anyhow::Result<()> {
+    if let Err(failure) = result {
+        eprintln!("error: {}", failure.message);
+        std::process::exit(failure.code);
     }
     Ok(())
 }

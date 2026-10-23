@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
 
-use super::process::{executable_available, run_bounded_command, CommandSpec};
+use super::process::{executable_available, resolve_executable, run_bounded_command, CommandSpec};
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(12);
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -89,6 +89,12 @@ impl ManagedCli {
             Self::Antigravity => ProviderKind::Antigravity,
             Self::DeepseekHarness => ProviderKind::DeepseekHarness,
         }
+    }
+
+    /// Whether the binary this CLI would launch ships with the container
+    /// image (`agent.image_cli_dirs`); the image, not TodeX, updates it.
+    pub(crate) fn managed_by_image(self, config: &Config) -> bool {
+        binary_in_dirs(self.binary(config), &config.deployment.image_cli_dirs)
     }
 
     pub(crate) fn binary(self, config: &Config) -> &str {
@@ -186,6 +192,35 @@ impl ManagedCli {
     }
 }
 
+/// Whether `program` resolves (as it would be launched) to a file under one
+/// of `dirs`. Both the resolved path and its canonical target count, and the
+/// directories are compared as given and canonicalized: an image may expose
+/// its CLIs as symlinks (`node_modules/.bin/codex`) into the package tree.
+fn binary_in_dirs(program: &str, dirs: &[std::path::PathBuf]) -> bool {
+    if dirs.is_empty() {
+        return false;
+    }
+    let Some(resolved) = resolve_executable(program) else {
+        return false;
+    };
+    let canonical = std::fs::canonicalize(&resolved).ok();
+    dirs.iter().any(|dir| {
+        let canonical_dir = std::fs::canonicalize(dir).ok();
+        [Some(&resolved), canonical.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|path| {
+                path.starts_with(dir)
+                    || canonical_dir
+                        .as_ref()
+                        .is_some_and(|canonical_dir| path.starts_with(canonical_dir))
+            })
+    })
+}
+
+/// The `managedBy` value of CLIs shipped with the container image.
+pub const MANAGED_BY_IMAGE: &str = "image";
+
 /// A fixed installer invocation: `curl -fsSL <url> | <shell> -s`. Nothing in
 /// it comes from the request, so the shell never sees user input.
 struct InstallScript {
@@ -215,6 +250,10 @@ pub struct CliVersionInfo {
     pub status: String,
     pub upgrade_supported: bool,
     pub install_supported: bool,
+    /// `"image"` when the binary ships with the container image; such a CLI
+    /// is neither installed nor upgraded by TodeX.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -395,6 +434,7 @@ impl CliManager {
             status: "external".to_owned(),
             upgrade_supported: false,
             install_supported: false,
+            managed_by: None,
             error: None,
         }));
         let (active_operation, active_operations) = self.running_operations().await;
@@ -503,6 +543,7 @@ impl CliManager {
             status: if upgrading { "unknown" } else { "notInstalled" }.to_owned(),
             upgrade_supported: false,
             install_supported: false,
+            managed_by: None,
             error: None,
         }
     }
@@ -798,6 +839,7 @@ async fn inspect_cli(
             status: "notInstalled".to_owned(),
             upgrade_supported: false,
             install_supported: config.security.enable_auth && provider.install_available(),
+            managed_by: None,
             error: None,
         };
     }
@@ -818,6 +860,7 @@ async fn inspect_cli(
         .err()
         .map(|error| user_facing_error(&error))
         .or_else(|| latest.err());
+    let managed_by_image = provider.managed_by_image(config);
     CliVersionInfo {
         id: provider.id().to_owned(),
         name: provider.name().to_owned(),
@@ -827,9 +870,11 @@ async fn inspect_cli(
         latest_version,
         status: status.to_owned(),
         upgrade_supported: installed
+            && !managed_by_image
             && config.security.enable_auth
             && (provider.npm_package().is_none() || provider.install_available()),
         install_supported: false,
+        managed_by: managed_by_image.then(|| MANAGED_BY_IMAGE.to_owned()),
         error,
     }
 }
@@ -1291,5 +1336,88 @@ mod tests {
     fn managed_cli_deserialization_rejects_arbitrary_commands() {
         assert!(serde_json::from_str::<ManagedCli>("\"codex\"").is_ok());
         assert!(serde_json::from_str::<ManagedCli>("\"sh -c whoami\"").is_err());
+    }
+
+    /// The image links its CLIs from `node_modules/.bin` into the package
+    /// tree; either the link or its target under an image directory counts.
+    #[cfg(unix)]
+    #[test]
+    fn image_managed_binaries_are_detected_through_symlinks() {
+        use super::binary_in_dirs;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!("todex-image-cli-{}", uuid::Uuid::new_v4()));
+        let image = root.join("opt/todex/agents");
+        let package = image.join("node_modules/@openai/codex/bin");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(image.join("node_modules/.bin")).unwrap();
+        let target = package.join("codex.js");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = image.join("node_modules/.bin/codex");
+        symlink(&target, &link).unwrap();
+        // A user-installed CLI linking into the image is the image's too.
+        let user_bin = root.join("home/.local/bin");
+        std::fs::create_dir_all(&user_bin).unwrap();
+        symlink(&target, user_bin.join("codex")).unwrap();
+        let own = user_bin.join("claude");
+        std::fs::write(&own, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The configured directory itself may be a symlink.
+        let alias = root.join("agents-alias");
+        symlink(&image, &alias).unwrap();
+
+        let link = link.to_str().unwrap();
+        assert!(binary_in_dirs(link, std::slice::from_ref(&image)));
+        assert!(binary_in_dirs(link, std::slice::from_ref(&alias)));
+        assert!(binary_in_dirs(
+            user_bin.join("codex").to_str().unwrap(),
+            std::slice::from_ref(&image)
+        ));
+        assert!(!binary_in_dirs(
+            own.to_str().unwrap(),
+            &[image.clone(), alias]
+        ));
+        assert!(!binary_in_dirs(link, &[]));
+        assert!(!binary_in_dirs(
+            link,
+            &[root.join("opt/todex/agents-other")]
+        ));
+        assert!(!binary_in_dirs(
+            root.join("missing").to_str().unwrap(),
+            std::slice::from_ref(&image)
+        ));
+
+        let mut config = crate::config::Config::default();
+        config.agent.codex_bin = link.to_owned();
+        assert!(!ManagedCli::Codex.managed_by_image(&config));
+        config.deployment.image_cli_dirs = vec![image];
+        assert!(ManagedCli::Codex.managed_by_image(&config));
+        // `pi` resolves from PATH, outside the temporary image directory.
+        assert!(!ManagedCli::Pi.managed_by_image(&config));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_by_is_omitted_unless_set() {
+        let mut row = super::CliVersionInfo {
+            id: "codex".to_owned(),
+            name: "Codex".to_owned(),
+            kind: "managed".to_owned(),
+            installed: true,
+            current_version: Some("1.0.0".to_owned()),
+            latest_version: None,
+            status: "unknown".to_owned(),
+            upgrade_supported: true,
+            install_supported: false,
+            managed_by: None,
+            error: None,
+        };
+        assert!(serde_json::to_value(&row)
+            .unwrap()
+            .get("managedBy")
+            .is_none());
+        row.managed_by = Some(super::MANAGED_BY_IMAGE.to_owned());
+        assert_eq!(serde_json::to_value(&row).unwrap()["managedBy"], "image");
     }
 }

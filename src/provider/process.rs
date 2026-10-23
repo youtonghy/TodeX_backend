@@ -727,7 +727,7 @@ pub(crate) fn executable_stamp(program: &str) -> Option<ExecutableStamp> {
     })
 }
 
-fn resolve_executable(program: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_executable(program: &str) -> Option<PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {
         if executable_file(path) {

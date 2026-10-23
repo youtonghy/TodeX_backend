@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -50,6 +50,70 @@ pub struct Config {
     pub agent: AgentConfig,
     pub security: SecurityConfig,
     pub api: ApiConfig,
+    /// How this daemon is deployed and reached (`[server]`
+    /// `advertise_url`/`deployment`, `agent.image_cli_dirs`,
+    /// `[[workspace.path_mappings]]`). All of it is off by default.
+    pub deployment: DeploymentConfig,
+}
+
+/// Where the daemon runs. `container` marks a daemon shipped in a container
+/// image: the image is the update unit, so self-update is off.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Deployment {
+    #[default]
+    Host,
+    Container,
+}
+
+impl Deployment {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "host" => Some(Self::Host),
+            "container" => Some(Self::Container),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Container => "container",
+        }
+    }
+}
+
+/// One client-side directory and the path it has on this backend (a
+/// container bind mount at another path). Clients use it to translate local
+/// paths; the backend itself only publishes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PathMapping {
+    pub host_path: String,
+    pub backend_path: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeploymentConfig {
+    pub kind: Deployment,
+    /// The `http(s)://host[:port]` clients should use, shown in the startup
+    /// log and the TUI pairing link instead of guessed interface addresses.
+    pub advertise_url: Option<String>,
+    /// A managed CLI whose resolved binary lies under one of these
+    /// directories ships with the image and is not installed or upgraded
+    /// by TodeX.
+    pub image_cli_dirs: Vec<PathBuf>,
+    pub path_mappings: Vec<PathMapping>,
+}
+
+/// Set once any configuration with `deployment = container` was loaded in
+/// this process; see [`container_deployment`].
+static CONTAINER_DEPLOYMENT: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process loaded a container deployment's configuration. The
+/// updater reads it, since it runs without a [`Config`] at hand.
+pub fn container_deployment() -> bool {
+    CONTAINER_DEPLOYMENT.load(Ordering::Relaxed)
 }
 
 /// The external API listener (`[api]`): REST + SSE authenticated with API
@@ -236,6 +300,26 @@ struct FileConfig {
     agent: Option<PartialAgentConfig>,
     security: Option<PartialSecurityConfig>,
     api: Option<PartialApiConfig>,
+    server: Option<PartialServerConfig>,
+    workspace: Option<PartialWorkspaceConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialServerConfig {
+    advertise_url: Option<String>,
+    deployment: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialWorkspaceConfig {
+    path_mappings: Option<Vec<FilePathMapping>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilePathMapping {
+    host_path: String,
+    backend_path: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -270,6 +354,7 @@ struct PartialAgentConfig {
     provider_idle_timeout_minutes: Option<u64>,
     provider_keepalive_seconds: Option<u64>,
     provider_prewarm: Option<bool>,
+    image_cli_dirs: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -353,6 +438,16 @@ impl Config {
         );
 
         let agent_file = file_config.agent.unwrap_or_default();
+        let deployment = resolve_deployment_config(
+            &|key| env::var_os(key),
+            file_config.server.unwrap_or_default(),
+            agent_file.image_cli_dirs.clone(),
+            file_config.workspace.unwrap_or_default(),
+            &workspace_roots,
+        )?;
+        if deployment.kind == Deployment::Container {
+            CONTAINER_DEPLOYMENT.store(true, Ordering::Relaxed);
+        }
         let security_file = file_config.security.unwrap_or_default();
         let api_file = file_config.api.unwrap_or_default();
         let api = ApiConfig {
@@ -533,6 +628,7 @@ impl Config {
                 ),
             },
             api,
+            deployment,
         })
     }
 
@@ -738,6 +834,7 @@ impl Default for Config {
                 enable_tls: false,
             },
             api: ApiConfig::default(),
+            deployment: DeploymentConfig::default(),
         }
     }
 }
@@ -865,6 +962,7 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
             overlay_agent.provider_keepalive_seconds
         );
         replace_some!(base_agent.provider_prewarm, overlay_agent.provider_prewarm);
+        replace_some!(base_agent.image_cli_dirs, overlay_agent.image_cli_dirs);
     }
     if let Some(overlay_security) = overlay.security {
         let base_security = base
@@ -882,6 +980,20 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
         replace_some!(
             base_api.allow_plaintext_remote,
             overlay_api.allow_plaintext_remote
+        );
+    }
+    if let Some(overlay_server) = overlay.server {
+        let base_server = base.server.get_or_insert_with(PartialServerConfig::default);
+        replace_some!(base_server.advertise_url, overlay_server.advertise_url);
+        replace_some!(base_server.deployment, overlay_server.deployment);
+    }
+    if let Some(overlay_workspace) = overlay.workspace {
+        let base_workspace = base
+            .workspace
+            .get_or_insert_with(PartialWorkspaceConfig::default);
+        replace_some!(
+            base_workspace.path_mappings,
+            overlay_workspace.path_mappings
         );
     }
     base
@@ -912,6 +1024,161 @@ pub fn warn_retired_history_encryption(data_dir: &Path) {
             tracing::debug!(error = %error, "config file unreadable while checking retired settings")
         }
     }
+}
+
+/// `[server]`, `agent.image_cli_dirs` and `[[workspace.path_mappings]]`,
+/// each overridden by its environment variable. Compose files pass these
+/// variables even when left blank, so an empty value counts as unset.
+fn resolve_deployment_config(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    server: PartialServerConfig,
+    file_image_cli_dirs: Option<Vec<PathBuf>>,
+    workspace: PartialWorkspaceConfig,
+    workspace_roots: &[PathBuf],
+) -> anyhow::Result<DeploymentConfig> {
+    let var =
+        |key: &str| optional_non_empty(env(key).map(|value| value.to_string_lossy().into_owned()));
+    let kind = match var("TODEX_AGENTD_DEPLOYMENT")
+        .map(|value| ("TODEX_AGENTD_DEPLOYMENT", value))
+        .or_else(|| optional_non_empty(server.deployment).map(|value| ("server.deployment", value)))
+    {
+        Some((source, value)) => Deployment::parse(&value).ok_or_else(|| {
+            anyhow::anyhow!("{source} must be \"host\" or \"container\", got {value:?}")
+        })?,
+        None => Deployment::Host,
+    };
+    let advertise_url = match var("TODEX_AGENTD_ADVERTISE_URL")
+        .map(|value| ("TODEX_AGENTD_ADVERTISE_URL", value))
+        .or_else(|| {
+            optional_non_empty(server.advertise_url).map(|value| ("server.advertise_url", value))
+        }) {
+        Some((source, value)) => {
+            Some(validate_advertise_url(&value).with_context(|| format!("invalid {source}"))?)
+        }
+        None => None,
+    };
+    let image_cli_dirs = match env("TODEX_AGENTD_IMAGE_CLI_DIR")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+    {
+        Some(value) => validate_image_cli_dirs(
+            env::split_paths(&value).collect(),
+            "TODEX_AGENTD_IMAGE_CLI_DIR",
+        )?,
+        None => validate_image_cli_dirs(
+            file_image_cli_dirs.unwrap_or_default(),
+            "agent.image_cli_dirs",
+        )?,
+    };
+    let path_mappings = match var("TODEX_AGENTD_PATH_MAPPINGS") {
+        Some(value) => {
+            let mappings: Vec<PathMapping> = serde_json::from_str(&value).context(
+                "TODEX_AGENTD_PATH_MAPPINGS must be a JSON array of {\"hostPath\", \"backendPath\"}",
+            )?;
+            validate_path_mappings(mappings, workspace_roots)
+                .context("invalid TODEX_AGENTD_PATH_MAPPINGS")?
+        }
+        None => validate_path_mappings(
+            workspace
+                .path_mappings
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mapping| PathMapping {
+                    host_path: mapping.host_path,
+                    backend_path: mapping.backend_path,
+                })
+                .collect(),
+            workspace_roots,
+        )
+        .context("invalid workspace.path_mappings")?,
+    };
+    Ok(DeploymentConfig {
+        kind,
+        advertise_url,
+        image_cli_dirs,
+        path_mappings,
+    })
+}
+
+/// An `http(s)` URL with a host and no credentials, query or fragment,
+/// returned without a trailing `/`.
+fn validate_advertise_url(value: &str) -> anyhow::Result<String> {
+    // Never echo a value that may carry credentials.
+    let url = reqwest::Url::parse(value)
+        .map_err(|error| anyhow::anyhow!("not an absolute http(s) URL ({error})"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("the advertised URL must not contain credentials");
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("{value:?} must use http or https");
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        anyhow::bail!("{value:?} has no host");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("{value:?} must not contain a query or fragment");
+    }
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
+fn validate_image_cli_dirs(dirs: Vec<PathBuf>, source: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let mut resolved: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let dir = expand_home(dir);
+        if !dir.is_absolute() {
+            anyhow::bail!("{source} entry {} is not an absolute path", dir.display());
+        }
+        if !resolved.contains(&dir) {
+            resolved.push(dir);
+        }
+    }
+    Ok(resolved)
+}
+
+/// Each `backendPath` is absolute, free of `..` and inside a workspace root
+/// (checked lexically: roots may be mounted after the daemon starts); no
+/// `hostPath` or `backendPath` appears twice.
+fn validate_path_mappings(
+    mappings: Vec<PathMapping>,
+    workspace_roots: &[PathBuf],
+) -> anyhow::Result<Vec<PathMapping>> {
+    let mut validated: Vec<PathMapping> = Vec::with_capacity(mappings.len());
+    for mapping in mappings {
+        let host_path = mapping.host_path.trim().to_owned();
+        let backend_path = mapping.backend_path.trim().to_owned();
+        if host_path.is_empty() {
+            anyhow::bail!("hostPath must not be empty");
+        }
+        let backend = Path::new(&backend_path);
+        if !backend.is_absolute() {
+            anyhow::bail!("backendPath {backend_path:?} must be an absolute path");
+        }
+        if backend
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("backendPath {backend_path:?} must not contain \"..\"");
+        }
+        if !workspace_roots.iter().any(|root| backend.starts_with(root)) {
+            anyhow::bail!("backendPath {backend_path:?} is not inside a workspace root");
+        }
+        if validated.iter().any(|other| other.host_path == host_path) {
+            anyhow::bail!("hostPath {host_path:?} is mapped more than once");
+        }
+        if validated
+            .iter()
+            .any(|other| Path::new(&other.backend_path) == backend)
+        {
+            anyhow::bail!("backendPath {backend_path:?} is mapped more than once");
+        }
+        validated.push(PathMapping {
+            host_path,
+            backend_path,
+        });
+    }
+    Ok(validated)
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -1624,5 +1891,245 @@ codex_bin = "codex"
             expand_home_with_home(PathBuf::from("~/github/TodeX"), Some(home)),
             PathBuf::from("/tmp/todex-home/github/TodeX")
         );
+    }
+
+    fn deployment_from(
+        vars: &[(&str, &str)],
+        file: &str,
+        roots: &[&str],
+    ) -> anyhow::Result<super::DeploymentConfig> {
+        let file: super::FileConfig = toml::from_str(file).unwrap();
+        let vars: std::collections::HashMap<String, OsString> = vars
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), OsString::from(value)))
+            .collect();
+        let roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
+        super::resolve_deployment_config(
+            &|key| vars.get(key).cloned(),
+            file.server.unwrap_or_default(),
+            file.agent.unwrap_or_default().image_cli_dirs,
+            file.workspace.unwrap_or_default(),
+            &roots,
+        )
+    }
+
+    #[test]
+    fn deployment_defaults_to_host_and_blank_variables_count_as_unset() {
+        let defaults = deployment_from(&[], "", &["/srv"]).unwrap();
+        assert_eq!(defaults, super::DeploymentConfig::default());
+        assert_eq!(defaults.kind, super::Deployment::Host);
+        assert_eq!(Config::default().deployment, defaults);
+        // Compose passes variables the user left blank.
+        let blank = deployment_from(
+            &[
+                ("TODEX_AGENTD_DEPLOYMENT", " "),
+                ("TODEX_AGENTD_ADVERTISE_URL", ""),
+                ("TODEX_AGENTD_IMAGE_CLI_DIR", "  "),
+                ("TODEX_AGENTD_PATH_MAPPINGS", ""),
+            ],
+            "[server]\ndeployment = \"container\"\n",
+            &["/srv"],
+        )
+        .unwrap();
+        assert_eq!(blank.kind, super::Deployment::Container);
+        assert_eq!(blank.advertise_url, None);
+        assert!(blank.image_cli_dirs.is_empty() && blank.path_mappings.is_empty());
+    }
+
+    #[test]
+    fn deployment_parses_from_env_over_file_and_rejects_unknown_values() {
+        let env_wins = deployment_from(
+            &[("TODEX_AGENTD_DEPLOYMENT", "Container")],
+            "[server]\ndeployment = \"host\"\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(env_wins.kind, super::Deployment::Container);
+        assert_eq!(env_wins.kind.as_str(), "container");
+        for (vars, file) in [
+            (vec![("TODEX_AGENTD_DEPLOYMENT", "docker")], ""),
+            (vec![], "[server]\ndeployment = \"vm\"\n"),
+        ] {
+            let error = deployment_from(&vars, file, &[]).unwrap_err().to_string();
+            assert!(error.contains("\"host\" or \"container\""), "{error}");
+        }
+    }
+
+    #[test]
+    fn advertise_url_accepts_plain_http_urls_only() {
+        for (value, expected) in [
+            ("http://127.0.0.1:7345", "http://127.0.0.1:7345"),
+            ("https://todex.example/", "https://todex.example"),
+            ("http://[::1]:7345", "http://[::1]:7345"),
+        ] {
+            let config =
+                deployment_from(&[("TODEX_AGENTD_ADVERTISE_URL", value)], "", &[]).unwrap();
+            assert_eq!(config.advertise_url.as_deref(), Some(expected), "{value}");
+        }
+        let file = deployment_from(
+            &[],
+            "[server]\nadvertise_url = \"http://192.168.1.20:7345\"\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            file.advertise_url.as_deref(),
+            Some("http://192.168.1.20:7345")
+        );
+        for value in [
+            "127.0.0.1:7345",
+            "ws://127.0.0.1:7345",
+            "http://user:secret@127.0.0.1:7345",
+            "http://127.0.0.1:7345/?token=1",
+            "http://127.0.0.1:7345/#frag",
+            "file:///tmp/x",
+        ] {
+            let error =
+                deployment_from(&[("TODEX_AGENTD_ADVERTISE_URL", value)], "", &[]).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("TODEX_AGENTD_ADVERTISE_URL"), "{message}");
+            assert!(!message.contains("secret"), "{message}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_cli_dirs_load_from_env_list_or_file_and_must_be_absolute() {
+        let env = deployment_from(
+            &[(
+                "TODEX_AGENTD_IMAGE_CLI_DIR",
+                "/opt/todex/agents:/opt/other:",
+            )],
+            "[agent]\nimage_cli_dirs = [\"/ignored\"]\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            env.image_cli_dirs,
+            [
+                PathBuf::from("/opt/todex/agents"),
+                PathBuf::from("/opt/other")
+            ]
+        );
+        let file = deployment_from(&[], "[agent]\nimage_cli_dirs = [\"/opt/a\"]\n", &[]).unwrap();
+        assert_eq!(file.image_cli_dirs, [PathBuf::from("/opt/a")]);
+        assert!(
+            deployment_from(&[("TODEX_AGENTD_IMAGE_CLI_DIR", "relative/bin")], "", &[]).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_mappings_are_validated_against_workspace_roots() {
+        let roots = ["/workspace"];
+        let env = deployment_from(
+            &[(
+                "TODEX_AGENTD_PATH_MAPPINGS",
+                r#"[{"hostPath":"C:\\Users\\me\\code","backendPath":"/workspace/code"}]"#,
+            )],
+            "[[workspace.path_mappings]]\nhost_path = \"/ignored\"\nbackend_path = \"/workspace/x\"\n",
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(
+            env.path_mappings,
+            [super::PathMapping {
+                host_path: r"C:\Users\me\code".to_owned(),
+                backend_path: "/workspace/code".to_owned(),
+            }]
+        );
+        let file = deployment_from(
+            &[],
+            "[[workspace.path_mappings]]\nhost_path = \"/Users/me/a\"\nbackend_path = \"/workspace/a\"\n\n\
+             [[workspace.path_mappings]]\nhost_path = \"/Users/me/b\"\nbackend_path = \"/workspace\"\n",
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(file.path_mappings.len(), 2);
+
+        for (mappings, expected) in [
+            (
+                r#"{"hostPath":"a","backendPath":"/workspace/a"}"#,
+                "JSON array",
+            ),
+            (
+                r#"[{"hostPath":"a","backendPath":"/workspace/a","x":1}]"#,
+                "JSON array",
+            ),
+            (
+                r#"[{"hostPath":" ","backendPath":"/workspace/a"}]"#,
+                "hostPath",
+            ),
+            (
+                r#"[{"hostPath":"a","backendPath":"workspace/a"}]"#,
+                "absolute",
+            ),
+            (
+                r#"[{"hostPath":"a","backendPath":"/srv/a"}]"#,
+                "workspace root",
+            ),
+            (
+                r#"[{"hostPath":"a","backendPath":"/workspace/../etc"}]"#,
+                "..",
+            ),
+            (
+                r#"[{"hostPath":"a","backendPath":"/workspaces/a"}]"#,
+                "workspace root",
+            ),
+            (
+                r#"[{"hostPath":"a","backendPath":"/workspace/a"},{"hostPath":"a","backendPath":"/workspace/b"}]"#,
+                "hostPath",
+            ),
+            (
+                r#"[{"hostPath":"a","backendPath":"/workspace/a"},{"hostPath":"b","backendPath":"/workspace/a/"}]"#,
+                "backendPath",
+            ),
+        ] {
+            let error = deployment_from(&[("TODEX_AGENTD_PATH_MAPPINGS", mappings)], "", &roots)
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{mappings}: {message}");
+        }
+        assert!(deployment_from(
+            &[],
+            "[[workspace.path_mappings]]\nhost_path = \"a\"\nbackend_path = \"/elsewhere\"\n",
+            &roots,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn loaded_config_reads_the_server_and_workspace_sections() {
+        let root = env::temp_dir().join(format!("todex-config-deploy-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace-root");
+        fs::write(
+            root.join("config.toml"),
+            format!(
+                "workspace_roots = [{workspace:?}]\n[server]\nadvertise_url = \"http://127.0.0.1:7345\"\n\n\
+                 [[workspace.path_mappings]]\nhost_path = \"/host/code\"\nbackend_path = {:?}\n",
+                workspace.join("code").display().to_string(),
+                workspace = workspace.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let config = Config::load_read_only(ServeArgs {
+            data_dir: Some(root.clone()),
+            ..Default::default()
+        });
+        let unset = |key| env::var(key).map_or(true, |value| value.trim().is_empty());
+        if unset("TODEX_AGENTD_ADVERTISE_URL")
+            && unset("TODEX_AGENTD_PATH_MAPPINGS")
+            && unset("TODEX_AGENTD_WORKSPACE_ROOTS")
+            && unset("TODEX_AGENTD_WORKSPACE_ROOT")
+        {
+            let config = config.unwrap();
+            assert_eq!(
+                config.deployment.advertise_url.as_deref(),
+                Some("http://127.0.0.1:7345")
+            );
+            assert_eq!(config.deployment.path_mappings.len(), 1);
+        }
+        let _ = fs::remove_dir_all(root);
     }
 }

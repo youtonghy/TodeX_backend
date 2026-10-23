@@ -525,10 +525,12 @@ pub(super) async fn version(
             .map(|root| root.display().to_string())
             .collect(),
         scratch_workspace_root: state.config.scratch_workspace_root().display().to_string(),
+        path_mappings: state.config.deployment.path_mappings.clone(),
     });
     Json(VersionResponse {
         name: env!("CARGO_PKG_NAME"),
         version: crate::version::APP_VERSION,
+        deployment: state.config.deployment.kind.as_str(),
         paths,
         history_encryption: HISTORY_ENCRYPTION_VERSION,
         terminal_replay: crate::local_terminal::TERMINAL_REPLAY_VERSION,
@@ -2053,6 +2055,22 @@ async fn start_cli_operation(
         return Err(AppError::Unauthorized(
             "CLI installs and upgrades require device authentication".to_owned(),
         ));
+    }
+    if provider.managed_by_image(&state.config) {
+        append_cli_audit(
+            &state,
+            &auth,
+            provider,
+            action,
+            None,
+            "deny",
+            Some("CLI_MANAGED_BY_IMAGE"),
+        )
+        .await?;
+        return Err(AppError::CliManagedByImage(format!(
+            "{} ships with the container image; update the image instead",
+            provider.name()
+        )));
     }
     // Held for the whole run: starts of this CLI wait, other Agents do not.
     let execution_guard = match state
@@ -4320,6 +4338,9 @@ fn error_response(id: Option<String>, error: AppError) -> Value {
 pub(super) struct VersionResponse {
     name: &'static str,
     version: &'static str,
+    /// `"host"` or `"container"`; public, so a client can show how to
+    /// approve pairing before it is paired.
+    deployment: &'static str,
     /// Omitted for anonymous callers.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     paths: Option<VersionPaths>,
@@ -4344,6 +4365,9 @@ pub(super) struct VersionPaths {
     /// Parent of the per-conversation folders of conversations started
     /// without a workspace; usable for discovery before the first one.
     scratch_workspace_root: String,
+    /// Client paths and their backend paths (`TODEX_AGENTD_PATH_MAPPINGS`).
+    #[serde(rename = "pathMappings", skip_serializing_if = "Vec::is_empty")]
+    path_mappings: Vec<crate::config::PathMapping>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4933,6 +4957,83 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn container_deployment_publishes_mappings_and_refuses_image_cli_changes() {
+        let root = std::env::temp_dir().join(format!("todex-v2-container-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut config = Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root.clone()],
+            deployment: crate::config::DeploymentConfig {
+                kind: crate::config::Deployment::Container,
+                advertise_url: Some("http://127.0.0.1:7345".to_owned()),
+                image_cli_dirs: vec![executable.parent().unwrap().to_path_buf()],
+                path_mappings: vec![crate::config::PathMapping {
+                    host_path: r"C:\Users\me\code".to_owned(),
+                    backend_path: workspace_root.join("code").display().to_string(),
+                }],
+            },
+            ..Config::default()
+        };
+        config.agent.codex_bin = executable.display().to_string();
+        let state = AppState::new_for_tests(config).await.unwrap();
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state);
+        let read = |response: axum::response::Response| async move {
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&body).unwrap())
+        };
+
+        let (_, anonymous) = read(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v2/version")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(anonymous["deployment"], "container");
+        assert!(anonymous.get("pathMappings").is_none());
+        assert!(anonymous.get("data_dir").is_none());
+
+        let (_, signed) = read(
+            app.clone()
+                .oneshot(signed_request(&device, "GET", "/v2/version", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(signed["deployment"], "container");
+        assert_eq!(
+            signed["pathMappings"],
+            json!([{
+                "hostPath": r"C:\Users\me\code",
+                "backendPath": workspace_root.join("code").display().to_string(),
+            }])
+        );
+
+        for action in ["upgrade", "install"] {
+            let uri = format!("/v2/providers/codex/{action}");
+            let (status, body) = read(
+                app.clone()
+                    .oneshot(signed_request(&device, "POST", &uri, ""))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{action}: {body}");
+            assert_eq!(body["code"], "CLI_MANAGED_BY_IMAGE", "{action}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn signed_request(device: &TestDevice, method: &str, uri: &str, body: &str) -> Request<Body> {
         let mut builder = Request::builder()
             .method(method)
@@ -5005,6 +5106,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -5250,6 +5352,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -5652,6 +5755,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -5769,6 +5873,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -5931,6 +6036,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -6099,6 +6205,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -6242,6 +6349,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -6384,6 +6492,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -6603,6 +6712,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -6796,6 +6906,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -6815,6 +6926,9 @@ mod tests {
             version_json["workspace_roots"],
             json!([workspace_root.display().to_string()])
         );
+        // No mappings configured: the field is omitted.
+        assert!(version_json.get("pathMappings").is_none());
+        assert_eq!(version_json["deployment"], "host");
         assert_eq!(
             version_json["scratch_workspace_root"],
             root.join("data").join("workspace").display().to_string()
@@ -6923,6 +7037,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -7426,6 +7541,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -7451,8 +7567,15 @@ mod tests {
             version_json["historyEncryption"],
             HISTORY_ENCRYPTION_VERSION
         );
+        // A host daemon says so to anyone.
+        assert_eq!(version_json["deployment"], "host");
         // Paths are only for authenticated callers.
-        for field in ["data_dir", "workspace_root", "workspace_roots"] {
+        for field in [
+            "data_dir",
+            "workspace_root",
+            "workspace_roots",
+            "pathMappings",
+        ] {
             assert!(version_json.get(field).is_none(), "{field} leaked");
         }
 
@@ -8302,6 +8425,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -8523,6 +8647,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -8847,6 +8972,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -8934,6 +9060,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -9084,6 +9211,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         };
 
         // Token-less deployments keep the historical local trust model: the
@@ -9263,6 +9391,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         })
         .await
         .unwrap();
@@ -9691,6 +9820,7 @@ mod tests {
                 enable_tls: false,
             },
             api: Default::default(),
+            deployment: Default::default(),
         }
     }
 

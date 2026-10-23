@@ -887,6 +887,16 @@ fn remove_local_files(directory: &Path, id: &str) {
 pub(crate) fn list_device_pairing_requests(
     data_dir: &Path,
 ) -> Result<Vec<DevicePairingRequestSummary>> {
+    let now = unix_ms();
+    Ok(read_undecided_requests(data_dir)?
+        .into_iter()
+        .filter(|summary| summary.expires_at > now)
+        .collect())
+}
+
+/// Revealed requests without a decision, expired ones included, ordered by
+/// expiry.
+fn read_undecided_requests(data_dir: &Path) -> Result<Vec<DevicePairingRequestSummary>> {
     let directory = data_dir.join(DIRECTORY);
     if !directory.exists() {
         return Ok(vec![]);
@@ -906,7 +916,7 @@ pub(crate) fn list_device_pairing_requests(
             continue;
         }
         if let Some(summary) = read_private_json::<DevicePairingRequestSummary>(&entry.path())? {
-            if summary.request_id == id && summary.expires_at > unix_ms() {
+            if summary.request_id == id {
                 requests.push(summary);
             }
         }
@@ -917,6 +927,77 @@ pub(crate) fn list_device_pairing_requests(
             .then(a.request_id.cmp(&b.request_id))
     });
     Ok(requests)
+}
+
+/// How a `pair approve|reject` argument named its request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PairingTarget {
+    /// The verification code: typing it is the confirmation.
+    Code,
+    /// The request id, which does not show the code being approved.
+    RequestId,
+}
+
+#[derive(Debug)]
+pub(crate) enum PairingLookup {
+    Found(DevicePairingRequestSummary),
+    Expired(DevicePairingRequestSummary),
+    NotFound,
+    /// More than one undecided, unexpired request has this code.
+    Ambiguous(Vec<DevicePairingRequestSummary>),
+}
+
+/// Uppercase, without hyphens or whitespace: `abcde-fghjk` matches `ABCDEFGHJK`.
+fn normalize_code(code: &str) -> String {
+    code.chars()
+        .filter(|ch| *ch != '-' && !ch.is_whitespace())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+/// Finds the undecided request named by `target`: its request id, or its
+/// verification code compared case-insensitively with hyphens optional.
+pub(crate) fn find_device_pairing_request(
+    data_dir: &Path,
+    target: &str,
+) -> Result<(PairingTarget, PairingLookup)> {
+    let target = target.trim();
+    let kind = if validate_id(target).is_ok() {
+        PairingTarget::RequestId
+    } else {
+        PairingTarget::Code
+    };
+    let wanted = normalize_code(target);
+    if kind == PairingTarget::Code && wanted.is_empty() {
+        return Ok((kind, PairingLookup::NotFound));
+    }
+    let now = unix_ms();
+    let (live, expired): (Vec<_>, Vec<_>) = read_undecided_requests(data_dir)?
+        .into_iter()
+        .filter(|summary| match kind {
+            PairingTarget::RequestId => summary.request_id == target,
+            PairingTarget::Code => normalize_code(&summary.verification_code) == wanted,
+        })
+        .partition(|summary| summary.expires_at > now);
+    let lookup = match (live.len(), expired.into_iter().next_back()) {
+        (0, Some(summary)) => PairingLookup::Expired(summary),
+        (0, None) => PairingLookup::NotFound,
+        (1, _) => PairingLookup::Found(live.into_iter().next().expect("one request")),
+        _ => PairingLookup::Ambiguous(live),
+    };
+    Ok((kind, lookup))
+}
+
+/// The owner of the pairing control directory (or, before the daemon made
+/// it, the data directory) when it is not `euid`. Decisions are accepted
+/// only from files that user owns, so another user cannot record them.
+#[cfg(unix)]
+pub(crate) fn control_owner_mismatch(data_dir: &Path, euid: u32) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(data_dir.join(DIRECTORY))
+        .or_else(|_| fs::metadata(data_dir))
+        .ok()?;
+    (metadata.uid() != euid).then_some(metadata.uid())
 }
 
 pub(crate) fn decide_device_pairing(
@@ -1071,6 +1152,28 @@ fn read_private_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option
         return Err(invalid("local pairing control record is too large"));
     }
     Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+/// A revealed request as the daemon records it for the local approver.
+#[cfg(test)]
+pub(crate) fn write_test_request(root: &Path, code: &str, expires_at: u64) -> String {
+    let directory = prepare_directory(root).unwrap();
+    let id = Uuid::new_v4().to_string();
+    write_new_json(
+        &directory,
+        &summary_path(&directory, &id),
+        &DevicePairingRequestSummary {
+            request_id: id.clone(),
+            verification_code: code.to_owned(),
+            device_name: "Synthetic device".to_owned(),
+            device_id: Some("dev_test".to_owned()),
+            expires_at,
+            peer_address: "172.17.0.1".to_owned(),
+            transport_fingerprint: Some("ABCD-EF01-2345-6789".to_owned()),
+        },
+    )
+    .unwrap();
+    id
 }
 
 #[cfg(test)]
@@ -2136,6 +2239,89 @@ mod tests {
         assert_eq!(
             fs::read_to_string(outside).unwrap(),
             "synthetic unrelated file"
+        );
+    }
+
+    #[test]
+    fn pairing_requests_are_found_by_code_or_id_and_report_expiry_and_ambiguity() {
+        let fixture = Fixture::new();
+        let root = &fixture.root;
+        let live = unix_ms() + 60_000;
+        assert!(matches!(
+            find_device_pairing_request(root, "ABCDE-FGHJK").unwrap(),
+            (PairingTarget::Code, PairingLookup::NotFound)
+        ));
+        let id = write_test_request(root, "ABCDE-FGHJK", live);
+        // Case-insensitive, hyphen optional, surrounding space ignored.
+        for target in ["ABCDE-FGHJK", "abcdefghjk", " abcde-fghjk ", "AbCdEfGhJk"] {
+            let (kind, lookup) = find_device_pairing_request(root, target).unwrap();
+            assert_eq!(kind, PairingTarget::Code);
+            assert!(
+                matches!(&lookup, PairingLookup::Found(found) if found.request_id == id),
+                "{target}: {lookup:?}"
+            );
+        }
+        let (kind, lookup) = find_device_pairing_request(root, &id).unwrap();
+        assert_eq!(kind, PairingTarget::RequestId);
+        assert!(matches!(lookup, PairingLookup::Found(found) if found.request_id == id));
+        for target in ["ABCDE-FGHJX", "", "-", &Uuid::new_v4().to_string()] {
+            assert!(
+                matches!(
+                    find_device_pairing_request(root, target).unwrap().1,
+                    PairingLookup::NotFound
+                ),
+                "{target}"
+            );
+        }
+
+        // An expired request is reported as such, not as missing, and is
+        // not listed.
+        let expired = write_test_request(root, "QRSTV-WXYZ0", unix_ms() - 1);
+        assert!(matches!(
+            find_device_pairing_request(root, "qrstvwxyz0").unwrap().1,
+            PairingLookup::Expired(found) if found.request_id == expired
+        ));
+        assert!(matches!(
+            find_device_pairing_request(root, &expired).unwrap().1,
+            PairingLookup::Expired(_)
+        ));
+        assert_eq!(list_device_pairing_requests(root).unwrap().len(), 1);
+
+        // Two live requests with one code: refuse to pick.
+        write_test_request(root, "abcde-fghjk", live);
+        assert!(matches!(
+            find_device_pairing_request(root, "ABCDE-FGHJK").unwrap().1,
+            PairingLookup::Ambiguous(found) if found.len() == 2
+        ));
+        // The id still names exactly one.
+        assert!(matches!(
+            find_device_pairing_request(root, &id).unwrap().1,
+            PairingLookup::Found(_)
+        ));
+
+        // A decided request is no longer offered.
+        decide_device_pairing(root, &id, false).unwrap();
+        assert!(matches!(
+            find_device_pairing_request(root, &id).unwrap().1,
+            PairingLookup::NotFound
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_owner_mismatch_names_the_owner() {
+        let fixture = Fixture::new();
+        let euid = unsafe { libc::geteuid() };
+        assert_eq!(control_owner_mismatch(&fixture.root, euid), None);
+        prepare_directory(&fixture.root).unwrap();
+        assert_eq!(control_owner_mismatch(&fixture.root, euid), None);
+        assert_eq!(
+            control_owner_mismatch(&fixture.root, euid.wrapping_add(1)),
+            Some(euid)
+        );
+        assert_eq!(
+            control_owner_mismatch(&fixture.root.join("missing"), euid.wrapping_add(1)),
+            None
         );
     }
 }
