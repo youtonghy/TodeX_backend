@@ -17,6 +17,8 @@ use crate::provider::{read_current_version, run_install, ManagedCli};
 /// Not found, expired or ambiguous.
 pub const EXIT_NOT_FOUND: i32 = 2;
 /// The caller is not the user owning the daemon's control files.
+// Only Unix checks file ownership.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub const EXIT_WRONG_USER: i32 = 3;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
