@@ -177,22 +177,39 @@ where
     let _ = send_with_deadline(WS_SOCKET_SEND_TIMEOUT, sink.send(crypto_close_frame())).await;
 }
 
-/// Lets the read loop ask the send task to close the socket with 4400.
+/// Close code for a connection whose device was revoked after it connected.
+pub(crate) const WS_DEVICE_REVOKED_CODE: u16 = 4401;
+pub(crate) const WS_DEVICE_REVOKED_REASON: &str = "device revoked";
+
+/// Why the read loop asks the send task to close the socket.
+#[derive(Clone, Copy, Debug)]
+enum CloseReason {
+    /// `4400 transport crypto failure`.
+    CryptoFailure,
+    /// `4401 device revoked`.
+    DeviceRevoked,
+}
+
+/// Lets the read loop ask the send task to close the socket.
 #[derive(Clone)]
-pub(crate) struct CloseHandle(mpsc::Sender<()>);
+pub(crate) struct CloseHandle(mpsc::Sender<CloseReason>);
 
 impl CloseHandle {
     pub(crate) fn crypto_failure(&self) {
         // Capacity 1: a pending request is already enough.
-        let _ = self.0.try_send(());
+        let _ = self.0.try_send(CloseReason::CryptoFailure);
+    }
+
+    pub(crate) fn device_revoked(&self) {
+        let _ = self.0.try_send(CloseReason::DeviceRevoked);
     }
 }
 
 /// Seals queued messages and live-view frames and writes them, plus periodic
 /// pings. Queued messages go first; a pending frame is sent when the queue
 /// is idle or after [`MAX_MESSAGES_BEFORE_FRAME`] messages. Ends when the
-/// queue closes, the peer stops accepting frames, sealing fails or a close
-/// is requested (the last two close with 4400).
+/// queue closes, the peer stops accepting frames, sealing fails (closing
+/// with 4400) or a close is requested (4400 or 4401, see [`CloseHandle`]).
 pub(crate) fn spawn_sender<S>(
     mut sink: S,
     mut sealer: Box<dyn FrameSealer>,
@@ -202,7 +219,7 @@ pub(crate) fn spawn_sender<S>(
 where
     S: futures_util::Sink<Message> + Unpin + Send + 'static,
 {
-    let (close_tx, mut close_rx) = mpsc::channel::<()>(1);
+    let (close_tx, mut close_rx) = mpsc::channel::<CloseReason>(1);
     let task = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -222,11 +239,23 @@ where
                 None => tokio::select! {
                     biased;
                     request = close_rx.recv(), if close_open => {
-                        if request.is_none() {
-                            close_open = false;
-                            continue;
+                        match request {
+                            None => {
+                                close_open = false;
+                                continue;
+                            }
+                            Some(CloseReason::CryptoFailure) => {
+                                close_for_crypto_failure(&mut sink).await;
+                            }
+                            Some(CloseReason::DeviceRevoked) => {
+                                let frame = Message::Close(Some(CloseFrame {
+                                    code: WS_DEVICE_REVOKED_CODE,
+                                    reason: WS_DEVICE_REVOKED_REASON.into(),
+                                }));
+                                let _ = send_with_deadline(WS_SOCKET_SEND_TIMEOUT, sink.send(frame))
+                                    .await;
+                            }
                         }
-                        close_for_crypto_failure(&mut sink).await;
                         break;
                     }
                     message = outgoing.recv() => {

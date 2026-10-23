@@ -224,6 +224,42 @@ async fn expect_crypto_close(socket: &mut ClientSocket) {
     .unwrap();
 }
 
+#[tokio::test]
+async fn revoking_a_device_closes_its_open_websocket_with_4401() {
+    let server = TestServer::start(PairingEncryption::X25519).await;
+    let keys = server.state.pairing_keys.current().unwrap();
+    let protocol = EncryptionProtocol::parse(PairingEncryption::X25519.as_str()).unwrap();
+    let device = TestDevice::new(37);
+    device.enroll(&server.root.join("data"));
+    let offer = ws_offer(&keys, protocol);
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(signed_ws_url(server.address, &device, &offer.query))
+            .await
+            .unwrap();
+    let mut channel = offer
+        .accept_hello(&keys, &device.device_id, &mut socket)
+        .await;
+    ping(&mut socket, &mut channel, "before").await;
+
+    // As the TUI or `devices revoke` does, from outside the daemon.
+    assert!(crate::devices::revoke_device(&server.root.join("data"), &device.device_id).unwrap());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => {
+                    assert_eq!(u16::from(frame.code), 4401);
+                    assert_eq!(frame.reason.as_str(), "device revoked");
+                    return;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected a 4401 close, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the revoked device's websocket closes");
+}
+
 async fn ping(socket: &mut ClientSocket, channel: &mut SecureChannel, id: &str) {
     let ping = json!({"id": id, "type": "server.ping", "payload": {}}).to_string();
     socket

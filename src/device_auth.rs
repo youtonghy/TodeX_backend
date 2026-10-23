@@ -147,6 +147,19 @@ impl DeviceAuthenticator {
         }
     }
 
+    /// Whether `device_id` is still paired: the registry is reloaded when
+    /// another process (the TUI, `devices revoke`) changed it. An unreadable
+    /// registry counts as not paired, as it does for a new request.
+    pub(crate) fn is_registered(&self, device_id: &str) -> bool {
+        match self.registry.get(device_id) {
+            Ok(record) => record.is_some(),
+            Err(error) => {
+                tracing::warn!(error = %error, "device registry is unreadable");
+                false
+            }
+        }
+    }
+
     /// Writes pending device `lastSeenAt` updates (daemon shutdown).
     pub(crate) fn flush_activity(&self) {
         if let Err(error) = self.registry.flush() {

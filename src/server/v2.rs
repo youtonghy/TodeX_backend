@@ -70,6 +70,12 @@ const MAX_WS_LANE_DEPTH: usize = 16;
 /// Commands and subscription backfill wait at most this long for room in the
 /// outgoing queue; a queue that stays full means the send side is stuck.
 const WS_QUEUE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often an open `/v2/ws` connection checks that its device is still
+/// paired; a revoked device's connection closes with 4401.
+#[cfg(not(test))]
+const WS_DEVICE_RECHECK: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const WS_DEVICE_RECHECK: Duration = Duration::from_millis(50);
 /// Teardown lets queued frames drain for this long before aborting the send task.
 const WS_SEND_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const BROWSER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -2948,6 +2954,10 @@ async fn handle_socket(
         queue_timeout: WS_QUEUE_SEND_TIMEOUT,
     };
     let stalled = lane_context.stalled.clone();
+    // Revocation happens in devices.json, usually from another process.
+    let mut device_recheck = tokio::time::interval(WS_DEVICE_RECHECK);
+    device_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    device_recheck.tick().await;
     loop {
         let text = tokio::select! {
             text = ws_socket::next_text(&mut receiver, opener.as_mut(), &close_handle) => text,
@@ -2956,6 +2966,14 @@ async fn handle_socket(
             _ = outgoing_tx.closed() => break,
             // A command off the read loop could not queue its answer.
             _ = stalled.notified() => break,
+            _ = device_recheck.tick(), if authenticated => {
+                if state.device_auth.is_registered(&auth.principal_id) {
+                    continue;
+                }
+                warn!(device_id = %auth.principal_id, "closing the websocket of a revoked device");
+                close_handle.device_revoked();
+                break;
+            }
         };
         let Some(text) = text else { break };
         // Parse once; every dispatcher below takes the parsed value.

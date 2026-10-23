@@ -1421,7 +1421,7 @@ Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`�
 
 TUI 配对二维码只携带后端地址（`{"kind":"todex-pairing-link","version":2,"serverUrl":"http://host:port"}`，不分片），不携带公钥或任何访问凭据——设备身份与传输公钥一律走 `/v2/device-pairing` 配对流程获取。
 
-- transport v2：`ws://.../v2/ws?tv=2&enc=<x25519|ml-kem-768>&client_nonce=<b64url 32B>&client_key=<b64url>`（ML-KEM-768 用 `ciphertext=<b64url>` 代替 `client_key`），再加设备签名参数。会话密钥由 HKDF-SHA256 从共享秘密与 transcript（含签名凭证里的 `device_id`，关闭认证时为空串、双方 nonce）派生，每个方向独立密钥与严格递增计数器，服务端 nonce 每次连接新鲜生成，重放握手不会得到相同密钥。`tv` 不是 `2` 时升级前返回 426 `PROTOCOL_UPGRADE_REQUIRED`；协议与服务端 `pairing_encryption` 不符返回 403；握手材料畸形、帧解密失败、计数器不连续或 hello 之后收到文本帧时以 close code `4400`、reason `transport crypto failure` 关闭，不带细节。
+- transport v2：`ws://.../v2/ws?tv=2&enc=<x25519|ml-kem-768>&client_nonce=<b64url 32B>&client_key=<b64url>`（ML-KEM-768 用 `ciphertext=<b64url>` 代替 `client_key`），再加设备签名参数。会话密钥由 HKDF-SHA256 从共享秘密与 transcript（含签名凭证里的 `device_id`，关闭认证时为空串、双方 nonce）派生，每个方向独立密钥与严格递增计数器，服务端 nonce 每次连接新鲜生成，重放握手不会得到相同密钥。`tv` 不是 `2` 时升级前返回 426 `PROTOCOL_UPGRADE_REQUIRED`；协议与服务端 `pairing_encryption` 不符返回 403；握手材料畸形、帧解密失败、计数器不连续或 hello 之后收到文本帧时以 close code `4400`、reason `transport crypto failure` 关闭，不带细节。开启认证时，已建立的 `/v2/ws`（不论是否 transport v2）每 5 秒复查一次签名设备是否仍在注册表中（TUI 或 `devices revoke` 在其他进程中吊销同样生效），已被吊销时以 close code `4401`、reason `device revoked` 关闭。
 - transport v1（`todex.crypto.v1`，`enc=` 而无 `tv`）已停用：升级前返回 426 `PROTOCOL_UPGRADE_REQUIRED`。不带 `enc` 的明文握手只接受回环对端，且服务端 `pairing_encryption` 必须为 `none`（否则 403）。
 
 兼容端点已移除：`/v1/ws` 与 `/v1/*` HTTP 不再注册，访问返回 404。旧客户端必须升级。
