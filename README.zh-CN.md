@@ -174,6 +174,17 @@ cargo run -- daemon stop
 cargo run -- daemon autostart enable   # status / disable 查询或取消
 ```
 
+#### 无 TUI 的本机管理（容器、无头服务器）
+
+以 daemon 的用户运行（容器内 `docker exec -u todex <容器> todex-agentd …`），均接受 `--data-dir`。退出码与细节见 [docs/BUILD_RUN.md](docs/BUILD_RUN.md)「在容器中运行」。
+
+```bash
+todex-agentd pair list [--format text|json]           # 待批准的配对申请
+todex-agentd pair approve <验证码|requestId> [--yes]   # 拒绝用 pair reject
+todex-agentd devices list [--format text|json]        # 吊销用 devices revoke <deviceId>
+todex-agentd providers install <id>... [--if-missing] # 与 App 相同的安装器
+```
+
 ---
 
 ## 配置说明
@@ -197,6 +208,10 @@ cargo run -- daemon autostart enable   # status / disable 查询或取消
 | **Claude 可执行文件**| — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Claude Code CLI 路径或命令名称。 |
 | **Pi 可执行文件**    | — | `TODEX_AGENTD_PI_BIN` | `pi` | Pi CLI 路径或命令名称。 |
 | **启用认证** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | 是否启用 Fail-closed 设备签名认证。 |
+| **公布地址** | — | `TODEX_AGENTD_ADVERTISE_URL`（`server.advertise_url`） | 不设置 | 客户端应使用的 `http(s)` URL（不得带凭据、query、fragment）；启动日志先打印它，TUI 配对链接/二维码使用它。 |
+| **部署类型** | — | `TODEX_AGENTD_DEPLOYMENT`（`server.deployment`） | `host` | `host` 或 `container`，由 `/v2/version` 返回；`container` 时关闭自更新，`update` 不做改动。 |
+| **镜像 CLI 目录** | — | `TODEX_AGENTD_IMAGE_CLI_DIR`（路径列表；`agent.image_cli_dirs`） | 不设置 | 解析到这些目录下的 CLI 随容器镜像提供（`managedBy: "image"`），TodeX 不安装也不升级。 |
+| **路径映射** | — | `TODEX_AGENTD_PATH_MAPPINGS`（JSON；`[[workspace.path_mappings]]`） | 不设置 | `[{"hostPath","backendPath"}]`，经 `/v2/version` 公布给已配对客户端；`backendPath` 须位于某个工作区根目录内。 |
 | **配对加密方式** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | 配对加密算法（`none`、`x25519`、`ml-kem-768`）。监听非回环地址时不能为 `none`。客户端在设备验证时获取对应公钥。 |
 | **历史加密** | — | `TODEX_AGENTD_HISTORY_ENCRYPTION` | 始终 `e2e` | 已作废：会话历史始终端到端加密（见 [docs/history-encryption.md](docs/history-encryption.md)）。该变量或 `config.toml` 中 `history_encryption` 的任何值都只记一条警告后忽略。写入需要至少一台客户端登记设备密钥；旧版本写下的明文会话仍可读取，但只读。 |
 

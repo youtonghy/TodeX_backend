@@ -11,11 +11,23 @@ TodeX 的唯一授权方式是设备验证：每台客户端设备持有一对�
 3. 按 `a` 批准，或按 `r` 拒绝。设备名称由客户端自报，但已写入 transcript：名称被篡改时验证码不同。核对时以验证码为准。
 4. 批准后设备公钥写入注册表，加密凭据返回 `deviceId` 和后端当前的传输协议与公钥。客户端核对凭据与 `create` 响应一致后，一次性保存设备身份和公钥（`transportVerified`），然后用签名认证并加密连接。
 
+### 没有 TUI 时（容器、无头服务器）
+
+`todex-agentd pair` 读写与 TUI 相同的控制文件，必须以 daemon 的用户运行（容器内用 `docker exec -u todex <容器> todex-agentd …`）：
+
+```sh
+todex-agentd pair list [--format text|json]        # 已 reveal、未决定、未过期的申请
+todex-agentd pair approve <验证码|requestId> [--yes]
+todex-agentd pair reject  <验证码|requestId> [--yes]
+```
+
+`pair list` 列出 `requestId`、`verificationCode`、`deviceName`、`deviceId`、`peerAddress`、`transportFingerprint`、`expiresAt`（Unix 毫秒）。`approve`/`reject` 的参数可以是验证码（不区分大小写，连字符可省略），也可以是 `requestId`。输入客户端上显示的验证码本身就是核对，直接记录决定；用 `requestId` 时命令先显示申请详情并要求确认（`y`），非交互运行须加 `--yes`。命令成功后打印设备名称、验证码和传输公钥指纹。退出码：`0` 成功；`2` 没有匹配的申请、申请已过期或多个申请验证码相同（改用 `requestId`）；`3` 当前用户不是数据目录（控制目录）的属主，提示改用 daemon 的用户。与 TUI 一样，命令只写 `device-pairing/decision-<id>.json`（属主检查、`0600`、硬链接发布、不覆盖已有决定），不提供任何网络入口。TUI 显示的「已登记」「曾被吊销」警告不在命令行中显示，必要时先用 `todex-agentd devices list` 核对。
+
 申请有效期为 5 分钟，可在客户端取消；`create` 后 30 秒内未 `reveal` 的申请直接丢弃。设备名称规则在各端一致：客户端去掉首尾空白、为空时填默认名；后端只校验（1–80 个 Unicode 标量，无控制字符与 bidi 控制字符，首尾不是空白）并原样保存，不再改写。切换后端或修改地址会取消当前申请；过期、拒绝、取消以及已完成的申请不能再次领取结果。同一设备公钥重复配对会更新已有记录而不是新建；被吊销的设备可以重新配对恢复。
 
 ## 设备管理
 
-TUI `d` 面板分两段：上半是待验证申请（`a`/`r`），下半是已注册设备列表（Tab 切换，`x` 吊销所选设备）。`x` 重置菜单中的「设备」项会吊销全部已注册设备。吊销在下一个请求即生效——后端按文件修改时间重载注册表，无需重启 daemon。
+TUI `d` 面板分两段：上半是待验证申请（`a`/`r`），下半是已注册设备列表（Tab 切换，`x` 吊销所选设备）。`x` 重置菜单中的「设备」项会吊销全部已注册设备。没有 TUI 时用 `todex-agentd devices list [--format text|json]` 与 `todex-agentd devices revoke <deviceId>`（以 daemon 的用户运行；设备不存在时退出码为 `2`）。吊销在下一个请求即生效——后端按文件修改时间重载注册表，无需重启 daemon。
 
 ## 请求级签名
 

@@ -97,6 +97,12 @@ dsh --version
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
+| `TODEX_AGENTD_ADVERTISE_URL` | 客户端应使用的地址（`http(s)://主机[:端口]`，不得带凭据、query 或 fragment），启动日志与 TUI 配对链接/二维码优先显示它；容器、端口映射或反向代理之后使用。默认不设置 |
+| `TODEX_AGENTD_DEPLOYMENT` | `host`（默认）或 `container`；`container` 时 `/v2/version` 返回 `deployment: "container"`，自更新关闭，`update` 不做任何改动 |
+| `TODEX_AGENTD_IMAGE_CLI_DIR` | 随镜像提供的 CLI 所在目录，按平台路径分隔符分隔；解析出的 binary（或其符号链接目标）位于其中的 CLI 标记为 `managedBy: "image"`，不能在 TodeX 中安装或升级。默认为空 |
+| `TODEX_AGENTD_PATH_MAPPINGS` | 客户端路径与后端路径的对应关系，JSON 数组 `[{"hostPath":"C:\\Users\\me\\code","backendPath":"/workspace/code"}]`，经 `/v2/version` 的 `pathMappings` 公布给已配对客户端。默认为空 |
+
+以上四个部署变量为空（或只有空白）时视为未设置，compose 文件可以无条件传入。值无效时 daemon 与所有读取配置的命令都以配置错误退出：`ADVERTISE_URL` 不是合法的 http(s) URL；`DEPLOYMENT` 不是 `host`/`container`；`IMAGE_CLI_DIR` 含相对路径；`PATH_MAPPINGS` 不是该格式的 JSON、`hostPath` 为空、`backendPath` 不是绝对路径、含 `..` 或不在任何 workspace 根目录内（按字面判断，目录可以尚不存在），或同一 `hostPath`/`backendPath` 出现两次。
 
 本机临时测试可设置 `TODEX_AGENTD_ENABLE_AUTH=false`；此时后端不要求设备签名。生产环境应保持认证开启。`security.auth_token` 与 `TODEX_AGENTD_AUTH_TOKEN` 已废弃：授权只走设备验证（见 [device-verification.md](device-verification.md)），配置后会被忽略并产生告警。
 
@@ -147,6 +153,16 @@ enable_tls = false
 enabled = false
 host = "127.0.0.1"    # 非回环地址还需 allow_plaintext_remote = true，并在 TLS 反向代理之后使用
 port = 7346
+
+[server]              # 部署信息，均可省略；对应 TODEX_AGENTD_ADVERTISE_URL / TODEX_AGENTD_DEPLOYMENT
+# advertise_url = "http://127.0.0.1:7345"
+# deployment = "container"
+
+# [agent] 中还可写 image_cli_dirs = ["/opt/todex/agents"]（对应 TODEX_AGENTD_IMAGE_CLI_DIR）
+
+# [[workspace.path_mappings]]   # 对应 TODEX_AGENTD_PATH_MAPPINGS
+# host_path = 'C:\Users\me\code'
+# backend_path = "/workspace/code"
 
 [tui]
 language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
@@ -301,6 +317,28 @@ macOS 可使用 launchd 的 `ProgramArguments` 指向同一 `serve` 命令；Win
 - 备份前停止写入或使用文件系统快照，备份后做一次临时目录恢复和事件 replay 校验。
 
 升级前先停止 daemon，复制整个数据目录到带时间戳的备份目录，再升级 binary 并启动。后台迁移是幂等的：旧 `codex_gateway/sessions` 只读复制到 `conversations/`，不会删除或覆盖源文件。迁移只在首次运行时导入全部旧会话，之后只同步映射中已有的会话（见上文 `cutoverAt`）。升级失败时停止新 binary，恢复备份目录和旧 binary；不要手工编辑 `events.jsonl` 或 `provider-state.json`。
+
+### 在容器中运行
+
+容器镜像（[TodeX_container](https://github.com/youtonghy/TodeX_container)）用 `serve` 作为主进程，以非 root 用户运行，镜像本身就是更新单位。后端为此提供的设置与命令：
+
+- `TODEX_AGENTD_DEPLOYMENT=container`：`/v2/version` 对未签名请求也返回 `deployment: "container"`，客户端据此在配对时提示用命令行批准；无论 `TODEX_AUTO_UPDATE` 如何都不做自动更新；`todex-agentd update` 不做任何改动并以 0 退出（`update --check` 照常可用）。
+- `TODEX_AGENTD_HOST=0.0.0.0` 时日志里的网卡地址是容器内地址。用 `TODEX_AGENTD_ADVERTISE_URL`（例如 `http://127.0.0.1:7345`）给出宿主机上发布的地址，启动日志先打印它（`advertised client connect address`），再打印各网卡地址。非回环监听仍要求设备认证和非 `none` 的传输加密。
+- `TODEX_AGENTD_IMAGE_CLI_DIR`：镜像预装 CLI 的目录。这些 CLI 在 `/v2/providers/versions` 中带 `managedBy: "image"`，安装与升级接口返回 `409 CLI_MANAGED_BY_IMAGE`；用户另装到 `~/.local/bin` 且在 `PATH` 中排在前面的同名 CLI 不受影响。
+- 工作目录按原路径挂载时不需要映射；挂载到其他路径（例如 Windows 宿主机挂到 `/workspace/<名字>`）时，用 `TODEX_AGENTD_PATH_MAPPINGS` 告诉客户端宿主机路径与容器路径的对应关系。后端只公布映射，不改写路径。
+
+没有 TUI 时，用以下命令完成本机管理。它们读写与 TUI 相同的控制文件，必须以 daemon 的用户运行（容器内 `docker exec -u todex <容器> todex-agentd …`），不开放任何网络入口；都接受 `--data-dir`，按与 daemon 相同的方式读取配置：
+
+```bash
+todex-agentd pair list [--format text|json]          # 待批准的配对申请
+todex-agentd pair approve <验证码|requestId> [--yes]  # 批准；验证码不区分大小写，连字符可省略
+todex-agentd pair reject <验证码|requestId> [--yes]   # 拒绝
+todex-agentd devices list [--format text|json]       # 已配对设备
+todex-agentd devices revoke <deviceId>               # 吊销设备，无需重启 daemon
+todex-agentd providers install <id>... [--if-missing] # 用与 App 相同的安装器安装 Agent CLI
+```
+
+`pair approve|reject` 的退出码：`0` 成功；`2` 没有匹配的申请、已过期或验证码匹配到多个申请；`3` 当前用户不是数据目录属主。参数是 `requestId` 时需要交互确认或 `--yes`（细节见 [device-verification.md](device-verification.md)）。`devices revoke` 找不到设备时退出码为 `2`。`providers install` 接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode`、`antigravity`、`deepseek-harness`（空格或逗号分隔），依次同步执行与 `POST /v2/providers/{p}/install` 相同的安装器并打印结果；镜像管理的 CLI 直接跳过；`--if-missing` 跳过已安装的 CLI，不加时已安装算失败；任一安装失败则以非 0 退出。它在 daemon 之外运行，不占用 daemon 的 CLI 锁，也不写 daemon 的审计日志，适合在启动 daemon 之前执行（例如容器入口脚本）。
 
 ### 默认运行
 
@@ -526,6 +564,11 @@ installation refuses when the configured managed daemon is running. Use `daemon
 restart` to deliberately stop and update that daemon. Installations must reside in
 a directory writable by the current user; the updater never elevates privileges.
 In PowerShell, disable automatic startup updates with `$env:TODEX_AUTO_UPDATE="0"`.
+
+With `TODEX_AGENTD_DEPLOYMENT=container` (or `server.deployment = "container"`), the
+container image is the update unit: automatic updates stay off regardless of
+`TODEX_AUTO_UPDATE`, and `todex-agentd update` prints that the binary is managed by the
+image, changes nothing, and exits 0. `update --check` still reports the latest release.
 
 The updater checks the exact release tag, platform asset name, HTTPS GitHub URL,
 size limits, and `SHA256SUMS`, then runs the downloaded executable's `--version`

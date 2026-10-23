@@ -181,6 +181,17 @@ cargo run -- daemon stop
 cargo run -- daemon autostart enable   # status / disable to query or remove
 ```
 
+#### Headless administration (containers, servers without the TUI)
+
+Run these as the daemon's user (in a container: `docker exec -u todex <container> todex-agentd ...`); each accepts `--data-dir`. See [docs/BUILD_RUN.md](docs/BUILD_RUN.md) ("在容器中运行") for exit codes and details.
+
+```bash
+todex-agentd pair list [--format text|json]           # pairing requests waiting for a decision
+todex-agentd pair approve <CODE|REQUEST_ID> [--yes]   # also: pair reject
+todex-agentd devices list [--format text|json]        # also: devices revoke <deviceId>
+todex-agentd providers install <id>... [--if-missing] # same installers as the app
+```
+
 ---
 
 ## Configuration
@@ -204,6 +215,10 @@ Configuration values are resolved using the following precedence:
 | **Claude Binary** | — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Path or executable name for Claude Code CLI. |
 | **Pi Binary** | — | `TODEX_AGENTD_PI_BIN` | `pi` | Path or executable name for Pi CLI. |
 | **Enable Auth** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | Enables fail-closed device-signature authentication. |
+| **Advertise URL** | — | `TODEX_AGENTD_ADVERTISE_URL` (`server.advertise_url`) | unset | `http(s)` URL clients should use (no credentials, query, or fragment); shown first in the startup log and used by the TUI pairing link/QR. |
+| **Deployment** | — | `TODEX_AGENTD_DEPLOYMENT` (`server.deployment`) | `host` | `host` or `container`. Reported by `/v2/version`; `container` turns self-update off and makes `update` a no-op. |
+| **Image CLI Dirs** | — | `TODEX_AGENTD_IMAGE_CLI_DIR` (path-list; `agent.image_cli_dirs`) | unset | CLIs resolving under these directories ship with the container image (`managedBy: "image"`) and are not installed or upgraded by TodeX. |
+| **Path Mappings** | — | `TODEX_AGENTD_PATH_MAPPINGS` (JSON; `[[workspace.path_mappings]]`) | unset | `[{"hostPath","backendPath"}]` published to paired clients by `/v2/version`; each `backendPath` must lie inside a workspace root. |
 | **Pairing Encryption** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | Required WebSocket encryption (`x25519` or `ml-kem-768`); `none` permits plaintext from loopback clients and is refused on a non-loopback listener (remote clients must use encrypted transport v2). Clients receive the matching public key during device verification. |
 | **History Encryption** | — | `TODEX_AGENTD_HISTORY_ENCRYPTION` | always `e2e` | Retired: conversation history is always end-to-end encrypted (see [docs/history-encryption.md](docs/history-encryption.md)). Any value of this variable or of `history_encryption` in `config.toml` is ignored with a warning. Writes need at least one client device key; conversations written in plaintext by older versions stay readable but are read-only. |
 
