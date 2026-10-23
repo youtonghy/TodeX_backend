@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
@@ -35,6 +36,29 @@ pub struct ManagedServer {
     history_watch_task: Option<JoinHandle<()>>,
     /// The external API listener (`[api]`), when enabled.
     api: Option<ApiListener>,
+    /// Held until the server is dropped: see [`lock_data_dir`].
+    _data_dir_lock: std::fs::File,
+}
+
+/// `<data_dir>/daemon.lock`, locked for a server's lifetime.
+const DATA_DIR_LOCK_FILE: &str = "daemon.lock";
+
+/// Claims the data directory for this server. Two servers on one directory
+/// would both recover "interrupted" turns and append to the same journals,
+/// so a second one fails to start instead. The OS releases the lock when the
+/// process exits, however it exits.
+fn lock_data_dir(data_dir: &Path) -> Result<std::fs::File> {
+    let path = data_dir.join(DATA_DIR_LOCK_FILE);
+    crate::secure_fs::lock_exclusive(&path, std::time::Duration::ZERO).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            anyhow::anyhow!(
+                "another TodeX server is already using the data directory {}",
+                data_dir.display()
+            )
+        } else {
+            anyhow::Error::new(error).context(format!("failed to lock {}", path.display()))
+        }
+    })
 }
 
 struct ApiListener {
@@ -96,6 +120,9 @@ impl ManagedServer {
         } else {
             None
         };
+        // After the binds, so a port conflict still reports itself; before
+        // anything reads or recovers the data directory.
+        let data_dir_lock = lock_data_dir(&config.data_dir)?;
         // After the bind, so a second server on the same data directory that
         // cannot listen never kills the running one's providers; before
         // AppState::new, so conversation recovery sees no live orphans.
@@ -234,6 +261,7 @@ impl ManagedServer {
             legacy_scan_task,
             history_watch_task,
             api,
+            _data_dir_lock: data_dir_lock,
         })
     }
 
@@ -412,6 +440,33 @@ mod tests {
             assert!(plaintext_listener_needs_warning(false, host), "{host}");
             assert!(!plaintext_listener_needs_warning(true, host), "{host}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_second_server_cannot_share_the_data_directory() {
+        let root = env::temp_dir().join(format!("todex-server-lock-{}", uuid::Uuid::new_v4()));
+        let config = Config {
+            port: 0,
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..Config::default()
+        };
+        let first = ManagedServer::start(config.clone(), ProviderProcessTracking::Disabled)
+            .await
+            .unwrap();
+        let error = ManagedServer::start(config.clone(), ProviderProcessTracking::Disabled)
+            .await
+            .err()
+            .expect("a second server on the same data directory must not start");
+        assert!(error.to_string().contains("already using the data directory"), "{error}");
+        first.stop().await.unwrap();
+
+        // Stopping releases the directory for the next server.
+        let next = ManagedServer::start(config, ProviderProcessTracking::Disabled)
+            .await
+            .unwrap();
+        next.stop().await.unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

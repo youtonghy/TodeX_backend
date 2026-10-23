@@ -186,6 +186,8 @@ Antigravity 通过 `agy` 的 stream-json print 模式接入，每个 turn 一个
 
 ## Conversation 数据目录
 
+一个数据目录同一时间只能由一个 server（`serve`、`daemon-run`）使用：server 启动时对 `$TODEX_AGENTD_DATA_DIR/daemon.lock` 加排他锁并持有到退出，第二个 server 以 `another TodeX server is already using the data directory …` 启动失败。TUI 与无界面管理命令不占用这把锁。
+
 每个 v2 对话使用服务端生成的 UUID v4 目录：
 
 ```text
