@@ -149,6 +149,9 @@ mod tests {
         }
     }
 
+    // POSIX paths: on Windows `/tmp/...` has no drive and is not absolute,
+    // and `\` paths are refused, so no file rule is built there.
+    #[cfg(unix)]
     #[test]
     fn file_rules_name_one_absolute_path() {
         let cwd = Path::new("/work/repo");
