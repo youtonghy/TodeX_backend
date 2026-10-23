@@ -1046,7 +1046,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn wire_full_access_prefers_allow_always_option() {
+    async fn wire_full_access_answers_with_allow_once() {
         let fixture = Fixture::new().await;
         let (_cancel, task) = fixture
             .start_with(
@@ -1074,7 +1074,9 @@ mod tests {
             .expect("permission response recorded");
         assert_eq!(
             response["result"]["outcome"]["optionId"].as_str(),
-            Some("always")
+            // Not `always`: OpenCode would keep that grant for later turns
+            // of the resident session, including `ask` ones.
+            Some("once")
         );
         fixture.finish().await;
     }

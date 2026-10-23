@@ -762,9 +762,11 @@ pub(super) enum AutoApprove {
     /// Forward every request to the user through the permission broker.
     #[default]
     Mediate,
-    /// Answer immediately with the best `allow_once` option (product mode `auto`).
+    /// Answer immediately with an `allow_once` option (product mode `auto`);
+    /// a request without one goes to the user.
     Once,
-    /// Answer immediately with the best `allow_always` option (product mode `full-access`).
+    /// Answer immediately (product mode `full-access`): `allow_once` when
+    /// offered, otherwise `allow_always`.
     Always,
 }
 
@@ -3395,35 +3397,29 @@ async fn apply_legacy_model_config(
     Ok(())
 }
 
-/// Pick the option a client-side auto-approval should select. `Once` prefers
-/// `allow_once`; `Always` prefers `allow_always` so the agent stops asking for
-/// the same tool. Any other allow-style kind is a fallback; reject-only
-/// requests return `None` and fall back to user mediation.
+/// Pick the option a client-side auto-approval should select. Neither mode
+/// prefers `allow_always`: the agent would remember it for the rest of its
+/// resident session, so a later `ask` turn would never be asked. `auto`
+/// selects `allow_once` only; `full-access` falls back to `allow_always` when
+/// that is all the request offers. Requests without such an option return
+/// `None` and fall back to user mediation.
 fn auto_select_permission_option(
     request: &RequestPermissionRequest,
     auto_approve: AutoApprove,
 ) -> Option<PermissionOption> {
-    let preferred = if auto_approve == AutoApprove::Always {
-        PermissionOptionKind::AllowAlways
-    } else {
-        PermissionOptionKind::AllowOnce
+    let find = |kind: PermissionOptionKind| {
+        request
+            .options
+            .iter()
+            .find(|option| option.kind == kind)
+            .cloned()
     };
-    let fallback = if preferred == PermissionOptionKind::AllowAlways {
-        PermissionOptionKind::AllowOnce
-    } else {
-        PermissionOptionKind::AllowAlways
-    };
-    request
-        .options
-        .iter()
-        .find(|option| option.kind == preferred)
-        .or_else(|| {
-            request
-                .options
-                .iter()
-                .find(|option| option.kind == fallback)
-        })
-        .cloned()
+    match auto_approve {
+        AutoApprove::Mediate => None,
+        AutoApprove::Once => find(PermissionOptionKind::AllowOnce),
+        AutoApprove::Always => find(PermissionOptionKind::AllowOnce)
+            .or_else(|| find(PermissionOptionKind::AllowAlways)),
+    }
 }
 
 /// Mirror the broker's `permission.requested`/`permission.resolved` pair so an
@@ -3728,6 +3724,34 @@ mod tests {
             option_id: None,
             data: None,
         }
+    }
+
+    #[test]
+    fn auto_approval_never_prefers_a_remembered_grant() {
+        let both = request(json!([
+            { "optionId": "always", "name": "Always", "kind": "allow_always" },
+            { "optionId": "once", "name": "Once", "kind": "allow_once" },
+            { "optionId": "reject", "name": "Reject", "kind": "reject_once" }
+        ]));
+        let always_only = request(json!([
+            { "optionId": "always", "name": "Always", "kind": "allow_always" },
+            { "optionId": "reject", "name": "Reject", "kind": "reject_once" }
+        ]));
+        let selected = |request: &RequestPermissionRequest, mode| {
+            auto_select_permission_option(request, mode).map(|option| option.option_id.to_string())
+        };
+        assert_eq!(selected(&both, AutoApprove::Once).as_deref(), Some("once"));
+        assert_eq!(
+            selected(&both, AutoApprove::Always).as_deref(),
+            Some("once")
+        );
+        // `auto` leaves a grant the agent would remember to the user.
+        assert_eq!(selected(&always_only, AutoApprove::Once), None);
+        assert_eq!(
+            selected(&always_only, AutoApprove::Always).as_deref(),
+            Some("always")
+        );
+        assert_eq!(selected(&both, AutoApprove::Mediate), None);
     }
 
     #[test]
