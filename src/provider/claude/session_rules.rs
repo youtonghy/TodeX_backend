@@ -76,10 +76,15 @@ fn rule(tool: &str, content: Option<String>) -> Value {
 /// A single command without operators, redirections, substitutions or
 /// expansions. Checked on the raw text, quoted characters included, so
 /// some harmless commands are refused rather than any compound one let in.
+/// `*` is refused too: in a `Bash(...)` rule it is a wildcard (and a
+/// trailing `:*` a prefix match), so the rule would allow other commands.
 fn simple_command(command: &str) -> bool {
-    !command
-        .chars()
-        .any(|c| matches!(c, ';' | '&' | '|' | '<' | '>' | '`' | '$' | '\n' | '\r'))
+    !command.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '&' | '|' | '<' | '>' | '`' | '$' | '*' | '\n' | '\r'
+        )
+    })
 }
 
 /// `//abs/path` for a file, relative paths resolved against Claude's
@@ -138,6 +143,9 @@ mod tests {
             "echo `id`",
             "echo $HOME",
             "sleep 5 &",
+            "rm -f build/*.log",
+            "ls *",
+            "git status:*",
             "a\nb",
             "   ",
         ] {
