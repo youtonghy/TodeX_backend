@@ -1200,8 +1200,9 @@ impl SshService {
         self.inner.store.read().await.agent_output_filter.clone()
     }
 
-    /// Applies from the next `ssh_exec` result on.
-    #[cfg(test)]
+    /// Applies from the next `ssh_exec` result on. Only the Unix agent MCP
+    /// tests call it.
+    #[cfg(all(test, unix))]
     pub async fn set_agent_output_filter(
         &self,
         filter: AgentOutputFilter,
