@@ -44,6 +44,7 @@ TodeX lives in sibling checkouts under the same parent directory:
 
 - `../TodeX_desktop` — Electron desktop client (React + HeroUI, `src/renderer/`)
 - `../TodeX_web` — Web client (React + HeroUI, `src/renderer/`)
+- `../TodeX_container` — Docker image that bundles `todex-agentd` with agent CLIs; it depends on the container-facing CLI commands, environment variables and `/v2/version` fields (`docs/PLAN.md` there), so keep them aligned
 
 When a task requires it — aligning the API contract in `docs/API.md` with client usage, tracing a request or payload end to end, or a change that explicitly spans repos — read and edit those sibling repositories directly at their paths, even though they sit outside this repository. Follow each repo's own `AGENTS.md` while working inside it. Commit and push in each repository separately per its Git delivery rules; never mix another repo's changes into this repository's commits.
 
