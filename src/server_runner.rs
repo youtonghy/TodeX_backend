@@ -40,6 +40,32 @@ pub struct ManagedServer {
     _data_dir_lock: std::fs::File,
 }
 
+/// How long a stopping listener waits for its open requests. API event
+/// streams (and slow clients) never end on their own, and the shutdown steps
+/// after the wait must still run before `daemon stop` kills the process.
+const LISTENER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Waits for a listener task after its graceful shutdown was signalled, at
+/// most [`LISTENER_DRAIN_TIMEOUT`]; then aborts it, closing what is left
+/// open, and returns `None`.
+async fn drain_listener(
+    mut handle: JoinHandle<Result<()>>,
+    name: &str,
+) -> Option<std::result::Result<Result<()>, tokio::task::JoinError>> {
+    match tokio::time::timeout(LISTENER_DRAIN_TIMEOUT, &mut handle).await {
+        Ok(joined) => Some(joined),
+        Err(_) => {
+            tracing::warn!(
+                listener = name,
+                timeout_ms = LISTENER_DRAIN_TIMEOUT.as_millis() as u64,
+                "listener still had open requests at shutdown; closing them"
+            );
+            handle.abort();
+            None
+        }
+    }
+}
+
 /// `<data_dir>/daemon.lock`, locked for a server's lifetime.
 const DATA_DIR_LOCK_FILE: &str = "daemon.lock";
 
@@ -70,15 +96,19 @@ struct ApiListener {
 }
 
 impl ApiListener {
-    async fn stop(mut self) {
+    /// Stops accepting requests; [`Self::finish`] waits for open ones.
+    fn begin_stop(&mut self) {
         self.revocation_task.abort();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        match self.handle.await {
-            Ok(Err(error)) => tracing::warn!(error = %error, "API listener failed"),
-            Err(error) => tracing::warn!(error = %error, "API listener task failed"),
-            Ok(Ok(())) => {}
+    }
+
+    async fn finish(self) {
+        match drain_listener(self.handle, "API").await {
+            Some(Ok(Err(error))) => tracing::warn!(error = %error, "API listener failed"),
+            Some(Err(error)) => tracing::warn!(error = %error, "API listener task failed"),
+            Some(Ok(Ok(()))) | None => {}
         }
     }
 }
@@ -337,17 +367,25 @@ impl ManagedServer {
         if let Some(task) = self.kanban_schedule_task.take() {
             task.abort();
         }
-        if let Some(api) = self.api.take() {
-            api.stop().await;
+        // No new API requests (or turns) while conversations shut down.
+        let mut api = self.api.take();
+        if let Some(api) = api.as_mut() {
+            api.begin_stop();
         }
         self.state.conversations.shutdown_all().await;
+        if let Some(api) = api {
+            api.finish().await;
+        }
         self.state.codex_local_adapters.shutdown_all().await;
         // Port forwards and IP pool masters never outlive the daemon.
         self.state.ssh.shutdown().await;
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        let result = self.handle.await.context("server task join failed");
+        let result = match drain_listener(self.handle, "main").await {
+            Some(joined) => joined.context("server task join failed"),
+            None => Ok(Ok(())),
+        };
         self.state.device_auth.flush_activity();
         self.state.terminal_audit_log.flush();
         result?
@@ -370,8 +408,9 @@ impl ManagedServer {
         if let Some(task) = self.kanban_schedule_task.take() {
             task.abort();
         }
-        if let Some(api) = self.api.take() {
-            api.stop().await;
+        if let Some(mut api) = self.api.take() {
+            api.begin_stop();
+            api.finish().await;
         }
         if let Some(task) = self.migration_task.take() {
             task.abort();
@@ -421,8 +460,12 @@ fn plaintext_listener_needs_warning(enable_tls: bool, host: &str) -> bool {
 mod tests {
     use std::{env, fs};
 
-    use super::{plaintext_listener_needs_warning, ManagedServer, ProviderProcessTracking};
+    use super::{
+        drain_listener, plaintext_listener_needs_warning, ManagedServer, ProviderProcessTracking,
+        LISTENER_DRAIN_TIMEOUT,
+    };
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
+    use anyhow::Result;
 
     #[test]
     fn plaintext_warning_skips_loopback_hosts_including_localhost() {
@@ -443,6 +486,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listener_drain_stops_waiting_for_requests_that_never_end() {
+        // An API event stream keeps its connection, and so the graceful
+        // shutdown, open forever.
+        let stuck = tokio::spawn(std::future::pending::<Result<()>>());
+        let aborted = stuck.abort_handle();
+        let started = std::time::Instant::now();
+        assert!(drain_listener(stuck, "test").await.is_none());
+        assert!(started.elapsed() < LISTENER_DRAIN_TIMEOUT * 3);
+        tokio::task::yield_now().await;
+        assert!(aborted.is_finished());
+
+        let finished = tokio::spawn(async { Ok(()) });
+        assert!(matches!(
+            drain_listener(finished, "test").await,
+            Some(Ok(Ok(())))
+        ));
+    }
+
+    #[tokio::test]
     async fn a_second_server_cannot_share_the_data_directory() {
         let root = env::temp_dir().join(format!("todex-server-lock-{}", uuid::Uuid::new_v4()));
         let config = Config {
@@ -458,7 +520,12 @@ mod tests {
             .await
             .err()
             .expect("a second server on the same data directory must not start");
-        assert!(error.to_string().contains("already using the data directory"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("already using the data directory"),
+            "{error}"
+        );
         first.stop().await.unwrap();
 
         // Stopping releases the directory for the next server.
