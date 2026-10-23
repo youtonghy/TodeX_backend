@@ -1138,3 +1138,55 @@ fn cli_failures_are_reduced_to_their_error_line() {
         ["rm", "--force", "id3"]
     );
 }
+
+/// The provider state file of `conversation_id`, wherever the store keeps
+/// its conversation folders.
+fn provider_state_file(root: &Path, conversation_id: &str) -> PathBuf {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap().flatten() {
+            let path = entry.path();
+            if !entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            if entry.file_name().to_str() == Some(conversation_id) {
+                return path.join("provider-state.json");
+            }
+            pending.push(path);
+        }
+    }
+    panic!("no folder for conversation {conversation_id}");
+}
+
+#[tokio::test]
+async fn cleanup_keeps_sessions_while_a_reference_is_unreadable() {
+    let fixture = fixture().await;
+    let native = &fixture.state.native_history;
+    let plain = new_id();
+    let resumed = new_id();
+    let plain_path = claude_session(&fixture, "-work-a", &plain, "p");
+    let resumed_path = claude_session(&fixture, "-work-a", &resumed, "r");
+    let conversation = reference(&fixture, ProviderKind::ClaudeCode, &resumed).await;
+    // A damaged provider state hides which native session it resumes.
+    fs::write(
+        provider_state_file(&fixture.root.join("data"), &conversation),
+        b"{not json",
+    )
+    .unwrap();
+
+    let report = native
+        .cleanup(
+            &fixture.state.conversations,
+            NativeProvider::ClaudeCode,
+            &[plain.clone(), resumed.clone()],
+        )
+        .await
+        .unwrap();
+    assert!(report.deleted.is_empty(), "{:?}", report.deleted);
+    assert!(report
+        .skipped
+        .iter()
+        .all(|skip| skip.code == "CONFLICT" && skip.message.contains("could not be read")));
+    assert!(plain_path.exists());
+    assert!(resumed_path.exists());
+}

@@ -118,6 +118,15 @@ pub(crate) fn plan_policy_deletions(
     plan
 }
 
+/// The native sessions TodeX conversations resume. `complete` is false when
+/// a conversation's manifest or provider state could not be read: its
+/// reference is unknown, so no session of that provider may be deleted.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NativeSessionRefs {
+    pub refs: Vec<NativeSessionRef>,
+    pub complete: bool,
+}
+
 /// A TodeX conversation that resumes a provider's native session.
 #[derive(Clone, Debug)]
 pub(crate) struct NativeSessionRef {
@@ -143,21 +152,31 @@ impl ConversationSupervisor {
     pub(crate) async fn native_session_refs(
         &self,
         provider: ProviderKind,
-    ) -> Result<Vec<NativeSessionRef>, AppError> {
+    ) -> Result<NativeSessionRefs, AppError> {
         let active: HashSet<String> = self
             .active
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
+        let (manifests, unreadable) = self.store.list_counting_unreadable().await?;
+        // An unreadable manifest may belong to this provider and hide its
+        // native session id.
+        let mut complete = unreadable == 0;
         let mut refs = Vec::new();
-        for manifest in self.store.list().await? {
+        for manifest in manifests {
             if manifest.provider != provider {
                 continue;
             }
             let native_session_id = match self.store.provider_state(&manifest.id).await {
                 Ok(state) => state.native_session_id,
+                // No provider state yet: a first turn uses the conversation id.
+                Err(AppError::NotFound(_)) => None,
                 Err(error) => {
-                    tracing::debug!(
+                    // The recorded native id may differ from the conversation
+                    // id (Codex, Grok, Devin), so the fallback below would not
+                    // protect the session this conversation resumes.
+                    complete = false;
+                    tracing::warn!(
                         conversation_id = %manifest.id,
                         error = %error,
                         "could not read provider state for native history references"
@@ -173,7 +192,7 @@ impl ConversationSupervisor {
                 native_session_id,
             });
         }
-        Ok(refs)
+        Ok(NativeSessionRefs { refs, complete })
     }
 
     /// Disk usage of a conversation, `0` (with a warning) when it cannot be

@@ -348,6 +348,9 @@ struct SessionView<'a> {
 /// What keeps sessions from being deleted.
 struct Protection {
     refs: HashMap<String, Vec<NativeSessionRef>>,
+    /// Every conversation's reference was read; otherwise nothing is
+    /// deleted.
+    complete: bool,
     running_native: HashSet<String>,
     now: SystemTime,
 }
@@ -368,7 +371,13 @@ impl Protection {
     }
 
     fn skip(&self, session: &NativeSession) -> Option<AppError> {
-        if self.referenced(&session.id) {
+        if !self.complete {
+            Some(AppError::Conflict(
+                "some TodeX conversations could not be read, so it is unknown \
+                 whether one uses this session"
+                    .to_owned(),
+            ))
+        } else if self.referenced(&session.id) {
             Some(AppError::Conflict(
                 "a TodeX conversation uses this session".to_owned(),
             ))
@@ -476,7 +485,8 @@ impl NativeHistory {
         provider: NativeProvider,
     ) -> Result<Protection, AppError> {
         let mut refs: HashMap<String, Vec<NativeSessionRef>> = HashMap::new();
-        for reference in conversations.native_session_refs(provider.kind()).await? {
+        let collected = conversations.native_session_refs(provider.kind()).await?;
+        for reference in collected.refs {
             refs.entry(reference.native_session_id.clone())
                 .or_default()
                 .push(reference);
@@ -492,6 +502,7 @@ impl NativeHistory {
         };
         Ok(Protection {
             refs,
+            complete: collected.complete,
             running_native,
             now: SystemTime::now(),
         })

@@ -379,7 +379,7 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 }
 ```
 
-- 被任意 tenant 的 TodeX 会话引用 → `CONFLICT`（`a TodeX conversation uses this session`）；正在运行（同上 `running` 判定）→ `CONFLICT`（`session is running`）；扫描中找不到 → `NOT_FOUND`。删除 Pi 会话会让引用它的 TodeX 会话永久无法继续，因此引用保护不可绕过。
+- 被任意 tenant 的 TodeX 会话引用 → `CONFLICT`（`a TodeX conversation uses this session`）；正在运行（同上 `running` 判定）→ `CONFLICT`（`session is running`）；扫描中找不到 → `NOT_FOUND`。只要该 Provider 有任一 TodeX 会话的 manifest 或 provider state 读取失败（不存在除外），无法确定它引用哪个原生会话，该 Provider 的所有会话都以 `CONFLICT`（`… could not be read …`）跳过，策略运行同样不删除。删除 Pi 会话会让引用它的 TodeX 会话永久无法继续，因此引用保护不可绕过。
 - Codex / Grok / Devin 通过 CLI 删除（见上文，单个删除 60 秒超时）：CLI 未安装 → `UNSUPPORTED`（不会退回到直接删除文件）；非零退出时取 stderr（其次 stdout）最后一行 `Error: …`（否则最后一个非空行），脱敏并截断到 300 字符作为 `message`：含 `no session found` / `not found` → `NOT_FOUND`，含 `already open` / `another process`（Devin 拒绝删除被打开的会话）→ `CONFLICT`，其他 → `PROVIDER_UNAVAILABLE`。`grok sessions delete` 找不到会话时也以 0 退出并输出 `No session found…`，按 `NOT_FOUND` 处理。`freedBytes` 计入会话的 `bytes`（Devin 为 0）。
 - 安全规则（Claude/Pi）：id 先校验再通过一次全新的会话扫描解析为路径；每个待删路径都按其规范化（canonicalize）后的父目录校验必须位于 Provider 根目录内（Claude 会话文件为 `<claude_dir>/projects`，附属数据为 `<claude_dir>`；Pi 为会话目录）；符号链接从不跟随也不删除（扫描用 `symlink_metadata`，符号链接本身被拒绝）。先删会话文件，再尽力删除附属数据（失败只记警告）。每次删除写一条 `native history session deleted` 的 info 日志（provider、session_id、freed_bytes、trigger）。删除与策略运行、设置修改互斥串行。
 

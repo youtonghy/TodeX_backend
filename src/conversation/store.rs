@@ -1103,8 +1103,17 @@ impl ConversationStore {
     /// manifests missing from the cache are read from disk, so a list costs
     /// one `read_dir` instead of parsing every manifest.
     pub async fn list(&self) -> Result<Vec<ConversationManifest>, AppError> {
+        Ok(self.list_counting_unreadable().await?.0)
+    }
+
+    /// [`Self::list`] and how many conversation directories it skipped
+    /// because their manifest could not be read.
+    pub async fn list_counting_unreadable(
+        &self,
+    ) -> Result<(Vec<ConversationManifest>, usize), AppError> {
         let mut directory = tokio::fs::read_dir(&self.root).await?;
         let mut manifests = Vec::new();
+        let mut unreadable = 0;
         while let Some(entry) = directory.next_entry().await? {
             if !entry.file_type().await?.is_dir() {
                 continue;
@@ -1116,12 +1125,13 @@ impl ConversationStore {
             match self.get(&id).await {
                 Ok(manifest) => manifests.push(manifest),
                 Err(error) => {
+                    unreadable += 1;
                     tracing::warn!(conversation_id = %id, error = %error, "skipping unreadable conversation")
                 }
             }
         }
         manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.updated_at));
-        Ok(manifests)
+        Ok((manifests, unreadable))
     }
 
     pub async fn update_metadata(
