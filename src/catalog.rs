@@ -614,10 +614,15 @@ impl CatalogService {
             )));
         }
         let descriptor = self
-            .mcp_descriptor(provider, workspace, resource_id)
+            .mcp_descriptor(provider, workspace.clone(), resource_id)
             .await?;
         let origin = descriptor.origin.clone();
-        let removed = tokio::task::spawn_blocking(move || remove_mcp_entry(&origin)).await;
+        let confine = (descriptor.scope == CatalogScope::Project).then(|| workspace.clone());
+        let removed = tokio::task::spawn_blocking(move || {
+            confine_project_file(&origin.path, confine.as_deref())?;
+            remove_mcp_entry(&origin)
+        })
+        .await;
         self.cache.invalidate();
         removed.map_err(|error| AppError::Anyhow(error.into()))??;
         Ok(McpServerDeletion {
@@ -650,8 +655,12 @@ impl CatalogService {
             })?;
         let path = source.path.clone();
         let entry_name = name.clone();
-        let inserted =
-            tokio::task::spawn_blocking(move || insert_mcp_entry(&path, &entry_name, config)).await;
+        let confine = (source.scope == CatalogScope::Project).then(|| workspace.clone());
+        let inserted = tokio::task::spawn_blocking(move || {
+            confine_project_file(&path, confine.as_deref())?;
+            insert_mcp_entry(&path, &entry_name, config)
+        })
+        .await;
         self.cache.invalidate();
         inserted.map_err(|error| AppError::Anyhow(error.into()))??;
         let resource_id = resource_id_for_mcp(&name, &source.path);
@@ -680,9 +689,12 @@ impl CatalogService {
             .await?;
         let origin = descriptor.origin.clone();
         let entry_name = name.clone();
-        let replaced =
-            tokio::task::spawn_blocking(move || replace_mcp_entry(&origin, &entry_name, config))
-                .await;
+        let confine = (descriptor.scope == CatalogScope::Project).then(|| workspace.clone());
+        let replaced = tokio::task::spawn_blocking(move || {
+            confine_project_file(&origin.path, confine.as_deref())?;
+            replace_mcp_entry(&origin, &entry_name, config)
+        })
+        .await;
         self.cache.invalidate();
         replaced.map_err(|error| AppError::Anyhow(error.into()))??;
         let resource_id = resource_id_for_mcp(&name, &descriptor.origin.path);
@@ -1119,6 +1131,15 @@ fn skill_write_base(root: &SourceRoot, workspace: &Path) -> PathBuf {
 
 /// Fails unless `path` resolves (through every symlink in its existing
 /// part) to somewhere inside `base`, compared component-wise.
+/// Project-scope MCP config files are written only inside `workspace`
+/// (`None`: a user-level file, not confined), like skill files.
+fn confine_project_file(path: &Path, workspace: Option<&Path>) -> Result<(), AppError> {
+    match workspace {
+        Some(workspace) => ensure_confined(path, workspace),
+        None => Ok(()),
+    }
+}
+
 fn ensure_confined(path: &Path, base: &Path) -> Result<(), AppError> {
     let resolved = resolve_existing_prefix(path)?;
     let base = resolve_existing_prefix(base)?;
@@ -1418,6 +1439,13 @@ fn scan_mcp(
             Err(error) => return Err(error.into()),
         };
         validator.push((source.path.clone(), Some(Stamp::of(&metadata))));
+        // A project file reached through a symlinked parent (a repository's
+        // `.codex -> ~/.codex`) is not this workspace's config.
+        if source.scope == CatalogScope::Project
+            && ensure_confined(&source.path, workspace).is_err()
+        {
+            continue;
+        }
         let modified = metadata.modified().ok();
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
@@ -2987,6 +3015,56 @@ mod tests {
             .servers
             .is_empty());
         assert_eq!(fs::read_to_string(&patch).unwrap(), "[]\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_mcp_configs_behind_a_symlinked_directory_are_left_alone() {
+        let root = temp_dir("todex-catalog-mcp-escape");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        let outside = root.join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let foreign = "[mcp_servers.foreign]\ncommand = \"evil\"\n";
+        fs::write(outside.join("config.toml"), foreign).unwrap();
+        // A repository can ship `.codex` as a link to any directory.
+        std::os::unix::fs::symlink(&outside, workspace.join(".codex")).unwrap();
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home));
+
+        let catalog = service
+            .mcp(ProviderKind::Codex, workspace.clone())
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .servers
+                .iter()
+                .all(|server| server.name != "foreign"),
+            "{:?}",
+            catalog.servers
+        );
+        let created = service
+            .create_mcp(
+                ProviderKind::Codex,
+                workspace.clone(),
+                CatalogScope::Project,
+                "docs".to_owned(),
+                json!({ "command": "npx", "args": ["docs-mcp"] }),
+            )
+            .await;
+        assert!(
+            matches!(&created, Err(AppError::InvalidRequest(message)) if message.contains("resolves outside")),
+            "{created:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("config.toml")).unwrap(),
+            foreign
+        );
         let _ = fs::remove_dir_all(root);
     }
 
