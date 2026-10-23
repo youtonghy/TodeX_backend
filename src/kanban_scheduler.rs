@@ -412,6 +412,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         }
     }
 

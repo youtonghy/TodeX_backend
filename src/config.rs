@@ -54,6 +54,42 @@ pub struct Config {
     /// `advertise_url`/`deployment`, `agent.image_cli_dirs`,
     /// `[[workspace.path_mappings]]`). All of it is off by default.
     pub deployment: DeploymentConfig,
+    /// The same-user local IPC listener (`[ipc]`).
+    pub ipc: IpcConfig,
+    /// `[update]`: self-update preferences.
+    pub update: UpdateConfig,
+}
+
+/// `[ipc]`: a Unix socket (named pipe on Windows) that only the daemon's
+/// own user can open. It serves the normal router plus the local admin API
+/// (docs/API.md, "Local IPC").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcConfig {
+    pub enabled: bool,
+    /// Overrides the default path (`crate::ipc::default_path`).
+    pub path: Option<PathBuf>,
+}
+
+impl Default for IpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+        }
+    }
+}
+
+/// `[update]`. `auto_update = false` turns off the automatic updates at
+/// launch and in a running daemon; `TODEX_AUTO_UPDATE=0` does too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateConfig {
+    pub auto_update: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { auto_update: true }
+    }
 }
 
 /// Where the daemon runs. `container` marks a daemon shipped in a container
@@ -114,6 +150,22 @@ static CONTAINER_DEPLOYMENT: AtomicBool = AtomicBool::new(false);
 /// updater reads it, since it runs without a [`Config`] at hand.
 pub fn container_deployment() -> bool {
     CONTAINER_DEPLOYMENT.load(Ordering::Relaxed)
+}
+
+/// `[update] auto_update` of the configuration this process loaded last
+/// (`true` before any load); see [`auto_update_configured`].
+static AUTO_UPDATE_CONFIGURED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the loaded configuration allows automatic updates. The updater
+/// reads it, since it runs without a [`Config`] at hand.
+pub fn auto_update_configured() -> bool {
+    AUTO_UPDATE_CONFIGURED.load(Ordering::Relaxed)
+}
+
+/// Applies a changed `[update] auto_update` to this process right away (the
+/// local admin API), so a running daemon honours it without a restart.
+pub fn set_auto_update_configured(enabled: bool) {
+    AUTO_UPDATE_CONFIGURED.store(enabled, Ordering::Relaxed);
 }
 
 /// The external API listener (`[api]`): REST + SSE authenticated with API
@@ -302,6 +354,19 @@ struct FileConfig {
     api: Option<PartialApiConfig>,
     server: Option<PartialServerConfig>,
     workspace: Option<PartialWorkspaceConfig>,
+    ipc: Option<PartialIpcConfig>,
+    update: Option<PartialUpdateConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialIpcConfig {
+    enabled: Option<bool>,
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialUpdateConfig {
+    auto_update: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -370,14 +435,31 @@ impl Config {
     /// Loads the configuration a daemon runs with; it also becomes the
     /// process-wide [`provider_keepalive`].
     pub fn load(args: ServeArgs) -> anyhow::Result<Self> {
-        let config = Self::load_internal(args)?;
+        let config = Self::load_read_only(args)?;
         PROVIDER_KEEPALIVE_SECONDS
             .store(config.agent.provider_keepalive_seconds, Ordering::Relaxed);
         Ok(config)
     }
 
+    /// Loads the configuration without writing anything; it still sets the
+    /// process-wide deployment and auto-update flags the updater reads.
     pub fn load_read_only(args: ServeArgs) -> anyhow::Result<Self> {
-        Self::load_internal(args)
+        let config = Self::load_internal(args)?;
+        if config.deployment.kind == Deployment::Container {
+            CONTAINER_DEPLOYMENT.store(true, Ordering::Relaxed);
+        }
+        AUTO_UPDATE_CONFIGURED.store(config.update.auto_update, Ordering::Relaxed);
+        Ok(config)
+    }
+
+    /// The configuration a fresh start on `data_dir` would use (config file
+    /// and environment), without touching any process-wide state. The local
+    /// admin API compares it with the running one.
+    pub fn load_saved(data_dir: PathBuf) -> anyhow::Result<Self> {
+        Self::load_internal(ServeArgs {
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
     }
 
     fn load_internal(args: ServeArgs) -> anyhow::Result<Self> {
@@ -445,9 +527,25 @@ impl Config {
             file_config.workspace.unwrap_or_default(),
             &workspace_roots,
         )?;
-        if deployment.kind == Deployment::Container {
-            CONTAINER_DEPLOYMENT.store(true, Ordering::Relaxed);
-        }
+        let ipc_file = file_config.ipc.unwrap_or_default();
+        let ipc = IpcConfig {
+            enabled: coalesce(
+                None,
+                env_bool("TODEX_AGENTD_IPC_ENABLED"),
+                ipc_file.enabled,
+                defaults.ipc.enabled,
+            ),
+            path: env_path("TODEX_AGENTD_IPC_PATH")
+                .filter(|path| !path.as_os_str().is_empty())
+                .or(ipc_file.path.filter(|path| !path.as_os_str().is_empty()))
+                .map(expand_home),
+        };
+        let update = UpdateConfig {
+            auto_update: file_config
+                .update
+                .and_then(|update| update.auto_update)
+                .unwrap_or(defaults.update.auto_update),
+        };
         let security_file = file_config.security.unwrap_or_default();
         let api_file = file_config.api.unwrap_or_default();
         let api = ApiConfig {
@@ -629,6 +727,8 @@ impl Config {
             },
             api,
             deployment,
+            ipc,
+            update,
         })
     }
 
@@ -739,6 +839,17 @@ impl Config {
         Ok(())
     }
 
+    /// Saves `[update] auto_update`; the rest of the file is kept.
+    pub fn save_update_settings(data_dir: PathBuf, auto_update: bool) -> anyhow::Result<()> {
+        let data_dir = expand_home(data_dir);
+        let mut document = load_config_document(&data_dir)?;
+        if !document.get("update").is_some_and(Item::is_table) {
+            document.insert("update", Item::Table(Table::new()));
+        }
+        document["update"]["auto_update"] = value(auto_update);
+        write_config_document(&data_dir, &document)
+    }
+
     pub fn load_tui_language(data_dir: &Path) -> anyhow::Result<Option<String>> {
         let document = load_config_document(&data_dir.to_path_buf())?;
         Ok(document
@@ -784,6 +895,38 @@ pub fn ensure_listener_matches_auth(
         ));
     }
     Ok(())
+}
+
+/// A listen host as the TUI and the local admin API accept it: an IP literal.
+pub fn validate_host(value: &str) -> Result<String, String> {
+    let host = value.trim();
+    if host.is_empty() {
+        return Err("host cannot be empty".to_owned());
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|_| host.to_owned())
+        .map_err(|_| "host must be a valid IPv4 or IPv6 address".to_owned())
+}
+
+/// A listen port typed into the TUI: 1..=65535.
+pub fn validate_port(value: &str) -> Result<u16, String> {
+    let port = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "port must be a number from 1 to 65535".to_owned())?;
+    validate_listen_port(port, None)
+}
+
+/// 1..=65535, and not the API listener's port when `api_port` is given
+/// (the API is enabled).
+pub fn validate_listen_port(port: u16, api_port: Option<u16>) -> Result<u16, String> {
+    if port == 0 {
+        return Err("port must be a number from 1 to 65535".to_owned());
+    }
+    if api_port == Some(port) {
+        return Err(format!("port {port} is the API listener's port"));
+    }
+    Ok(port)
 }
 
 impl Default for Config {
@@ -835,6 +978,8 @@ impl Default for Config {
             },
             api: ApiConfig::default(),
             deployment: DeploymentConfig::default(),
+            ipc: IpcConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -986,6 +1131,15 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
         let base_server = base.server.get_or_insert_with(PartialServerConfig::default);
         replace_some!(base_server.advertise_url, overlay_server.advertise_url);
         replace_some!(base_server.deployment, overlay_server.deployment);
+    }
+    if let Some(overlay_ipc) = overlay.ipc {
+        let base_ipc = base.ipc.get_or_insert_with(PartialIpcConfig::default);
+        replace_some!(base_ipc.enabled, overlay_ipc.enabled);
+        replace_some!(base_ipc.path, overlay_ipc.path);
+    }
+    if let Some(overlay_update) = overlay.update {
+        let base_update = base.update.get_or_insert_with(PartialUpdateConfig::default);
+        replace_some!(base_update.auto_update, overlay_update.auto_update);
     }
     if let Some(overlay_workspace) = overlay.workspace {
         let base_workspace = base
@@ -1714,6 +1868,44 @@ mod tests {
         });
         assert_eq!((config.api.host.as_str(), config.api.port), ("::1", 9002));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ipc_and_auto_update_load_from_file_with_defaults() {
+        let root = env::temp_dir().join(format!("todex-config-ipc-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let config = Config::load_saved(root.clone()).unwrap();
+        assert_eq!(config.ipc, super::IpcConfig::default());
+        assert!(config.ipc.enabled);
+        assert!(config.update.auto_update);
+
+        fs::write(
+            root.join("config.toml"),
+            "port = 7400\n[ipc]\nenabled = false\npath = \"/run/todex-ipc/agentd.sock\"\n",
+        )
+        .unwrap();
+        Config::save_update_settings(root.clone(), false).unwrap();
+        let config = Config::load_saved(root.clone()).unwrap();
+        assert!(!config.ipc.enabled);
+        assert_eq!(
+            config.ipc.path.as_deref(),
+            Some(Path::new("/run/todex-ipc/agentd.sock"))
+        );
+        assert!(!config.update.auto_update);
+        // The rest of the file is kept.
+        assert_eq!(config.port, 7400);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn listen_validation_is_shared_by_the_tui_and_the_local_admin_api() {
+        assert_eq!(super::validate_host(" ::1 ").unwrap(), "::1");
+        assert!(super::validate_host("localhost").is_err());
+        assert!(super::validate_port("0").is_err());
+        assert!(super::validate_port("70000").is_err());
+        assert_eq!(super::validate_port("7345"), Ok(7345));
+        assert!(super::validate_listen_port(7346, Some(7346)).is_err());
+        assert_eq!(super::validate_listen_port(7346, None), Ok(7346));
     }
 
     #[test]

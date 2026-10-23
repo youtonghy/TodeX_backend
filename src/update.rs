@@ -117,11 +117,13 @@ pub fn enabled() -> bool {
 }
 
 /// Automatic updates at launch and in a running daemon; `update` stays manual.
-/// Off in a container deployment, whatever `TODEX_AUTO_UPDATE` says: the
-/// image is the update unit there.
+/// Off with `TODEX_AUTO_UPDATE=0` or `[update] auto_update = false`, and in a
+/// container deployment whatever either says: the image is the update unit
+/// there.
 pub fn auto_update_enabled() -> bool {
     enabled()
         && std::env::var("TODEX_AUTO_UPDATE").as_deref() != Ok("0")
+        && crate::config::auto_update_configured()
         && !crate::config::container_deployment()
 }
 

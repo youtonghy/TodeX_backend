@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -24,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 use crate::autostart;
+use crate::config::{validate_host, validate_listen_port, validate_port};
 use crate::config::{Config, PairingEncryption, ServeArgs};
 use crate::daemon::{self, DaemonProcess};
 use crate::event::EventRecord;
@@ -1083,6 +1083,9 @@ impl TuiApp {
     /// machine.
     fn peer_label(&self, address: &str) -> String {
         let shown = device_display_name(address);
+        if address == crate::device_pairing::IPC_PEER_ADDRESS {
+            return self.text("this machine (IPC)", "本机（IPC）").to_owned();
+        }
         if address
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.to_canonical().is_loopback())
@@ -2255,11 +2258,10 @@ impl TuiApp {
                 field: EditField::Port,
                 value,
             } => match validate_port(&value).and_then(|port| {
-                if self.config.api.enabled && port == self.config.api.port {
-                    Err(format!("port {port} is the API listener's port"))
-                } else {
-                    Ok(port)
-                }
+                validate_listen_port(
+                    port,
+                    self.config.api.enabled.then_some(self.config.api.port),
+                )
             }) {
                 Ok(port) => {
                     self.config.port = port;
@@ -3094,7 +3096,10 @@ impl TuiApp {
         let auto_update = if info.auto_update_enabled {
             self.text("on (default)", "开（默认）")
         } else if info.update_enabled {
-            self.text("off (TODEX_AUTO_UPDATE=0)", "关（TODEX_AUTO_UPDATE=0）")
+            self.text(
+                "off (TODEX_AUTO_UPDATE=0 or [update] auto_update = false)",
+                "关（TODEX_AUTO_UPDATE=0 或 [update] auto_update = false）",
+            )
         } else {
             self.text("unavailable (not a release build)", "不可用（非发布构建）")
         };
@@ -4640,27 +4645,6 @@ enum EditField {
 enum ResetTarget {
     Auth,
     Encryption,
-}
-
-fn validate_host(value: &str) -> std::result::Result<String, String> {
-    let host = value.trim();
-    if host.is_empty() {
-        return Err("host cannot be empty".to_owned());
-    }
-    host.parse::<IpAddr>()
-        .map(|_| host.to_owned())
-        .map_err(|_| "host must be a valid IPv4 or IPv6 address".to_owned())
-}
-
-fn validate_port(value: &str) -> std::result::Result<u16, String> {
-    let port = value
-        .trim()
-        .parse::<u16>()
-        .map_err(|_| "port must be a number from 1 to 65535".to_owned())?;
-    if port == 0 {
-        return Err("port must be a number from 1 to 65535".to_owned());
-    }
-    Ok(port)
 }
 
 fn format_duration(duration: Duration) -> String {

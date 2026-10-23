@@ -48,6 +48,9 @@ pub struct DaemonProcess {
     /// The external API listener (`host:port`), when enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_listen: Option<String>,
+    /// The local IPC socket or pipe the daemon bound, when it runs one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_path: Option<PathBuf>,
     /// Set by [`status`] when the executable on disk was replaced or removed
     /// after this daemon started, so it should be restarted to run it.
     #[serde(skip)]
@@ -184,7 +187,59 @@ fn detach_with_config(command: &mut Command, config: &Config) -> Result<()> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // No console window, and not attached to the caller's console.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
     Ok(())
+}
+
+/// `daemon status --format json`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusReport {
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub started_at: Option<String>,
+    pub executable: Option<PathBuf>,
+    pub ipc_path: Option<PathBuf>,
+    pub outdated: bool,
+    pub api_listen: Option<String>,
+}
+
+impl StatusReport {
+    pub fn new(process: Option<&DaemonProcess>) -> Self {
+        match process {
+            Some(process) => Self {
+                running: true,
+                pid: Some(process.pid),
+                host: Some(process.host.clone()),
+                port: Some(process.port),
+                started_at: Some(process.started_at.to_rfc3339()),
+                executable: Some(process.executable.clone()),
+                ipc_path: process.ipc_path.clone(),
+                outdated: process.outdated,
+                api_listen: process.api_listen.clone(),
+            },
+            None => Self {
+                running: false,
+                pid: None,
+                host: None,
+                port: None,
+                started_at: None,
+                executable: None,
+                ipc_path: None,
+                outdated: false,
+                api_listen: None,
+            },
+        }
+    }
 }
 
 /// Shifts `path` to `path.1`, `path.1` to `path.2`, … keeping `keep` rotated
@@ -429,7 +484,12 @@ pub async fn run(config: Config) -> Result<()> {
     let api_listen = server
         .api_addr()
         .map(|addr| format!("{}:{}", server.config().api.host, addr.port()));
-    let process = write_pid_file(server.config(), server.addr().port(), api_listen)?;
+    let process = write_pid_file(
+        server.config(),
+        server.addr().port(),
+        api_listen,
+        server.ipc_path().map(Path::to_path_buf),
+    )?;
     let pid_file = PidFileGuard {
         data_dir: server.config().data_dir.clone(),
         pid: process.pid,
@@ -554,7 +614,12 @@ fn read_pid_file(data_dir: &Path) -> Result<Option<DaemonProcess>> {
     Ok(Some(process))
 }
 
-fn write_pid_file(config: &Config, port: u16, api_listen: Option<String>) -> Result<DaemonProcess> {
+fn write_pid_file(
+    config: &Config,
+    port: u16,
+    api_listen: Option<String>,
+    ipc_path: Option<PathBuf>,
+) -> Result<DaemonProcess> {
     fs::create_dir_all(&config.data_dir).with_context(|| {
         format!(
             "failed to create data directory {}",
@@ -572,6 +637,7 @@ fn write_pid_file(config: &Config, port: u16, api_listen: Option<String>) -> Res
         started_at: Utc::now(),
         executable: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("todex-agentd")),
         api_listen,
+        ipc_path,
         outdated: false,
     };
     match write_pid_record(&process) {
@@ -978,6 +1044,7 @@ fn daemon_record_from_args(
         started_at: Utc::now(),
         executable,
         api_listen,
+        ipc_path: None,
         outdated: false,
     })
 }
@@ -1233,6 +1300,45 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn status_report_json_has_every_field_whether_or_not_running() {
+        assert_eq!(
+            serde_json::to_value(super::StatusReport::new(None)).unwrap(),
+            serde_json::json!({
+                "running": false, "pid": null, "host": null, "port": null,
+                "startedAt": null, "executable": null, "ipcPath": null,
+                "outdated": false, "apiListen": null,
+            })
+        );
+        let process = DaemonProcess {
+            pid: 42,
+            host: "127.0.0.1".to_owned(),
+            port: 7345,
+            data_dir: std::path::PathBuf::from("/data"),
+            workspace_roots: Vec::new(),
+            started_at: chrono::DateTime::parse_from_rfc3339("2026-10-01T08:00:00Z")
+                .unwrap()
+                .into(),
+            executable: std::path::PathBuf::from("/bin/todex-agentd"),
+            api_listen: None,
+            ipc_path: Some(std::path::PathBuf::from("/data/agentd.sock")),
+            outdated: true,
+        };
+        assert_eq!(
+            serde_json::to_value(super::StatusReport::new(Some(&process))).unwrap(),
+            serde_json::json!({
+                "running": true, "pid": 42, "host": "127.0.0.1", "port": 7345,
+                "startedAt": "2026-10-01T08:00:00+00:00",
+                "executable": "/bin/todex-agentd", "ipcPath": "/data/agentd.sock",
+                "outdated": true, "apiListen": null,
+            })
+        );
+        // daemon.json keeps the bound path.
+        let recorded: DaemonProcess =
+            serde_json::from_str(&serde_json::to_string(&process).unwrap()).unwrap();
+        assert_eq!(recorded.ipc_path, process.ipc_path);
+    }
+
+    #[test]
     fn daemon_log_rotates_past_the_limit_and_keeps_three() {
         let dir = unique_tmp_dir("todex-daemon-log-rotation");
         let _ = fs::remove_dir_all(&dir);
@@ -1301,6 +1407,7 @@ mod tests {
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
             api_listen: None,
+            ipc_path: None,
             outdated: false,
         };
         fs::write(
@@ -1330,6 +1437,7 @@ mod tests {
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
             api_listen: None,
+            ipc_path: None,
             outdated: false,
         };
         fs::write(
@@ -1354,6 +1462,7 @@ mod tests {
             started_at: Utc::now(),
             executable: std::env::temp_dir().join("definitely-not-todex-agentd"),
             api_listen: None,
+            ipc_path: None,
             outdated: false,
         };
         assert!(!process_matches_record(&process));
@@ -1406,6 +1515,7 @@ mod tests {
             started_at: Utc::now(),
             executable: executable.clone(),
             api_listen: None,
+            ipc_path: None,
             outdated: false,
         };
         // Stops the `sleep 30` helper however the test ends, panics included.
@@ -1500,6 +1610,7 @@ mod tests {
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
             api_listen: None,
+            ipc_path: None,
             outdated: false,
         };
         fs::write(
@@ -1592,6 +1703,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         }
     }
 

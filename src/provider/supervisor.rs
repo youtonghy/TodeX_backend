@@ -3859,6 +3859,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         });
         let mut store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -4765,6 +4767,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -6828,6 +6832,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -7098,6 +7104,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -7295,6 +7303,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -7363,6 +7373,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         });
         let store = ConversationStore::new(data_dir.clone()).await.unwrap();
         let supervisor =
@@ -8013,6 +8025,8 @@ done
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await

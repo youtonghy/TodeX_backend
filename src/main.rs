@@ -27,6 +27,7 @@ mod external_command;
 mod history_cleanup;
 mod history_crypto;
 mod history_keys;
+mod ipc;
 mod kanban_scheduler;
 mod kanban_store;
 mod listen_addrs;
@@ -148,12 +149,21 @@ enum DaemonCommand {
     #[command(about = "Restart the backend daemon")]
     Restart(ServeArgs),
     #[command(about = "Show backend daemon status")]
-    Status(ServeArgs),
+    Status(DaemonStatusArgs),
     #[command(about = "Manage launching the daemon automatically at login")]
     Autostart {
         #[command(subcommand)]
         command: AutostartCommand,
     },
+}
+
+#[derive(Debug, Args)]
+struct DaemonStatusArgs {
+    /// `json` prints one object (exit 0 whether or not the daemon runs).
+    #[arg(long, value_enum, default_value_t)]
+    format: admin_cli::OutputFormat,
+    #[command(flatten)]
+    args: ServeArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -237,7 +247,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             tui::run(args).await
         }
         Command::Daemon { command } => {
-            init_serve_logging();
+            if matches!(
+                &command,
+                DaemonCommand::Status(DaemonStatusArgs {
+                    format: admin_cli::OutputFormat::Json,
+                    ..
+                })
+            ) {
+                // stdout carries the JSON.
+                init_stderr_logging();
+            } else {
+                init_serve_logging();
+            }
             daemon_command(command).await
         }
         Command::Doctor { command } => doctor_command(command).await,
@@ -275,6 +296,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::About => {
+            // For `[update] auto_update` and the deployment; `about` still
+            // answers when the configuration does not load.
+            if let Err(error) = Config::load_read_only(ServeArgs::default()) {
+                eprintln!("warning: failed to load configuration: {error:#}");
+            }
             println!("{}", serde_json::to_string_pretty(&update::about().await)?);
             Ok(())
         }
@@ -335,6 +361,15 @@ fn init_serve_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(default_env_filter())
         .with_ansi(std::io::stdout().is_terminal())
+        .init();
+}
+
+fn init_stderr_logging() {
+    use std::io::IsTerminal;
+    tracing_subscriber::fmt()
+        .with_env_filter(default_env_filter())
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(std::io::stderr)
         .init();
 }
 
@@ -401,7 +436,18 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
             );
             print_connect_addresses(&process);
         }
-        DaemonCommand::Status(args) => {
+        DaemonCommand::Status(DaemonStatusArgs {
+            format: admin_cli::OutputFormat::Json,
+            args,
+        }) => {
+            let config = Config::load(args).context("failed to load configuration")?;
+            let process = daemon::recover(&config)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&daemon::StatusReport::new(process.as_ref()))?
+            );
+        }
+        DaemonCommand::Status(DaemonStatusArgs { args, .. }) => {
             let config = Config::load(args).context("failed to load configuration")?;
             match daemon::recover(&config)? {
                 Some(process) => {
@@ -419,6 +465,9 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
                     }
                     if let Some(api) = &process.api_listen {
                         println!("API listening: http://{api}/api/v1");
+                    }
+                    if let Some(ipc) = &process.ipc_path {
+                        println!("IPC listening: {}", ipc.display());
                     }
                     print_connect_addresses(&process);
                 }

@@ -9,6 +9,8 @@
 //! `400 TRANSPORT_CRYPTO_FAILED` without detail; an outer request without
 //! `X-Todex-Sealed-Revision: 2` answers a plain `426` before its body is read.
 use std::net::SocketAddr;
+
+use crate::ipc::{LocalPeer, PeerAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -454,16 +456,26 @@ fn inner_request(
     *request.headers_mut() = parts.headers;
     // Only the peer address carries over: the inner request gets no other
     // outer extension (body limits, matched route, ...).
-    if let Some(peer) = peer_address(outer_extensions) {
-        request.extensions_mut().insert(ConnectInfo(peer));
+    match peer_address(outer_extensions) {
+        Some(PeerAddr::Tcp(peer)) => {
+            request.extensions_mut().insert(ConnectInfo(peer));
+        }
+        Some(PeerAddr::Local) => {
+            request.extensions_mut().insert(ConnectInfo(LocalPeer));
+        }
+        None => {}
     }
     request.extensions_mut().insert(ArrivedViaTransportV2);
     request
 }
 
-/// The peer address the way the `ConnectInfo` extractor resolves it: the
-/// served connection's, or axum's test-only `MockConnectInfo`.
-pub(crate) fn peer_address(extensions: &axum::http::Extensions) -> Option<SocketAddr> {
+/// The peer the way the `ConnectInfo` extractor resolves it: the served
+/// TCP connection's address (or axum's test-only `MockConnectInfo`), or
+/// [`PeerAddr::Local`] for an IPC connection.
+pub(crate) fn peer_address(extensions: &axum::http::Extensions) -> Option<PeerAddr> {
+    if extensions.get::<ConnectInfo<LocalPeer>>().is_some() {
+        return Some(PeerAddr::Local);
+    }
     extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(peer)| *peer)
@@ -472,6 +484,7 @@ pub(crate) fn peer_address(extensions: &axum::http::Extensions) -> Option<Socket
                 .get::<axum::extract::connect_info::MockConnectInfo<SocketAddr>>()
                 .map(|mock| mock.0)
         })
+        .map(PeerAddr::Tcp)
 }
 
 /// `200 application/vnd.todex.sealed; r=2` whose body is the response nonce

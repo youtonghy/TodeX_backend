@@ -2,19 +2,20 @@ use crate::{
     app_state::AppState,
     device_pairing::{
         CreateDevicePairingRequest, CreateDevicePairingResponse, DevicePairingPollResponse,
-        DevicePairingProofRequest, RevealDevicePairingRequest, RevealDevicePairingResponse,
+        DevicePairingProofRequest, PairingPeer, RevealDevicePairingRequest,
+        RevealDevicePairingResponse,
     },
     error::AppError,
+    ipc::PeerAddr,
 };
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, State},
+    extract::{DefaultBodyLimit, FromRequest, State},
     http::header,
     routing::post,
     Json, Router,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use std::net::SocketAddr;
 
 /// Wraps `Json` so deserialization failures return the API error envelope
 /// (400 INVALID_REQUEST) instead of axum's bare 422 text — old clients hitting
@@ -52,7 +53,7 @@ pub(super) fn routes() -> Router<AppState> {
 
 async fn create(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    extensions: axum::http::Extensions,
     ApiJson(request): ApiJson<CreateDevicePairingRequest>,
 ) -> Result<
     (
@@ -63,9 +64,24 @@ async fn create(
 > {
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(state.device_pairing.create(peer.ip(), request)?),
+        Json(
+            state
+                .device_pairing
+                .create(pairing_peer(&extensions)?, request)?,
+        ),
     ))
 }
+/// The pairing source: the TCP peer's IP, or this machine over IPC.
+fn pairing_peer(extensions: &axum::http::Extensions) -> Result<PairingPeer, AppError> {
+    match super::sealed::peer_address(extensions) {
+        Some(PeerAddr::Tcp(address)) => Ok(PairingPeer::Ip(address.ip())),
+        Some(PeerAddr::Local) => Ok(PairingPeer::Ipc),
+        None => Err(AppError::InvalidRequest(
+            "the connection has no peer address".to_owned(),
+        )),
+    }
+}
+
 async fn reveal(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<RevealDevicePairingRequest>,
@@ -110,6 +126,7 @@ async fn cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::ConnectInfo;
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
@@ -121,6 +138,7 @@ mod tests {
     };
     use hkdf::Hkdf;
     use sha2::{Digest, Sha256};
+    use std::net::SocketAddr;
     use tower::ServiceExt;
     use x25519_dalek::{PublicKey, StaticSecret};
 

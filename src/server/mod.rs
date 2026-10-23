@@ -12,6 +12,7 @@ mod enforcement;
 mod git;
 mod history_cleanup;
 mod history_keys;
+mod local_admin;
 mod native_history;
 mod pi_mcp;
 mod pi_plugins;
@@ -30,6 +31,7 @@ mod ws;
 
 pub(crate) use api::api_router;
 pub(crate) use history_keys::spawn_history_watch;
+pub(crate) use local_admin::LocalAdminInfo;
 
 use std::time::Duration;
 
@@ -58,6 +60,12 @@ pub fn router(state: AppState) -> Router {
         .layer(compression_layer())
         .layer(cors_layer(&state.config.host))
         .layer(TraceLayer::new_for_http().make_span_with(request_span::<axum::body::Body>))
+}
+
+/// The IPC listener's router: [`router`] plus the local admin API, which no
+/// TCP listener serves.
+pub fn ipc_router(state: AppState, info: LocalAdminInfo) -> Router {
+    router(state.clone()).merge(local_admin::routes(state, info))
 }
 
 /// The request span: method, path and version. The query string is left out
