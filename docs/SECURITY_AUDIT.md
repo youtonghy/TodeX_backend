@@ -24,6 +24,8 @@
 - MCP/Skill catalog 只读取配置，跳过 symlink，限制扫描深度、文件数和文件大小；响应不包含 command、args、env、URL 或凭据；现有测试验证输入文件未被修改。
 - 旧 Codex session migration 是 copy-only、redacted、idempotent，并保留原始文件。
 
+- 自更新：只有 `SHA256SUMS.sig` 为 `src/update.rs` 中发布公钥对「`todex-release-v1\0` + 标签 + `\0` + `SHA256SUMS`」的有效 Ed25519 签名时才信任其中的哈希并安装；签名私钥只存于仓库 secret `RELEASE_SIGNING_KEY` 与维护者的离线备份，见 [RELEASING.md](RELEASING.md)。
+
 ## 性能边界
 
 - `cargo test --locked --all-targets --all-features -- --test-threads=1` 当前执行 177 个 backend 测试和 1 个非计费 E2E，耗时约 11 秒；5 个真实 provider 测试默认 ignored。

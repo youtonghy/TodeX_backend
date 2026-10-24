@@ -17,6 +17,18 @@ const RELAUNCHED_ENV: &str = "TODEX_UPDATE_RELAUNCHED";
 const HANDOFF_ENV: &str = "TODEX_UPDATE_HANDOFF_VERSION";
 /// Rollback copies are removed once they are older than this.
 const BACKUP_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Ed25519 keys whose signature an update's `SHA256SUMS.sig` must carry
+/// (SPKI PEM, as `openssl pkey -pubout` writes). Any one is enough, so a
+/// new key ships here before releases switch to it (docs/RELEASING.md).
+const RELEASE_SIGNING_KEYS: &[&str] = &[include_str!("../ci/release-signing.pub.pem")];
+/// What a release signature covers: this, the tag, NUL, then `SHA256SUMS`
+/// exactly as published. The tag keeps one release's checksums from being
+/// passed off under another.
+const RELEASE_SIGNATURE_DOMAIN: &[u8] = b"todex-release-v1\0";
+/// DER prefix of an Ed25519 SubjectPublicKeyInfo; the 32 key bytes follow.
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
 
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -161,6 +173,44 @@ async fn download(client: &reqwest::Client, url: &str, limit: usize) -> Result<V
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+fn release_signing_key(pem: &str) -> Result<ed25519_dalek::VerifyingKey> {
+    use base64::Engine as _;
+    let body: String = pem
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("-----"))
+        .collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .context("release signing key is not base64")?;
+    let key = der
+        .strip_prefix(ED25519_SPKI_PREFIX.as_slice())
+        .and_then(|key| <[u8; 32]>::try_from(key).ok())
+        .context("release signing key is not an Ed25519 public key")?;
+    ed25519_dalek::VerifyingKey::from_bytes(&key).context("release signing key is invalid")
+}
+
+/// Checks that one of `keys` signed `manifest` (`SHA256SUMS`) for `tag`.
+fn verify_release_signature(
+    tag: &str,
+    manifest: &[u8],
+    signature: &[u8],
+    keys: &[&str],
+) -> Result<()> {
+    let signature = ed25519_dalek::Signature::from_slice(signature)
+        .context("release signature is malformed")?;
+    let message = [RELEASE_SIGNATURE_DOMAIN, tag.as_bytes(), b"\0", manifest].concat();
+    for key in keys {
+        if release_signing_key(key)?
+            .verify_strict(&message, &signature)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    bail!("release signature does not verify; refusing to install this update")
 }
 
 fn verify_checksum(manifest: &str, name: &str, bytes: &[u8]) -> Result<()> {
@@ -362,6 +412,16 @@ pub async fn run(check_only: bool) -> Result<UpdateStatus> {
     let url = asset_url(&release, &name)?;
     let checksums_url = asset_url(&release, "SHA256SUMS")?;
     let manifest = download(&client, checksums_url, 1024 * 1024).await?;
+    // Before the binary is fetched: the checksums are trusted only once
+    // signed by a release key, not merely for coming from the release.
+    let signature_url = asset_url(&release, "SHA256SUMS.sig")?;
+    let signature = download(&client, signature_url, 1024).await?;
+    verify_release_signature(
+        &release.tag_name,
+        &manifest,
+        &signature,
+        RELEASE_SIGNING_KEYS,
+    )?;
     let bytes = download(&client, url, MAX_BINARY).await?;
     verify_checksum(std::str::from_utf8(&manifest)?, &name, &bytes)?;
     let executable = installed_executable()?;
@@ -613,6 +673,63 @@ mod tests {
         assert!(about.latest_version.is_none());
         assert!(!about.update_available);
         assert!(about.check_error.is_none());
+    }
+
+    /// Signed with a throwaway key by `openssl pkeyutl -sign -rawin`, as the
+    /// release workflow signs: the formats must agree.
+    const OPENSSL_TEST_KEY: &str = "-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAsbGbf0A8YCNCbJ+lEI7FeayIGzTxCU/OPwBsaAx1GS4=
+-----END PUBLIC KEY-----
+";
+    const OPENSSL_TEST_MANIFEST: &[u8] = b"abc  todex-agentd-v9.9.9-linux-x64.bin\n";
+    const OPENSSL_TEST_SIGNATURE: &str =
+        "4SRLsnVHZxYTNojV198uqeFn4WpPsHoU80dxwxE6LKW5MKIw/iBpfpkP2rgd0pQEIA3sVu/ymr6zb+xiZrykCg==";
+
+    #[test]
+    fn releases_must_be_signed_by_a_release_key_for_their_tag() {
+        use base64::Engine as _;
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(OPENSSL_TEST_SIGNATURE)
+            .unwrap();
+        let keys = [OPENSSL_TEST_KEY];
+        assert!(
+            verify_release_signature("v9.9.9", OPENSSL_TEST_MANIFEST, &signature, &keys).is_ok()
+        );
+        // Another release's tag, edited checksums, a corrupt or missing
+        // signature, or only an unrelated key: all refused.
+        assert!(
+            verify_release_signature("v9.9.8", OPENSSL_TEST_MANIFEST, &signature, &keys).is_err()
+        );
+        assert!(verify_release_signature("v9.9.9", b"abd", &signature, &keys).is_err());
+        let mut flipped = signature.clone();
+        flipped[0] ^= 1;
+        assert!(
+            verify_release_signature("v9.9.9", OPENSSL_TEST_MANIFEST, &flipped, &keys).is_err()
+        );
+        assert!(verify_release_signature("v9.9.9", OPENSSL_TEST_MANIFEST, &[], &keys).is_err());
+        assert!(verify_release_signature(
+            "v9.9.9",
+            OPENSSL_TEST_MANIFEST,
+            &signature,
+            RELEASE_SIGNING_KEYS
+        )
+        .is_err());
+        // Any listed key may sign (rotation).
+        assert!(verify_release_signature(
+            "v9.9.9",
+            OPENSSL_TEST_MANIFEST,
+            &signature,
+            &[RELEASE_SIGNING_KEYS[0], OPENSSL_TEST_KEY]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_shipped_release_keys_parse() {
+        assert!(!RELEASE_SIGNING_KEYS.is_empty());
+        for key in RELEASE_SIGNING_KEYS {
+            release_signing_key(key).unwrap();
+        }
     }
 
     #[test]

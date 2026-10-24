@@ -443,6 +443,40 @@ jobs:
         working-directory: dist
         run: sha256sum * > SHA256SUMS
 
+      # The release public key the built daemons trust, from the same commit.
+      - name: Checkout release signing key
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          path: source
+          sparse-checkout: ci/release-signing.pub.pem
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # Daemons install an update only when SHA256SUMS.sig verifies under a
+      # key in src/update.rs (`RELEASE_SIGNING_KEYS`). The signature covers
+      # "todex-release-v1\0" + tag + "\0" + SHA256SUMS; see docs/RELEASING.md.
+      - name: Sign checksums
+        working-directory: dist
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          if [[ -z "${RELEASE_SIGNING_KEY}" ]]; then
+            echo "RELEASE_SIGNING_KEY must hold the Ed25519 release signing key (PEM); daemons refuse unsigned updates." >&2
+            exit 1
+          fi
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "${workdir}"' EXIT
+          (umask 077 && printf '%s\n' "${RELEASE_SIGNING_KEY}" > "${workdir}/key.pem")
+          printf 'todex-release-v1\0%s\0' "${RELEASE_TAG}" > "${workdir}/message"
+          cat SHA256SUMS >> "${workdir}/message"
+          openssl pkeyutl -sign -inkey "${workdir}/key.pem" -rawin \
+            -in "${workdir}/message" -out SHA256SUMS.sig
+          # The key that signed must be the one the daemons ship.
+          openssl pkeyutl -verify -pubin -inkey ../source/ci/release-signing.pub.pem \
+            -rawin -in "${workdir}/message" -sigfile SHA256SUMS.sig
+
       - name: Create and verify release
         env:
           GH_TOKEN: ${{ github.token }}

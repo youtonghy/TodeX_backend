@@ -7,7 +7,7 @@ accepted). The workflow tags the selected source commit, injects the version at
 compile time, runs the backend checks, and builds native Linux x64, Linux ARM64,
 macOS ARM64, Windows x64, and Windows ARM64 binaries on matching GitHub-hosted
 runners. It verifies their embedded version and publishes all archives plus
-`SHA256SUMS` to the `v1.2.3` GitHub Release.
+`SHA256SUMS` and its signature `SHA256SUMS.sig` to the `v1.2.3` GitHub Release.
 
 Tick **dry_run** to run the same validation and builds without creating the tag
 or the Release; the binaries are kept as workflow artifacts for 7 days. Use it to
@@ -66,6 +66,43 @@ and is installed at the same path (by default `~/.local/bin/todex-agentd`, which
 An unsigned or ad-hoc signed build, a different or renewed self-signed
 certificate, or a move to another path makes macOS treat the daemon as a new
 app, and users must grant both permissions again.
+
+## Update signing
+
+The daemon's updater (automatic updates and `todex-agentd update`) installs a
+release only when `SHA256SUMS.sig` is a valid Ed25519 signature, by a key listed
+in `RELEASE_SIGNING_KEYS` (`src/update.rs`), over
+
+```text
+"todex-release-v1\0" || tag (e.g. "v1.2.3") || "\0" || SHA256SUMS as published
+```
+
+and only then trusts the checksums in `SHA256SUMS`. The release job signs with
+the repository secret `RELEASE_SIGNING_KEY` (the private key as PEM, as
+`openssl genpkey -algorithm ed25519` writes it), checks the signature against
+`ci/release-signing.pub.pem` from the released commit, and fails when the secret
+is missing. TLS and the checksums alone no longer suffice: an update published
+without the key (a leaked GitHub token, a compromised workflow) is refused.
+
+The private key exists only in that secret and in the maintainer's offline backup
+(created as `~/.todex-release-signing-key.pem`, mode 0600, on the machine that
+generated it). Keep the backup offline; whoever holds the key can ship code to
+every daemon with automatic updates enabled.
+
+**Rotating the key.** Daemons accept any listed key, so rotate in two releases:
+
+1. Generate the new key (`openssl genpkey -algorithm ed25519 -out new.pem`), add
+   its public key (`openssl pkey -in new.pem -pubout`) to `RELEASE_SIGNING_KEYS`
+   as a second `ci/*.pub.pem` entry, and release as usual (still signed with the
+   old key).
+2. Once daemons run that release, set `RELEASE_SIGNING_KEY` to the new key,
+   point the workflow's verify step and `ci/release-signing.pub.pem` at the new
+   public key, and drop the old one from `RELEASE_SIGNING_KEYS` in a later
+   release.
+
+If the key is lost, daemons cannot update automatically: ship a release with a
+new key and ask users to reinstall with `install.sh`, which checks `SHA256SUMS`
+over TLS but does not verify the signature.
 
 ## Failed releases
 
