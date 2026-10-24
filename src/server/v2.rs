@@ -2973,6 +2973,17 @@ async fn handle_socket(
                 }
                 warn!(device_id = %auth.principal_id, "closing the websocket of a revoked device");
                 close_handle.device_revoked();
+                // Finish the closing handshake: read (and drop) until the
+                // client answers the close. Dropping the socket with its
+                // reply unread resets the connection on Windows, and the
+                // reset can discard the close frame before the client reads it.
+                let _ = tokio::time::timeout(WS_SEND_DRAIN_TIMEOUT, async {
+                    while ws_socket::next_text(&mut receiver, opener.as_mut(), &close_handle)
+                        .await
+                        .is_some()
+                    {}
+                })
+                .await;
                 break;
             }
         };
