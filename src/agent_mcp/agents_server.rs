@@ -566,10 +566,23 @@ fn caller_refusal(manifest: &ConversationManifest) -> Result<(), String> {
 /// The permission mode a child of `agent` runs in under a parent turn in
 /// `parent_mode`: the most permissive mode the agent supports that does not
 /// exceed the parent's.
-fn inherited_mode(agent: ProviderKind, parent_mode: &str) -> Result<&'static str, AppError> {
+fn inherited_mode(
+    parent: ProviderKind,
+    agent: ProviderKind,
+    parent_mode: &str,
+) -> Result<&'static str, AppError> {
     let rank = |mode: &str| MODE_ORDER.iter().position(|known| *known == mode);
     // Anything unknown counts as the most restrictive.
-    let ceiling = rank(parent_mode).unwrap_or(0);
+    let mut ceiling = rank(parent_mode).unwrap_or(0);
+    // A sandboxed `auto` (Codex: workspace-write) is not the `auto` of an
+    // agent that only follows its own policy: such a child runs with its
+    // edits approved at most, never free outside the parent's sandbox.
+    if parent_mode == "auto"
+        && profile(parent).permission_config.enforcement == "sandbox"
+        && profile(agent).permission_config.enforcement != "sandbox"
+    {
+        ceiling = ceiling.min(rank("accept-edits").unwrap_or(0));
+    }
     let config = profile(agent).permission_config;
     config
         .modes
@@ -620,7 +633,8 @@ impl AgentsTools {
                     .to_owned(),
             );
         }
-        let permission_mode = inherited_mode(agent, &permission_mode).map_err(failure)?;
+        let permission_mode =
+            inherited_mode(caller.parent.provider, agent, &permission_mode).map_err(failure)?;
         Ok(TurnInput {
             text,
             model,
@@ -1413,38 +1427,86 @@ mod tests {
 
     #[test]
     fn children_never_run_above_the_parent_turns_mode() {
-        assert_eq!(inherited_mode(ProviderKind::Codex, "auto").unwrap(), "auto");
-        assert_eq!(inherited_mode(ProviderKind::Devin, "auto").unwrap(), "ask");
         assert_eq!(
-            inherited_mode(ProviderKind::Codex, "unknown").unwrap(),
+            inherited_mode(ProviderKind::ClaudeCode, ProviderKind::Codex, "auto").unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            inherited_mode(ProviderKind::ClaudeCode, ProviderKind::Devin, "auto").unwrap(),
             "ask"
         );
         assert_eq!(
-            inherited_mode(ProviderKind::Pi, "full-access").unwrap(),
+            inherited_mode(ProviderKind::ClaudeCode, ProviderKind::Codex, "unknown").unwrap(),
+            "ask"
+        );
+        assert_eq!(
+            inherited_mode(ProviderKind::ClaudeCode, ProviderKind::Pi, "full-access").unwrap(),
             "full-access"
         );
         assert_eq!(
-            inherited_mode(ProviderKind::Pi, "ask").unwrap_err().code(),
+            inherited_mode(ProviderKind::ClaudeCode, ProviderKind::Pi, "ask")
+                .unwrap_err()
+                .code(),
             "UNAUTHORIZED"
         );
         // Only Claude Code offers accept-edits; others step down to ask.
         assert_eq!(
-            inherited_mode(ProviderKind::ClaudeCode, "accept-edits").unwrap(),
+            inherited_mode(
+                ProviderKind::ClaudeCode,
+                ProviderKind::ClaudeCode,
+                "accept-edits"
+            )
+            .unwrap(),
             "accept-edits"
         );
         assert_eq!(
-            inherited_mode(ProviderKind::Codex, "accept-edits").unwrap(),
+            inherited_mode(
+                ProviderKind::ClaudeCode,
+                ProviderKind::Codex,
+                "accept-edits"
+            )
+            .unwrap(),
             "ask"
         );
         assert_eq!(
-            inherited_mode(ProviderKind::ClaudeCode, "auto").unwrap(),
+            inherited_mode(ProviderKind::ClaudeCode, ProviderKind::ClaudeCode, "auto").unwrap(),
             "auto"
         );
         assert_eq!(
-            inherited_mode(ProviderKind::Pi, "accept-edits")
+            inherited_mode(ProviderKind::ClaudeCode, ProviderKind::Pi, "accept-edits")
                 .unwrap_err()
                 .code(),
             "UNAUTHORIZED"
+        );
+        // A sandboxed auto parent (Codex) keeps children of agents without
+        // an OS sandbox at accept-edits (Claude) or ask (the rest).
+        let codex = ProviderKind::Codex;
+        assert_eq!(
+            inherited_mode(codex, ProviderKind::Codex, "auto").unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            inherited_mode(codex, ProviderKind::ClaudeCode, "auto").unwrap(),
+            "accept-edits"
+        );
+        assert_eq!(
+            inherited_mode(codex, ProviderKind::Opencode, "auto").unwrap(),
+            "ask"
+        );
+        assert_eq!(
+            inherited_mode(codex, ProviderKind::Pi, "auto")
+                .unwrap_err()
+                .code(),
+            "UNAUTHORIZED"
+        );
+        // Full access and non-sandboxed parents are unchanged.
+        assert_eq!(
+            inherited_mode(codex, ProviderKind::ClaudeCode, "full-access").unwrap(),
+            "full-access"
+        );
+        assert_eq!(
+            inherited_mode(ProviderKind::ClaudeCode, ProviderKind::Codex, "auto").unwrap(),
+            "auto"
         );
     }
 
