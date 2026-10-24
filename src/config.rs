@@ -290,6 +290,11 @@ pub struct SecurityConfig {
     /// allows any, marking browser origins in the approval.
     #[serde(default)]
     pub pairing_origins: Option<Vec<String>>,
+    /// Web origins, beyond the desktop app's and loopback pages, whose pages
+    /// may read the daemon's responses (CORS), e.g. a self-hosted web client
+    /// that connects directly.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for SecurityConfig {
@@ -299,6 +304,7 @@ impl Default for SecurityConfig {
             enable_tls: false,
             trusted_proxies: Vec::new(),
             pairing_origins: None,
+            cors_origins: Vec::new(),
         }
     }
 }
@@ -386,6 +392,7 @@ struct PartialSecurityConfig {
     auth_token: Option<String>,
     trusted_proxies: Option<Vec<std::net::IpAddr>>,
     pairing_origins: Option<Vec<String>>,
+    cors_origins: Option<Vec<String>>,
 }
 
 impl Config {
@@ -520,6 +527,9 @@ impl Config {
                 .clone()
                 .unwrap_or_else(|| defaults.security.trusted_proxies.clone()),
         };
+        let cors_origins = env_list("TODEX_AGENTD_CORS_ORIGINS")
+            .or_else(|| security_file.cors_origins.clone())
+            .unwrap_or_else(|| defaults.security.cors_origins.clone());
         let pairing_origins = env_list("TODEX_AGENTD_PAIRING_ORIGINS")
             .or_else(|| security_file.pairing_origins.clone())
             .or_else(|| defaults.security.pairing_origins.clone());
@@ -667,6 +677,7 @@ impl Config {
                 ),
                 trusted_proxies,
                 pairing_origins,
+                cors_origins,
             },
             api,
             deployment,

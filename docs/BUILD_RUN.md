@@ -97,6 +97,7 @@ dsh --version
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_TRUSTED_PROXIES` | 同机反向代理的 IP（逗号分隔），其 `X-Forwarded-For` 最右一项作为客户端地址；默认空 |
+| `TODEX_AGENTD_CORS_ORIGINS` | 允许跨域读取响应的网页 origin（逗号分隔），在桌面端与回环页面之外；直连 daemon 的自建 web 客户端需要配置。默认空 |
 | `TODEX_AGENTD_PAIRING_ORIGINS` | 允许发起设备配对的 `Origin`（逗号分隔，如 `todex-desktop://app`）；默认不限制，网页来源在审批时警告 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
 | `TODEX_AGENTD_ADVERTISE_URL` | 客户端应使用的地址（`http(s)://主机[:端口]`，不得带凭据、query 或 fragment），启动日志与 TUI 配对链接/二维码优先显示它；容器、端口映射或反向代理之后使用。默认不设置 |

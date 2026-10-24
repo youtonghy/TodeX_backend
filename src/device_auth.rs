@@ -535,7 +535,7 @@ fn has_loopback_host(headers: &HeaderMap, uri: &Uri) -> bool {
 /// cannot send it: browsers only emit serialized web origins.
 pub(crate) const DESKTOP_APP_ORIGIN: &str = "todex-desktop://app";
 
-fn is_local_origin(origin: &str) -> bool {
+pub(crate) fn is_local_origin(origin: &str) -> bool {
     if origin == DESKTOP_APP_ORIGIN {
         return true;
     }

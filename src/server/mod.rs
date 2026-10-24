@@ -34,9 +34,12 @@ pub(crate) use history_keys::spawn_history_watch;
 use std::time::Duration;
 
 use axum::Router;
+use std::sync::Arc;
 use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
+
+use axum::http::HeaderValue;
+use tower_http::cors::{AllowOrigin, AllowPrivateNetwork, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::app_state::AppState;
@@ -56,7 +59,10 @@ pub fn router(state: AppState) -> Router {
         // Inside CORS, so browsers can read the 426.
         .layer(axum::middleware::from_fn(enforcement::enforce_transport_v2))
         .layer(compression_layer())
-        .layer(cors_layer(&state.config.host))
+        .layer(cors_layer(
+            &state.config.host,
+            &state.config.security.cors_origins,
+        ))
         .layer(TraceLayer::new_for_http().make_span_with(request_span::<axum::body::Body>))
 }
 
@@ -113,10 +119,33 @@ fn compression_layer() -> CompressionLayer<impl Predicate> {
 /// their six-connection-per-host pool. Chromium caps the cache at two hours.
 const CORS_PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(2 * 60 * 60);
 
-fn cors_layer(host: &str) -> CorsLayer {
-    let layer = CorsLayer::permissive().max_age(CORS_PREFLIGHT_MAX_AGE);
+/// Pages that may read the daemon's responses: the desktop app, any
+/// loopback page (a local web client or dev server), and `configured`
+/// (`security.cors_origins`). Other pages still reach the daemon with simple
+/// requests, as browsers allow, but never read the answers; everything
+/// signed or JSON (pairing included) needs a preflight, which they fail.
+fn cors_origin_allowed(origin: &HeaderValue, configured: &[String]) -> bool {
+    origin.to_str().is_ok_and(|origin| {
+        crate::device_auth::is_local_origin(origin)
+            || configured.iter().any(|allowed| allowed == origin)
+    })
+}
+
+fn cors_layer(host: &str, configured: &[String]) -> CorsLayer {
+    let configured: Arc<[String]> = configured.into();
+    let origins = Arc::clone(&configured);
+    let layer = CorsLayer::new()
+        .allow_headers(Any)
+        .allow_methods(Any)
+        .expose_headers(Any)
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            cors_origin_allowed(origin, &origins)
+        }))
+        .max_age(CORS_PREFLIGHT_MAX_AGE);
     if is_loopback_host(host) {
-        layer.allow_private_network(true)
+        layer.allow_private_network(AllowPrivateNetwork::predicate(move |origin, _| {
+            cors_origin_allowed(origin, &configured)
+        }))
     } else {
         layer
     }
@@ -180,10 +209,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_desktop_app_loopback_and_configured_origins_pass_cors() {
+        let app = Router::new()
+            .route("/v2/device-pairing/create", get(|| async { "ok" }))
+            .layer(cors_layer(
+                "127.0.0.1",
+                &["https://todex.example.com".to_owned()],
+            ));
+        let preflight = |origin: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::options("/v2/device-pairing/create")
+                        .header("origin", origin)
+                        .header("access-control-request-method", "POST")
+                        .header("access-control-request-headers", "content-type")
+                        .header("access-control-request-private-network", "true")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        for allowed in [
+            "todex-desktop://app",
+            "http://127.0.0.1:5173",
+            "http://localhost:4173",
+            "https://todex.example.com",
+        ] {
+            let response = preflight(allowed).await;
+            assert_eq!(
+                response.headers()["access-control-allow-origin"],
+                allowed,
+                "{allowed}"
+            );
+            assert_eq!(
+                response.headers()["access-control-allow-private-network"],
+                "true"
+            );
+        }
+        for refused in [
+            "https://evil.example",
+            "null",
+            "http://127.0.0.1.evil.example",
+            "https://todex.example.com.evil.example",
+        ] {
+            let response = preflight(refused).await;
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("access-control-allow-origin"),
+                "{refused}"
+            );
+            assert!(!response
+                .headers()
+                .contains_key("access-control-allow-private-network"));
+        }
+    }
+
+    #[tokio::test]
     async fn signed_request_preflights_are_cacheable() {
         let app = Router::new()
             .route("/v2/providers/models", get(|| async { "ok" }))
-            .layer(cors_layer("127.0.0.1"));
+            .layer(cors_layer("127.0.0.1", &[]));
         let response = app
             .oneshot(
                 Request::options("/v2/providers/models")
