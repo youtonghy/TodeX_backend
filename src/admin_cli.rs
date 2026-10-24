@@ -314,6 +314,18 @@ fn print_request(request: &DevicePairingRequestSummary) {
         remaining % 60
     );
     println!("  request id:            {}", request.request_id);
+    if let Some(origin) = &request.origin {
+        println!("  origin:                {origin}");
+    }
+    if request.via_proxy {
+        println!("  forwarded:             by a reverse proxy (the address is not this machine)");
+    }
+    if request.from_web_page() {
+        println!(
+            "  WARNING: started from a web page; any page can start a pairing and show \
+             its own code. Approve only if you opened TodeX there to pair."
+        );
+    }
     if let Some(device_id) = &request.device_id {
         println!("  device id:             {device_id}");
     }

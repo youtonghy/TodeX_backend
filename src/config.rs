@@ -281,6 +281,26 @@ fn default_true() -> bool {
 pub struct SecurityConfig {
     pub enable_auth: bool,
     pub enable_tls: bool,
+    /// Reverse proxies on this machine whose `X-Forwarded-For` names the
+    /// real client (its rightmost entry); see `listen_addrs::forwarded_peer`.
+    /// Requests that arrive through any proxy are never treated as local.
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// Origins allowed to start a device pairing (`Origin` header); `None`
+    /// allows any, marking browser origins in the approval.
+    #[serde(default)]
+    pub pairing_origins: Option<Vec<String>>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            enable_auth: true,
+            enable_tls: false,
+            trusted_proxies: Vec::new(),
+            pairing_origins: None,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -364,6 +384,8 @@ struct PartialSecurityConfig {
     /// Legacy bearer token. Parsed only to warn that it is ignored; device
     /// signature auth replaced it.
     auth_token: Option<String>,
+    trusted_proxies: Option<Vec<std::net::IpAddr>>,
+    pairing_origins: Option<Vec<String>>,
 }
 
 impl Config {
@@ -484,6 +506,23 @@ impl Config {
             security_file.enable_auth,
             defaults.security.enable_auth,
         );
+        let trusted_proxies = match env_list("TODEX_AGENTD_TRUSTED_PROXIES") {
+            Some(list) => list
+                .iter()
+                .map(|item| {
+                    item.parse::<std::net::IpAddr>().with_context(|| {
+                        format!("TODEX_AGENTD_TRUSTED_PROXIES: {item} is not an IP address")
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            None => security_file
+                .trusted_proxies
+                .clone()
+                .unwrap_or_else(|| defaults.security.trusted_proxies.clone()),
+        };
+        let pairing_origins = env_list("TODEX_AGENTD_PAIRING_ORIGINS")
+            .or_else(|| security_file.pairing_origins.clone())
+            .or_else(|| defaults.security.pairing_origins.clone());
         if optional_non_empty(env::var("TODEX_AGENTD_AUTH_TOKEN").ok()).is_some()
             || optional_non_empty(security_file.auth_token).is_some()
         {
@@ -626,6 +665,8 @@ impl Config {
                     security_file.enable_tls,
                     defaults.security.enable_tls,
                 ),
+                trusted_proxies,
+                pairing_origins,
             },
             api,
             deployment,
@@ -832,6 +873,7 @@ impl Default for Config {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: ApiConfig::default(),
             deployment: DeploymentConfig::default(),
@@ -1462,6 +1504,7 @@ mod tests {
             security: super::SecurityConfig {
                 enable_auth: false,
                 enable_tls: false,
+                ..Default::default()
             },
             ..Config::default()
         };

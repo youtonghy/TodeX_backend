@@ -99,10 +99,21 @@ pub(super) async fn require_api_key(
     mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
+    // Behind a trusted reverse proxy, failures count per client, not
+    // against the proxy that forwards everyone.
     let address = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(address)| address.ip());
+        .map(|ConnectInfo(address)| address.ip())
+        .map(|peer| {
+            let forwarded = crate::listen_addrs::forwarded(
+                request.headers(),
+                request.extensions(),
+                Some(peer),
+                &state.config.security.trusted_proxies,
+            );
+            crate::listen_addrs::client_address(peer, forwarded)
+        });
     state.api_auth_failures.check(address)?;
     let authenticated = presented_key(request.headers())
         .ok_or(AppError::Unauthenticated)

@@ -96,6 +96,8 @@ dsh --version
 | `TODEX_AGENTD_PROVIDER_PREWARM` | 是否允许 `conversation.warm` 预先启动会话的 Provider 进程（默认 `true`） |
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
+| `TODEX_AGENTD_TRUSTED_PROXIES` | 同机反向代理的 IP（逗号分隔），其 `X-Forwarded-For` 最右一项作为客户端地址；默认空 |
+| `TODEX_AGENTD_PAIRING_ORIGINS` | 允许发起设备配对的 `Origin`（逗号分隔，如 `todex-desktop://app`）；默认不限制，网页来源在审批时警告 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
 | `TODEX_AGENTD_ADVERTISE_URL` | 客户端应使用的地址（`http(s)://主机[:端口]`，不得带凭据、query 或 fragment），启动日志与 TUI 配对链接/二维码优先显示它；容器、端口映射或反向代理之后使用。默认不设置 |
 | `TODEX_AGENTD_DEPLOYMENT` | `host`（默认）或 `container`；`container` 时 `/v2/version` 返回 `deployment: "container"`，自更新关闭，`update` 不做任何改动 |
@@ -307,7 +309,7 @@ sudo systemctl status todex-agentd
 
 macOS 可使用 launchd 的 `ProgramArguments` 指向同一 `serve` 命令；Windows 则使用 NSSM 或 Windows Service wrapper，服务账户必须拥有数据目录、workspace 和各 Provider CLI 的原生登录配置。`devices.json` 注册表位于数据目录内，服务账户需对其有读写权限。
 
-反向代理至少需要转发 `/health` 与 `/v2/*`，启用 WebSocket upgrade，设置合理的 request/body timeout，并只允许 HTTPS 来源。代理到 daemon 的 upstream 仍使用 `http://127.0.0.1:7345`；移动端使用代理公开的 HTTPS/WSS 地址重新生成配对二维码。注意设备签名的 `auth_sig` 等 query 参数可能进入代理访问日志：生产环境优先使用 header 认证。
+反向代理至少需要转发 `/health` 与 `/v2/*`，启用 WebSocket upgrade，设置合理的 request/body timeout，并只允许 HTTPS 来源。代理到 daemon 的 upstream 仍使用 `http://127.0.0.1:7345`；移动端使用代理公开的 HTTPS/WSS 地址重新生成配对二维码。注意设备签名的 `auth_sig` 等 query 参数可能进入代理访问日志：生产环境优先使用 header 认证。daemon 把带 `X-Forwarded-For`、`Forwarded` 或 `X-Real-IP` 的请求视为远端：客户端必须经 transport v2（配对后自动使用），关闭认证的部署不能放在代理之后；在 `[security] trusted_proxies = ["127.0.0.1"]` 中登记代理后，限流与配对审批按代理给出的真实客户端地址计算。客户端若以回环地址、未经配对固定传输公钥的 profile 经代理访问，需重新配对。
 
 生产检查清单：
 

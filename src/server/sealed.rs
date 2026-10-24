@@ -292,7 +292,11 @@ fn is_public_route(path: &str) -> bool {
 /// peer cannot make the daemon buffer a large inner body. Returns the inner
 /// body limit. The full signature check over the body still runs in the
 /// router's device auth middleware.
-fn admit(state: &AppState, parts: &InnerParts) -> Result<Admission, AppError> {
+fn admit(
+    state: &AppState,
+    parts: &InnerParts,
+    forwarded: Option<crate::listen_addrs::Forwarded>,
+) -> Result<Admission, AppError> {
     if is_public_route(parts.uri.path()) {
         return Ok(Admission {
             body_limit: PUBLIC_INNER_BODY_MAX,
@@ -304,6 +308,11 @@ fn admit(state: &AppState, parts: &InnerParts) -> Result<Admission, AppError> {
             .device_auth
             .check_credential_headers(&parts.headers, parts.uri.query())?;
     } else {
+        if forwarded.is_some() {
+            return Err(AppError::Unauthorized(
+                "anonymous access is not available through a reverse proxy".to_owned(),
+            ));
+        }
         device_auth::ensure_local_request(&parts.headers, &parts.uri)?;
     }
     Ok(Admission {
@@ -344,6 +353,13 @@ async fn open_request(
     let state = &sealed.state;
     let limits = sealed.limits;
     let (parts, body) = request.into_parts();
+    // The inner request drops the outer forwarding headers; it keeps this.
+    let forwarded = crate::listen_addrs::forwarded(
+        &parts.headers,
+        &parts.extensions,
+        peer_address(&parts.extensions).map(|peer| peer.ip()),
+        &sealed.state.config.security.trusted_proxies,
+    );
     let headers = &parts.headers;
     if !is_sealed_content_type(headers) || header(headers, HEADER_TRANSPORT)? != "2" {
         return Err(TransportCryptoError::new("outer headers"));
@@ -394,7 +410,7 @@ async fn open_request(
         if admitted.is_none() {
             if let Some((head, head_end)) = parse_inner_head(&plaintext)? {
                 let inner = inner_parts(head, &parts.headers)?;
-                let admission = match admit(state, &inner) {
+                let admission = match admit(state, &inner, forwarded) {
                     Ok(admission) => admission,
                     // Stop reading: the rest of the outer body is dropped.
                     Err(error) => return Ok((Opened::Rejected(error), down)),
@@ -478,7 +494,7 @@ async fn open_request(
     };
     // Reuse the allocation for the body.
     plaintext.drain(..head_end);
-    let request = inner_request(inner, plaintext, &parts.extensions);
+    let request = inner_request(inner, plaintext, &parts.extensions, forwarded);
     Ok((Opened::Forward(Box::new(request), permit), down))
 }
 
@@ -535,15 +551,20 @@ fn inner_request(
     parts: InnerParts,
     body: Vec<u8>,
     outer_extensions: &axum::http::Extensions,
+    forwarded: Option<crate::listen_addrs::Forwarded>,
 ) -> Request {
     let mut request = Request::new(Body::from(body));
     *request.method_mut() = parts.method;
     *request.uri_mut() = parts.uri;
     *request.headers_mut() = parts.headers;
-    // Only the peer address carries over: the inner request gets no other
-    // outer extension (body limits, matched route, ...).
+    // Only the peer address, and whether a proxy forwarded the outer
+    // request, carry over: the inner request gets no other outer extension
+    // (body limits, matched route, ...).
     if let Some(peer) = peer_address(outer_extensions) {
         request.extensions_mut().insert(ConnectInfo(peer));
+    }
+    if let Some(forwarded) = forwarded {
+        request.extensions_mut().insert(forwarded);
     }
     request.extensions_mut().insert(ArrivedViaTransportV2);
     request

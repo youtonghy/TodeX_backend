@@ -5,7 +5,7 @@ TodeX 的唯一授权方式是设备验证：每台客户端设备持有一对�
 ## 配对流程
 
 1. 客户端生成（或复用本 profile 的）设备密钥对，发起配对申请（`create`）并提交设备公钥与对临时公钥、随机数的承诺，再用 `reveal` 公开二者（配对 v3，见 [transport-v2.md](transport-v2.md#device-pairing-v3-commit-then-reveal)）。验证码只在 reveal 之后出现在 TUI。
-2. 在后端 TUI 按 `d` 打开设备面板，选择待验证申请，核对双方完整的 `XXXXX-XXXXX` 验证码。验证码旁显示后端传输公钥指纹（`XXXX-XXXX-XXXX-XXXX`，`none` 表示明文，仅限回环）；验证码同时认证该公钥和设备名称。详情还列出设备名称、由设备公钥推导的设备 ID（批准后登记的就是这个 ID）、对端地址（回环地址标注「本机」）。两类警告紧跟在验证码下方：
+2. 在后端 TUI 按 `d` 打开设备面板，选择待验证申请，核对双方完整的 `XXXXX-XXXXX` 验证码。验证码旁显示后端传输公钥指纹（`XXXX-XXXX-XXXX-XXXX`，`none` 表示明文，仅限回环）；验证码同时认证该公钥和设备名称。详情还列出设备名称、由设备公钥推导的设备 ID（批准后登记的就是这个 ID）、对端地址（只有未经代理、且不是网页发起的回环请求才标注「本机」；经反向代理的标注「经反向代理」，网页发起的标注「网页」）。申请记录发起时的 `Origin`：不是桌面端固定的 `todex-desktop://app` 时，验证码下方警告该申请由该网页发起——任何网页都能发起配对并显示自己的验证码，只有确实在该页面中打开 TodeX 配对时才批准。配置 `security.pairing_origins`（或 `TODEX_AGENTD_PAIRING_ORIGINS`）后，`Origin` 不在列表中（含缺省）的 `create` 返回 403。两类警告紧跟在验证码下方：
    - 该公钥已登记：「重新配对，会覆盖现有记录」；
    - 该设备 ID 在历史封禁列表（`revokedDevices`）中：「该设备曾于 … 被吊销。批准后恢复 API 访问，历史仍需另一台设备执行恢复」。
 3. 按 `a` 批准，或按 `r` 拒绝。设备名称由客户端自报，但已写入 transcript：名称被篡改时验证码不同。核对时以验证码为准。
@@ -21,7 +21,7 @@ todex-agentd pair approve <验证码|requestId> [--yes]
 todex-agentd pair reject  <验证码|requestId> [--yes]
 ```
 
-`pair list` 列出 `requestId`、`verificationCode`、`deviceName`、`deviceId`、`peerAddress`、`transportFingerprint`、`expiresAt`（Unix 毫秒）。`approve`/`reject` 的参数可以是验证码（不区分大小写，连字符可省略），也可以是 `requestId`。输入客户端上显示的验证码本身就是核对，直接记录决定；用 `requestId` 时命令先显示申请详情并要求确认（`y`），非交互运行须加 `--yes`。命令成功后打印设备名称、验证码和传输公钥指纹。退出码：`0` 成功；`2` 没有匹配的申请、申请已过期或多个申请验证码相同（改用 `requestId`）；`3` 当前用户不是数据目录（控制目录）的属主，提示改用 daemon 的用户。与 TUI 一样，命令只写 `device-pairing/decision-<id>.json`（属主检查、`0600`、硬链接发布、不覆盖已有决定），不提供任何网络入口。TUI 显示的「已登记」「曾被吊销」警告不在命令行中显示，必要时先用 `todex-agentd devices list` 核对。
+`pair list` 列出 `requestId`、`verificationCode`、`deviceName`、`deviceId`、`peerAddress`、`transportFingerprint`、`expiresAt`（Unix 毫秒），以及有值时的 `origin` 与 `viaProxy`；网页发起的申请在文本输出中带警告。`approve`/`reject` 的参数可以是验证码（不区分大小写，连字符可省略），也可以是 `requestId`。输入客户端上显示的验证码本身就是核对，直接记录决定；用 `requestId` 时命令先显示申请详情并要求确认（`y`），非交互运行须加 `--yes`。命令成功后打印设备名称、验证码和传输公钥指纹。退出码：`0` 成功；`2` 没有匹配的申请、申请已过期或多个申请验证码相同（改用 `requestId`）；`3` 当前用户不是数据目录（控制目录）的属主，提示改用 daemon 的用户。与 TUI 一样，命令只写 `device-pairing/decision-<id>.json`（属主检查、`0600`、硬链接发布、不覆盖已有决定），不提供任何网络入口。TUI 显示的「已登记」「曾被吊销」警告不在命令行中显示，必要时先用 `todex-agentd devices list` 核对。
 
 申请有效期为 5 分钟，可在客户端取消；`create` 后 30 秒内未 `reveal` 的申请直接丢弃。设备名称规则在各端一致：客户端去掉首尾空白、为空时填默认名；后端只校验（1–80 个 Unicode 标量，无控制字符与 bidi 控制字符，首尾不是空白）并原样保存，不再改写。切换后端或修改地址会取消当前申请；过期、拒绝、取消以及已完成的申请不能再次领取结果。同一设备公钥重复配对会更新已有记录而不是新建；被吊销的设备可以重新配对恢复。
 

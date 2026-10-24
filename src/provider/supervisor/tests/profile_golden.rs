@@ -64,6 +64,7 @@ fn golden_config(root: &Path, executable: Option<&str>) -> Config {
         security: SecurityConfig {
             enable_auth: true,
             enable_tls: false,
+            ..Default::default()
         },
         api: Default::default(),
         deployment: Default::default(),

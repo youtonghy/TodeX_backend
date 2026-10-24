@@ -242,3 +242,107 @@ mod tests {
         assert_eq!(hosts(&addresses), expected);
     }
 }
+
+/// Headers a reverse proxy adds to name the client it forwards for.
+const FORWARDING_HEADERS: [&str; 3] = ["forwarded", "x-forwarded-for", "x-real-ip"];
+
+/// A request a reverse proxy forwarded: the TCP peer is the proxy, not the
+/// client. Such a request is never treated as coming from this machine, even
+/// over loopback (a reverse proxy on the same host makes every remote
+/// client look local).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Forwarded {
+    /// The client, when the proxy is one of `security.trusted_proxies`: the
+    /// rightmost `X-Forwarded-For` entry, which that proxy appended.
+    pub client: Option<IpAddr>,
+}
+
+/// Whether `headers` carry a forwarding header (any value).
+pub(crate) fn has_forwarding_headers(headers: &axum::http::HeaderMap) -> bool {
+    FORWARDING_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
+}
+
+/// The [`Forwarded`] of a request from `peer`: set on the request by the
+/// sealed tunnel (whose inner request drops these headers), or read from
+/// its own forwarding headers.
+pub(crate) fn forwarded(
+    headers: &axum::http::HeaderMap,
+    extensions: &axum::http::Extensions,
+    peer: Option<IpAddr>,
+    trusted_proxies: &[IpAddr],
+) -> Option<Forwarded> {
+    if let Some(forwarded) = extensions.get::<Forwarded>() {
+        return Some(*forwarded);
+    }
+    if !has_forwarding_headers(headers) {
+        return None;
+    }
+    let trusted = peer.is_some_and(|peer| {
+        trusted_proxies
+            .iter()
+            .any(|proxy| proxy.to_canonical() == peer.to_canonical())
+    });
+    let client = trusted
+        .then(|| {
+            headers
+                .get_all("x-forwarded-for")
+                .iter()
+                .last()?
+                .to_str()
+                .ok()?
+                .rsplit(',')
+                .next()
+                .map(|entry| entry.trim().trim_matches(['[', ']']))
+                .and_then(|entry| entry.parse::<IpAddr>().ok())
+        })
+        .flatten();
+    Some(Forwarded { client })
+}
+
+/// The address a request is attributed to (rate limits, pairing approvals):
+/// the client a trusted proxy named, or else the TCP peer.
+pub(crate) fn client_address(peer: IpAddr, forwarded: Option<Forwarded>) -> IpAddr {
+    forwarded
+        .and_then(|forwarded| forwarded.client)
+        .unwrap_or(peer)
+}
+
+#[cfg(test)]
+mod forwarding_tests {
+    use super::*;
+    use axum::http::{Extensions, HeaderMap};
+
+    #[test]
+    fn forwarded_requests_are_marked_and_only_trusted_proxies_name_the_client() {
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        let none = Extensions::new();
+        assert_eq!(forwarded(&headers, &none, Some(proxy), &[proxy]), None);
+        headers.append(
+            "x-forwarded-for",
+            "198.51.100.9, 203.0.113.7".parse().unwrap(),
+        );
+        // Untrusted: forwarded, but the header names nobody.
+        assert_eq!(
+            forwarded(&headers, &none, Some(proxy), &[]),
+            Some(Forwarded { client: None })
+        );
+        let trusted = forwarded(&headers, &none, Some(proxy), &[proxy]);
+        assert_eq!(
+            client_address(proxy, trusted),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+        // Other forwarding headers mark the request too.
+        for name in ["forwarded", "x-real-ip"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, "for=192.0.2.1".parse().unwrap());
+            assert!(forwarded(&headers, &none, Some(proxy), &[]).is_some());
+        }
+        // Set by the tunnel on its inner request.
+        let mut extensions = Extensions::new();
+        extensions.insert(Forwarded { client: None });
+        assert!(forwarded(&HeaderMap::new(), &extensions, Some(proxy), &[]).is_some());
+    }
+}

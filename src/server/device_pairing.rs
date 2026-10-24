@@ -53,6 +53,8 @@ pub(super) fn routes() -> Router<AppState> {
 async fn create(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    forwarded: Option<axum::Extension<crate::listen_addrs::Forwarded>>,
     ApiJson(request): ApiJson<CreateDevicePairingRequest>,
 ) -> Result<
     (
@@ -61,9 +63,32 @@ async fn create(
     ),
     AppError,
 > {
+    let security = &state.config.security;
+    let forwarded = forwarded
+        .map(|axum::Extension(forwarded)| forwarded)
+        .or_else(|| {
+            crate::listen_addrs::forwarded(
+                &headers,
+                &axum::http::Extensions::new(),
+                Some(peer.ip()),
+                &security.trusted_proxies,
+            )
+        });
+    let client = crate::listen_addrs::client_address(peer.ip(), forwarded);
+    let origin = headers
+        .get(header::ORIGIN)
+        .map(|value| value.to_str().unwrap_or("?"));
+    if let Some(allowed) = &security.pairing_origins {
+        if !origin.is_some_and(|origin| allowed.iter().any(|allowed| allowed == origin)) {
+            return Err(AppError::Unauthorized(
+                "device pairing is not allowed from this origin".to_owned(),
+            ));
+        }
+    }
+    let arrival = crate::device_pairing::PairingArrival::new(origin, forwarded.is_some());
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(state.device_pairing.create(peer.ip(), request)?),
+        Json(state.device_pairing.create_from(client, arrival, request)?),
     ))
 }
 async fn reveal(
@@ -144,6 +169,58 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn pairing_origins_limit_where_a_pairing_may_start() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-device-pairing-origins-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = crate::config::Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..crate::config::Config::default()
+        };
+        config.security.pairing_origins = Some(vec!["todex-desktop://app".to_owned()]);
+        let state = AppState::new_for_tests(config).await.unwrap();
+        let app = super::super::loopback_test_router(state);
+        let create = |origin: Option<&str>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v2/device-pairing/create")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            // Well-formed but outdated: past the origin check it fails on
+            // its own (426), never with 403.
+            let body = json!({
+                "clientCommitment": URL_SAFE_NO_PAD.encode([1_u8; 32]),
+                "deviceName": "Origin test",
+                "devicePublicKey": URL_SAFE_NO_PAD.encode([2_u8; 32]),
+            });
+            app.clone()
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        };
+        for refused in [Some("https://evil.example"), None] {
+            let response = create(refused).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{refused:?}");
+        }
+        let response = create(Some("todex-desktop://app")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pairing_arrivals_keep_a_printable_origin() {
+        let arrival =
+            crate::device_pairing::PairingArrival::new(Some("https://a.example\u{1b}[2J"), true);
+        assert_eq!(arrival.origin.as_deref(), Some("https://a.example[2J"));
+        assert!(arrival.via_proxy);
+        let long = "x".repeat(500);
+        let arrival = crate::device_pairing::PairingArrival::new(Some(&long), false);
+        assert_eq!(arrival.origin.unwrap().len(), 200);
     }
 
     #[tokio::test]

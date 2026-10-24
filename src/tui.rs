@@ -241,6 +241,14 @@ struct DevicePairingRequest {
     /// Derived from the device key; `None` from an older daemon.
     device_id: Option<String>,
     peer_address: String,
+    /// The page or app the request was made from (`Origin`), if sent.
+    origin: Option<String>,
+    /// Made from a web page rather than the desktop app.
+    from_web_page: bool,
+    /// A reverse proxy forwarded it.
+    via_proxy: bool,
+    /// A loopback peer no proxy forwarded.
+    from_this_machine: bool,
     /// When the device id is on the history block list (`revokedDevices`).
     revoked_at: Option<chrono::DateTime<Utc>>,
     expires_at: i64,
@@ -850,6 +858,8 @@ impl TuiApp {
                     requests
                         .into_iter()
                         .map(|request| DevicePairingRequest {
+                            from_web_page: request.from_web_page(),
+                            from_this_machine: request.from_this_machine(),
                             revoked_at: request.device_id.as_ref().and_then(|id| {
                                 revoked_list
                                     .iter()
@@ -860,6 +870,8 @@ impl TuiApp {
                             verification_code: request.verification_code,
                             transport_fingerprint: request.transport_fingerprint,
                             device_name: request.device_name,
+                            via_proxy: request.via_proxy,
+                            origin: request.origin,
                             device_id: request.device_id,
                             peer_address: request.peer_address,
                             expires_at: i64::try_from(request.expires_at).unwrap_or(i64::MAX),
@@ -1079,14 +1091,20 @@ impl TuiApp {
         }
     }
 
-    /// The peer address of a pairing request; loopback is marked as this
-    /// machine.
-    fn peer_label(&self, address: &str) -> String {
-        let shown = device_display_name(address);
-        if address
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.to_canonical().is_loopback())
-        {
+    /// The peer address of a pairing request. Only a request from this
+    /// machine's own TodeX app is marked as this machine: a web page in a
+    /// local browser, or a remote client behind a local proxy, also arrives
+    /// over loopback.
+    fn peer_label(&self, request: &DevicePairingRequest) -> String {
+        let shown = device_display_name(&request.peer_address);
+        if request.via_proxy {
+            format!(
+                "{shown}{}",
+                self.text(" (via a reverse proxy)", "（经反向代理）")
+            )
+        } else if request.from_web_page {
+            format!("{shown}{}", self.text(" (a web page)", "（网页）"))
+        } else if request.from_this_machine {
             format!("{shown}{}", self.text(" (this machine)", "（本机）"))
         } else {
             shown
@@ -1095,10 +1113,28 @@ impl TuiApp {
 
     /// Re-pair and revoked-device warnings for a pending request.
     fn device_pairing_warnings(&self, request: &DevicePairingRequest) -> Vec<Line<'static>> {
-        let Some(device_id) = request.device_id.as_deref() else {
-            return Vec::new();
-        };
         let mut lines = Vec::new();
+        if request.from_web_page {
+            let origin = request
+                .origin
+                .as_deref()
+                .map(device_display_name)
+                .unwrap_or_default();
+            lines.push(Line::styled(
+                match self.language {
+                    TuiLanguage::English => format!(
+                        "! Started from the web page {origin}. Any page can start a pairing and show its own code; approve only if you opened TodeX there to pair."
+                    ),
+                    TuiLanguage::Chinese => format!(
+                        "! 由网页 {origin} 发起。任何网页都能发起配对并显示自己的验证码，只有你确实在该页面中打开 TodeX 配对时才批准。"
+                    ),
+                },
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        let Some(device_id) = request.device_id.as_deref() else {
+            return lines;
+        };
         if self
             .device_pairing
             .devices
@@ -1368,7 +1404,7 @@ impl TuiApp {
                 Line::from(format!(
                     "{}{}",
                     self.text("Address: ", "地址："),
-                    self.peer_label(&request.peer_address)
+                    self.peer_label(request)
                 )),
                 Line::from(match self.language {
                     TuiLanguage::English => format!("Expires in {remaining}s"),
@@ -4946,6 +4982,10 @@ mod tests {
             device_name: "My laptop".to_owned(),
             device_id: Some("dev_AAAAAAAAAAAAAAAA".to_owned()),
             peer_address: "192.0.2.4".to_owned(),
+            origin: None,
+            from_web_page: false,
+            via_proxy: false,
+            from_this_machine: false,
             revoked_at: None,
             expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
         }
@@ -5243,6 +5283,7 @@ mod tests {
         app.device_pairing.open = true;
         let mut request = device_request("pending");
         request.peer_address = "::ffff:127.0.0.1".to_owned();
+        request.from_this_machine = true;
         app.device_pairing.replace(vec![request.clone()]);
         app.device_pairing.navigate(true);
         let plain = render_pairing(&app);
@@ -5255,6 +5296,28 @@ mod tests {
         assert!(!plain.contains("revoked on"));
         // The code was on screen, so approval is possible.
         assert!(app.device_pairing.displayed_request.borrow().is_some());
+
+        // A web page in a local browser is not "this machine".
+        request.origin = Some("https://evil.example".to_owned());
+        request.from_web_page = true;
+        app.device_pairing.replace(vec![request.clone()]);
+        let web = render_pairing(&app);
+        assert!(web.contains("(a web page)"), "{web}");
+        assert!(!web.contains("(this machine)"), "{web}");
+        assert!(
+            web.contains("Started from the web page https://evil.example"),
+            "{web}"
+        );
+        // Nor is a client behind a local reverse proxy.
+        request.origin = None;
+        request.from_web_page = false;
+        request.via_proxy = true;
+        app.device_pairing.replace(vec![request.clone()]);
+        let proxied = render_pairing(&app);
+        assert!(proxied.contains("(via a reverse proxy)"), "{proxied}");
+        assert!(!proxied.contains("(this machine)"), "{proxied}");
+        request.via_proxy = false;
+        request.from_this_machine = false;
 
         // Same key already registered, and revoked from history earlier.
         request.peer_address = "192.0.2.4".to_owned();

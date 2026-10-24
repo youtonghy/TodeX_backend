@@ -394,6 +394,15 @@ pub(crate) async fn device_auth_middleware(
         .headers
         .remove(HeaderName::from_static(VERIFIED_HEADER));
     if !state.config.security.enable_auth {
+        if parts
+            .extensions
+            .get::<crate::listen_addrs::Forwarded>()
+            .is_some()
+        {
+            return Err(AppError::Unauthorized(
+                "anonymous access is not available through a reverse proxy".to_owned(),
+            ));
+        }
         ensure_local_request(&parts.headers, &parts.uri)?;
         return Ok(next.run(Request::from_parts(parts, body)).await);
     }
@@ -431,6 +440,13 @@ pub(crate) async fn device_auth_middleware(
 /// rewrites its own `null`/`file://` origins to [`DESKTOP_APP_ORIGIN`] before
 /// they leave the process. Native clients send no `Origin`.
 pub(crate) fn ensure_local_request(headers: &HeaderMap, uri: &Uri) -> Result<(), AppError> {
+    // A same-host reverse proxy rewrites `Host` to loopback for remote
+    // clients; what it forwarded is not local.
+    if crate::listen_addrs::has_forwarding_headers(headers) {
+        return Err(AppError::Unauthorized(
+            "anonymous access is not available through a reverse proxy".to_owned(),
+        ));
+    }
     if !has_loopback_host(headers, uri) {
         return Err(AppError::Unauthorized(
             "anonymous access requires a loopback Host".to_owned(),
@@ -761,6 +777,21 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn anonymous_access_is_refused_through_a_reverse_proxy() {
+        let uri: Uri = "/v2/workspaces".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, "127.0.0.1:7345".parse().unwrap());
+        assert!(ensure_local_request(&headers, &uri).is_ok());
+        // What nginx sends for a remote client (`proxy_set_header Host
+        // $proxy_host`): a loopback Host, plus who it forwards for.
+        headers.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        assert!(matches!(
+            ensure_local_request(&headers, &uri),
+            Err(AppError::Unauthorized(_))
+        ));
+    }
 
     #[tokio::test]
     async fn unverified_bodies_are_bounded_in_size_room_and_time() {

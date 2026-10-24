@@ -158,6 +158,60 @@ pub(crate) struct DevicePairingRequestSummary {
     /// (`None` for `pairing_encryption = "none"`), shown next to the code.
     #[serde(default)]
     pub transport_fingerprint: Option<String>,
+    /// The `Origin` the request was made from (`todex-desktop://app` for
+    /// the desktop app; a web page's origin otherwise), when it sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// A reverse proxy forwarded the request: `peer_address` is the proxy
+    /// (or the client a trusted proxy named), never "this machine".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub via_proxy: bool,
+}
+
+impl DevicePairingRequestSummary {
+    /// Made from a browser page rather than a TodeX app: any web page can
+    /// start a pairing and show its own code, so approvers are warned.
+    pub(crate) fn from_web_page(&self) -> bool {
+        self.origin
+            .as_deref()
+            .is_some_and(|origin| origin != crate::device_auth::DESKTOP_APP_ORIGIN)
+    }
+
+    /// The request came from this machine itself: a loopback peer that no
+    /// proxy forwarded.
+    pub(crate) fn from_this_machine(&self) -> bool {
+        !self.via_proxy
+            && self
+                .peer_address
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.to_canonical().is_loopback())
+    }
+}
+
+/// How a pairing request reached the daemon, beyond its peer address.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PairingArrival {
+    pub origin: Option<String>,
+    pub via_proxy: bool,
+}
+
+impl PairingArrival {
+    /// Keeps at most 200 printable ASCII characters of an `Origin` value, so
+    /// the approval screen shows nothing a page could use to spoof it.
+    pub(crate) fn new(origin: Option<&str>, via_proxy: bool) -> Self {
+        let origin = origin.map(|origin| {
+            let mut kept: String = origin
+                .chars()
+                .filter(|c| c.is_ascii_graphic())
+                .take(200)
+                .collect();
+            if kept.is_empty() {
+                kept.push('?');
+            }
+            kept
+        });
+        Self { origin, via_proxy }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -346,6 +400,7 @@ struct PendingRequest {
     peer: IpAddr,
     /// [`source_key`] of `peer`.
     source: IpAddr,
+    arrival: PairingArrival,
     device_name: String,
     device_public_key: [u8; 32],
     created: Instant,
@@ -428,9 +483,19 @@ impl DevicePairingRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn create(
         &self,
         peer: IpAddr,
+        request: CreateDevicePairingRequest,
+    ) -> Result<CreateDevicePairingResponse> {
+        self.create_from(peer, PairingArrival::default(), request)
+    }
+
+    pub(crate) fn create_from(
+        &self,
+        peer: IpAddr,
+        arrival: PairingArrival,
         request: CreateDevicePairingRequest,
     ) -> Result<CreateDevicePairingResponse> {
         if !self.enabled {
@@ -531,6 +596,7 @@ impl DevicePairingRegistry {
                 transport: transport.clone(),
                 peer,
                 source,
+                arrival,
                 device_name: request.device_name,
                 device_public_key: device_public,
                 created: now,
@@ -630,6 +696,8 @@ impl DevicePairingRegistry {
             transport_fingerprint: crate::transport_crypto::transport_fingerprint(
                 &pending.transport.public_key,
             ),
+            origin: pending.arrival.origin.clone(),
+            via_proxy: pending.arrival.via_proxy,
         };
         // The summary file is what the local approver (TUI) lists, so the
         // code becomes visible only now.
@@ -1170,6 +1238,8 @@ pub(crate) fn write_test_request(root: &Path, code: &str, expires_at: u64) -> St
             expires_at,
             peer_address: "172.17.0.1".to_owned(),
             transport_fingerprint: Some("ABCD-EF01-2345-6789".to_owned()),
+            origin: None,
+            via_proxy: false,
         },
     )
     .unwrap();

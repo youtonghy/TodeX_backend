@@ -819,6 +819,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -901,6 +902,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -981,6 +983,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: true,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),

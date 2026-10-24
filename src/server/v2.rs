@@ -512,6 +512,7 @@ pub(super) async fn version(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    forwarded: Option<axum::Extension<crate::listen_addrs::Forwarded>>,
 ) -> Json<VersionResponse> {
     let trusted = if state.config.security.enable_auth {
         state
@@ -519,7 +520,7 @@ pub(super) async fn version(
             .authenticate(&method, uri.path(), uri.query(), &headers, &[])
             .is_ok()
     } else {
-        device_auth::ensure_local_request(&headers, &uri).is_ok()
+        forwarded.is_none() && device_auth::ensure_local_request(&headers, &uri).is_ok()
     };
     let paths = trusted.then(|| VersionPaths {
         data_dir: state.config.data_dir.display().to_string(),
@@ -5122,6 +5123,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -5368,6 +5370,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -5771,6 +5774,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -5889,6 +5893,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -6052,6 +6057,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -6221,6 +6227,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -6365,6 +6372,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -6508,6 +6516,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -6728,6 +6737,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -6922,6 +6932,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -7053,6 +7064,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -7557,6 +7569,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -8441,6 +8454,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -8663,6 +8677,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -8988,6 +9003,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: false,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -9076,6 +9092,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -9227,6 +9244,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: false,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -9407,6 +9425,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
@@ -9836,6 +9855,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                ..Default::default()
             },
             api: Default::default(),
             deployment: Default::default(),
