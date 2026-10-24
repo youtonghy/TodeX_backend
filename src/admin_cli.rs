@@ -320,7 +320,7 @@ fn print_request(request: &DevicePairingRequestSummary) {
     if request.via_proxy {
         println!("  forwarded:             by a reverse proxy (the address is not this machine)");
     }
-    if request.from_web_page() {
+    if request.is_web_page_request() {
         println!(
             "  WARNING: started from a web page; any page can start a pairing and show \
              its own code. Approve only if you opened TodeX there to pair."

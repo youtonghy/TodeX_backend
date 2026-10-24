@@ -858,8 +858,8 @@ impl TuiApp {
                     requests
                         .into_iter()
                         .map(|request| DevicePairingRequest {
-                            from_web_page: request.from_web_page(),
-                            from_this_machine: request.from_this_machine(),
+                            from_web_page: request.is_web_page_request(),
+                            from_this_machine: request.is_from_this_machine(),
                             revoked_at: request.device_id.as_ref().and_then(|id| {
                                 revoked_list
                                     .iter()

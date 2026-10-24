@@ -289,7 +289,7 @@ pub(crate) fn forwarded(
             headers
                 .get_all("x-forwarded-for")
                 .iter()
-                .last()?
+                .next_back()?
                 .to_str()
                 .ok()?
                 .rsplit(',')

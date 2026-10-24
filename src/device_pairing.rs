@@ -171,7 +171,7 @@ pub(crate) struct DevicePairingRequestSummary {
 impl DevicePairingRequestSummary {
     /// Made from a browser page rather than a TodeX app: any web page can
     /// start a pairing and show its own code, so approvers are warned.
-    pub(crate) fn from_web_page(&self) -> bool {
+    pub(crate) fn is_web_page_request(&self) -> bool {
         self.origin
             .as_deref()
             .is_some_and(|origin| origin != crate::device_auth::DESKTOP_APP_ORIGIN)
@@ -179,7 +179,7 @@ impl DevicePairingRequestSummary {
 
     /// The request came from this machine itself: a loopback peer that no
     /// proxy forwarded.
-    pub(crate) fn from_this_machine(&self) -> bool {
+    pub(crate) fn is_from_this_machine(&self) -> bool {
         !self.via_proxy
             && self
                 .peer_address
