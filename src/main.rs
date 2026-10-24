@@ -131,6 +131,22 @@ enum Command {
     /// `PreToolUse` hook TodeX installs for the Antigravity CLI.
     #[command(name = agent_mcp::AGY_HOOK_SUBCOMMAND, hide = true)]
     AgyHook,
+    /// Checks a release's `SHA256SUMS.sig` with this binary's release keys,
+    /// so `install.sh update` needs no Ed25519-capable OpenSSL. Exit 0:
+    /// verified; 3: not signed by a release key; 1: unusable input (clap's
+    /// own usage errors exit 2).
+    #[command(name = "verify-release", hide = true)]
+    VerifyRelease {
+        /// The release tag, e.g. `v1.2.3`.
+        #[arg(long)]
+        tag: String,
+        /// `SHA256SUMS` as downloaded.
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+        /// `SHA256SUMS.sig` as downloaded.
+        #[arg(long)]
+        signature: std::path::PathBuf,
+    },
     /// `SSH_ASKPASS` helper for password-authenticated SFTP sessions.
     #[command(name = "ssh-askpass", hide = true)]
     SshAskpass {
@@ -289,6 +305,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::AgentMcpBridge { route } => agent_mcp::run_bridge(route).await,
         // No logging: stdout carries the hook's decision.
         Command::AgyHook => agent_mcp::run_agy_hook().await,
+        Command::VerifyRelease {
+            tag,
+            manifest,
+            signature,
+        } => std::process::exit(update::verify_release_files(&tag, &manifest, &signature)),
         Command::SshAskpass { prompt } => {
             std::process::exit(remote_fs::askpass::run(prompt.as_deref()))
         }

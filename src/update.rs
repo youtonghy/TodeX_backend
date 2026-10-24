@@ -213,6 +213,29 @@ fn verify_release_signature(
     bail!("release signature does not verify; refusing to install this update")
 }
 
+/// `verify-release`: whether `signature` (a downloaded `SHA256SUMS.sig`)
+/// signs `manifest` for `tag` under this binary's release keys. Returns the
+/// exit code: 0 verified, 3 not signed by a release key, 1 unreadable
+/// (2 is clap's usage error).
+pub fn verify_release_files(tag: &str, manifest: &Path, signature: &Path) -> i32 {
+    let read =
+        |path: &Path| fs::read(path).with_context(|| format!("cannot read {}", path.display()));
+    let (manifest, signature) = match (read(manifest), read(signature)) {
+        (Ok(manifest), Ok(signature)) => (manifest, signature),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("verify-release: {error:#}");
+            return 1;
+        }
+    };
+    match verify_release_signature(tag, &manifest, &signature, RELEASE_SIGNING_KEYS) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("verify-release: {error:#}");
+            3
+        }
+    }
+}
+
 fn verify_checksum(manifest: &str, name: &str, bytes: &[u8]) -> Result<()> {
     let hashes: Vec<_> = manifest
         .lines()
@@ -722,6 +745,35 @@ MCowBQYDK2VwAyEAsbGbf0A8YCNCbJ+lEI7FeayIGzTxCU/OPwBsaAx1GS4=
             &[RELEASE_SIGNING_KEYS[0], OPENSSL_TEST_KEY]
         )
         .is_ok());
+    }
+
+    #[test]
+    fn verify_release_files_reports_its_verdict_as_an_exit_code() {
+        let directory = std::env::temp_dir().join(format!("todex-verify-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let manifest = directory.join("SHA256SUMS");
+        let signature = directory.join("SHA256SUMS.sig");
+        fs::write(&manifest, OPENSSL_TEST_MANIFEST).unwrap();
+        fs::write(&signature, [0_u8; 64]).unwrap();
+        // Not signed by a shipped release key.
+        assert_eq!(verify_release_files("v9.9.9", &manifest, &signature), 3);
+        assert_eq!(
+            verify_release_files("v9.9.9", &manifest, &directory.join("missing")),
+            1
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    /// `install.sh` verifies with its own copy of the release key; it must be
+    /// the one the daemon ships.
+    #[test]
+    fn install_sh_carries_the_shipped_release_key() {
+        let script = include_str!("../install.sh");
+        for key in RELEASE_SIGNING_KEYS {
+            for line in key.lines().filter(|line| !line.trim().is_empty()) {
+                assert!(script.contains(line.trim()), "install.sh lacks {line}");
+            }
+        }
     }
 
     #[test]

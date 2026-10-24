@@ -603,7 +603,10 @@ first, then remove the abandoned lock directory before retrying.
 
 `install.sh` at the repository root manages the prebuilt binary end to end:
 `install` (default) downloads the latest release `.bin` asset for the detected
-platform, verifies `SHA256SUMS`, validates the executable's `--version`, installs
+platform, checks that `SHA256SUMS.sig` is the release key's signature over
+`SHA256SUMS` (with an installed `todex-agentd` when it can, otherwise with
+OpenSSL 3) before trusting the checksums, verifies the checksum, validates the
+executable's `--version`, installs
 to `~/.local/bin` (override with `--prefix` or `TODEX_INSTALL_DIR`), and restarts
 a running managed daemon. The running daemon is stopped only after the new release
 is verified, the swap takes the same `*.update-lock` as the built-in updater, and
@@ -614,7 +617,11 @@ script restarts after a `--version` install has automatic updates disabled; set
 the rest of the lifecycle; `uninstall --purge` also removes the data directory and
 needs `--yes` when no terminal is available to confirm (for example, when piped
 from `curl`). A `data_dir` redirect in that directory's `config.toml` is reported
-but not deleted. Typical usage:
+but not deleted. Releases up to v2.3.6 predate signing: the script warns and
+checks only their checksum. When the signature cannot be checked at all (no
+OpenSSL 3, e.g. stock macOS with LibreSSL, and no installed `todex-agentd` that
+can verify) it refuses to install unless `--allow-unverified` is given. Typical
+usage:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/youtonghy/TodeX_backend/main/install.sh | bash

@@ -29,12 +29,30 @@ REPO="${TODEX_REPO:-youtonghy/TodeX_backend}"
 BIN_NAME="todex-agentd"
 MAX_BINARY_BYTES=$((256 * 1024 * 1024))
 MAX_SUMS_BYTES=$((1024 * 1024))
+MAX_SIG_BYTES=1024
+
+# The release signing key (ci/release-signing.pub.pem; a backend test keeps
+# this copy identical). SHA256SUMS is trusted only once SHA256SUMS.sig, an
+# Ed25519 signature over "todex-release-v1\0" + tag + "\0" + SHA256SUMS,
+# verifies under it (docs/RELEASING.md).
+RELEASE_SIGNING_KEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAdKUgyyGFfByhDCxXFpvqlEO09bcxzYudjsoH5ise5Z0=
+-----END PUBLIC KEY-----'
+# Releases up to this one were published before signing and have no
+# SHA256SUMS.sig; only their checksum can be checked.
+LAST_UNSIGNED_VERSION="2.3.6"
+# A throwaway key whose signature (tag v9.9.9, the vector the updater tests
+# use) tells an OpenSSL that can verify Ed25519 from one that cannot.
+OPENSSL_PROBE_KEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAsbGbf0A8YCNCbJ+lEI7FeayIGzTxCU/OPwBsaAx1GS4=
+-----END PUBLIC KEY-----'
 
 COMMAND=""
 PIN_VERSION=""
 PURGE=0
 ASSUME_YES=0
 WITH_BROWSER=0
+ALLOW_UNVERIFIED=0
 INSTALL_DIR=""
 DATA_DIR=""
 BIN_PATH=""
@@ -75,6 +93,10 @@ Options:
   --purge           With uninstall: also remove the data directory (~/.todex-agent)
   --with-browser    With install/update: also download the agent browser's
                     Chromium now (otherwise it downloads on first use)
+  --allow-unverified
+                    Install even when the release signature cannot be checked
+                    on this system (no OpenSSL 3 and no installed todex-agentd
+                    that can verify); only the SHA-256 checksum is checked
   --yes             Skip confirmations (required for --purge without a terminal)
   --help            Show this help
 
@@ -107,6 +129,7 @@ parse_args() {
                 [[ -n "$INSTALL_DIR" ]] || die "--prefix requires a value" ;;
             --purge) PURGE=1 ;;
             --with-browser) WITH_BROWSER=1 ;;
+            --allow-unverified) ALLOW_UNVERIFIED=1 ;;
             --yes|-y) ASSUME_YES=1 ;;
             --help|-h) usage; exit 0 ;;
             *) die "unknown argument: $1 (try --help)" ;;
@@ -281,6 +304,64 @@ download() {
     [[ "$size" -le "$max_bytes" ]] || die "downloaded file exceeds the size limit ($url)"
 }
 
+# The bytes a release signature covers: "todex-release-v1\0" tag "\0" manifest.
+signed_message() {
+    local tag="$1" manifest="$2" out="$3"
+    printf 'todex-release-v1\0%s\0' "$tag" > "$out"
+    cat "$manifest" >> "$out"
+}
+
+# Whether openssl can check Ed25519 signatures (OpenSSL 3; macOS ships
+# LibreSSL, which cannot): it must accept a known-good signature.
+openssl_can_verify() {
+    command -v openssl >/dev/null 2>&1 || return 1
+    [[ "$(openssl version 2>/dev/null)" == "OpenSSL 3."* ]] || return 1
+    local probe="$WORK_DIR/probe"
+    mkdir -p "$probe"
+    printf '%s\n' "$OPENSSL_PROBE_KEY_PEM" > "$probe/key.pem"
+    printf 'abc  todex-agentd-v9.9.9-linux-x64.bin\n' > "$probe/SHA256SUMS"
+    signed_message "v9.9.9" "$probe/SHA256SUMS" "$probe/message"
+    printf '%s' '4SRLsnVHZxYTNojV198uqeFn4WpPsHoU80dxwxE6LKW5MKIw/iBpfpkP2rgd0pQEIA3sVu/ymr6zb+xiZrykCg==' \
+        | openssl base64 -d -A > "$probe/sig" 2>/dev/null || return 1
+    openssl pkeyutl -verify -pubin -inkey "$probe/key.pem" -rawin \
+        -in "$probe/message" -sigfile "$probe/sig" >/dev/null 2>&1
+}
+
+# Requires SHA256SUMS.sig to verify under the release key, before the binary
+# is downloaded. Releases up to $LAST_UNSIGNED_VERSION were never signed.
+verify_release_signature() {
+    local version="$1" base="$2"
+    if ! semver_gt "$version" "$LAST_UNSIGNED_VERSION"; then
+        warn "v$version was published before releases were signed; only its SHA-256 checksum can be checked"
+        return 0
+    fi
+    local sums="$WORK_DIR/SHA256SUMS" sig="$WORK_DIR/SHA256SUMS.sig" status=0
+    download "$base/SHA256SUMS.sig" "$sig" "$MAX_SIG_BYTES"
+    info "Verifying the release signature"
+    # An installed todex-agentd checks with the keys it already trusts.
+    if [[ -x "$BIN_PATH" ]] && "$BIN_PATH" verify-release --help >/dev/null 2>&1; then
+        "$BIN_PATH" verify-release --tag "v$version" --manifest "$sums" --signature "$sig" || status=$?
+        case "$status" in
+            0) return 0 ;;
+            3) die "SHA256SUMS.sig for v$version is not signed by the TodeX release key; refusing to install" ;;
+            *) warn "the installed $BIN_NAME could not check the signature; trying OpenSSL" ;;
+        esac
+    fi
+    if openssl_can_verify; then
+        printf '%s\n' "$RELEASE_SIGNING_KEY_PEM" > "$WORK_DIR/release-key.pem"
+        signed_message "v$version" "$sums" "$WORK_DIR/signed-message"
+        openssl pkeyutl -verify -pubin -inkey "$WORK_DIR/release-key.pem" -rawin \
+            -in "$WORK_DIR/signed-message" -sigfile "$sig" >/dev/null 2>&1 \
+            || die "SHA256SUMS.sig for v$version is not signed by the TodeX release key; refusing to install"
+        return 0
+    fi
+    if [[ "$ALLOW_UNVERIFIED" == 1 ]]; then
+        warn "cannot check the release signature on this system; --allow-unverified: relying on the SHA-256 checksum alone"
+        return 0
+    fi
+    die "cannot check the release signature: this system has no OpenSSL 3 (macOS ships LibreSSL, which cannot). Install it (e.g. brew install openssl@3, then put it first on PATH) and retry, or rerun with --allow-unverified to rely on the SHA-256 checksum alone"
+}
+
 # Download and verify a release into WORK_DIR without touching the install.
 fetch_release() {
     local version="$1"
@@ -291,6 +372,7 @@ fetch_release() {
 
     info "Downloading $asset"
     download "$base/SHA256SUMS" "$WORK_DIR/SHA256SUMS" "$MAX_SUMS_BYTES"
+    verify_release_signature "$version" "$base"
     download "$base/$asset" "$bin" "$MAX_BINARY_BYTES"
 
     info "Verifying SHA-256 checksum"

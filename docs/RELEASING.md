@@ -100,9 +100,13 @@ every daemon with automatic updates enabled.
    public key, and drop the old one from `RELEASE_SIGNING_KEYS` in a later
    release.
 
-If the key is lost, daemons cannot update automatically: ship a release with a
-new key and ask users to reinstall with `install.sh`, which checks `SHA256SUMS`
-over TLS but does not verify the signature.
+`install.sh` carries its own copy of the public key (a backend test keeps it
+identical to `ci/release-signing.pub.pem`), as do the desktop app's local backend
+deploy and the container image build; update all of them when rotating.
+
+If the key is lost, daemons cannot update automatically: ship a release signed
+with a new key (with every copy of the public key replaced) and ask users to
+reinstall with `install.sh` from `main`.
 
 ## Failed releases
 
