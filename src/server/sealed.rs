@@ -100,13 +100,14 @@ impl Default for TunnelLimits {
 
 /// Inner request headers the tunnel forwards; everything else (hop-by-hop
 /// headers, `x-todex-transport*`, cookies, ...) is dropped.
-const FORWARDED_INNER_HEADERS: [&str; 6] = [
+const FORWARDED_INNER_HEADERS: [&str; 7] = [
     "content-type",
     "accept",
     device_auth::HEADER_DEVICE_ID,
     device_auth::HEADER_TIMESTAMP,
     device_auth::HEADER_NONCE,
     device_auth::HEADER_SIGNATURE,
+    device_auth::HEADER_CONTENT_SHA256,
 ];
 
 /// Inner response headers that describe the outer connection, not the

@@ -42,12 +42,17 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 pub(crate) const HEADER_DEVICE_ID: &str = "x-todex-device-id";
 pub(crate) const HEADER_TIMESTAMP: &str = "x-todex-auth-ts";
 pub(crate) const HEADER_NONCE: &str = "x-todex-auth-nonce";
 pub(crate) const HEADER_SIGNATURE: &str = "x-todex-auth-sig";
+/// Optional: base64url (no padding) SHA-256 of the body, the value the
+/// signature covers. With it the signature is checked, and the nonce
+/// claimed, before the body is read; the body must then match it.
+pub(crate) const HEADER_CONTENT_SHA256: &str = "x-todex-content-sha256";
 /// Internal marker the middleware sets after verification. Clients can never
 /// reach handlers with this header intact: the middleware strips it on entry.
 pub(crate) const VERIFIED_HEADER: &str = "x-todex-verified-device";
@@ -347,20 +352,34 @@ impl PendingCredential {
         query: Option<&str>,
         body: &[u8],
     ) -> Result<AuthContext, AppError> {
+        let body_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(body));
+        self.verify_body_hash(auth, method, path, query, &body_hash)
+    }
+
+    /// [`Self::verify`] against the body hash the request declared, before
+    /// its body is read; the caller then checks the body against it.
+    fn verify_body_hash(
+        self,
+        auth: &DeviceAuthenticator,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
+        body_hash: &str,
+    ) -> Result<AuthContext, AppError> {
         let Self {
             credential,
             timestamp,
             key,
             signature,
         } = self;
-        let payload = signed_payload(
+        let payload = signed_payload_for_hash(
             &credential.device_id,
             method.as_str(),
             path,
             &canonical_query(query),
             &credential.timestamp,
             &credential.nonce,
-            body,
+            body_hash,
         );
         // Verify before claiming the nonce so a forged request cannot burn a
         // nonce belonging to an in-flight legitimate request.
@@ -409,17 +428,50 @@ pub(crate) async fn device_auth_middleware(
     let pending = state
         .device_auth
         .check_credential(&parts.headers, parts.uri.query())?;
-    let bytes = state
-        .device_auth
-        .read_unverified_body(&parts.method, body)
-        .await?;
-    let auth = pending.verify(
-        &state.device_auth,
-        &parts.method,
-        parts.uri.path(),
-        parts.uri.query(),
-        &bytes,
-    )?;
+    let declared = parts
+        .headers
+        .get(HEADER_CONTENT_SHA256)
+        .map(|value| value.to_str().map(str::to_owned));
+    let (auth, bytes) = match declared {
+        // The signature (and nonce) are settled before any body is read.
+        Some(declared) => {
+            let declared = declared.map_err(|_| AppError::Unauthenticated)?;
+            let digest = URL_SAFE_NO_PAD
+                .decode(&declared)
+                .ok()
+                .filter(|digest| digest.len() == 32)
+                .ok_or(AppError::Unauthenticated)?;
+            let auth = pending.verify_body_hash(
+                &state.device_auth,
+                &parts.method,
+                parts.uri.path(),
+                parts.uri.query(),
+                &declared,
+            )?;
+            let bytes = state
+                .device_auth
+                .read_unverified_body(&parts.method, body)
+                .await?;
+            if !bool::from(Sha256::digest(&bytes).as_slice().ct_eq(&digest)) {
+                return Err(AppError::Unauthenticated);
+            }
+            (auth, bytes)
+        }
+        None => {
+            let bytes = state
+                .device_auth
+                .read_unverified_body(&parts.method, body)
+                .await?;
+            let auth = pending.verify(
+                &state.device_auth,
+                &parts.method,
+                parts.uri.path(),
+                parts.uri.query(),
+                &bytes,
+            )?;
+            (auth, bytes)
+        }
+    };
     let mut request = Request::from_parts(parts, Body::from(bytes));
     request.headers_mut().insert(
         HeaderName::from_static(VERIFIED_HEADER),
@@ -641,6 +693,7 @@ fn strict_encode(value: &str) -> String {
     encoded
 }
 
+#[cfg(test)]
 pub(crate) fn signed_payload(
     device_id: &str,
     method: &str,
@@ -651,6 +704,27 @@ pub(crate) fn signed_payload(
     body: &[u8],
 ) -> Vec<u8> {
     let body_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(body));
+    signed_payload_for_hash(
+        device_id,
+        method,
+        path,
+        canonical_query,
+        timestamp,
+        nonce,
+        &body_hash,
+    )
+}
+
+/// [`signed_payload`] given the body's base64url SHA-256.
+fn signed_payload_for_hash(
+    device_id: &str,
+    method: &str,
+    path: &str,
+    canonical_query: &str,
+    timestamp: &str,
+    nonce: &str,
+    body_hash: &str,
+) -> Vec<u8> {
     [
         SIGN_DOMAIN,
         device_id.as_bytes(),
@@ -777,6 +851,63 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_declared_body_hash_settles_the_signature_before_the_body_is_read() {
+        use axum::{body::Body, http::Request, routing::put, Router};
+        use tower::ServiceExt;
+
+        let root = std::env::temp_dir().join(format!("todex-digest-{}", uuid::Uuid::new_v4()));
+        let config = crate::config::Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..crate::config::Config::default()
+        };
+        let state = AppState::new_for_tests(config).await.unwrap();
+        let device = test_support::TestDevice::new(51);
+        device.enroll(&root.join("data"));
+        let app = Router::new()
+            .route("/echo", put(|body: axum::body::Bytes| async move { body }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                device_auth_middleware,
+            ))
+            .with_state(state);
+        let digest = |body: &[u8]| URL_SAFE_NO_PAD.encode(Sha256::digest(body));
+        let send = |signed_body: &'static [u8], declared: Option<String>, body: Body| {
+            let mut request = Request::put("/echo");
+            for (name, value) in device.sign("PUT", "/echo", signed_body) {
+                request = request.header(name, value);
+            }
+            if let Some(declared) = declared {
+                request = request.header(HEADER_CONTENT_SHA256, declared);
+            }
+            app.clone().oneshot(request.body(body).unwrap())
+        };
+        // Signed over another body: refused without reading this one, which
+        // would fail if read.
+        let unreadable = Body::from_stream(futures_util::stream::once(async {
+            Err::<axum::body::Bytes, _>(std::io::Error::other("must not be read"))
+        }));
+        let response = send(b"other", Some(digest(b"mine")), unreadable)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        // Signature and declaration agree, the body does not.
+        let response = send(b"mine", Some(digest(b"mine")), Body::from("swapped"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        // All three agree.
+        let response = send(b"mine", Some(digest(b"mine")), Body::from("mine"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        // Clients without the header are verified after reading, as before.
+        let response = send(b"mine", None, Body::from("mine")).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn anonymous_access_is_refused_through_a_reverse_proxy() {

@@ -398,7 +398,8 @@ name, a tampered name, and valid and invalid device names).
     permit; at most 8 of the 32 go to one device id, which is known to be
     registered but not yet verified here.
   - Inner headers kept: `content-type`, `accept`, `x-todex-device-id`,
-    `x-todex-auth-ts`, `x-todex-auth-nonce`, `x-todex-auth-sig` (names are
+    `x-todex-auth-ts`, `x-todex-auth-nonce`, `x-todex-auth-sig`,
+    `x-todex-content-sha256` (names are
     matched case-insensitively). `Host` and `Origin` are taken from the outer
     request, because anonymous (`enable_auth = false`) deployments check them.
     The peer address (`ConnectInfo`) carries over; no other outer request
