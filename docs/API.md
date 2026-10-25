@@ -852,6 +852,25 @@ GET /v2/version
 | `terminalReplay` | number | 终端输出序号与 `terminal.attach` / `terminal.clear` 的协议版本（当前 `1`），见「终端」；旧后端没有该字段 |
 | `terminalSnapshot` | number | `terminal.attach` 无法衔接时发送屏幕快照（当前 `1`），见「终端」；旧后端没有该字段 |
 
+## 本机 IPC 与本地管理 API
+
+daemon 默认另开一个本机 IPC 监听：Unix socket（默认 `<data_dir>/agentd.sock`）或 Windows 命名管道（`\\.\pipe\todex-agentd-<hash16>`），只有 daemon 的同一用户能连接（Unix 校验对端 uid，Windows 管道 DACL 只授予当前用户与 SYSTEM 并拒绝远程客户端）。配置（`[ipc] enabled`/`path`，`TODEX_AGENTD_IPC_ENABLED`/`TODEX_AGENTD_IPC_PATH`）、默认路径规则与信任模型见 [BUILD_RUN.md](BUILD_RUN.md#本机-ipc)。实际路径记录在 `daemon.json` 的 `ipc_path` 和 `daemon status --format json` 的 `ipcPath` 中。
+
+IPC 上是普通 HTTP/1.1（含 WebSocket 升级），客户端发送 `Host: localhost`。它提供与 TCP 监听相同的全部路由，对端视为回环：不强制 transport v2，匿名部署的 `Host`/`Origin` 检查照常进行，设备签名要求不变。经 IPC 的 `POST /v2/device-pairing/create` 在待批准列表中记为 `peerAddress: "ipc"`，并使用独立的频率限制桶。
+
+另外只在 IPC 上提供本地管理 API（TCP 上这些路径一律 404）。这些路由不需要设备签名：调用者已通过同用户检查，本来就能直接读写数据目录。响应均为 JSON；错误为 HTTP 4xx/5xx 加 `{"error":{"code":"...","message":"..."}}`，`code` 为小写（`invalid_config`、`invalid_request`、`managed_by_image`、`code_mismatch`、`not_found`、`conflict`、`internal`）。
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `GET /v2/local-admin/status` | `{version, deployment: "host"\|"container", dataDir, pid, startedAt (RFC 3339), listen: {host, port}, connectUrls: [{url: "ws://h:p/v2/ws", interface\|null}], advertiseUrl\|null, pairingLink（二维码 JSON 字符串）, transportFingerprint\|null（pairing_encryption = "none" 时为 null）, pairingEncryption, authEnabled, deviceCount, pendingPairingCount, api: {enabled, host, port, listening: "h:p"\|null}, workspaceRoots, ipcPath, autoUpdate（实际生效值）, configEditable}`。`listen.port` 为实际绑定端口 |
+| `GET /v2/local-admin/config` | `{host, port, pairingEncryption, workspaceRoots, autoUpdate, editable, restartRequired}`：已保存（`config.toml` + 环境变量）的设置；`restartRequired` 表示保存的 host/port/加密方式/根目录与运行中服务不同 |
+| `PUT /v2/local-admin/config` | body 为 `{host, port, pairingEncryption, workspaceRoots, autoUpdate}` 的任意子集（未知字段报错）。校验与 TUI 相同：host 为 IP 字面量；port 为 1–65535，API 开启时不得等于 `api.port`；host 与加密方式须满足 `enable_auth`/回环规则；根目录须为已存在目录，规范化、去重，至少一个，第一个为主根。校验失败 400 `invalid_config`；容器部署 409 `managed_by_image`。通过后写入 `config.toml`（与 TUI 相同的键，`autoUpdate` 写 `[update] auto_update` 并立即对运行中的 daemon 生效）；其余设置在重启后生效。响应同 GET |
+| `GET /v2/local-admin/pairing-requests` | 等待决定的配对申请 `[{requestId, verificationCode, deviceName, deviceId\|null, expiresAt（毫秒）, peerAddress, transportFingerprint\|null}]`，与 `pair list --format json` 相同 |
+| `POST /v2/local-admin/pairing-requests/{requestId}/decision` | body `{approved, verificationCode}`。验证码须与该申请一致（不区分大小写，连字符可省），否则 409 `code_mismatch`；申请不存在、已过期或已决定 404 `not_found`。成功 `{ok: true}` |
+| `GET /v2/local-admin/devices` | `[{deviceId, name, publicKey, pairedAt, lastSeenAt\|null}]` |
+| `DELETE /v2/local-admin/devices/{deviceId}` | 吊销设备（同 `devices revoke`），`{ok: true}`；不存在 404 `not_found` |
+| `POST /v2/local-admin/reset` | body `{target: "devices"\|"encryption"}`：吊销全部设备，或重新生成传输密钥（同 TUI 重置）。`{ok: true, restartRequired: true}` |
+
 ## Workspace 缓存同步
 
 工作区清单由后端持久化到 `$TODEX_AGENTD_DATA_DIR/workspaces.json`。手机和桌面端的本地存储只作为离线缓存；连接成功后会拉取当前身份的后端快照。工作区 ID 由后端根据规范化路径稳定生成，并与对话 manifest 的 `workspaceId` 共用，从而让不同设备恢复同一工作区内的对话。

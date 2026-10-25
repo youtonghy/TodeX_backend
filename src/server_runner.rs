@@ -38,6 +38,8 @@ pub struct ManagedServer {
     api: Option<ApiListener>,
     /// Held until the server is dropped: see [`lock_data_dir`].
     _data_dir_lock: std::fs::File,
+    /// The local IPC listener (`[ipc]`), when enabled and bound.
+    ipc: Option<IpcServer>,
 }
 
 /// How long a stopping listener waits for its open requests. API event
@@ -179,6 +181,28 @@ async fn serve_listener(
     while connections.join_next().await.is_some() {}
 }
 
+struct IpcServer {
+    path: std::path::PathBuf,
+    shutdown: Option<oneshot::Sender<()>>,
+    handle: JoinHandle<Result<()>>,
+}
+
+impl IpcServer {
+    /// Ends the listener; the socket file goes with it.
+    async fn stop(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        match drain_listener(self.handle, "ipc").await {
+            Some(Ok(Err(error))) => tracing::warn!(error = %error, "IPC listener failed"),
+            Some(Err(error)) if !error.is_cancelled() => {
+                tracing::warn!(error = %error, "IPC listener task failed")
+            }
+            _ => {}
+        }
+    }
+}
+
 /// `<data_dir>/daemon.lock`, locked for a server's lifetime.
 const DATA_DIR_LOCK_FILE: &str = "daemon.lock";
 
@@ -198,6 +222,57 @@ fn lock_data_dir(data_dir: &Path) -> Result<std::fs::File> {
             anyhow::Error::new(error).context(format!("failed to lock {}", path.display()))
         }
     })
+}
+
+/// Binds and serves the IPC listener. Failing to bind is not fatal: the
+/// daemon keeps serving TCP only.
+#[cfg(any(unix, windows))]
+fn start_ipc(
+    config: &Config,
+    state: &AppState,
+    info: impl FnOnce(String) -> server::LocalAdminInfo,
+) -> Option<IpcServer> {
+    use crate::ipc::{IpcListener, LocalPeer};
+    if !config.ipc.enabled {
+        return None;
+    }
+    let bound = crate::ipc::resolve_path(config)
+        .and_then(|path| IpcListener::bind(&path).map(|listener| (path, listener)));
+    let (path, listener) = match bound {
+        Ok(bound) => bound,
+        Err(error) => {
+            tracing::warn!(error = %error, "local IPC listener unavailable; serving TCP only");
+            return None;
+        }
+    };
+    let app = server::ipc_router(state.clone(), info(path.display().to_string()));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<LocalPeer>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .context("IPC server failed")
+    });
+    info!(path = %path.display(), "todex-agentd IPC listening");
+    Some(IpcServer {
+        path,
+        shutdown: Some(shutdown_tx),
+        handle,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn start_ipc(
+    _config: &Config,
+    _state: &AppState,
+    _info: impl FnOnce(String) -> server::LocalAdminInfo,
+) -> Option<IpcServer> {
+    None
 }
 
 struct ApiListener {
@@ -238,6 +313,7 @@ pub enum ProviderProcessTracking {
 
 impl ManagedServer {
     pub async fn start(config: Config, tracking: ProviderProcessTracking) -> Result<Self> {
+        let started_at = chrono::Utc::now();
         if config.security.enable_tls {
             anyhow::bail!(
                 "TLS is configured but this build has no certificate/key listener; terminate TLS at a trusted reverse proxy or disable enable_tls"
@@ -374,6 +450,13 @@ impl ManagedServer {
             }
             None => None,
         };
+        let api_listen = api.as_ref().map(|api| api.addr);
+        let ipc = start_ipc(&config, &state, |ipc_path| server::LocalAdminInfo {
+            started_at,
+            port: addr.port(),
+            api_listen,
+            ipc_path,
+        });
         let migration_task = Some(state.spawn_legacy_conversation_migration());
         let maintenance_task = Some(state.spawn_journal_maintenance());
         let legacy_scan_task = state.spawn_legacy_history_scan();
@@ -397,7 +480,13 @@ impl ManagedServer {
             history_watch_task,
             api,
             _data_dir_lock: data_dir_lock,
+            ipc,
         })
+    }
+
+    /// The path the IPC listener bound, when it runs.
+    pub fn ipc_path(&self) -> Option<&std::path::Path> {
+        self.ipc.as_ref().map(|ipc| ipc.path.as_path())
     }
 
     /// The bound API listener address, when `[api]` is enabled.
@@ -487,6 +576,9 @@ impl ManagedServer {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
+        if let Some(ipc) = self.ipc.take() {
+            ipc.stop().await;
+        }
         let result = match drain_listener(self.handle, "main").await {
             Some(joined) => joined.context("server task join failed"),
             None => Ok(Ok(())),
@@ -516,6 +608,9 @@ impl ManagedServer {
         if let Some(mut api) = self.api.take() {
             api.begin_stop();
             api.finish().await;
+        }
+        if let Some(ipc) = self.ipc.take() {
+            ipc.stop().await;
         }
         if let Some(task) = self.migration_task.take() {
             task.abort();
@@ -588,6 +683,261 @@ mod tests {
             assert!(plaintext_listener_needs_warning(false, host), "{host}");
             assert!(!plaintext_listener_needs_warning(true, host), "{host}");
         }
+    }
+
+    /// One HTTP/1.1 request over the IPC socket: the status and JSON body.
+    #[cfg(unix)]
+    async fn ipc_request(
+        path: &std::path::Path,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        let body = body.map(|body| body.to_string()).unwrap_or_default();
+        let request = format!(
+            "{method} {uri} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let raw = String::from_utf8(raw).unwrap();
+        let (head, mut payload) = raw.split_once("\r\n\r\n").unwrap();
+        let status = head[9..12].parse().unwrap();
+        let decoded;
+        if head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            let mut out = String::new();
+            loop {
+                let (size, rest) = payload.split_once("\r\n").unwrap();
+                let size = usize::from_str_radix(size.trim(), 16).unwrap();
+                if size == 0 {
+                    break;
+                }
+                out.push_str(&rest[..size]);
+                payload = &rest[size + 2..];
+            }
+            decoded = out;
+            payload = &decoded;
+        }
+        let value = if payload.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(payload).unwrap_or(serde_json::Value::String(payload.to_owned()))
+        };
+        (status, value)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ipc_listener_serves_the_router_and_the_local_admin_api_only_there() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::temp_dir().join(format!(
+            "todex-ipc-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let config = Config {
+            port: 0,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace.clone()],
+            ..Config::default()
+        };
+        let server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
+            .await
+            .unwrap();
+        let path = server.ipc_path().unwrap().to_path_buf();
+        assert_eq!(
+            path,
+            fs::canonicalize(root.join("data"))
+                .unwrap()
+                .join("agentd.sock")
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let (status, version) = ipc_request(&path, "GET", "/v2/version", None).await;
+        assert_eq!(status, 200, "{version}");
+        // Never routed on TCP.
+        let tcp = reqwest::get(format!("http://{}/v2/local-admin/status", server.addr()))
+            .await
+            .unwrap();
+        assert_eq!(tcp.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let (status, body) = ipc_request(&path, "GET", "/v2/local-admin/status", None).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["ipcPath"], path.display().to_string());
+        assert_eq!(body["listen"]["port"], server.addr().port());
+        assert_eq!(body["deployment"], "host");
+        assert_eq!(body["configEditable"], true);
+        assert_eq!(body["pendingPairingCount"], 0);
+        assert!(body["pairingLink"]
+            .as_str()
+            .unwrap()
+            .contains("todex-pairing-link"));
+        assert!(body["transportFingerprint"].is_string());
+
+        let (status, body) = ipc_request(&path, "GET", "/v2/local-admin/config", None).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["editable"], true);
+        for invalid in [
+            json!({ "port": 0 }),
+            json!({ "port": 70000 }),
+            json!({ "host": "not-an-ip" }),
+            json!({ "workspaceRoots": [] }),
+            json!({ "pairingEncryption": "rot13" }),
+            json!({ "unknown": true }),
+        ] {
+            let (status, body) = ipc_request(
+                &path,
+                "PUT",
+                "/v2/local-admin/config",
+                Some(invalid.clone()),
+            )
+            .await;
+            assert_eq!(status, 400, "{invalid}: {body}");
+            assert_eq!(body["error"]["code"], "invalid_config", "{body}");
+        }
+        let (status, body) = ipc_request(
+            &path,
+            "PUT",
+            "/v2/local-admin/config",
+            Some(json!({ "port": 7999, "workspaceRoots": [workspace, workspace] })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["port"], 7999);
+        assert_eq!(body["restartRequired"], true);
+        assert_eq!(
+            body["workspaceRoots"],
+            json!([fs::canonicalize(&workspace).unwrap()])
+        );
+        let saved = fs::read_to_string(root.join("data/config.toml")).unwrap();
+        assert!(saved.contains("port = 7999"), "{saved}");
+
+        // A pairing request made over IPC is recorded as coming from "ipc".
+        let device_key = ed25519_dalek::SigningKey::from_bytes(&[21; 32])
+            .verifying_key()
+            .to_bytes();
+        let client_public =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([7; 32])).to_bytes();
+        let nonce = [5u8; 32];
+        let (status, created) = ipc_request(
+            &path,
+            "POST",
+            "/v2/device-pairing/create",
+            Some(json!({
+                "deviceName": "IPC device",
+                "devicePublicKey": URL_SAFE_NO_PAD.encode(device_key),
+                "clientCommitment": URL_SAFE_NO_PAD.encode(
+                    crate::device_pairing::commitment(&client_public, &nonce)
+                ),
+                "transportBinding": 1,
+                "deviceNameBinding": 1,
+            })),
+        )
+        .await;
+        assert_eq!(status, 200, "{created}");
+        let request_id = created["requestId"].as_str().unwrap().to_owned();
+        let (status, body) = ipc_request(
+            &path,
+            "POST",
+            "/v2/device-pairing/reveal",
+            Some(json!({
+                "requestId": request_id,
+                "clientPublicKey": URL_SAFE_NO_PAD.encode(client_public),
+                "clientNonce": URL_SAFE_NO_PAD.encode(nonce),
+            })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let (status, listed) =
+            ipc_request(&path, "GET", "/v2/local-admin/pairing-requests", None).await;
+        assert_eq!(status, 200, "{listed}");
+        assert_eq!(listed[0]["requestId"], request_id.as_str());
+        assert_eq!(listed[0]["peerAddress"], "ipc");
+        let code = listed[0]["verificationCode"].as_str().unwrap().to_owned();
+        let decision = format!("/v2/local-admin/pairing-requests/{request_id}/decision");
+        let (status, body) = ipc_request(
+            &path,
+            "POST",
+            &decision,
+            Some(json!({ "approved": true, "verificationCode": "AAAAA-AAAAA" })),
+        )
+        .await;
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (409, &json!("code_mismatch"))
+        );
+        let (status, body) = ipc_request(
+            &path,
+            "POST",
+            &format!(
+                "/v2/local-admin/pairing-requests/{}/decision",
+                uuid::Uuid::new_v4()
+            ),
+            Some(json!({ "approved": true, "verificationCode": code })),
+        )
+        .await;
+        assert_eq!((status, &body["error"]["code"]), (404, &json!("not_found")));
+        let (status, body) = ipc_request(
+            &path,
+            "POST",
+            &decision,
+            Some(json!({ "approved": false, "verificationCode": code.to_lowercase().replace('-', "") })),
+        )
+        .await;
+        assert_eq!((status, body), (200, json!({ "ok": true })));
+
+        let (status, body) = ipc_request(&path, "GET", "/v2/local-admin/devices", None).await;
+        assert_eq!((status, body), (200, json!([])));
+        let (status, body) =
+            ipc_request(&path, "DELETE", "/v2/local-admin/devices/dev_missing", None).await;
+        assert_eq!((status, &body["error"]["code"]), (404, &json!("not_found")));
+        let (status, body) = ipc_request(
+            &path,
+            "POST",
+            "/v2/local-admin/reset",
+            Some(json!({ "target": "devices" })),
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (200, json!({ "ok": true, "restartRequired": true }))
+        );
+
+        server.stop().await.unwrap();
+        assert!(!path.exists(), "the socket is removed on shutdown");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_ipc_listener_can_be_disabled() {
+        let root = env::temp_dir().join(format!("todex-ipc-off-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            port: 0,
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..Config::default()
+        };
+        config.ipc.enabled = false;
+        let server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
+            .await
+            .unwrap();
+        assert!(server.ipc_path().is_none());
+        server.stop().await.unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -823,6 +1173,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         };
 
         let server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
@@ -906,6 +1258,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         };
 
         let mut server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
@@ -987,6 +1341,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         };
         assert!(
             ManagedServer::start(config, ProviderProcessTracking::Disabled)

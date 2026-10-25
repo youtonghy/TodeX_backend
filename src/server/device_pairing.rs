@@ -2,19 +2,20 @@ use crate::{
     app_state::AppState,
     device_pairing::{
         CreateDevicePairingRequest, CreateDevicePairingResponse, DevicePairingPollResponse,
-        DevicePairingProofRequest, RevealDevicePairingRequest, RevealDevicePairingResponse,
+        DevicePairingProofRequest, PairingPeer, RevealDevicePairingRequest,
+        RevealDevicePairingResponse,
     },
     error::AppError,
+    ipc::PeerAddr,
 };
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, State},
+    extract::{DefaultBodyLimit, FromRequest, State},
     http::header,
     routing::post,
     Json, Router,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use std::net::SocketAddr;
 
 /// Wraps `Json` so deserialization failures return the API error envelope
 /// (400 INVALID_REQUEST) instead of axum's bare 422 text — old clients hitting
@@ -52,9 +53,8 @@ pub(super) fn routes() -> Router<AppState> {
 
 async fn create(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
-    forwarded: Option<axum::Extension<crate::listen_addrs::Forwarded>>,
+    extensions: axum::http::Extensions,
     ApiJson(request): ApiJson<CreateDevicePairingRequest>,
 ) -> Result<
     (
@@ -64,17 +64,28 @@ async fn create(
     AppError,
 > {
     let security = &state.config.security;
-    let forwarded = forwarded
-        .map(|axum::Extension(forwarded)| forwarded)
+    let peer = pairing_peer(&extensions)?;
+    let peer_ip = match peer {
+        PairingPeer::Ip(address) => Some(address),
+        PairingPeer::Ipc => None,
+    };
+    let forwarded = extensions
+        .get::<crate::listen_addrs::Forwarded>()
+        .copied()
         .or_else(|| {
             crate::listen_addrs::forwarded(
                 &headers,
                 &axum::http::Extensions::new(),
-                Some(peer.ip()),
+                peer_ip,
                 &security.trusted_proxies,
             )
         });
-    let client = crate::listen_addrs::client_address(peer.ip(), forwarded);
+    let client = match peer {
+        PairingPeer::Ip(address) => {
+            PairingPeer::Ip(crate::listen_addrs::client_address(address, forwarded))
+        }
+        PairingPeer::Ipc => PairingPeer::Ipc,
+    };
     let origin = headers
         .get(header::ORIGIN)
         .map(|value| value.to_str().unwrap_or("?"));
@@ -91,6 +102,17 @@ async fn create(
         Json(state.device_pairing.create_from(client, arrival, request)?),
     ))
 }
+/// The pairing source: the TCP peer's IP, or this machine over IPC.
+fn pairing_peer(extensions: &axum::http::Extensions) -> Result<PairingPeer, AppError> {
+    match super::sealed::peer_address(extensions) {
+        Some(PeerAddr::Tcp(address)) => Ok(PairingPeer::Ip(address.ip())),
+        Some(PeerAddr::Local) => Ok(PairingPeer::Ipc),
+        None => Err(AppError::InvalidRequest(
+            "the connection has no peer address".to_owned(),
+        )),
+    }
+}
+
 async fn reveal(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<RevealDevicePairingRequest>,
@@ -135,6 +157,7 @@ async fn cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::ConnectInfo;
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
@@ -146,6 +169,7 @@ mod tests {
     };
     use hkdf::Hkdf;
     use sha2::{Digest, Sha256};
+    use std::net::SocketAddr;
     use tower::ServiceExt;
     use x25519_dalek::{PublicKey, StaticSecret};
 

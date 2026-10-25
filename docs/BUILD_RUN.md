@@ -103,6 +103,8 @@ dsh --version
 | `TODEX_AGENTD_ADVERTISE_URL` | 客户端应使用的地址（`http(s)://主机[:端口]`，不得带凭据、query 或 fragment），启动日志与 TUI 配对链接/二维码优先显示它；容器、端口映射或反向代理之后使用。默认不设置 |
 | `TODEX_AGENTD_DEPLOYMENT` | `host`（默认）或 `container`；`container` 时 `/v2/version` 返回 `deployment: "container"`，自更新关闭，`update` 不做任何改动 |
 | `TODEX_AGENTD_IMAGE_CLI_DIR` | 随镜像提供的 CLI 所在目录，按平台路径分隔符分隔；解析出的 binary（或其符号链接目标）位于其中的 CLI 标记为 `managedBy: "image"`，不能在 TodeX 中安装或升级。默认为空 |
+| `TODEX_AGENTD_IPC_ENABLED` | 是否开启本机 IPC 监听（`0/1/true/false`，默认开启），见下文「本机 IPC」 |
+| `TODEX_AGENTD_IPC_PATH` | IPC socket（Windows 为命名管道）路径，覆盖默认路径；为空时视为未设置 |
 | `TODEX_AGENTD_PATH_MAPPINGS` | 客户端路径与后端路径的对应关系，JSON 数组 `[{"hostPath":"C:\\Users\\me\\code","backendPath":"/workspace/code"}]`，经 `/v2/version` 的 `pathMappings` 公布给已配对客户端。默认为空 |
 
 以上四个部署变量为空（或只有空白）时视为未设置，compose 文件可以无条件传入。值无效时 daemon 与所有读取配置的命令都以配置错误退出：`ADVERTISE_URL` 不是合法的 http(s) URL；`DEPLOYMENT` 不是 `host`/`container`；`IMAGE_CLI_DIR` 含相对路径；`PATH_MAPPINGS` 不是该格式的 JSON、`hostPath` 为空、`backendPath` 不是绝对路径、含 `..` 或不在任何 workspace 根目录内（按字面判断，目录可以尚不存在），或同一 `hostPath`/`backendPath` 出现两次。
@@ -167,9 +169,26 @@ port = 7346
 # host_path = 'C:\Users\me\code'
 # backend_path = "/workspace/code"
 
+[ipc]                 # 本机 IPC 监听（同一用户专用），默认开启；对应 TODEX_AGENTD_IPC_ENABLED / TODEX_AGENTD_IPC_PATH
+enabled = true
+# path = "/run/todex-ipc/agentd.sock"
+
+[update]
+auto_update = true    # false 关闭启动时与运行中 daemon 的自动更新（TODEX_AUTO_UPDATE=0 同样关闭）；手动 update 不受影响
+
 [tui]
 language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 ```
+
+### 本机 IPC
+
+除 TCP 监听外，daemon 默认再开一个只有自己的用户能连的本机 IPC 监听，供同机的桌面端和容器宿主使用（协议与本地管理 API 见 [API 文档](API.md#本机-ipc-与本地管理-api)）：
+
+- Unix：默认 `<data_dir>/agentd.sock`（`data_dir` 取规范化路径）；该路径超过 100 字节时改用 `$XDG_RUNTIME_DIR/todex-agentd-<hash8>.sock`（`XDG_RUNTIME_DIR` 已设置且为绝对路径时），否则 `/tmp/todex-<uid>/agentd-<hash8>.sock`（目录以 0700 创建，必须属于当前用户）。`<hash8>` 为规范化 `data_dir` 的 UTF-8 字节 SHA-256 小写十六进制前 8 位。socket 文件权限 0600，所在目录不得对组或其他用户可写；路径上残留的旧 socket（无人监听）会被删除后重建，仍有进程在监听或路径是普通文件时放弃 IPC。正常退出时删除 socket 文件。每个连接都校验对端 uid（`SO_PEERCRED` / `getpeereid`）必须等于 daemon 的有效 uid，否则直接断开（只告警一次）。
+- Windows：默认命名管道 `\\.\pipe\todex-agentd-<hash16>`（同样的哈希取前 16 位，哈希前去掉规范化路径的 `\\?\` 前缀）。管道 DACL 只授予当前用户 SID 与 SYSTEM，并拒绝远程客户端（`PIPE_REJECT_REMOTE_CLIENTS`）。
+- 实际绑定的路径写入 `daemon.json` 的 `ipc_path`，`daemon status` 显示 `IPC listening: <路径>`，客户端应以它为准。IPC 无法建立（目录不存在、不可写、权限过宽等）时只记录告警，daemon 继续只用 TCP，`daemon.json` 中不写 `ipc_path`。
+
+信任模型：能通过上述检查的 IPC 对端与 daemon 是同一用户，本来就能直接读写数据目录（`devices.json`、配对控制文件、`config.toml`、传输密钥），因此 IPC 不新增权限：它的请求按回环对待（不强制 transport v2），本地管理 API 无需设备签名。网络上没有任何等价的批准入口：`/v2/local-admin/*` 只挂在 IPC 监听上，TCP 监听对这些路径返回 404。经 IPC 发起的配对申请记录来源为 `ipc`（TUI 显示为「本机（IPC）」），并单独计入配对频率限制。
 
 `enable_tls = true` 会直接拒绝启动，因为当前 binary 没有证书/私钥配置入口。需要 TLS 时应由可信反向代理终止 TLS；不要把明文监听端口直接暴露到公网。
 
@@ -355,6 +374,8 @@ cargo run -- daemon status
 cargo run -- daemon stop
 ```
 
+`daemon status --format json` 输出一个对象 `{running, pid, host, port, startedAt, executable, ipcPath, outdated, apiListen}`（daemon 未运行时 `running: false`，其余字段为 `null`/`false`），无论是否运行都以 0 退出；该格式下日志写到 stderr。
+
 daemon 启动后会写入 `~/.todex-agent/daemon.json`，日志写入 `~/.todex-agent/logs/todex-agentd-daemon.log`（不含 ANSI 颜色码；超过 10 MiB 时在启动时及运行中（Unix）每分钟检查并轮转为 `.1`…`.3`，最多保留 3 份旧日志）。TUI 退出时把本次日志自动保存到 `~/.todex-agent/tui-logs/`（目录 0700、文件 0600；没有事件时不生成 `.jsonl`，只保留最近 20 次）。`daemon start`、`restart` 和 `status` 会在监听地址下方逐行列出客户端可用的连接地址（`connect: ws://<IP>:<端口>/v2/ws (<网卡>)`）。
 
 登录时自动启动 daemon（开机自启）：
@@ -534,7 +555,10 @@ is recovered as interrupted like after any daemon stop. The handoff's output is 
 comes back on the old version (for example, the release lacks this platform's
 asset), the daemon does not retry that version until a newer release appears or it
 is restarted manually. Foreground `serve` and `tui` servers are not restarted.
-`TODEX_AUTO_UPDATE=0` in the daemon's environment disables these checks as well.
+`TODEX_AUTO_UPDATE=0` in the daemon's environment, or `auto_update = false` under
+`[update]` in `config.toml`, disables these checks as well (`todex-agentd about` reports
+the effective value; the local admin API's `PUT /v2/local-admin/config` applies a
+changed `autoUpdate` to the running daemon at once).
 
 Eligibility requires **both** the release workflow's `TODEX_RELEASE_BUILD=1`
 compile-time marker and a strict stable `TODEX_BUILD_VERSION=X.Y.Z` other than
@@ -561,6 +585,9 @@ todex-agentd about
 todex-agentd update
 # Disable automatic startup updates; manual update remains available
 TODEX_AUTO_UPDATE=0 todex-agentd serve
+# or persistently, in $TODEX_AGENTD_DATA_DIR/config.toml:
+#   [update]
+#   auto_update = false
 ```
 
 The `update` command accepts the normal `--data-dir` and other server configuration

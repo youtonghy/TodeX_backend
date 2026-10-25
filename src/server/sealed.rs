@@ -10,6 +10,8 @@
 //! `X-Todex-Sealed-Revision: 2` answers a plain `426` before its body is read.
 use std::collections::HashMap;
 use std::net::SocketAddr;
+
+use crate::ipc::{LocalPeer, PeerAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -358,7 +360,7 @@ async fn open_request(
     let forwarded = crate::listen_addrs::forwarded(
         &parts.headers,
         &parts.extensions,
-        peer_address(&parts.extensions).map(|peer| peer.ip()),
+        peer_address(&parts.extensions).and_then(PeerAddr::ip),
         &sealed.state.config.security.trusted_proxies,
     );
     let headers = &parts.headers;
@@ -561,8 +563,14 @@ fn inner_request(
     // Only the peer address, and whether a proxy forwarded the outer
     // request, carry over: the inner request gets no other outer extension
     // (body limits, matched route, ...).
-    if let Some(peer) = peer_address(outer_extensions) {
-        request.extensions_mut().insert(ConnectInfo(peer));
+    match peer_address(outer_extensions) {
+        Some(PeerAddr::Tcp(peer)) => {
+            request.extensions_mut().insert(ConnectInfo(peer));
+        }
+        Some(PeerAddr::Local) => {
+            request.extensions_mut().insert(ConnectInfo(LocalPeer));
+        }
+        None => {}
     }
     if let Some(forwarded) = forwarded {
         request.extensions_mut().insert(forwarded);
@@ -571,9 +579,13 @@ fn inner_request(
     request
 }
 
-/// The peer address the way the `ConnectInfo` extractor resolves it: the
-/// served connection's, or axum's test-only `MockConnectInfo`.
-pub(crate) fn peer_address(extensions: &axum::http::Extensions) -> Option<SocketAddr> {
+/// The peer the way the `ConnectInfo` extractor resolves it: the served
+/// TCP connection's address (or axum's test-only `MockConnectInfo`), or
+/// [`PeerAddr::Local`] for an IPC connection.
+pub(crate) fn peer_address(extensions: &axum::http::Extensions) -> Option<PeerAddr> {
+    if extensions.get::<ConnectInfo<LocalPeer>>().is_some() {
+        return Some(PeerAddr::Local);
+    }
     extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(peer)| *peer)
@@ -582,6 +594,7 @@ pub(crate) fn peer_address(extensions: &axum::http::Extensions) -> Option<Socket
                 .get::<axum::extract::connect_info::MockConnectInfo<SocketAddr>>()
                 .map(|mock| mock.0)
         })
+        .map(PeerAddr::Tcp)
 }
 
 /// `200 application/vnd.todex.sealed; r=2` whose body is the response nonce

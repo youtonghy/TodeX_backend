@@ -29,12 +29,17 @@ pub(super) async fn enforce_transport_v2(
 ) -> Result<Response, AppError> {
     // `ConnectInfo` is installed by `into_make_service_with_connect_info`
     // for every served connection. A request without it has no known peer
-    // and is treated as remote.
-    let peer = super::sealed::peer_address(request.extensions()).map(|peer| peer.ip());
+    // and is treated as remote; IPC peers count as loopback.
+    let peer = super::sealed::peer_address(request.extensions());
     // A reverse proxy on this machine forwards remote clients over loopback.
-    let loopback = peer.is_some_and(|peer| peer.to_canonical().is_loopback())
-        && crate::listen_addrs::forwarded(request.headers(), request.extensions(), peer, &[])
-            .is_none();
+    let loopback = peer.is_some_and(crate::ipc::PeerAddr::is_loopback)
+        && crate::listen_addrs::forwarded(
+            request.headers(),
+            request.extensions(),
+            peer.and_then(crate::ipc::PeerAddr::ip),
+            &[],
+        )
+        .is_none();
     if loopback
         || request
             .extensions()

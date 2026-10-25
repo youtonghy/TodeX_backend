@@ -5138,6 +5138,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -5385,6 +5387,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -5789,6 +5793,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -5908,6 +5914,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -6072,6 +6080,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -6242,6 +6252,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -6387,6 +6399,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -6531,6 +6545,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -6752,6 +6768,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -6947,6 +6965,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -7079,6 +7099,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -7584,6 +7606,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -8469,6 +8493,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -8692,6 +8718,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -9018,6 +9046,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -9107,6 +9137,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -9259,6 +9291,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         };
 
         // Token-less deployments keep the historical local trust model: the
@@ -9440,6 +9474,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         })
         .await
         .unwrap();
@@ -9870,6 +9906,8 @@ mod tests {
             },
             api: Default::default(),
             deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
         }
     }
 

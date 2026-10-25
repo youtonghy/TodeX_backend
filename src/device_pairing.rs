@@ -253,7 +253,7 @@ impl Drop for PairingMaterial {
     }
 }
 
-fn commitment(client_public: &[u8; 32], client_nonce: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn commitment(client_public: &[u8; 32], client_nonce: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update((COMMIT_LABEL.len() as u32).to_be_bytes());
     hasher.update(COMMIT_LABEL);
@@ -393,13 +393,48 @@ enum Stage {
     Revealed(PairingMaterial),
 }
 
+/// `peerAddress` of pairing requests that arrived over the local IPC
+/// listener.
+pub(crate) const IPC_PEER_ADDRESS: &str = "ipc";
+
+/// Where a pairing request came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PairingPeer {
+    Ip(IpAddr),
+    /// A same-user client of the local IPC listener.
+    Ipc,
+}
+
+impl From<IpAddr> for PairingPeer {
+    fn from(address: IpAddr) -> Self {
+        Self::Ip(address)
+    }
+}
+
+impl PairingPeer {
+    /// `peerAddress` as the approver sees it.
+    fn display(self) -> String {
+        match self {
+            Self::Ip(address) => address.to_canonical().to_string(),
+            Self::Ipc => IPC_PEER_ADDRESS.to_owned(),
+        }
+    }
+}
+
+/// The counting key for pairing rate limits; IPC requests get their own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceKey {
+    Ip(IpAddr),
+    Ipc,
+}
+
 struct PendingRequest {
     stage: Stage,
     server_public: [u8; 32],
     transport: TransportBinding,
-    peer: IpAddr,
+    peer: PairingPeer,
     /// [`source_key`] of `peer`.
-    source: IpAddr,
+    source: SourceKey,
     arrival: PairingArrival,
     device_name: String,
     device_public_key: [u8; 32],
@@ -416,7 +451,7 @@ struct RegistryState {
     directory: PathBuf,
     requests: HashMap<String, PendingRequest>,
     /// `create` calls per source key (4 per minute) and overall (24).
-    creates: RateWindow<IpAddr>,
+    creates: RateWindow<SourceKey>,
     /// Every reveal, poll and cancel (1024 per second): the backstop for
     /// unknown request ids.
     lookups: RateWindow<()>,
@@ -486,15 +521,15 @@ impl DevicePairingRegistry {
     #[cfg(test)]
     pub(crate) fn create(
         &self,
-        peer: IpAddr,
+        peer: impl Into<PairingPeer>,
         request: CreateDevicePairingRequest,
     ) -> Result<CreateDevicePairingResponse> {
-        self.create_from(peer, PairingArrival::default(), request)
+        self.create_from(peer.into(), PairingArrival::default(), request)
     }
 
     pub(crate) fn create_from(
         &self,
-        peer: IpAddr,
+        peer: PairingPeer,
         arrival: PairingArrival,
         request: CreateDevicePairingRequest,
     ) -> Result<CreateDevicePairingResponse> {
@@ -536,7 +571,10 @@ impl DevicePairingRegistry {
             return Err(invalid("device public key is a weak Ed25519 key"));
         }
         let transport = self.transport_binding()?;
-        let source = source_key(peer);
+        let source = match peer {
+            PairingPeer::Ip(address) => SourceKey::Ip(source_key(address)),
+            PairingPeer::Ipc => SourceKey::Ipc,
+        };
         let mut state = self
             .inner
             .lock()
@@ -692,7 +730,7 @@ impl DevicePairingRegistry {
             device_name: pending.device_name.clone(),
             device_id: Some(crate::devices::device_id_for(&pending.device_public_key)),
             expires_at: pending.expires_at,
-            peer_address: pending.peer.to_canonical().to_string(),
+            peer_address: pending.peer.display(),
             transport_fingerprint: crate::transport_crypto::transport_fingerprint(
                 &pending.transport.public_key,
             ),
@@ -1016,7 +1054,7 @@ pub(crate) enum PairingLookup {
 }
 
 /// Uppercase, without hyphens or whitespace: `abcde-fghjk` matches `ABCDEFGHJK`.
-fn normalize_code(code: &str) -> String {
+pub(crate) fn normalize_code(code: &str) -> String {
     code.chars()
         .filter(|ch| *ch != '-' && !ch.is_whitespace())
         .flat_map(char::to_uppercase)
@@ -1914,7 +1952,7 @@ mod tests {
         }
         assert!(matches!(
             registry.create(
-                "2001:db8::abcd:1:2:3".parse().unwrap(),
+                "2001:db8::abcd:1:2:3".parse::<IpAddr>().unwrap(),
                 create_request(Some([1; 32]))
             ),
             Err(AppError::PairingBusy(_))
@@ -1923,7 +1961,10 @@ mod tests {
         commit_from(&registry, "192.0.2.50".parse().unwrap());
         commit_from(&registry, "::ffff:192.0.2.50".parse().unwrap());
         assert!(matches!(
-            registry.create("192.0.2.50".parse().unwrap(), create_request(Some([1; 32]))),
+            registry.create(
+                "192.0.2.50".parse::<IpAddr>().unwrap(),
+                create_request(Some([1; 32]))
+            ),
             Err(AppError::PairingBusy(_))
         ));
         assert_eq!(
@@ -1960,6 +2001,13 @@ mod tests {
             other => panic!("expected a rate limit, got {:?}", other.err()),
         }
         commit_from(&registry, "192.0.2.60".parse().unwrap());
+        // IPC requests have their own bucket, apart from loopback TCP.
+        registry
+            .create(
+                PairingPeer::Ipc,
+                create_request(Some(commitment(&client_public(), &CLIENT_NONCE))),
+            )
+            .unwrap();
     }
 
     #[test]
