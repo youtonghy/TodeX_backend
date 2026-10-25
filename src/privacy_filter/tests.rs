@@ -256,6 +256,123 @@ fn chinese_resident_ids_need_a_valid_date_and_check_digit() {
 }
 
 #[test]
+fn national_ids_with_a_strong_check_or_shape_count_alone() {
+    for (id, label) in [
+        ("A123456(3)", "hk_id"),
+        ("A123456789", "tw_id"),
+        ("123-45-6789", "us_ssn"),
+        ("AB 12 34 56 C", "uk_nino"),
+        ("S1234567D", "sg_nric"),
+        ("900101-1234567", "kr_rrn"),
+        ("12345678Z", "es_dni"),
+        ("X1234567L", "es_dni"),
+        ("529.982.247-25", "br_cpf"),
+    ] {
+        let redacted = all(&format!("id {id} ok\n"));
+        assert_eq!(redacted.text, format!("id [REDACTED:{label}] ok\n"), "{id}");
+        assert_eq!(redacted.counts.get(&Category::IdCard), Some(&1), "{id}");
+    }
+    // Wrong check digits, letters or ranges.
+    for id in [
+        "A123456(4)",
+        "A123456788",
+        "666-45-6789",
+        "123-00-6789",
+        "BG 12 34 56 C",
+        "S1234567E",
+        "901301-1234567",
+        "12345678A",
+        "529.982.247-26",
+        "111.111.111-11",
+    ] {
+        assert_clean(&format!("id {id} ok\n"));
+    }
+}
+
+#[test]
+fn weakly_checked_national_ids_need_a_word_naming_them() {
+    for (text, label) in [
+        ("TFN: 123 456 782", "au_tfn"),
+        ("Tax file number 123456782", "au_tfn"),
+        ("Medicare card 2123 45670 1", "au_medicare"),
+        ("SIN 130-692-544", "ca_sin"),
+        ("Aadhaar: 2345 6789 0124", "in_aadhaar"),
+        ("PAN ABCPE1234F", "in_pan"),
+        ("マイナンバー 1234 5678 9018", "jp_my_number"),
+        ("SSN 123456789", "us_ssn"),
+        ("CPF 52998224725", "br_cpf"),
+        ("Passport No.: PA1234567", "passport"),
+        ("护照号码 E12345678", "passport"),
+        ("HKID A1234563", "hk_id"),
+    ] {
+        let redacted = all(&format!("{text}\n"));
+        assert!(
+            redacted.text.ends_with(&format!(" [REDACTED:{label}]\n")),
+            "{text}: {}",
+            redacted.text
+        );
+    }
+    for text in [
+        "order 123 456 782",
+        "build 2123 45670 1",
+        "using 130-692-544",
+        "row 2345 6789 0124",
+        "ABCPE1234F",
+        "id 123456789",
+        "Medicare 2123 45671 1",
+        "TFN: 123 456 781",
+    ] {
+        assert_clean(&format!("{text}\n"));
+    }
+}
+
+#[test]
+fn phone_numbers_of_common_countries() {
+    let phones = only(Category::Phone);
+    for number in [
+        "13800138000",
+        "+86 139-1234-5678",
+        "+61 4 1234 5678",
+        "+1 (415) 555-2671",
+        "+44 20 7946 0958",
+        "+81-90-1234-5678",
+        "(415) 555-2671",
+        "415-555-2671",
+        "1-800-555-0199",
+        "0412 345 678",
+        "(02) 9876 5432",
+        "1300 123 456",
+        "07700 900123",
+        "020 7946 0958",
+        "06 12 34 56 78",
+        "090-1234-5678",
+        "03-1234-5678",
+        "010-1234-5678",
+        "0912-345-678",
+    ] {
+        let redacted = redact(&format!("call {number} now\n"), &phones);
+        assert_eq!(redacted.text, "call [REDACTED:phone] now\n", "{number}");
+    }
+    let redacted = redact("Tel: 2345 6789\nWhatsApp +852 2345 6789\n", &phones);
+    assert_eq!(
+        redacted.text,
+        "Tel: [REDACTED:phone]\nWhatsApp [REDACTED:phone]\n"
+    );
+    for text in [
+        "version 1.2.3.4",
+        "build 20241025 done",
+        "(911) 555-2671",
+        "0412-345 678",
+        "+1234567",
+        "id 2345 6789",
+        "on 2024-10-25",
+    ] {
+        let redacted = redact(&format!("{text}\n"), &phones);
+        assert_eq!(redacted.text, format!("{text}\n"));
+    }
+}
+
+#[test]
 fn categories_switch_detectors_independently() {
     let text = "password=Zq8!x7Lk\n4111111111111111\n";
     let cards_only = redact(text, &only(Category::BankCard));

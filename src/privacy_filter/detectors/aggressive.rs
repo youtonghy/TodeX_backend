@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use regex::bytes::Regex;
 
 use super::super::{shannon_entropy, Categories, Category, Finding};
-use super::{is_word, regex, standalone};
+use super::{is_word, regex};
 
 pub(super) fn find(bytes: &[u8], categories: &Categories, findings: &mut Vec<Finding>) {
     if categories.url_token {
@@ -25,7 +25,7 @@ pub(super) fn find(bytes: &[u8], categories: &Categories, findings: &mut Vec<Fin
         emails(bytes, findings);
     }
     if categories.phone {
-        phones(bytes, findings);
+        super::phones::find(bytes, findings);
     }
     if categories.public_ip {
         public_ips(bytes, findings);
@@ -161,28 +161,6 @@ fn emails(bytes: &[u8], findings: &mut Vec<Finding>) {
             Category::Email,
             "email",
         ));
-    }
-}
-
-/// Mainland China mobile numbers, optionally with +86 and grouped 3-4-4.
-fn phones(bytes: &[u8], findings: &mut Vec<Finding>) {
-    static PHONE: OnceLock<Regex> = OnceLock::new();
-    let phone = regex(
-        &PHONE,
-        r"(?:\+86[ -]?)?1[3-9][0-9](?:[0-9]{8}|[ -][0-9]{4}[ -][0-9]{4})",
-    );
-    for found in phone.find_iter(bytes) {
-        let (start, end) = (found.start(), found.end());
-        let raw = found.as_bytes();
-        let separators: Vec<u8> = raw[raw.len() - 11..]
-            .iter()
-            .copied()
-            .filter(|byte| !byte.is_ascii_digit())
-            .collect();
-        if separators.windows(2).any(|pair| pair[0] != pair[1]) || !standalone(bytes, start, end) {
-            continue;
-        }
-        findings.push(Finding::new(start, end, Category::Phone, "phone"));
     }
 }
 

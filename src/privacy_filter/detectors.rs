@@ -1,12 +1,15 @@
 //! Built-in detectors: PEM/OpenSSH keys, secret assignments and URL
 //! credentials, and numbers that must pass a checksum (cards with Luhn and
-//! issuer ranges, IBAN with MOD 97, Chinese resident IDs with their check
-//! digit). A pattern without a checksum only counts next to a context word.
-//! Proxy node credentials and the aggressive, off-by-default categories
-//! live in [`proxy`] and [`aggressive`].
+//! issuer ranges, IBAN with MOD 97, national ID numbers with their check
+//! digits). A pattern without a checksum only counts next to a context word.
+//! ID numbers, phone numbers, proxy node credentials and the aggressive,
+//! off-by-default categories live in [`ids`], [`phones`], [`proxy`] and
+//! [`aggressive`].
 
 mod aggressive;
+mod ids;
 mod keyed;
+mod phones;
 mod proxy;
 
 use std::sync::OnceLock;
@@ -18,12 +21,14 @@ use self::keyed::{KeyedRule, Target};
 use super::{gitleaks::is_placeholder, Categories, Category, Finding};
 
 fn regex(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
-    cell.get_or_init(|| {
-        RegexBuilder::new(pattern)
-            .unicode(false)
-            .build()
-            .expect("built-in privacy pattern compiles")
-    })
+    cell.get_or_init(|| build(pattern))
+}
+
+fn build(pattern: &str) -> Regex {
+    RegexBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("built-in privacy pattern compiles")
 }
 
 pub(super) fn find(
@@ -40,7 +45,7 @@ pub(super) fn find(
         openssh_public_keys(bytes, findings);
     }
     if categories.id_card {
-        cn_resident_ids(bytes, findings);
+        ids::find(bytes, findings);
     }
     if categories.bank_card {
         card_numbers(bytes, findings);
@@ -467,50 +472,6 @@ fn password_hashes(bytes: &[u8], findings: &mut Vec<Finding>) {
 
 // -------------------------------------------------------------- numbers
 
-/// 18-digit PRC resident ID numbers with a valid date and check digit.
-fn cn_resident_ids(bytes: &[u8], findings: &mut Vec<Finding>) {
-    static ID: OnceLock<Regex> = OnceLock::new();
-    let id = regex(
-        &ID,
-        r"[1-9][0-9]{5}(?:18|19|20)[0-9]{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]",
-    );
-    let mut from = 0;
-    while let Some(found) = id.find_at(bytes, from) {
-        from = found.start() + 1;
-        if !standalone(bytes, found.start(), found.end()) || !valid_cn_id(found.as_bytes()) {
-            continue;
-        }
-        findings.push(Finding::new(
-            found.start(),
-            found.end(),
-            Category::IdCard,
-            "cn_id",
-        ));
-        from = found.end();
-    }
-}
-
-fn valid_cn_id(id: &[u8]) -> bool {
-    const WEIGHTS: [u32; 17] = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2];
-    const CHECK: &[u8; 11] = b"10X98765432";
-    let digit = |index: usize| u32::from(id[index] - b'0');
-    let number =
-        |range: std::ops::Range<usize>| range.fold(0, |value, index| value * 10 + digit(index));
-    let (year, month, day) = (number(6..10), number(10..12), number(12..14));
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let days = match month {
-        2 if leap => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
-    if day > days {
-        return false;
-    }
-    let sum: u32 = (0..17).map(|index| digit(index) * WEIGHTS[index]).sum();
-    CHECK[(sum % 11) as usize] == id[17].to_ascii_uppercase()
-}
-
 /// Card numbers: 13–19 digits, contiguous or in groups of four (Amex
 /// 4-6-5), that pass Luhn and fall in a card issuer's range. UnionPay
 /// numbers (62…) that fail Luhn, which some do, count next to a card word.
@@ -779,6 +740,75 @@ fn iban_length(country: &[u8]) -> Option<usize> {
         .iter()
         .find(|(code, _)| code.as_slice() == country)
         .map(|(_, length)| *length)
+}
+
+/// A number shape for [`find_numbers`]: what it is redacted as, the check
+/// it must pass, and the words one of which must come shortly before it
+/// (none: the shape and check are distinctive enough on their own).
+struct NumberRule {
+    label: &'static str,
+    pattern: &'static str,
+    valid: fn(&[u8]) -> bool,
+    context: &'static [&'static str],
+}
+
+/// Standalone matches of `rules` that pass their check and context, as
+/// `category`. `compiled` caches the rules' regexes in order.
+fn find_numbers(
+    bytes: &[u8],
+    rules: &[NumberRule],
+    compiled: &'static OnceLock<Vec<Regex>>,
+    category: Category,
+    findings: &mut Vec<Finding>,
+) {
+    let compiled = compiled.get_or_init(|| rules.iter().map(|rule| build(rule.pattern)).collect());
+    for (rule, pattern) in rules.iter().zip(compiled) {
+        let mut from = 0;
+        while let Some(found) = pattern.find_at(bytes, from) {
+            let (start, end) = (found.start(), found.end());
+            from = start + 1;
+            if !standalone(bytes, start, end)
+                || continues_number(bytes, start, end)
+                || !(rule.valid)(found.as_bytes())
+                || !(rule.context.is_empty() || near_word(bytes, start, rule.context))
+            {
+                continue;
+            }
+            findings.push(Finding::new(start, end, category, rule.label));
+            from = end;
+        }
+    }
+}
+
+/// One of `words` in the 40 bytes before `start`. ASCII words match in any
+/// case and only as whole words (`sin`, not `using`); others as written.
+fn near_word(bytes: &[u8], start: usize, words: &[&str]) -> bool {
+    let window = bytes[start.saturating_sub(40)..start].to_ascii_lowercase();
+    words.iter().any(|word| {
+        let word = word.as_bytes();
+        if !word.is_ascii() {
+            return contains(&window, word);
+        }
+        let mut from = 0;
+        while let Some(at) = find_from(&window, word, from) {
+            let end = at + word.len();
+            let before = at > 0 && window[at - 1].is_ascii_alphanumeric();
+            let after = window.get(end).is_some_and(u8::is_ascii_alphanumeric);
+            if !before && !after {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    })
+}
+
+/// The digits of `raw` as numbers, separators dropped.
+fn digit_values(raw: &[u8]) -> Vec<u32> {
+    raw.iter()
+        .filter(|byte| byte.is_ascii_digit())
+        .map(|byte| u32::from(byte - b'0'))
+        .collect()
 }
 
 // -------------------------------------------------------------- helpers
