@@ -446,7 +446,12 @@ mod tests {
     #[tokio::test]
     async fn bind_replaces_stale_sockets_and_refuses_live_ones_and_shared_dirs() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("todex-ipc-bind-{}", uuid::Uuid::new_v4()));
+        // `/tmp`, not `temp_dir()`: macOS's per-user temp directory is too
+        // long for a socket path (104 bytes).
+        let dir = PathBuf::from(format!(
+            "/tmp/todex-ipc-bind-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("agentd.sock");
