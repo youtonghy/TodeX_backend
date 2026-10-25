@@ -68,6 +68,18 @@ pub fn router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http().make_span_with(request_span::<axum::body::Body>))
 }
 
+/// The main listener's router with the network off (`network_enabled =
+/// false`): only the agent MCP routes, which agents reach over loopback,
+/// and the unauthenticated `/v2/version` the daemon health check polls.
+/// Clients use the IPC listener.
+pub fn agent_router(state: AppState) -> Router {
+    Router::new()
+        .route("/v2/version", axum::routing::get(v2::version))
+        .merge(crate::agent_mcp::routes(&state))
+        .with_state(state)
+        .layer(TraceLayer::new_for_http().make_span_with(request_span::<axum::body::Body>))
+}
+
 /// The IPC listener's router: [`router`] plus the local admin API, which no
 /// TCP listener serves.
 pub fn ipc_router(state: AppState, info: LocalAdminInfo) -> Router {

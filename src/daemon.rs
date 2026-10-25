@@ -40,6 +40,10 @@ pub struct DaemonProcess {
     pub pid: u32,
     pub host: String,
     pub port: u16,
+    /// `false`: `host`/`port` is the loopback port that only serves agent
+    /// tools; clients connect over `ipc_path`.
+    #[serde(default = "default_true")]
+    pub network_enabled: bool,
     pub data_dir: PathBuf,
     #[serde(default)]
     pub workspace_roots: Vec<PathBuf>,
@@ -57,6 +61,10 @@ pub struct DaemonProcess {
     pub outdated: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl DaemonProcess {
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
@@ -71,7 +79,8 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
     // reason instead of a generic "exited during startup".
     config.ensure_listener_matches_auth()?;
     remove_stale_pid_file(&config.data_dir)?;
-    if port_is_listening(&config.host, config.port) {
+    config.ensure_network_off_has_ipc()?;
+    if config.network_enabled && port_is_listening(&config.host, config.port) {
         bail!(
             "cannot start daemon because {}:{} is already in use by an unmanaged process; stop that service or choose another port",
             config.host,
@@ -206,6 +215,8 @@ pub struct StatusReport {
     pub pid: Option<u32>,
     pub host: Option<String>,
     pub port: Option<u16>,
+    /// `false`: `host:port` only serves agent tools; clients use `ipcPath`.
+    pub network_enabled: Option<bool>,
     pub started_at: Option<String>,
     pub executable: Option<PathBuf>,
     pub ipc_path: Option<PathBuf>,
@@ -221,6 +232,7 @@ impl StatusReport {
                 pid: Some(process.pid),
                 host: Some(process.host.clone()),
                 port: Some(process.port),
+                network_enabled: Some(process.network_enabled),
                 started_at: Some(process.started_at.to_rfc3339()),
                 executable: Some(process.executable.clone()),
                 ipc_path: process.ipc_path.clone(),
@@ -232,6 +244,7 @@ impl StatusReport {
                 pid: None,
                 host: None,
                 port: None,
+                network_enabled: None,
                 started_at: None,
                 executable: None,
                 ipc_path: None,
@@ -630,8 +643,13 @@ fn write_pid_file(
     let path = pid_file_path(&config.data_dir);
     let process = DaemonProcess {
         pid: std::process::id(),
-        host: config.host.clone(),
+        host: if config.network_enabled {
+            config.host.clone()
+        } else {
+            std::net::Ipv4Addr::LOCALHOST.to_string()
+        },
         port,
+        network_enabled: config.network_enabled,
         data_dir: config.data_dir.clone(),
         workspace_roots: config.workspace_roots.clone(),
         started_at: Utc::now(),
@@ -1037,6 +1055,7 @@ fn daemon_record_from_args(
         pid,
         host: value("--host").unwrap_or_else(|| config.host.clone()),
         port,
+        network_enabled: true,
         data_dir: value("--data-dir")
             .map(PathBuf::from)
             .unwrap_or_else(|| config.data_dir.clone()),
@@ -1305,7 +1324,7 @@ mod tests {
             serde_json::to_value(super::StatusReport::new(None)).unwrap(),
             serde_json::json!({
                 "running": false, "pid": null, "host": null, "port": null,
-                "startedAt": null, "executable": null, "ipcPath": null,
+                "networkEnabled": null, "startedAt": null, "executable": null, "ipcPath": null,
                 "outdated": false, "apiListen": null,
             })
         );
@@ -1313,6 +1332,7 @@ mod tests {
             pid: 42,
             host: "127.0.0.1".to_owned(),
             port: 7345,
+            network_enabled: true,
             data_dir: std::path::PathBuf::from("/data"),
             workspace_roots: Vec::new(),
             started_at: chrono::DateTime::parse_from_rfc3339("2026-10-01T08:00:00Z")
@@ -1327,6 +1347,7 @@ mod tests {
             serde_json::to_value(super::StatusReport::new(Some(&process))).unwrap(),
             serde_json::json!({
                 "running": true, "pid": 42, "host": "127.0.0.1", "port": 7345,
+                "networkEnabled": true,
                 "startedAt": "2026-10-01T08:00:00+00:00",
                 "executable": "/bin/todex-agentd", "ipcPath": "/data/agentd.sock",
                 "outdated": true, "apiListen": null,
@@ -1402,6 +1423,7 @@ mod tests {
             pid: std::process::id(),
             host: config.host.clone(),
             port: config.port,
+            network_enabled: true,
             data_dir: config.data_dir.clone(),
             workspace_roots: config.workspace_roots.clone(),
             started_at: Utc::now(),
@@ -1432,6 +1454,7 @@ mod tests {
             pid: u32::MAX,
             host: config.host.clone(),
             port: config.port,
+            network_enabled: true,
             data_dir: config.data_dir.clone(),
             workspace_roots: config.workspace_roots.clone(),
             started_at: Utc::now(),
@@ -1457,6 +1480,7 @@ mod tests {
             pid: std::process::id(),
             host: "127.0.0.1".to_owned(),
             port: 0,
+            network_enabled: true,
             data_dir: std::env::temp_dir(),
             workspace_roots: vec![std::env::temp_dir()],
             started_at: Utc::now(),
@@ -1510,6 +1534,7 @@ mod tests {
             pid,
             host: "127.0.0.1".to_owned(),
             port: 0,
+            network_enabled: true,
             data_dir: root.clone(),
             workspace_roots: Vec::new(),
             started_at: Utc::now(),
@@ -1605,6 +1630,7 @@ mod tests {
             pid,
             host: config.host.clone(),
             port: config.port,
+            network_enabled: true,
             data_dir: config.data_dir.clone(),
             workspace_roots: config.workspace_roots.clone(),
             started_at: Utc::now(),
@@ -1668,6 +1694,7 @@ mod tests {
         Config {
             host: "127.0.0.1".to_owned(),
             port: 7345,
+            network_enabled: true,
             pairing_encryption: PairingEncryption::default(),
             data_dir: root.join("data"),
             workspace_roots: vec![root.join("workspace")],

@@ -4148,6 +4148,7 @@ mod tests {
         Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
+            network_enabled: true,
             pairing_encryption: PairingEncryption::None,
             data_dir,
             workspace_roots: vec![workspace_root],

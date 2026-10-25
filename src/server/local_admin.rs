@@ -181,6 +181,10 @@ struct StatusBody {
     pid: u32,
     started_at: String,
     listen: Listen,
+    /// `false`: `listen` is the configured but unbound address; clients
+    /// connect over IPC only, so `connectUrls` is empty and `pairingLink`
+    /// is `""`.
+    network_enabled: bool,
     connect_urls: Vec<ConnectUrl>,
     advertise_url: Option<String>,
     pairing_link: String,
@@ -198,16 +202,24 @@ struct StatusBody {
 
 async fn status(State(admin): State<LocalAdmin>) -> AdminResult<StatusBody> {
     let config = &admin.state.config;
-    let port = admin.info.port;
-    let connect_urls = match crate::listen_addrs::connect_addresses(&config.host) {
-        Ok(addresses) => addresses
+    let network_enabled = config.network_enabled;
+    // With the network off the bound port only serves agent tools.
+    let port = if network_enabled {
+        admin.info.port
+    } else {
+        config.port
+    };
+    let addresses = network_enabled.then(|| crate::listen_addrs::connect_addresses(&config.host));
+    let connect_urls = match addresses {
+        None => Vec::new(),
+        Some(Ok(addresses)) => addresses
             .into_iter()
             .map(|address| ConnectUrl {
                 url: address.ws_url(port),
                 interface: address.interface,
             })
             .collect(),
-        Err(error) => {
+        Some(Err(error)) => {
             tracing::warn!(%error, "failed to list network interface addresses");
             Vec::new()
         }
@@ -223,9 +235,14 @@ async fn status(State(admin): State<LocalAdmin>) -> AdminResult<StatusBody> {
             host: config.host.clone(),
             port,
         },
+        network_enabled,
         connect_urls,
         advertise_url: config.deployment.advertise_url.clone(),
-        pairing_link: crate::transport_crypto::pairing_link_json(config, port)?,
+        pairing_link: if network_enabled {
+            crate::transport_crypto::pairing_link_json(config, port)?
+        } else {
+            String::new()
+        },
         transport_fingerprint: crate::transport_crypto::transport_fingerprint(
             keys.transport_public_key(config.pairing_encryption),
         ),
@@ -255,6 +272,7 @@ async fn status(State(admin): State<LocalAdmin>) -> AdminResult<StatusBody> {
 struct ConfigBody {
     host: String,
     port: u16,
+    network_enabled: bool,
     pairing_encryption: &'static str,
     workspace_roots: Vec<PathBuf>,
     auto_update: bool,
@@ -274,18 +292,21 @@ fn comparable_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
 fn config_body(admin: &LocalAdmin) -> Result<ConfigBody, AdminError> {
     let running = &admin.state.config;
     let saved = Config::load_saved(running.data_dir.clone())?;
-    let running_port = if running.port == 0 {
+    // With the network off the bound port is the agent tools' one.
+    let running_port = if running.port == 0 && running.network_enabled {
         admin.info.port
     } else {
         running.port
     };
-    let restart_required = saved.host != running.host
+    let restart_required = saved.network_enabled != running.network_enabled
+        || saved.host != running.host
         || saved.port != running_port
         || saved.pairing_encryption != running.pairing_encryption
         || comparable_roots(&saved.workspace_roots) != comparable_roots(&running.workspace_roots);
     Ok(ConfigBody {
         host: saved.host,
         port: saved.port,
+        network_enabled: saved.network_enabled,
         pairing_encryption: saved.pairing_encryption.as_str(),
         workspace_roots: saved.workspace_roots,
         auto_update: saved.update.auto_update,
@@ -303,6 +324,7 @@ async fn get_config(State(admin): State<LocalAdmin>) -> AdminResult<ConfigBody> 
 struct ConfigPatch {
     host: Option<String>,
     port: Option<i64>,
+    network_enabled: Option<bool>,
     pairing_encryption: Option<String>,
     workspace_roots: Option<Vec<PathBuf>>,
     auto_update: Option<bool>,
@@ -372,6 +394,12 @@ async fn put_config(State(admin): State<LocalAdmin>, body: Bytes) -> AdminResult
         .map_err(|error| AdminError::invalid_config(format!("invalid request body: {error}")))?;
     let saved = Config::load_saved(running.data_dir.clone())?;
     let auto_update = patch.auto_update;
+    let network_enabled = patch.network_enabled;
+    if network_enabled == Some(false) && !saved.ipc.enabled {
+        return Err(AdminError::invalid_config(
+            "the network listener can only be turned off while [ipc] is enabled",
+        ));
+    }
     let touches_listener = patch.host.is_some()
         || patch.port.is_some()
         || patch.pairing_encryption.is_some()
@@ -379,6 +407,9 @@ async fn put_config(State(admin): State<LocalAdmin>, body: Bytes) -> AdminResult
     let (host, port, encryption, roots) = validated_settings(&saved, patch)?;
     if touches_listener {
         Config::save_tui_settings(running.data_dir.clone(), &host, port, encryption, &roots)?;
+    }
+    if let Some(enabled) = network_enabled {
+        Config::save_network_enabled(running.data_dir.clone(), enabled)?;
     }
     if let Some(enabled) = auto_update {
         Config::save_update_settings(running.data_dir.clone(), enabled)?;

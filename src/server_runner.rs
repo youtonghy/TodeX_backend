@@ -224,33 +224,55 @@ fn lock_data_dir(data_dir: &Path) -> Result<std::fs::File> {
     })
 }
 
-/// Binds and serves the IPC listener. Failing to bind is not fatal: the
-/// daemon keeps serving TCP only.
+/// The IPC socket, bound before the server state exists and served once it
+/// does.
 #[cfg(any(unix, windows))]
-fn start_ipc(
-    config: &Config,
-    state: &AppState,
-    info: impl FnOnce(String) -> server::LocalAdminInfo,
-) -> Option<IpcServer> {
-    use crate::ipc::{IpcListener, LocalPeer};
+type BoundIpc = (std::path::PathBuf, crate::ipc::IpcListener);
+#[cfg(not(any(unix, windows)))]
+type BoundIpc = (std::path::PathBuf, std::convert::Infallible);
+
+/// Binds the IPC listener. With the network on, failing to bind is not
+/// fatal: the daemon keeps serving TCP only. With it off nothing else could
+/// reach the daemon, so the start fails.
+#[cfg(any(unix, windows))]
+fn bind_ipc(config: &Config) -> Result<Option<BoundIpc>> {
     if !config.ipc.enabled {
-        return None;
+        return Ok(None);
     }
     let bound = crate::ipc::resolve_path(config)
-        .and_then(|path| IpcListener::bind(&path).map(|listener| (path, listener)));
-    let (path, listener) = match bound {
-        Ok(bound) => bound,
-        Err(error) => {
+        .and_then(|path| crate::ipc::IpcListener::bind(&path).map(|listener| (path, listener)));
+    match bound {
+        Ok(bound) => Ok(Some(bound)),
+        Err(error) if config.network_enabled => {
             tracing::warn!(error = %error, "local IPC listener unavailable; serving TCP only");
-            return None;
+            Ok(None)
         }
-    };
+        Err(error) => Err(anyhow::Error::new(error)
+            .context("network_enabled = false needs the local IPC listener, which failed to bind")),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn bind_ipc(config: &Config) -> Result<Option<BoundIpc>> {
+    if config.network_enabled {
+        return Ok(None);
+    }
+    anyhow::bail!("network_enabled = false needs local IPC, which this platform does not have")
+}
+
+/// Serves a bound IPC listener.
+#[cfg(any(unix, windows))]
+fn serve_ipc(
+    (path, listener): BoundIpc,
+    state: &AppState,
+    info: impl FnOnce(String) -> server::LocalAdminInfo,
+) -> IpcServer {
     let app = server::ipc_router(state.clone(), info(path.display().to_string()));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         axum::serve(
             listener,
-            app.into_make_service_with_connect_info::<LocalPeer>(),
+            app.into_make_service_with_connect_info::<crate::ipc::LocalPeer>(),
         )
         .with_graceful_shutdown(async {
             let _ = shutdown_rx.await;
@@ -259,20 +281,20 @@ fn start_ipc(
         .context("IPC server failed")
     });
     info!(path = %path.display(), "todex-agentd IPC listening");
-    Some(IpcServer {
+    IpcServer {
         path,
         shutdown: Some(shutdown_tx),
         handle,
-    })
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn start_ipc(
-    _config: &Config,
+fn serve_ipc(
+    (_, never): BoundIpc,
     _state: &AppState,
     _info: impl FnOnce(String) -> server::LocalAdminInfo,
-) -> Option<IpcServer> {
-    None
+) -> IpcServer {
+    match never {}
 }
 
 struct ApiListener {
@@ -321,7 +343,8 @@ impl ManagedServer {
         }
         config.ensure_listener_matches_auth()?;
         config.ensure_api_listener_is_valid()?;
-        let addr = bind_addr(&config)?;
+        config.ensure_network_off_has_ipc()?;
+        let addr = listener_addr(&config)?;
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("failed to bind {addr}"))?;
@@ -342,6 +365,9 @@ impl ManagedServer {
         // After the binds, so a port conflict still reports itself; before
         // anything reads or recovers the data directory.
         let data_dir_lock = lock_data_dir(&config.data_dir)?;
+        // After the lock: binding replaces a stale socket file, which must
+        // not be a running server's.
+        let bound_ipc = bind_ipc(&config)?;
         // After the bind, so a second server on the same data directory that
         // cannot listen never kills the running one's providers; before
         // AppState::new, so conversation recovery sees no live orphans.
@@ -373,43 +399,30 @@ impl ManagedServer {
         });
         let history_cleanup_task = Some(crate::history_cleanup::spawn(state.clone()));
         let upload_cleanup_task = Some(crate::prompt_uploads::spawn_cleanup());
-        let app = server::router(state.clone());
+        let app = if config.network_enabled {
+            server::router(state.clone())
+        } else {
+            server::agent_router(state.clone())
+        };
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        info!(
-            host = %config.host,
-            port = config.port,
-            data_dir = %config.data_dir.display(),
-            workspace_roots = ?config.workspace_roots,
-            "todex-agentd listening"
-        );
-        // The advertised address comes first: inside a container the
-        // interface addresses below are not reachable from clients.
-        if let Some(url) = &config.deployment.advertise_url {
-            info!(url = %url, "advertised client connect address");
-        }
-        match listen_addrs::connect_addresses(&config.host) {
-            Ok(addresses) => {
-                for address in addresses {
-                    info!(
-                        url = %address.ws_url(addr.port()),
-                        interface = address.interface.as_deref().unwrap_or("-"),
-                        "client connect address"
-                    );
-                }
-            }
-            Err(error) => tracing::warn!(
-                error = %error,
-                "failed to list network interface addresses for the listener"
-            ),
-        }
-        if plaintext_listener_needs_warning(config.security.enable_tls, &config.host) {
-            tracing::warn!(
-                host = %config.host,
-                "non-loopback listener is using plaintext HTTP; pairing encryption protects websocket frames but not bearer headers"
+        if !config.network_enabled {
+            info!(
+                agent_addr = %addr,
+                data_dir = %config.data_dir.display(),
+                workspace_roots = ?config.workspace_roots,
+                "todex-agentd network listener off; clients connect over IPC only"
             );
+        } else {
+            info!(
+                host = %config.host,
+                port = config.port,
+                data_dir = %config.data_dir.display(),
+                workspace_roots = ?config.workspace_roots,
+                "todex-agentd listening"
+            );
+            log_connect_addresses(&config, addr);
         }
-
         let (exited_tx, exited) = watch::channel(());
         let handle = tokio::spawn(async move {
             let _exited = exited_tx;
@@ -451,11 +464,13 @@ impl ManagedServer {
             None => None,
         };
         let api_listen = api.as_ref().map(|api| api.addr);
-        let ipc = start_ipc(&config, &state, |ipc_path| server::LocalAdminInfo {
-            started_at,
-            port: addr.port(),
-            api_listen,
-            ipc_path,
+        let ipc = bound_ipc.map(|bound| {
+            serve_ipc(bound, &state, |ipc_path| server::LocalAdminInfo {
+                started_at,
+                port: addr.port(),
+                api_listen,
+                ipc_path,
+            })
         });
         let migration_task = Some(state.spawn_legacy_conversation_migration());
         let maintenance_task = Some(state.spawn_journal_maintenance());
@@ -642,6 +657,47 @@ pub fn api_bind_addr(config: &Config) -> Result<SocketAddr> {
     };
     text.parse()
         .with_context(|| format!("invalid API bind address {host}:{port}"))
+}
+
+/// Logs where clients reach the main listener, and warns when it serves
+/// plaintext beyond loopback.
+fn log_connect_addresses(config: &Config, addr: SocketAddr) {
+    // The advertised address comes first: inside a container the
+    // interface addresses below are not reachable from clients.
+    if let Some(url) = &config.deployment.advertise_url {
+        info!(url = %url, "advertised client connect address");
+    }
+    match listen_addrs::connect_addresses(&config.host) {
+        Ok(addresses) => {
+            for address in addresses {
+                info!(
+                    url = %address.ws_url(addr.port()),
+                    interface = address.interface.as_deref().unwrap_or("-"),
+                    "client connect address"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            error = %error,
+            "failed to list network interface addresses for the listener"
+        ),
+    }
+    if plaintext_listener_needs_warning(config.security.enable_tls, &config.host) {
+        tracing::warn!(
+            host = %config.host,
+            "non-loopback listener is using plaintext HTTP; pairing encryption protects websocket frames but not bearer headers"
+        );
+    }
+}
+
+/// The main listener: `host:port`, or with the network off a loopback port
+/// on a random number that serves only the agent MCP routes.
+fn listener_addr(config: &Config) -> Result<SocketAddr> {
+    if config.network_enabled {
+        bind_addr(config)
+    } else {
+        Ok(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)))
+    }
 }
 
 pub fn bind_addr(config: &Config) -> Result<SocketAddr> {
@@ -940,6 +996,127 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn with_the_network_off_clients_use_ipc_and_tcp_serves_only_agent_tools() {
+        use serde_json::json;
+
+        let root = env::temp_dir().join(format!(
+            "todex-netoff-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        // Saved like the running config except for the network, so only it
+        // makes a restart required.
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(
+            root.join("data/config.toml"),
+            format!(
+                "host = \"0.0.0.0\"\nport = 0\nworkspace_roots = [{:?}]\n",
+                root.join("workspace")
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            host: "0.0.0.0".to_owned(),
+            port: 0,
+            network_enabled: false,
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspace")],
+            ..Config::default()
+        };
+        let server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
+            .await
+            .unwrap();
+        assert!(server.addr().ip().is_loopback(), "{}", server.addr());
+        let tcp = |path: &str| format!("http://{}{path}", server.addr());
+        // The daemon health check and the agent MCP routes stay on TCP.
+        assert!(reqwest::get(tcp("/v2/version"))
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        let mcp = reqwest::Client::new()
+            .post(tcp(crate::agent_mcp::SSH_ROUTE))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(mcp.status(), reqwest::StatusCode::NOT_FOUND);
+        for client_route in ["/health", "/v2/workspaces", "/v2/device-pairing/create"] {
+            let status = reqwest::get(tcp(client_route)).await.unwrap().status();
+            assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{client_route}");
+        }
+
+        let path = server.ipc_path().unwrap().to_path_buf();
+        let (status, body) = ipc_request(&path, "GET", "/v2/local-admin/status", None).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["networkEnabled"], false);
+        assert_eq!(body["connectUrls"], json!([]));
+        assert_eq!(body["pairingLink"], "");
+        assert_eq!(body["listen"], json!({ "host": "0.0.0.0", "port": 0 }));
+
+        let (status, body) = ipc_request(&path, "GET", "/v2/local-admin/config", None).await;
+        assert_eq!((status, &body["networkEnabled"]), (200, &json!(true)));
+        assert_eq!(
+            body["restartRequired"], true,
+            "the saved config has the network on"
+        );
+        let (status, body) = ipc_request(
+            &path,
+            "PUT",
+            "/v2/local-admin/config",
+            Some(json!({ "networkEnabled": false })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            (&body["networkEnabled"], &body["restartRequired"]),
+            (&json!(false), &json!(false))
+        );
+        let saved = fs::read_to_string(root.join("data/config.toml")).unwrap();
+        assert!(saved.contains("network_enabled = false"), "{saved}");
+
+        server.stop().await.unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_network_cannot_be_off_without_ipc() {
+        let root = env::temp_dir().join(format!("todex-netoff-noipc-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            port: 0,
+            network_enabled: false,
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..Config::default()
+        };
+        config.ipc.enabled = false;
+        let error = ManagedServer::start(config.clone(), ProviderProcessTracking::Disabled)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("[ipc] is disabled"), "{error:#}");
+
+        // An IPC listener that cannot bind fails the start instead of
+        // leaving a daemon nothing can reach.
+        #[cfg(unix)]
+        {
+            config.ipc.enabled = true;
+            fs::create_dir_all(&root).unwrap();
+            let not_a_socket = root.join("agentd.sock");
+            fs::write(&not_a_socket, b"file").unwrap();
+            config.ipc.path = Some(not_a_socket);
+            let error = ManagedServer::start(config, ProviderProcessTracking::Disabled)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                format!("{error:#}").contains("network_enabled = false"),
+                "{error:#}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn silent_connections_time_out_and_waiting_ones_are_served_after() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1137,6 +1314,7 @@ mod tests {
         let config = Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
+            network_enabled: true,
             pairing_encryption: PairingEncryption::default(),
             data_dir,
             workspace_roots: vec![workspace_root],
@@ -1222,6 +1400,7 @@ mod tests {
         let config = Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
+            network_enabled: true,
             pairing_encryption: PairingEncryption::default(),
             data_dir,
             workspace_roots: vec![workspace_root],
@@ -1305,6 +1484,7 @@ mod tests {
         let config = Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
+            network_enabled: true,
             pairing_encryption: PairingEncryption::default(),
             data_dir: root.join("data"),
             workspace_roots: vec![workspace_root],

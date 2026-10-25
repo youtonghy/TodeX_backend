@@ -32,7 +32,7 @@ use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
 use crate::update;
 use crate::workspace_paths::canonical_workspace_root;
 
-const ACTION_COUNT: usize = 14;
+const ACTION_COUNT: usize = 15;
 const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
@@ -1572,6 +1572,7 @@ impl TuiApp {
             KeyCode::Char('a') => self.toggle_autostart(),
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
+            KeyCode::Char('b') => self.toggle_network(),
             KeyCode::Char('w') => self.start_workspace_roots_manager(),
             KeyCode::Char('e') => self.start_pairing_encryption_edit(),
             KeyCode::Char('x') => self.start_reset_edit(),
@@ -1704,15 +1705,16 @@ impl TuiApp {
             2 => self.toggle_autostart(),
             3 => self.start_host_edit(),
             4 => self.start_port_edit(),
-            5 => self.start_workspace_roots_manager(),
-            6 => self.start_pairing_encryption_edit(),
-            7 => self.start_reset_edit(),
-            8 => self.show_pairing_qr().await,
-            9 => self.show_credentials().await,
-            10 => self.toggle_language(),
-            11 => self.open_device_pairing(),
-            12 => self.open_about(),
-            13 => return Ok(true),
+            5 => self.toggle_network(),
+            6 => self.start_workspace_roots_manager(),
+            7 => self.start_pairing_encryption_edit(),
+            8 => self.start_reset_edit(),
+            9 => self.show_pairing_qr().await,
+            10 => self.show_credentials().await,
+            11 => self.toggle_language(),
+            12 => self.open_device_pairing(),
+            13 => self.open_about(),
+            14 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -1723,6 +1725,53 @@ impl TuiApp {
             self.queue_daemon_op(DaemonOpKind::Stop);
         } else {
             self.queue_daemon_op(DaemonOpKind::Start);
+        }
+    }
+
+    /// Turns the network listener on or off (`network_enabled`); the
+    /// daemon applies it on its next start.
+    fn toggle_network(&mut self) {
+        let enabled = !self.config.network_enabled;
+        if !enabled && !self.config.ipc.enabled {
+            self.notice = self
+                .text(
+                    "The network listener can only be turned off while [ipc] is enabled.",
+                    "只有启用 [ipc] 时才能关闭网络接口。",
+                )
+                .to_owned();
+            return;
+        }
+        match Config::save_network_enabled(self.config.data_dir.clone(), enabled) {
+            Ok(()) => {
+                self.config.network_enabled = enabled;
+                self.last_error = None;
+                self.notice = match (enabled, self.daemon.is_some()) {
+                    (true, false) => self.text("Network listener on.", "已开启网络接口。"),
+                    (false, false) => self.text(
+                        "Network listener off: clients connect over IPC only.",
+                        "已关闭网络接口：客户端只能通过 IPC 连接。",
+                    ),
+                    (true, true) => self.text(
+                        "Network listener on; restart the daemon (r) to apply.",
+                        "已开启网络接口；重启 daemon（r）后生效。",
+                    ),
+                    (false, true) => self.text(
+                        "Network listener off: clients connect over IPC only; restart the daemon (r) to apply.",
+                        "已关闭网络接口：客户端只能通过 IPC 连接；重启 daemon（r）后生效。",
+                    ),
+                }
+                .to_owned();
+                self.push_log(self.notice.clone());
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                self.notice = self
+                    .text(
+                        "Failed to save the network setting.",
+                        "保存网络接口设置失败。",
+                    )
+                    .to_owned();
+            }
         }
     }
 
@@ -2910,9 +2959,17 @@ impl TuiApp {
                     })
                     .add_modifier(Modifier::BOLD),
             ),
-            Line::from(match self.language {
-                TuiLanguage::English => format!("Listen: {listen_host}:{listen_port}"),
-                TuiLanguage::Chinese => format!("监听：{listen_host}:{listen_port}"),
+            Line::from(if process.is_some_and(|process| !process.network_enabled) {
+                self.text(
+                    "Listen: network off — clients connect over IPC",
+                    "监听：网络接口已关闭 — 客户端通过 IPC 连接",
+                )
+                .to_owned()
+            } else {
+                match self.language {
+                    TuiLanguage::English => format!("Listen: {listen_host}:{listen_port}"),
+                    TuiLanguage::Chinese => format!("监听：{listen_host}:{listen_port}"),
+                }
             }),
             Line::from(match self.language {
                 TuiLanguage::English => {
@@ -3024,12 +3081,18 @@ impl TuiApp {
             (Some(version), TuiLanguage::Chinese) => format!("关于与更新（有更新 {version}）"),
             (None, _) => self.text("About & updates", "关于与更新").to_owned(),
         };
+        let network = if self.config.network_enabled {
+            self.text("Network listener: on", "网络接口：开")
+        } else {
+            self.text("Network listener: off (IPC only)", "网络接口：关（仅 IPC）")
+        };
         let actions = [
             start_stop,
             restart,
             autostart,
             self.text("Edit listen IP", "编辑监听 IP"),
             self.text("Edit listen port", "编辑监听端口"),
+            network,
             self.text("Manage workspace roots", "管理工作区根目录"),
             self.text("Edit required encryption", "编辑强制加密"),
             self.text("Reset", "重置"),
@@ -3041,7 +3104,7 @@ impl TuiApp {
             self.text("Quit", "退出"),
         ];
         let shortcuts = [
-            "s", "r", "a", "h", "p", "w", "e", "x", "g", "c", "l", "d", "u", "q",
+            "s", "r", "a", "h", "p", "b", "w", "e", "x", "g", "c", "l", "d", "u", "q",
         ];
         let items = actions
             .iter()
@@ -3057,7 +3120,7 @@ impl TuiApp {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else if (idx == 1 && restart_recommended)
-                    || (idx == 12 && self.update_available.is_some())
+                    || (idx == 13 && self.update_available.is_some())
                 {
                     Style::default().fg(Color::Yellow)
                 } else {
@@ -4807,7 +4870,7 @@ mod tests {
                         .map(|cell| cell.symbol())
                         .collect::<String>();
                     let shortcut = [
-                        "s", "r", "a", "h", "p", "w", "e", "x", "g", "c", "l", "d", "u", "q",
+                        "s", "r", "a", "h", "p", "b", "w", "e", "x", "g", "c", "l", "d", "u", "q",
                     ][selected];
                     assert!(
                         contents.contains(&format!("> [{shortcut}]")),
@@ -5209,6 +5272,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn network_listener_toggle_saves_and_needs_ipc() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (mut app, data_dir) = temp_app("network-toggle");
+        let press = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        app.config.ipc.enabled = false;
+        app.handle_key(press).await.unwrap();
+        assert!(app.config.network_enabled, "IPC off keeps the network on");
+        assert!(!data_dir.join("config.toml").exists());
+
+        app.config.ipc.enabled = true;
+        app.handle_key(press).await.unwrap();
+        assert!(!app.config.network_enabled);
+        let saved = std::fs::read_to_string(data_dir.join("config.toml")).unwrap();
+        assert!(saved.contains("network_enabled = false"), "{saved}");
+        app.handle_key(press).await.unwrap();
+        assert!(app.config.network_enabled);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn api_listener_status_is_read_only() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -5559,7 +5643,7 @@ mod tests {
         assert_eq!(TuiLanguage::parse("invalid"), None);
         assert_eq!(TuiLanguage::Chinese.as_str(), "zh-CN");
         assert_eq!(TuiLanguage::English.as_str(), "en");
-        assert_eq!(ACTION_COUNT, 14);
+        assert_eq!(ACTION_COUNT, 15);
     }
 
     #[test]

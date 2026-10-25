@@ -50,6 +50,7 @@ impl Harness {
         let config = Arc::new(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
+            network_enabled: true,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
             workspace_roots: vec![root.clone()],

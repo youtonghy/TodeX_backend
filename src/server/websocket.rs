@@ -4038,6 +4038,7 @@ mod tests {
         AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
+            network_enabled: true,
             pairing_encryption: crate::config::PairingEncryption::default(),
             data_dir: unique_tmp_dir("todex-codex-auth-test-data"),
             workspace_roots: vec![std::env::temp_dir()],

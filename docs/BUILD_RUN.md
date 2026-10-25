@@ -71,6 +71,7 @@ dsh --version
 | --- | --- |
 | `TODEX_AGENTD_HOST` | 监听地址 |
 | `TODEX_AGENTD_PORT` | 监听端口 |
+| `TODEX_AGENTD_NETWORK_ENABLED` | 是否开启网络监听（`0/1/true/false`，默认开启）；关闭后客户端只能经本机 IPC 连接，见下文「本机 IPC」 |
 | `TODEX_AGENTD_DATA_DIR` | 数据目录 |
 | `TODEX_AGENTD_WORKSPACE_ROOT` | workspace 根目录 |
 | `TODEX_AGENTD_WORKSPACE_ROOTS` | 多个 workspace 根目录，按平台路径分隔符分隔（macOS/Linux 为 `:`，Windows 为 `;`） |
@@ -116,6 +117,7 @@ dsh --version
 ```toml
 host = "127.0.0.1"
 port = 7345
+# network_enabled = false   # 只经本机 IPC 服务客户端，不绑定 host/port；需要 [ipc] 开启
 data_dir = "/home/user/.todex-agent"
 workspace_root = "/home/user/projects"
 # 多个根目录时使用数组；与 workspace_root 并存时取并集，主根为 workspace_root
@@ -187,6 +189,8 @@ language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 - Unix：默认 `<data_dir>/agentd.sock`（`data_dir` 取规范化路径）；该路径超过 100 字节时改用 `$XDG_RUNTIME_DIR/todex-agentd-<hash8>.sock`（`XDG_RUNTIME_DIR` 已设置且为绝对路径时），否则 `/tmp/todex-<uid>/agentd-<hash8>.sock`（目录以 0700 创建，必须属于当前用户）。`<hash8>` 为规范化 `data_dir` 的 UTF-8 字节 SHA-256 小写十六进制前 8 位。socket 文件权限 0600，所在目录不得对组或其他用户可写；路径上残留的旧 socket（无人监听）会被删除后重建，仍有进程在监听或路径是普通文件时放弃 IPC。正常退出时删除 socket 文件。每个连接都校验对端 uid（`SO_PEERCRED` / `getpeereid`）必须等于 daemon 的有效 uid，否则直接断开（只告警一次）。
 - Windows：默认命名管道 `\\.\pipe\todex-agentd-<hash16>`（同样的哈希取前 16 位，哈希前去掉规范化路径的 `\\?\` 前缀）。管道 DACL 只授予当前用户 SID 与 SYSTEM，并拒绝远程客户端（`PIPE_REJECT_REMOTE_CLIENTS`）。
 - 实际绑定的路径写入 `daemon.json` 的 `ipc_path`，`daemon status` 显示 `IPC listening: <路径>`，客户端应以它为准。IPC 无法建立（目录不存在、不可写、权限过宽等）时只记录告警，daemon 继续只用 TCP，`daemon.json` 中不写 `ipc_path`。
+
+关闭网络监听（`network_enabled = false`，或 `TODEX_AGENTD_NETWORK_ENABLED=false`；桌面端「本机 Backend → 监听 → 网络接口」、TUI 按 `b`）后，daemon 不再绑定 `host:port`，局域网、本机浏览器和 Web 客户端都无法连接，客户端只能经 IPC 连接；配对二维码/链接不再提供给其他设备。daemon 另在 `127.0.0.1` 的随机端口上开一个内部监听，只提供 Agent 工具回连所需的 `/internal/agent-mcp/*` 路由和供健康检查的 `/v2/version`，其他路径返回 404，因此 todex_agents、SSH、桌面工具和 Antigravity 审批 hook 照常可用。该模式要求 `[ipc]` 开启；IPC 无法建立时 daemon 启动失败（而不是退回只用 TCP）。`daemon.json` 与 `daemon status --format json` 中 `network_enabled`/`networkEnabled` 为 `false`，`host:port` 为上述内部端口。改动在重启 daemon 后生效。要恢复网络，在 TUI 按 `b`、在 `config.toml` 写 `network_enabled = true`，或以 `TODEX_AGENTD_NETWORK_ENABLED=true` 临时启动。
 
 信任模型：能通过上述检查的 IPC 对端与 daemon 是同一用户，本来就能直接读写数据目录（`devices.json`、配对控制文件、`config.toml`、传输密钥），因此 IPC 不新增权限：它的请求按回环对待（不强制 transport v2），本地管理 API 无需设备签名。网络上没有任何等价的批准入口：`/v2/local-admin/*` 只挂在 IPC 监听上，TCP 监听对这些路径返回 404。经 IPC 发起的配对申请记录来源为 `ipc`（TUI 显示为「本机（IPC）」），并单独计入配对频率限制。
 

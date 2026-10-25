@@ -870,6 +870,7 @@ mod tests {
         Config {
             host: "127.0.0.1".to_owned(),
             port: 7345,
+            network_enabled: true,
             pairing_encryption: PairingEncryption::default(),
             data_dir: PathBuf::from("/tmp/todex-test"),
             workspace_roots: vec![PathBuf::from("/tmp/todex-test/workspace")],

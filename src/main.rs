@@ -538,6 +538,10 @@ fn autostart_command(command: AutostartCommand) -> anyhow::Result<()> {
 }
 
 fn print_connect_addresses(process: &daemon::DaemonProcess) {
+    if !process.network_enabled {
+        println!("  network listener off (network_enabled = false); clients connect over IPC only");
+        return;
+    }
     match listen_addrs::connect_addresses(&process.host) {
         Ok(addresses) => {
             for address in addresses {

@@ -854,7 +854,7 @@ GET /v2/version
 
 ## 本机 IPC 与本地管理 API
 
-daemon 默认另开一个本机 IPC 监听：Unix socket（默认 `<data_dir>/agentd.sock`）或 Windows 命名管道（`\\.\pipe\todex-agentd-<hash16>`），只有 daemon 的同一用户能连接（Unix 校验对端 uid，Windows 管道 DACL 只授予当前用户与 SYSTEM 并拒绝远程客户端）。配置（`[ipc] enabled`/`path`，`TODEX_AGENTD_IPC_ENABLED`/`TODEX_AGENTD_IPC_PATH`）、默认路径规则与信任模型见 [BUILD_RUN.md](BUILD_RUN.md#本机-ipc)。实际路径记录在 `daemon.json` 的 `ipc_path` 和 `daemon status --format json` 的 `ipcPath` 中。
+daemon 默认另开一个本机 IPC 监听：Unix socket（默认 `<data_dir>/agentd.sock`）或 Windows 命名管道（`\\.\pipe\todex-agentd-<hash16>`），只有 daemon 的同一用户能连接（Unix 校验对端 uid，Windows 管道 DACL 只授予当前用户与 SYSTEM 并拒绝远程客户端）。配置（`[ipc] enabled`/`path`，`TODEX_AGENTD_IPC_ENABLED`/`TODEX_AGENTD_IPC_PATH`）、默认路径规则与信任模型见 [BUILD_RUN.md](BUILD_RUN.md#本机-ipc)。实际路径记录在 `daemon.json` 的 `ipc_path` 和 `daemon status --format json` 的 `ipcPath` 中。`network_enabled = false` 时 daemon 只经 IPC 服务客户端，TCP 上只剩内部 Agent 工具端口（见 [BUILD_RUN.md](BUILD_RUN.md#本机-ipc)）。
 
 IPC 上是普通 HTTP/1.1（含 WebSocket 升级），客户端发送 `Host: localhost`。它提供与 TCP 监听相同的全部路由，对端视为回环：不强制 transport v2，匿名部署的 `Host`/`Origin` 检查照常进行，设备签名要求不变。经 IPC 的 `POST /v2/device-pairing/create` 在待批准列表中记为 `peerAddress: "ipc"`，并使用独立的频率限制桶。
 
@@ -862,9 +862,9 @@ IPC 上是普通 HTTP/1.1（含 WebSocket 升级），客户端发送 `Host: loc
 
 | 方法与路径 | 说明 |
 | --- | --- |
-| `GET /v2/local-admin/status` | `{version, deployment: "host"\|"container", dataDir, pid, startedAt (RFC 3339), listen: {host, port}, connectUrls: [{url: "ws://h:p/v2/ws", interface\|null}], advertiseUrl\|null, pairingLink（二维码 JSON 字符串）, transportFingerprint\|null（pairing_encryption = "none" 时为 null）, pairingEncryption, authEnabled, deviceCount, pendingPairingCount, api: {enabled, host, port, listening: "h:p"\|null}, workspaceRoots, ipcPath, autoUpdate（实际生效值）, configEditable}`。`listen.port` 为实际绑定端口 |
-| `GET /v2/local-admin/config` | `{host, port, pairingEncryption, workspaceRoots, autoUpdate, editable, restartRequired}`：已保存（`config.toml` + 环境变量）的设置；`restartRequired` 表示保存的 host/port/加密方式/根目录与运行中服务不同 |
-| `PUT /v2/local-admin/config` | body 为 `{host, port, pairingEncryption, workspaceRoots, autoUpdate}` 的任意子集（未知字段报错）。校验与 TUI 相同：host 为 IP 字面量；port 为 1–65535，API 开启时不得等于 `api.port`；host 与加密方式须满足 `enable_auth`/回环规则；根目录须为已存在目录，规范化、去重，至少一个，第一个为主根。校验失败 400 `invalid_config`；容器部署 409 `managed_by_image`。通过后写入 `config.toml`（与 TUI 相同的键，`autoUpdate` 写 `[update] auto_update` 并立即对运行中的 daemon 生效）；其余设置在重启后生效。响应同 GET |
+| `GET /v2/local-admin/status` | `{version, deployment: "host"\|"container", dataDir, pid, startedAt (RFC 3339), listen: {host, port}, networkEnabled, connectUrls: [{url: "ws://h:p/v2/ws", interface\|null}], advertiseUrl\|null, pairingLink（二维码 JSON 字符串）, transportFingerprint\|null（pairing_encryption = "none" 时为 null）, pairingEncryption, authEnabled, deviceCount, pendingPairingCount, api: {enabled, host, port, listening: "h:p"\|null}, workspaceRoots, ipcPath, autoUpdate（实际生效值）, configEditable}`。`listen.port` 为实际绑定端口；`networkEnabled: false` 时 `listen` 为已配置但未绑定的地址，`connectUrls` 为 `[]`，`pairingLink` 为 `""` |
+| `GET /v2/local-admin/config` | `{host, port, networkEnabled, pairingEncryption, workspaceRoots, autoUpdate, editable, restartRequired}`：已保存（`config.toml` + 环境变量）的设置；`restartRequired` 表示保存的网络开关/host/port/加密方式/根目录与运行中服务不同 |
+| `PUT /v2/local-admin/config` | body 为 `{host, port, networkEnabled, pairingEncryption, workspaceRoots, autoUpdate}` 的任意子集（未知字段报错）。`networkEnabled: false` 要求 `[ipc]` 开启，写入顶层 `network_enabled`。校验与 TUI 相同：host 为 IP 字面量；port 为 1–65535，API 开启时不得等于 `api.port`；host 与加密方式须满足 `enable_auth`/回环规则；根目录须为已存在目录，规范化、去重，至少一个，第一个为主根。校验失败 400 `invalid_config`；容器部署 409 `managed_by_image`。通过后写入 `config.toml`（与 TUI 相同的键，`autoUpdate` 写 `[update] auto_update` 并立即对运行中的 daemon 生效）；其余设置在重启后生效。响应同 GET |
 | `GET /v2/local-admin/pairing-requests` | 等待决定的配对申请 `[{requestId, verificationCode, deviceName, deviceId\|null, expiresAt（毫秒）, peerAddress, transportFingerprint\|null}]`，与 `pair list --format json` 相同 |
 | `POST /v2/local-admin/pairing-requests/{requestId}/decision` | body `{approved, verificationCode}`。验证码须与该申请一致（不区分大小写，连字符可省），否则 409 `code_mismatch`；申请不存在、已过期或已决定 404 `not_found`。成功 `{ok: true}` |
 | `GET /v2/local-admin/devices` | `[{deviceId, name, publicKey, pairedAt, lastSeenAt\|null}]` |

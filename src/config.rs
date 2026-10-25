@@ -38,6 +38,10 @@ pub struct ServeArgs {
 pub struct Config {
     pub host: String,
     pub port: u16,
+    /// `network_enabled = false` serves clients over IPC only: `host`/`port`
+    /// are not bound, and a loopback port on a random number serves just the
+    /// agent MCP routes. Needs `[ipc]` enabled.
+    pub network_enabled: bool,
     pub pairing_encryption: PairingEncryption,
     pub data_dir: PathBuf,
     pub workspace_roots: Vec<PathBuf>,
@@ -365,6 +369,7 @@ impl Default for SecurityConfig {
 struct FileConfig {
     host: Option<String>,
     port: Option<u16>,
+    network_enabled: Option<bool>,
     pairing_encryption: Option<PairingEncryption>,
     /// Retired: history is always end-to-end encrypted. Any value (even an
     /// invalid one) is accepted and only logged; see
@@ -539,6 +544,12 @@ impl Config {
             file_config.port,
             defaults.port,
         );
+        let network_enabled = coalesce(
+            None,
+            env_bool("TODEX_AGENTD_NETWORK_ENABLED"),
+            file_config.network_enabled,
+            defaults.network_enabled,
+        );
         let pairing_encryption = coalesce(
             None,
             env::var("TODEX_AGENTD_PAIRING_ENCRYPTION")
@@ -643,6 +654,7 @@ impl Config {
         Ok(Config {
             host,
             port,
+            network_enabled,
             pairing_encryption,
             data_dir,
             workspace_roots,
@@ -809,6 +821,25 @@ impl Config {
         Ok(())
     }
 
+    /// With the network off only IPC reaches the daemon, so IPC must be on.
+    pub fn ensure_network_off_has_ipc(&self) -> anyhow::Result<()> {
+        if !self.network_enabled && !self.ipc.enabled {
+            anyhow::bail!(
+                "network_enabled = false serves clients over IPC only, but [ipc] is disabled; \
+                 enable [ipc] or set network_enabled = true"
+            );
+        }
+        Ok(())
+    }
+
+    /// Saves top-level `network_enabled`; the rest of the file is kept.
+    pub fn save_network_enabled(data_dir: PathBuf, enabled: bool) -> anyhow::Result<()> {
+        let data_dir = expand_home(data_dir);
+        let mut document = load_config_document(&data_dir)?;
+        document["network_enabled"] = value(enabled);
+        write_config_document(&data_dir, &document)
+    }
+
     /// Saves the external API listener's `[api]` `enabled` and `port`,
     /// each only when given; the rest of the file is kept.
     pub fn save_api_settings(
@@ -836,6 +867,9 @@ impl Config {
     /// needs a pairing key, so such a listener also needs
     /// `pairing_encryption` other than `none`.
     pub fn ensure_listener_matches_auth(&self) -> anyhow::Result<()> {
+        if !self.network_enabled {
+            return Ok(());
+        }
         ensure_listener_matches_auth(
             &self.host,
             self.security.enable_auth,
@@ -995,6 +1029,7 @@ impl Default for Config {
         Config {
             host: "127.0.0.1".to_owned(),
             port: 7345,
+            network_enabled: true,
             pairing_encryption: PairingEncryption::default(),
             data_dir,
             workspace_roots: vec![workspace_root],
