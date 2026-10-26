@@ -537,10 +537,17 @@ struct Live {
     provider_work: Option<(ProviderWorkHandle, DriverPrompt)>,
     /// What the process reported about its permission mode at start-up.
     mode: super::permission_mode::ModeReport,
+    /// The process's subagent runs, which background agents keep updating
+    /// after the turn that started them.
+    subagents: super::ClaudeSubagents,
+    runtime_id: String,
+    /// From the last turn: journals subagent progress while no turn runs,
+    /// and the turn a run without one of its own is attributed to.
+    idle_sink: Option<(DriverEventSink, String)>,
 }
 
 impl Live {
-    fn new(process: JsonLineProcess, key: LaunchKey) -> Self {
+    fn new(process: JsonLineProcess, key: LaunchKey, runtime_id: String) -> Self {
         Self {
             process,
             key,
@@ -548,6 +555,9 @@ impl Live {
             work: SessionWork::default(),
             provider_work: None,
             mode: Default::default(),
+            subagents: Default::default(),
+            runtime_id,
+            idle_sink: None,
         }
     }
 
@@ -761,7 +771,7 @@ async fn worker(
                         // Held before `initialize`: a failed process is
                         // stopped by this worker, which stays in the table
                         // until it has exited.
-                        let started = live.insert(Live::new(process, key));
+                        let started = live.insert(Live::new(process, key, runtime_id.clone()));
                         let expected = started.key.permission_mode.clone();
                         started.mode = super::initialize_session(
                             &mut started.process,
@@ -868,7 +878,7 @@ async fn worker(
                 if live.is_none() {
                     let (process, runtime_id) =
                         super::spawn_claude(&launcher.binary, &context, &prompt).await?;
-                    let started = live.insert(Live::new(process, key));
+                    let started = live.insert(Live::new(process, key, runtime_id.clone()));
                     let expected = started.key.permission_mode.clone();
                     started.mode = super::initialize_session(
                         &mut started.process,
@@ -887,6 +897,10 @@ async fn worker(
                 if let Some(provider_work) = pending_provider_work.take() {
                     started.provider_work = Some(provider_work);
                 }
+                started.idle_sink = Some((
+                    sink.clone().for_runtime(started.runtime_id.clone()),
+                    prompt.turn_id.clone(),
+                ));
                 super::run_claude_turn(
                     &mut started.process,
                     &mut started.usage,
@@ -898,6 +912,7 @@ async fn worker(
                     &launcher.catalogs,
                     &mut cancel,
                     &mut started.work,
+                    &mut started.subagents,
                     start,
                 )
                 .await
@@ -977,8 +992,8 @@ async fn worker(
     let _ = stopped.send(true);
 }
 
-/// Reads one frame while no turn runs. Nothing here reaches the journal;
-/// background task frames update the session's work.
+/// Reads one frame while no turn runs. Background task frames update the
+/// session's work; of them only subagent lifecycle reaches the journal.
 async fn between_turns(live: &mut Live) -> Ended {
     let process = &mut live.process;
     let message = match process.read().await {
@@ -997,6 +1012,16 @@ async fn between_turns(live: &mut Live) -> Ended {
             }
             Ended::Reusable
         }
+        // A background subagent Claude restarted because a command it left
+        // behind finished: it works on its own, and the main session goes
+        // `running` once it reports.
+        Some("assistant" | "stream_event")
+            if message
+                .get("parent_tool_use_id")
+                .is_some_and(|parent| !parent.is_null()) =>
+        {
+            Ended::Reusable
+        }
         Some("assistant" | "stream_event" | "result") => {
             tracing::warn!("Claude Code produced output between turns; restarting its process");
             Ended::Retire
@@ -1009,6 +1034,14 @@ async fn between_turns(live: &mut Live) -> Ended {
         }
         Some("system") => {
             live.work.apply_system(&message);
+            let Some((sink, turn_id)) = &live.idle_sink else {
+                return Ended::Reusable;
+            };
+            if let Some((event, payload)) = live.subagents.system_event(&message, turn_id) {
+                if let Err(error) = sink.emit(event, payload).await {
+                    tracing::warn!(%error, "could not journal a Claude Code subagent between turns");
+                }
+            }
             Ended::Reusable
         }
         _ => Ended::Reusable,
@@ -1137,6 +1170,7 @@ async fn run_once(
             &launcher.catalogs,
             &mut cancel,
             &mut SessionWork::default(),
+            &mut super::ClaudeSubagents::default(),
             TurnStart::Prompt,
         )
         .await
@@ -1165,7 +1199,10 @@ mod tests {
     /// SIGTERM take a moment, `late-permission` / `late-output` follow the
     /// turn with a frame while no turn runs, `background` leaves a background
     /// task that finishes once a `finish-bg` file appears, after which Claude
-    /// starts an invocation of its own (as Claude Code 2.1.299 does). A
+    /// starts an invocation of its own (as Claude Code 2.1.299 does);
+    /// `subagent-resume` leaves a background agent waiting on a command of
+    /// its own, which restarts the agent between turns once `finish-bg`
+    /// appears (as Claude Code 2.1.310 does). A
     /// `reported-mode` file sets initialize's `current_permission_mode` and
     /// an `init-mode` file each turn's `init` frame mode; with an
     /// `early-request` file a permission request precedes the initialize
@@ -1239,6 +1276,33 @@ while IFS= read -r line; do
   mode=
   slow=
   case "$line" in
+    *subagent-resume*)
+      printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-a","name":"Agent","input":{"description":"Scan","prompt":"scan","run_in_background":true}}]}}\n'
+      printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-a","content":"launched"}]},"tool_use_result":{"status":"async_launched","agentId":"agent-1"}}\n'
+      printf '{"type":"system","subtype":"task_started","task_id":"agent-1","tool_use_id":"toolu-a","is_backgrounded":true,"task_type":"local_agent"}\n'
+      printf '{"type":"system","subtype":"task_started","task_id":"sh-1","owned_by_subagent":true,"parent_task_id":"agent-1","is_backgrounded":true,"task_type":"local_bash"}\n'
+      printf '{"type":"system","subtype":"task_notification","task_id":"agent-1","tool_use_id":"toolu-a","status":"completed","summary":"still waiting"}\n'
+      printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"sh-1","parent_task_id":"agent-1"}]}\n'
+      parent=$$
+      (
+        while [ ! -f "$dir/finish-bg" ] && kill -0 "$parent" 2>/dev/null; do sleep 0.02; done
+        [ -f "$dir/finish-bg" ] || exit 0
+        rm -f "$dir/finish-bg"
+        printf '{"type":"system","subtype":"task_notification","task_id":"sh-1","status":"completed"}\n'
+        printf '{"type":"system","subtype":"task_started","task_id":"agent-1","tool_use_id":"toolu-a","is_backgrounded":true,"task_type":"local_agent"}\n'
+        printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"agent-1"}]}\n'
+        printf '{"type":"assistant","parent_tool_use_id":"toolu-a","message":{"content":[{"type":"text","text":"reading the output"}]}}\n'
+        printf '{"type":"system","subtype":"task_progress","task_id":"agent-1","usage":{"total_tokens":42}}\n'
+        printf '{"type":"system","subtype":"task_notification","task_id":"agent-1","tool_use_id":"toolu-a","status":"completed","summary":"alpha done"}\n'
+        printf '{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n'
+        sleep 0.1
+        printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+        printf '{"type":"system","subtype":"init"}\n'
+        printf '{"type":"assistant","message":{"content":[{"type":"text","text":"own work done"}]}}\n'
+        printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"own work done"}\n'
+        printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+      ) &
+      ;;
     *background*)
       printf '{"type":"system","subtype":"task_started","task_id":"bg-1","is_backgrounded":true,"task_type":"local_bash"}\n'
       printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bg-1"}]}\n'
@@ -1792,6 +1856,75 @@ done
         fixture.turn(&sessions, &manifest, "after").await;
         assert_eq!(fixture.launches().len(), 1);
         assert!(fixture.overlaps().is_empty());
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    /// The incident behind this: a background subagent backgrounded a command
+    /// of its own, the turn ended, and when the command finished Claude
+    /// restarted the subagent. Its output between turns made TodeX restart
+    /// the process, losing the subagent and Claude's follow-up, and its card
+    /// stayed as the turn left it.
+    #[tokio::test]
+    async fn a_subagent_restarted_between_turns_keeps_its_process_and_reports() {
+        let fixture = Fixture::new().await;
+        let sessions = Sessions::new(Duration::from_millis(200), 16);
+        let manifest = fixture.conversation().await;
+        let (handle, mut offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &manifest, "subagent-resume", offering(&handle))
+            .await;
+        // The subagent's command holds the process past its keepalive.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(sessions.holds(&manifest.id).await);
+
+        fixture.finish_background();
+        let work = next_offer(&mut offers).await;
+        assert_eq!(work.trigger["kind"], "background_task");
+        // The report the first turn already answered is not the trigger.
+        assert_eq!(work.trigger["taskIds"], json!(["agent-1"]));
+        assert_eq!(work.trigger["summary"], "alpha done");
+        fixture
+            .turn_with(&sessions, &manifest, "unused", adopting(&work.adoption))
+            .await;
+        assert_eq!(fixture.launches().len(), 1);
+        let history = fixture.store.complete_history(&manifest.id).await.unwrap();
+        assert!(history
+            .iter()
+            .any(|event| event.payload.to_string().contains("own work done")));
+        let runs: Vec<_> = history
+            .iter()
+            .filter(|event| {
+                event.event_type.starts_with("subagent.")
+                    && event.payload["subagentId"] == "toolu-a"
+            })
+            .collect();
+        let lifecycle: Vec<_> = runs
+            .iter()
+            .filter(|event| event.event_type != "subagent.updated")
+            .map(|event| {
+                (
+                    event.event_type.as_str(),
+                    event.payload["result"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lifecycle,
+            [
+                ("subagent.started", ""),
+                ("subagent.completed", "still waiting"),
+                ("subagent.started", ""),
+                ("subagent.completed", "alpha done"),
+            ]
+        );
+        assert!(runs.iter().any(|event| {
+            event.event_type == "subagent.updated"
+                && event.payload.pointer("/metadata/usage/total_tokens") == Some(&json!(42))
+        }));
+        // Between turns the run still names the turn that started it.
+        let turn = &runs[0].payload["turnId"];
+        assert!(runs.iter().all(|event| &event.payload["turnId"] == turn));
         sessions.stop_all().await;
         cleanup(&fixture.root);
     }

@@ -6,6 +6,8 @@
 //! Claude starts an invocation of its own (`running`), which the worker
 //! hands to the supervisor as a provider-initiated turn. Until then the
 //! process must outlive the provider keepalive, or the work is lost with it.
+//! A background command a subagent left behind counts too: when it finishes,
+//! Claude restarts that subagent between turns.
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,6 +28,12 @@ const FOLLOW_UP_GRACE: Duration = Duration::from_secs(30);
 pub(super) struct SessionWork {
     /// Live background tasks of the main session: task id → its type.
     live: HashMap<String, Option<String>>,
+    /// Live background tasks subagents own. They report to their subagent,
+    /// not the main session, but restart it when they finish.
+    subagent_live: HashSet<String>,
+    /// When the last of them finished: Claude restarts its subagent moments
+    /// later.
+    subagent_finished_at: Option<Instant>,
     /// Known tasks of the session (including foreground tasks):
     /// task id → (task_type, is_subagent).
     known: HashMap<String, (Option<String>, bool)>,
@@ -54,6 +62,12 @@ impl SessionWork {
         self.recently_left.clear();
     }
 
+    /// A turn ended at `idle`: Claude already answered every task it was
+    /// notified of, so none of them triggers the next invocation.
+    pub(super) fn end_turn(&mut self) {
+        self.finished.clear();
+    }
+
     /// Tracks a `system` frame, in or between turns.
     pub(super) fn apply_system(&mut self, message: &Value) {
         let task_id = message.get("task_id").and_then(Value::as_str);
@@ -72,10 +86,12 @@ impl SessionWork {
                     .map(str::to_owned);
                 self.known
                     .insert(id.to_owned(), (task_type.clone(), is_subagent));
-                if !is_subagent
-                    && message.get("is_backgrounded").and_then(Value::as_bool) != Some(false)
-                {
-                    self.live.insert(id.to_owned(), task_type);
+                if message.get("is_backgrounded").and_then(Value::as_bool) != Some(false) {
+                    if is_subagent {
+                        self.subagent_live.insert(id.to_owned());
+                    } else {
+                        self.live.insert(id.to_owned(), task_type);
+                    }
                 }
             }
             Some("task_updated") => {
@@ -86,17 +102,27 @@ impl SessionWork {
                 {
                     let (task_type, is_subagent) =
                         self.known.get(id).cloned().unwrap_or((None, false));
-                    if !is_subagent {
-                        if bg {
+                    match (is_subagent, bg) {
+                        (false, true) => {
                             self.live.insert(id.to_owned(), task_type);
-                        } else {
+                        }
+                        (false, false) => {
                             self.live.remove(id);
+                        }
+                        (true, true) => {
+                            self.subagent_live.insert(id.to_owned());
+                        }
+                        (true, false) => {
+                            self.subagent_live.remove(id);
                         }
                     }
                 }
             }
             Some("task_notification") => {
                 let Some(id) = task_id else { return };
+                if self.subagent_live.remove(id) {
+                    self.subagent_finished_at = Some(Instant::now());
+                }
                 let started_type = self.live.remove(id).or_else(|| {
                     self.recently_left
                         .remove(id)
@@ -122,6 +148,7 @@ impl SessionWork {
             }
             Some("background_tasks_changed") => {
                 let mut current_main = HashSet::new();
+                let mut current_subagent = HashSet::new();
                 if let Some(tasks) = message.get("tasks").and_then(Value::as_array) {
                     for task in tasks {
                         let Some(id) = task.get("task_id").and_then(Value::as_str) else {
@@ -131,7 +158,9 @@ impl SessionWork {
                             == Some(true)
                             || task.get("parent_task_id").and_then(Value::as_str).is_some()
                             || self.known.get(id).is_some_and(|(_, sub)| *sub);
-                        if !is_subagent {
+                        if is_subagent {
+                            current_subagent.insert(id.to_owned());
+                        } else {
                             current_main.insert(id.to_owned());
                             let task_type = task
                                 .get("task_type")
@@ -151,6 +180,7 @@ impl SessionWork {
                     }
                     keep
                 });
+                self.subagent_live = current_subagent;
             }
             _ => {}
         }
@@ -213,15 +243,19 @@ impl SessionWork {
     /// work that has no end of its own (a task that never exits, cron).
     pub(super) fn hold_until(&mut self, now: Instant, cap: Instant) -> Option<Instant> {
         self.wakeups.retain(|due| *due + WAKEUP_GRACE > now);
-        if !self.live.is_empty() || self.cron {
+        if !self.live.is_empty() || !self.subagent_live.is_empty() || self.cron {
             return Some(cap);
         }
-        // A finished task's follow-up has not started yet.
+        // A finished task's follow-up, or the subagent restart a finished
+        // subagent command brings, has not started yet.
         let follow_up = self
             .finished_at
             .filter(|_| !self.finished.is_empty())
+            .into_iter()
+            .chain(self.subagent_finished_at)
             .map(|at| at + FOLLOW_UP_GRACE)
-            .filter(|until| *until > now);
+            .filter(|until| *until > now)
+            .max();
         self.wakeups
             .iter()
             .map(|due| *due + WAKEUP_GRACE)
@@ -232,13 +266,17 @@ impl SessionWork {
 
     /// Whether anything keeps the process beyond the keepalive.
     pub(super) fn pending(&self) -> bool {
-        !self.live.is_empty() || self.cron || !self.wakeups.is_empty()
+        !self.live.is_empty()
+            || !self.subagent_live.is_empty()
+            || self.cron
+            || !self.wakeups.is_empty()
     }
 
     /// Background tasks that are running or whose follow-up has not started:
     /// lost if the process stops now.
     pub(super) fn task_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.live.keys().cloned().collect();
+        ids.extend(self.subagent_live.iter().cloned());
         ids.extend(
             self.finished
                 .iter()
@@ -368,9 +406,53 @@ mod tests {
         ));
         work.apply_system(&system(
             "task_started",
-            json!({ "task_id": "sub", "owned_by_subagent": true }),
+            json!({ "task_id": "sub", "owned_by_subagent": true, "is_backgrounded": false }),
         ));
         assert!(!work.pending());
+    }
+
+    /// The frames Claude Code 2.1.310 sends when a background subagent
+    /// backgrounds a command of its own: the agent reports done, the main
+    /// session goes idle, and the command restarts the agent when it ends.
+    #[test]
+    fn a_subagents_background_command_holds_until_it_finishes() {
+        let now = Instant::now();
+        let cap = now + Duration::from_secs(3600);
+        let mut work = SessionWork::default();
+        work.apply_system(&system(
+            "task_started",
+            json!({ "task_id": "agent-1", "is_backgrounded": true, "task_type": "local_agent" }),
+        ));
+        work.apply_system(&system(
+            "task_started",
+            json!({ "task_id": "sh-1", "owned_by_subagent": true, "is_backgrounded": true,
+                    "parent_task_id": "agent-1", "task_type": "local_bash" }),
+        ));
+        work.apply_system(&system(
+            "task_notification",
+            json!({ "task_id": "agent-1", "status": "completed", "task_type": "local_agent" }),
+        ));
+        work.apply_system(&system(
+            "background_tasks_changed",
+            json!({ "tasks": [{ "task_id": "sh-1", "parent_task_id": "agent-1" }] }),
+        ));
+        work.begin_turn();
+        assert!(work.pending());
+        assert_eq!(work.hold_until(now, cap), Some(cap));
+        assert_eq!(work.task_ids(), ["sh-1"]);
+
+        // The command's notification goes to its agent, not the main session.
+        work.apply_system(&system(
+            "task_notification",
+            json!({ "task_id": "sh-1", "status": "completed" }),
+        ));
+        work.apply_system(&system("background_tasks_changed", json!({ "tasks": [] })));
+        assert!(!work.pending());
+        assert_eq!(work.trigger(now)["kind"], "unknown");
+        // Claude restarts the agent a moment later.
+        assert!(work
+            .hold_until(now, cap)
+            .is_some_and(|until| until > now && until < cap));
     }
 
     #[test]

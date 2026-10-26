@@ -29,10 +29,16 @@ optional and canonical aliases are recomputed when old journals are replayed.
   at most 16; busy slots fall back to a one-turn process). Each turn writes a
   `user` frame to it; a changed launch setting (model, effort, permission
   mode, MCP config, settings) or a dead process restarts it with `--resume`.
-  Between turns stdout is drained, not journalled: control requests are
-  refused and unprompted output retires the process. Background work outlives
-  the turn: a backgrounded Bash task, a pending `ScheduleWakeup` or a
-  `CronCreate` job keeps the process past the keepalive (at most 6 h after
+  Between turns stdout is drained: control requests are refused and
+  unprompted main-session output retires the process. Subagent output
+  (`parent_tool_use_id` set) is not unprompted: when a command a background
+  subagent backgrounded finishes, Claude restarts that subagent while the
+  main session is still `idle`. Only subagent lifecycle is journalled between
+  turns (`subagent.*`, naming the turn that started the run); a restarted
+  subagent reopens with another `subagent.started`. Background work outlives
+  the turn: a backgrounded Bash task (a subagent's included), a pending
+  `ScheduleWakeup` or a `CronCreate` job keeps the process past the keepalive
+  (at most 6 h after
   the last turn; a wakeup until 2 min after it is due), and such sessions are
   evicted last. When that work finishes or fires, Claude starts an invocation
   of its own (`running` between turns); the worker leaves its frames unread

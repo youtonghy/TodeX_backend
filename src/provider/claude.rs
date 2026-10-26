@@ -2563,6 +2563,7 @@ enum TurnStart {
 /// [`TurnStart`]) and reads until the turn ends. `work` follows the
 /// session's background work across turns. A cancelled turn returns at once
 /// with the process still mid-turn; the caller interrupts or stops it.
+/// `subagents` follows the process's subagent runs across turns.
 #[allow(clippy::too_many_arguments)]
 async fn run_claude_turn(
     process: &mut JsonLineProcess,
@@ -2575,6 +2576,7 @@ async fn run_claude_turn(
     catalogs: &Catalogs,
     cancel: &mut watch::Receiver<bool>,
     work: &mut session_work::SessionWork,
+    subagents: &mut ClaudeSubagents,
     start: TurnStart,
 ) -> Result<DriverTurnResult, AppError> {
     work.begin_turn();
@@ -2626,7 +2628,6 @@ async fn run_claude_turn(
     let mut saw_output = false;
     let mut tools = ClaudeToolCalls::default();
     let mut background_tasks = BackgroundTasks::default();
-    let mut subagents = ClaudeSubagents::default();
     // Epoch from a rejected `rate_limit_event` or `quotaLimits`. Preferred
     // over the wall clock in the error text, which Claude rounds.
     let mut rejected_reset: Option<DateTime<Utc>> = None;
@@ -3015,6 +3016,9 @@ async fn run_claude_turn(
             None => {}
         }
     };
+    if session_states {
+        work.end_turn();
+    }
     // The settings probe went unanswered: report without a source.
     auto_fallback.probe_answered(sink, mode).await?;
     // Work Claude did on its own may end without visible output.
@@ -3623,6 +3627,8 @@ impl BackgroundTasks {
 /// tool_use id when the run came from a tool call, otherwise the provider
 /// task_id. `by_task` links background task frames (keyed by task_id) back to
 /// that surfaced id so progress and terminal notifications update one entry.
+/// Kept for the whole process: a background agent reports in later turns and
+/// between turns.
 #[derive(Default)]
 struct ClaudeSubagents {
     /// subagentId → tool_use_id of the spawning Task/Agent call.
@@ -3631,6 +3637,9 @@ struct ClaudeSubagents {
     by_task: HashMap<String, String>,
     /// subagentIds that already emitted a terminal event.
     finished: HashSet<String>,
+    /// subagentId → the turn that started it, which its events name when
+    /// no turn runs.
+    turns: HashMap<String, String>,
 }
 
 impl ClaudeSubagents {
@@ -3653,6 +3662,7 @@ impl ClaudeSubagents {
             return None;
         }
         self.items.insert(tool_id.clone(), tool_id.clone());
+        self.turns.insert(tool_id.clone(), turn_id.to_owned());
         let input = block.get("input").cloned().unwrap_or(Value::Null);
         Some(json!({
             "provider": "claude-code",
@@ -3729,9 +3739,17 @@ impl ClaudeSubagents {
     }
 
     /// `task_started`, `task_progress` and `task_notification` frames carry the
-    /// subagent lifecycle for provider-side tasks.
+    /// subagent lifecycle for provider-side tasks. `turn_id` is the running
+    /// turn; a run started earlier keeps naming its own turn.
     fn system_event(&mut self, message: &Value, turn_id: &str) -> Option<(&'static str, Value)> {
         let task_id = message.get("task_id").and_then(Value::as_str)?;
+        let turn_id = self
+            .by_task
+            .get(task_id)
+            .and_then(|subagent_id| self.turns.get(subagent_id))
+            .map_or(turn_id, String::as_str)
+            .to_owned();
+        let turn_id = turn_id.as_str();
         match message.get("subtype").and_then(Value::as_str) {
             Some("task_started") => {
                 let tool_use_id = message.get("tool_use_id").and_then(Value::as_str);
@@ -3739,13 +3757,33 @@ impl ClaudeSubagents {
                 // A linked Task call already opened the run from its tool_use;
                 // record the task_id link so later task frames find it.
                 if let Some(subagent_id) = tool_use_id.and_then(|id| self.items.get(id)).cloned() {
-                    self.by_task.insert(task_id.to_owned(), subagent_id);
-                    return None;
+                    self.by_task.insert(task_id.to_owned(), subagent_id.clone());
+                    // Claude restarts a finished agent when a background
+                    // command it left behind completes: the run is live again.
+                    if !self.finished.remove(&subagent_id) {
+                        return None;
+                    }
+                    let turn_id = self.turns.get(&subagent_id).map_or(turn_id, String::as_str);
+                    return Some((
+                        "subagent.started",
+                        json!({
+                            "provider": "claude-code",
+                            "source": "provider",
+                            "turnId": turn_id,
+                            "subagentId": subagent_id,
+                            "providerItemId": self.items.get(&subagent_id),
+                            "agentId": message.get("agent_id"),
+                            "status": "running",
+                        }),
+                    ));
                 }
                 if !Self::is_agent_task_kind(kind) {
                     return None;
                 }
                 self.by_task.insert(task_id.to_owned(), task_id.to_owned());
+                self.turns.insert(task_id.to_owned(), turn_id.to_owned());
+                // A restart reports through its own task_notification again.
+                self.finished.remove(task_id);
                 if let Some(tool_use_id) = tool_use_id {
                     self.items
                         .insert(task_id.to_owned(), tool_use_id.to_owned());
