@@ -1243,7 +1243,8 @@ mod tests {
         let mut started_host = None;
         let cwd_name = cwd.file_name().unwrap().to_string_lossy().into_owned();
         // The exit event is published by a different task than the output,
-        // so it can arrive first: wait for the output itself.
+        // so it can arrive first: wait for the output itself. `terminal.started`
+        // shares that race, so the loop also waits for it before leaving.
         loop {
             tokio::select! {
                 _ = &mut deadline => break,
@@ -1254,7 +1255,7 @@ mod tests {
                         "terminal.output" => output.push_str(&payload_text(&event.payload, "data")),
                         _ => {}
                     }
-                    if output.contains(&cwd_name) {
+                    if started_host.is_some() && output.contains(&cwd_name) {
                         break;
                     }
                 }
