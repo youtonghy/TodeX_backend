@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, watch, Mutex};
+use tokio::time::Instant;
 
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
@@ -2665,6 +2666,13 @@ async fn run_claude_turn(
     // Claude's own invocation began with a `running` the worker already read.
     let mut session_states = start != TurnStart::Prompt;
     let mut settled: Option<Value> = None;
+    // When the settled `result` stops waiting for `idle`: Claude withholds
+    // that frame while it still counts work as live, including work whose
+    // completion TodeX already saw, so a turn could otherwise stay open until
+    // the user cancelled it. See [`IDLE_CONFIRM_GRACE`].
+    let mut idle_deadline: Option<Instant> = None;
+    // Prompts queued behind Claude's own invocation that it never took.
+    let mut prompt_resends = 0_u32;
     // `can_use_tool` waits on the user for up to the permission timeout, so
     // control requests are answered by detached tasks while this loop keeps
     // draining stdout — awaiting a prompt inline would let the pipe fill and
@@ -2689,6 +2697,46 @@ async fn run_claude_turn(
                     process.send(&response).await?;
                 }
                 continue;
+            }
+            // Claude owes a follow-up it never starts, or swallows the
+            // `idle` that would end the turn: end it on the answer it already
+            // gave instead of holding the client in "working".
+            _ = confirmation_due(idle_deadline), if !open_requests.outstanding() => {
+                idle_deadline = None;
+                let Some(result) = settled.take() else {
+                    continue;
+                };
+                if unreplayed.is_some() {
+                    if prompt_resends >= MAX_EMPTY_RESULT_RESENDS {
+                        return Err(AppError::ProviderUnavailable(
+                            "Claude Code never took the queued prompt; please retry".to_owned(),
+                        ));
+                    }
+                    // The prompt never reached the model: send it again rather
+                    // than ending a turn that shows an answer to it.
+                    prompt_resends += 1;
+                    unreplayed = None;
+                    process.send(&user_message).await?;
+                    continue;
+                }
+                tracing::warn!(
+                    grace_ms = idle_confirm_grace(&background_tasks).as_millis() as u64,
+                    background_tasks = background_tasks.pending(),
+                    "Claude Code did not report idle after its result; ending the turn"
+                );
+                sink.emit(
+                    "provider.event",
+                    json!({
+                        "provider": "claude-code",
+                        "providerMethod": "idle_timeout",
+                        "metadata": {
+                            "taskIds": background_tasks.ids(),
+                            "tasks": background_tasks.tasks(),
+                        },
+                    }),
+                )
+                .await?;
+                break result;
             }
                 changed = cancel.changed() => {
                     let _ = changed;
@@ -2750,6 +2798,10 @@ async fn run_claude_turn(
                 // subagents mid-flight or drops their queued hand-back. With
                 // session state events the pending notice is only for clients;
                 // `idle` decides when the turn ends.
+                //
+                // The `result` is the turn's answer either way, so it is kept
+                // even while that work is outstanding: dropping it left the
+                // turn with nothing to end on when the `idle` never came.
                 if background_tasks.pending() {
                     sink.emit(
                         "provider.event",
@@ -2763,15 +2815,20 @@ async fn run_claude_turn(
                         }),
                     )
                     .await?;
-                    if !session_states {
-                        continue;
-                    }
                 }
                 if session_states {
                     settled = Some(message);
+                    idle_deadline = Some(Instant::now() + idle_confirm_grace(&background_tasks));
                     continue;
                 }
-                break message;
+                // No session state events (an older CLI): only outstanding
+                // work keeps the turn open.
+                if !background_tasks.pending() {
+                    break message;
+                }
+                settled = Some(message);
+                idle_deadline = Some(Instant::now() + idle_confirm_grace(&background_tasks));
+                continue;
             }
             Some("stream_event") => {
                 saw_output = true;
@@ -2875,14 +2932,46 @@ async fn run_claude_turn(
             Some("system") => {
                 if message.get("subtype").and_then(Value::as_str) == Some("session_state_changed") {
                     session_states = true;
-                    // An `idle` before any successful `result` follows a
-                    // zero-turn `result` whose prompt was just resent.
-                    if message.get("state").and_then(Value::as_str) == Some("idle") {
-                        if let Some(result) = settled.take() {
-                            if unreplayed.is_none() {
+                    let state = message.get("state").and_then(Value::as_str);
+                    // Journaled so a stuck turn can be diagnosed from the
+                    // conversation alone: the frames themselves are invisible
+                    // to clients.
+                    sink.emit(
+                        "provider.event",
+                        json!({
+                            "provider": "claude-code",
+                            "providerMethod": "session_state_changed",
+                            "metadata": {
+                                "state": state,
+                                "waitingOnUser": message.get("waiting_on_user"),
+                            },
+                        }),
+                    )
+                    .await?;
+                    match state {
+                        // Claude waits on the user (a parked permission
+                        // prompt): no deadline covers a person's decision.
+                        Some("requires_action") => idle_deadline = None,
+                        // A new invocation began: the previous answer no longer
+                        // ends this turn.
+                        Some("running") => {
+                            settled = None;
+                            idle_deadline = None;
+                        }
+                        // An `idle` before any successful `result` follows a
+                        // zero-turn `result` whose prompt was just resent.
+                        Some("idle") => {
+                            if unreplayed.is_some() {
+                                // Behind Claude's own invocation the prompt is
+                                // queued in its input and taken next, so this
+                                // `idle` answers nothing of this turn's. A
+                                // prompt it never takes is resent once the
+                                // turn has waited for `idle` too long.
+                            } else if let Some(result) = settled.take() {
                                 break result;
                             }
                         }
+                        _ => {}
                     }
                     continue;
                 }
@@ -3014,6 +3103,13 @@ async fn run_claude_turn(
                 .await?;
             }
             None => {}
+        }
+        // Any frame while a deadline waits for `idle` resets it: only real
+        // silence ends a turn without the frame. A prompt waiting on the user
+        // is never on a deadline.
+        if idle_deadline.is_some() {
+            idle_deadline = (!open_requests.outstanding())
+                .then(|| Instant::now() + idle_confirm_grace(&background_tasks));
         }
     };
     if session_states {
@@ -3379,6 +3475,53 @@ fn content_blocks<'a>(message: &'a Value, kind: &'a str) -> impl Iterator<Item =
 /// queued notifications can each consume an invocation, so the cap is above
 /// one but still bounded.
 const MAX_EMPTY_RESULT_RESENDS: u32 = 3;
+
+/// How long a settled `result` waits for Claude's `idle`, with no background
+/// task outstanding.
+///
+/// `idle` is the authoritative end of a turn, but Claude only reports it once
+/// it stops counting work as live, and that bookkeeping can disagree with
+/// reality: a subagent restart, a notification it already answered, or a
+/// parked prompt leaves it `running` for the rest of the process's life. The
+/// turn then stays open until the user cancels it, which is exactly what a
+/// client shows as "working". The Agent SDK driving the same stream guards
+/// itself the same way (`runEndCeilingMs`: "No 'idle' N ms after the last
+/// result, ending the run"), so ending on the answer Claude already gave is
+/// the vendor's own fallback. The process stays alive: whatever Claude runs
+/// afterwards reaches the supervisor as a provider-initiated turn.
+const IDLE_CONFIRM_GRACE: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(30)
+};
+
+/// The same wait while Claude still owes a follow-up invocation for
+/// background work: a command may run for minutes before it reports back, and
+/// the vendor's own ceiling for that case is ten minutes.
+const IDLE_CONFIRM_GRACE_PENDING: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(600)
+};
+
+/// How long this turn waits for `idle` once a `result` settles it.
+fn idle_confirm_grace(background_tasks: &BackgroundTasks) -> Duration {
+    if background_tasks.pending() {
+        IDLE_CONFIRM_GRACE_PENDING
+    } else {
+        IDLE_CONFIRM_GRACE
+    }
+}
+
+/// Resolves when `deadline` passes; never when there is none, so the select
+/// arm costs nothing while a turn waits for frames. A frame resets it: only
+/// real silence ends a turn without `idle`.
+async fn confirmation_due(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
 
 /// Background work that keeps a Claude turn open.
 ///
@@ -4195,6 +4338,11 @@ impl OpenRequests {
         if let Some(sender) = sender {
             sender.send_replace(true);
         }
+    }
+
+    /// Whether a prompt still waits on the user; such a wait has no deadline.
+    fn outstanding(&self) -> bool {
+        !self.0.lock().expect("Claude open requests lock").is_empty()
     }
 
     /// Done with `request_id`; false when Claude withdrew it, so the answer

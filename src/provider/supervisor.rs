@@ -6197,6 +6197,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_late_idle_ends_the_turn_on_the_result_it_found() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-claude-late-idle").await;
+        fs::write(root.join("late-idle"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "answer it".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|event| event.event_type == "turn.completed"
+                    && event.payload["turnId"] == turn_id),
+            "{history:?}"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|event| event.payload.to_string().contains("answered before idle")),
+            "{history:?}"
+        );
+        // `idle` ended the turn: the `result` it followed was still there to
+        // end on, even though a background task was outstanding when it came.
+        assert!(
+            !history
+                .iter()
+                .any(|event| event.payload.to_string().contains("idle_timeout")),
+            "{history:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_result_whose_idle_never_comes_still_ends_the_turn() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-withheld-idle").await;
+        fs::write(root.join("withheld-idle"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "answer it".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|event| event.event_type == "turn.completed"
+                    && event.payload["turnId"] == turn_id),
+            "{history:?}"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|event| event.payload.to_string().contains("answered without idle")),
+            "{history:?}"
+        );
+        // Ending on the answer it gave is not a failure of the turn.
+        assert!(
+            !history
+                .iter()
+                .any(|event| event.event_type == "turn.failed"),
+            "{history:?}"
+        );
+        // The cause is journalled while the task is still counted live.
+        assert!(
+            history
+                .iter()
+                .any(|event| event.payload.to_string().contains("idle_timeout")),
+            "{history:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_late_task_notification_keeps_the_claude_turn_open() {
         let (root, store, supervisor, workspace) =
             control_fixture("todex-claude-late-notification").await;
@@ -7545,6 +7630,52 @@ elif [ "$mode" = "--mode" ]; then
         printf '{"type":"agent_settled"}\n'
         ;;
     esac
+  done
+elif [ -f "$(dirname "$0")/late-idle" ]; then
+  # Frame order captured from Claude Code 2.1.310: the `result` arrives while the
+  # tracker still counts a background task as live, and only then does the
+  # `idle` that ends the turn follow. A turn that dropped such a `result` had
+  # nothing left to end on and stayed open until the user cancelled it.
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$(dirname "$0")/stdin.log"
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
+        continue
+        ;;
+    esac
+    [ -n "$started" ] && continue
+    started=1
+    (
+      printf '{"type":"system","subtype":"task_started","task_id":"bg-late","is_backgrounded":true,"task_type":"local_bash"}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"answered before idle"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"answered before idle"}\n'
+      printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+    ) &
+  done
+elif [ -f "$(dirname "$0")/withheld-idle" ]; then
+  # Frame order captured from Claude Code 2.1.310: the answer is out while
+  # Claude still counts a background task as live, and the `idle` that would
+  # end the turn never comes — no task notification either. The turn has to end
+  # on the answer it already gave instead of waiting for a frame that never
+  # arrives.
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$(dirname "$0")/stdin.log"
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
+        continue
+        ;;
+    esac
+    [ -n "$started" ] && continue
+    started=1
+    (
+      printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+      printf '{"type":"system","subtype":"init"}\n'
+      printf '{"type":"system","subtype":"task_started","task_id":"bg-stuck","is_backgrounded":true,"task_type":"local_bash"}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"answered without idle"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"answered without idle"}\n'
+    ) &
   done
 elif [ -f "$(dirname "$0")/late-notification" ]; then
   # Frame order captured from Claude Code: a subagent finishes while the main

@@ -57,6 +57,18 @@ optional and canonical aliases are recomputed when old journals are replayed.
   drained. A CLI without session state events falls back to keeping the turn
   open while provider-reported background tasks remain. A zero-iteration result
   means the prompt was consumed unanswered and is resent on the open stream.
+  Every successful `result` is kept as the turn's answer even while background
+  work is outstanding, and the wait for `idle` is bounded: a result with no
+  background task left ends the turn 30 s after the last frame, one that still
+  owes follow-up work after 10 min (the ceiling the Agent SDK itself applies,
+  `runEndCeilingMs`). A settle that timed out is journalled as `provider.event`
+  `providerMethod: "idle_timeout"`; the process is kept, so whatever Claude runs
+  afterwards still becomes a provider-initiated turn. Frames reset the window,
+  and `requires_action` (a prompt waiting on the user) suspends it. Claude's
+  `session_state_changed` frames are journalled as `provider.event` too, so a
+  turn that hangs can be diagnosed from the conversation alone. A prompt queued
+  behind Claude's own invocation is resent only when that invocation ends in
+  `idle` without ever taking it.
 - Subagent runs are normalized to `subagent.*` events carrying a stable
   `subagentId`, `title`, `task`, `status` and optional `parentId`, `turnId`,
   `providerItemId`, `agentKind`, `agentId`, `result`, `error` and `metadata`.
