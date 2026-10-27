@@ -34,6 +34,7 @@ mod listen_addrs;
 mod local_terminal;
 mod mcp;
 mod native_history;
+mod pi_agent_templates;
 mod pi_mcp;
 mod pi_plugins;
 mod privacy_filter;

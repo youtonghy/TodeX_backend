@@ -388,7 +388,7 @@ fn toml_to_json(value: toml::Value) -> Value {
     }
 }
 
-fn revision(bytes: &[u8]) -> String {
+pub(crate) fn revision(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
