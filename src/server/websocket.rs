@@ -1075,10 +1075,17 @@ async fn dispatch(
                 state,
             )
             .await?;
-            // An SSH terminal only reaches a host from the inventory; it is
-            // not tied to a workspace, so workspace roots do not apply.
-            // Local shells keep that check.
+            // An SSH terminal only reaches a host from the inventory, or the
+            // daemon's own machine as `Local`; it is not tied to a workspace,
+            // so workspace roots do not apply. Local shells keep that check.
             let (cwd, command, askpass_secret) = match payload.ssh.as_mut() {
+                Some(target) if crate::ssh::is_agent_local_alias(&target.host) => {
+                    // Ignored, as behind a jump host: the user signs in at
+                    // the prompt. Zeroized as it drops.
+                    drop(target.password.take().map(Zeroizing::new));
+                    let command = state.ssh.local_terminal_command().await?;
+                    (command.cwd.display().to_string(), Some(command), None)
+                }
                 Some(target) => {
                     state.ssh.require_host(&target.host).await?;
                     // Moved out, not copied, so the only copy is zeroized.

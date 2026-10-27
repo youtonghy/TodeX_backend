@@ -133,7 +133,11 @@ async fn list_hosts(
     require_auth(&state, &headers)?;
     let hosts = state.ssh.list_hosts().await?;
     let ftp_sites = state.ssh.ftp_sites().await;
-    Ok(Json(json!({ "hosts": hosts, "ftpSites": ftp_sites })))
+    Ok(Json(json!({
+        "hosts": hosts,
+        "ftpSites": ftp_sites,
+        "localTerminal": crate::ssh::LOCAL_TERMINAL_SUPPORTED,
+    })))
 }
 
 async fn create_host(

@@ -1236,7 +1236,7 @@ Content-Type: application/json
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /v2/ssh/hosts` | `{ hosts: SshHost[], ftpSites: FtpSite[] }`。`SshHost`：`alias`、`source`（`sshConfig` 只读 / `managed`）、`sourcePath?`、`agentAccess`、`resolved?`（`hostName`、`user`、`port`、`proxyJump`、`identityFiles`）、`resolveError?`、`managed?`（可编辑定义）。 |
+| `GET /v2/ssh/hosts` | `{ hosts: SshHost[], ftpSites: FtpSite[], localTerminal }`。`localTerminal`：daemon 在 Linux/macOS 上为 `true`，表示可以打开 `Local` 终端（见「SSH 终端」）；旧 daemon 没有该字段。`SshHost`：`alias`、`source`（`sshConfig` 只读 / `managed`）、`sourcePath?`、`agentAccess`、`resolved?`（`hostName`、`user`、`port`、`proxyJump`、`identityFiles`）、`resolveError?`、`managed?`（可编辑定义）。 |
 | `POST /v2/ssh/hosts` | 新建自管主机 `{ alias, hostName, user?, port?, identityFile?, proxyJump?, options?: [{key, value}], authMethod? }`。`authMethod` 为 `key`（默认，省略时即此值）或 `password`：`password` 主机渲染 `PreferredAuthentications keyboard-interactive,password` 与 `PubkeyAuthentication no` 并忽略 `identityFile`；密码本身从不保存。别名已存在于 `~/.ssh/config` 或自管列表返回 409；拒绝换行、引号、以 `-` 开头的值以及 `Host`/`Match`/`Include`/`LocalCommand`/`PermitLocalCommand`/`KnownHostsCommand` 选项。 |
 | `POST /v2/ssh/hosts/import` | `{ text }` 粘贴 `ssh_config` 片段，返回 `{ hosts, errors }`；通配符、`Match`、`Include` 只报告不导入。 |
 | `PUT` / `DELETE /v2/ssh/hosts/{alias}` | 修改或删除自管主机（`~/.ssh/config` 中的主机只读）。 |
@@ -1313,6 +1313,8 @@ Content-Type: application/json
 ### SSH 终端
 
 `terminal.start`（见「统一 WebSocket 命令面」）可带 `ssh: { host }`：后端在 PTY 中运行 `ssh -tt <alias>`，工作目录为用户主目录，环境变量清空后只保留白名单（不继承 `TODEX_AGENTD_*`）。此时忽略 `cwd` 与 `workspaceId`，也不做 workspace 根目录检查，只要求别名存在于主机清单。主机密钥确认与密码提示直接在终端里完成；也可带 `ssh: { host, password }`，由 askpass 应答一次密码提示（经一次性密码文件，见「主机清单」；不写日志），此时未知主机密钥直接拒绝而不询问（客户端可不带密码重试以确认指纹）；ProxyJump/ProxyCommand 主机忽略该密码，照常在终端中提示；登录后的共享连接可被 SFTP 与 Agent 命令复用。`terminal.started` 事件额外带 `ssh: { host }`，其余 `terminal.*` 命令与事件不变。
+
+`ssh: { host: "Local" }`（不区分大小写）是本机终端：后端运行 `ssh -tt localhost`，以 daemon 的用户登录 daemon 所在机器，需要本机 sshd（macOS 需开启「远程登录」）。它不要求主机清单中存在该别名，清单中同名的主机在终端里被它遮蔽（与 Agent 的 `Local` 一致）；`password` 被忽略，在终端中登录；其余同上，`terminal.started` 带 `ssh: { host: "Local" }`。仅 Linux/macOS daemon 支持，其他平台返回 `INVALID_REQUEST`。
 
 ### 远程文件（SFTP / FTP）
 
