@@ -6236,6 +6236,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_idle_without_a_result_fails_the_turn_instead_of_hanging() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-idle-without-result").await;
+        fs::write(root.join("idle-without-result"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "answer it".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let failed = history
+            .iter()
+            .find(|event| event.event_type == "turn.failed")
+            .unwrap_or_else(|| panic!("{history:?}"));
+        assert_eq!(failed.payload["turnId"], turn_id);
+        assert_eq!(failed.payload["code"], "PROVIDER_UNAVAILABLE");
+        let message = failed.payload["message"].as_str().unwrap();
+        assert!(message.contains("idle without a result"), "{message}");
+        assert!(message.contains("1 output line(s) over 4 MiB"), "{message}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_idle_after_a_zero_turn_resend_does_not_fail_the_turn() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-zero-turn-idle").await;
+        fs::write(root.join("zero-turn-idle"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "answer it".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|event| event.event_type == "turn.completed"
+                    && event.payload["turnId"] == turn_id),
+            "{history:?}"
+        );
+        let stdin = fs::read_to_string(root.join("stdin.log")).unwrap();
+        assert_eq!(stdin.matches("answer it").count(), 2, "{stdin}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_result_whose_idle_never_comes_still_ends_the_turn() {
         let (root, store, supervisor, workspace) =
             control_fixture("todex-claude-withheld-idle").await;
@@ -7652,6 +7708,47 @@ elif [ -f "$(dirname "$0")/late-idle" ]; then
       printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"answered before idle"}\n'
       printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
     ) &
+  done
+elif [ -f "$(dirname "$0")/idle-without-result" ]; then
+  # Claude answers, but the `result` line is over 4 MiB and TodeX drops it:
+  # only the `idle` that follows reaches the turn.
+  while IFS= read -r line; do
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
+        continue
+        ;;
+    esac
+    printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+    printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"answered"}}}\n'
+    head -c 4194400 /dev/zero | tr '\0' x
+    printf '\n'
+    printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+  done
+elif [ -f "$(dirname "$0")/zero-turn-idle" ]; then
+  # A queued notification consumes the prompt in a zero-turn invocation that
+  # ends in `idle`; the resent prompt is answered after a pause shorter than
+  # the wait that `idle` starts.
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$(dirname "$0")/stdin.log"
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
+        continue
+        ;;
+    esac
+    if [ -z "$started" ]; then
+      started=1
+      printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"session_id":"claude-native","result":""}\n'
+      printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+      continue
+    fi
+    sleep 0.5
+    printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+    printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"answered on resend"}}}\n'
+    printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"answered on resend"}\n'
+    printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
   done
 elif [ -f "$(dirname "$0")/withheld-idle" ]; then
   # Frame order captured from Claude Code 2.1.310: the answer is out while

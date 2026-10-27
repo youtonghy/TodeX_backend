@@ -762,6 +762,9 @@ pub struct DriverEventSink {
     scope: Option<&'static str>,
     /// Shared by the clones of one turn (or one runtime scope).
     unparsed_lines: Arc<AtomicUsize>,
+    /// The share of `unparsed_lines` dropped for exceeding
+    /// MAX_PROTOCOL_LINE_BYTES, shared the same way.
+    oversized_lines: Arc<AtomicUsize>,
     activity: Option<ProviderActivity>,
     /// Account-level quota snapshots (`quota.updated`) mirrored for
     /// `/v2/providers/quota`.
@@ -808,6 +811,7 @@ impl DriverEventSink {
             runtime_id: None,
             scope: None,
             unparsed_lines: Arc::default(),
+            oversized_lines: Arc::default(),
             activity: None,
             quota: crate::quota_store::QuotaStore::default(),
             snapshots: Arc::default(),
@@ -899,6 +903,7 @@ impl DriverEventSink {
     pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
         self.current_turn_id = Some(turn_id.into());
         self.unparsed_lines = Arc::default();
+        self.oversized_lines = Arc::default();
         self.snapshots = Arc::default();
         if self.runtime_id.is_some() {
             self.scope = Some("turn");
@@ -913,6 +918,7 @@ impl DriverEventSink {
         self.runtime_id = Some(runtime_id.into());
         self.scope = Some("session");
         self.unparsed_lines = Arc::default();
+        self.oversized_lines = Arc::default();
         self.snapshots = Arc::default();
         self
     }
@@ -1099,6 +1105,7 @@ impl DriverEventSink {
                 json!({ "kind": "invalid_line", "preview": preview })
             }
             Some(ProviderRead::Oversized { bytes }) => {
+                self.oversized_lines.fetch_add(1, Ordering::Relaxed);
                 json!({ "kind": "oversized_line", "bytes": bytes })
             }
         };
@@ -1113,6 +1120,12 @@ impl DriverEventSink {
             );
         }
         Ok(Some(Value::Null))
+    }
+
+    /// Lines this turn (or runtime scope) dropped for size: unlike a
+    /// banner, each was a frame the provider meant to send.
+    pub fn oversized_line_count(&self) -> usize {
+        self.oversized_lines.load(Ordering::Relaxed)
     }
 
     /// Runtime, scope and turn attribution shared by every emitted event.

@@ -1049,7 +1049,7 @@ async fn between_turns(live: &mut Live) -> Ended {
 }
 
 /// The result of a provider-initiated turn whose work was already gone.
-fn nothing_to_adopt(session_id: String) -> DriverTurnResult {
+pub(super) fn nothing_to_adopt(session_id: String) -> DriverTurnResult {
     DriverTurnResult {
         native_session_id: Some(session_id),
         stop_reason: "no_work".to_owned(),
@@ -1257,6 +1257,13 @@ while IFS= read -r line; do
       continue ;;
     *'"type":"control_response"'*) continue ;;
   esac
+  # A prompt Claude never takes, or one whose replay is too long to read.
+  [ -f "$dir/ignore-prompts" ] && continue
+  if [ -f "$dir/oversize-replay" ]; then
+    head -c 4194400 /dev/zero | tr '\0' x
+    printf '\n'
+    continue
+  fi
   printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
   printf '%s\n' "$line"
   if [ -f "$dir/init-mode" ]; then
@@ -1318,7 +1325,8 @@ while IFS= read -r line; do
         printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
         printf '{"type":"system","subtype":"init"}\n'
         printf '{"type":"assistant","message":{"content":[{"type":"text","text":"own work done"}]}}\n'
-        printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"own work done"}\n'
+        # Its `result` never reaches TodeX.
+        [ -f "$dir/own-work-no-result" ] || printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"own work done"}\n'
         printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
       ) &
       ;;
@@ -2111,6 +2119,94 @@ done
         assert!(offers.try_recv().is_err());
         fixture.turn(&sessions, &manifest, "after").await;
         assert_eq!(fixture.launches().len(), 1);
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_queued_prompt_claude_never_takes_is_resent_three_times_then_fails() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (handle, mut offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        std::fs::write(fixture.root.join("ignore-prompts"), "").unwrap();
+        fixture.finish_background();
+        let _work = next_offer(&mut offers).await;
+        let (_cancel, cancel) = watch::channel(false);
+        let error = fixture
+            .run_with(
+                &sessions,
+                &manifest,
+                "user-next",
+                None,
+                cancel,
+                offering(&handle),
+            )
+            .await
+            .expect_err("a prompt Claude never takes fails the turn");
+        assert!(
+            error.to_string().contains("never took the queued prompt"),
+            "{error}"
+        );
+        // The first send and three resends: each resend still counts.
+        assert_eq!(fixture.wire().matches("user-next").count(), 4);
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_queued_prompt_is_not_resent_when_its_replay_may_have_been_dropped() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (handle, mut offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        std::fs::write(fixture.root.join("oversize-replay"), "").unwrap();
+        fixture.finish_background();
+        let _work = next_offer(&mut offers).await;
+        let (_cancel, cancel) = watch::channel(false);
+        let error = fixture
+            .run_with(
+                &sessions,
+                &manifest,
+                "user-next",
+                None,
+                cancel,
+                offering(&handle),
+            )
+            .await
+            .expect_err("an unconfirmed prompt fails the turn");
+        assert!(error.to_string().contains("over 4 MiB"), "{error}");
+        assert_eq!(fixture.wire().matches("user-next").count(), 1);
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn an_adopted_invocation_that_goes_idle_without_a_result_ends_with_no_work() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (handle, mut offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        std::fs::write(fixture.root.join("own-work-no-result"), "").unwrap();
+        fixture.finish_background();
+        let work = next_offer(&mut offers).await;
+        let adopted = fixture
+            .turn_with(&sessions, &manifest, "unused", adopting(&work.adoption))
+            .await;
+        assert_eq!(adopted.stop_reason, "no_work");
+        assert!(fixture
+            .history_text(&manifest)
+            .await
+            .contains("own work done"));
         sessions.stop_all().await;
         cleanup(&fixture.root);
     }

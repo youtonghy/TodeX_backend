@@ -66,9 +66,14 @@ optional and canonical aliases are recomputed when old journals are replayed.
   afterwards still becomes a provider-initiated turn. Frames reset the window,
   and `requires_action` (a prompt waiting on the user) suspends it. Claude's
   `session_state_changed` frames are journalled as `provider.event` too, so a
-  turn that hangs can be diagnosed from the conversation alone. A prompt queued
-  behind Claude's own invocation is resent only when that invocation ends in
-  `idle` without ever taking it.
+  turn that hangs can be diagnosed from the conversation alone.
+- `idle` without a result for the turn is bounded too: after 30 s with no
+  frame and no new `running`, a user turn fails (`PROVIDER_UNAVAILABLE`, the
+  message counts lines over 4 MiB dropped in the turn) and a provider-initiated
+  turn ends with `stop_reason: "no_work"`. A prompt queued behind Claude's own
+  invocation that Claude never replays is resent on the same 30 s windows, up
+  to three times, then the turn fails; it is not resent once a line over 4 MiB
+  was dropped after it was sent, since that line may have been its replay.
 - Subagent runs are normalized to `subagent.*` events carrying a stable
   `subagentId`, `title`, `task`, `status` and optional `parentId`, `turnId`,
   `providerItemId`, `agentKind`, `agentId`, `result`, `error` and `metadata`.

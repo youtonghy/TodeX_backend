@@ -2610,6 +2610,9 @@ async fn run_claude_turn(
     if !adopt {
         process.send(&user_message).await?;
     }
+    // A replay over MAX_PROTOCOL_LINE_BYTES (a prompt with large images) is
+    // dropped like any such line, so a prompt Claude did take looks untaken.
+    let oversized_at_prompt = sink.oversized_line_count();
     // Behind Claude's own invocation, its `idle` ends nothing: only the one
     // after Claude took (and replayed) this prompt does.
     let mut unreplayed = (start == TurnStart::AfterOwnWork)
@@ -2666,11 +2669,12 @@ async fn run_claude_turn(
     // Claude's own invocation began with a `running` the worker already read.
     let mut session_states = start != TurnStart::Prompt;
     let mut settled: Option<Value> = None;
-    // When the settled `result` stops waiting for `idle`: Claude withholds
-    // that frame while it still counts work as live, including work whose
-    // completion TodeX already saw, so a turn could otherwise stay open until
-    // the user cancelled it. See [`IDLE_CONFIRM_GRACE`].
-    let mut idle_deadline: Option<Instant> = None;
+    // When the turn stops waiting on Claude: for `idle` after a settled
+    // `result` (Claude withholds that frame while it still counts work as
+    // live, including work whose completion TodeX already saw), or for a
+    // `result` or the queued prompt's replay after `idle`. Without it a turn
+    // could stay open until the user cancelled it. See [`IdleWait`].
+    let mut wait: Option<IdleWait> = None;
     // Prompts queued behind Claude's own invocation that it never took.
     let mut prompt_resends = 0_u32;
     // `can_use_tool` waits on the user for up to the permission timeout, so
@@ -2701,24 +2705,43 @@ async fn run_claude_turn(
             // Claude owes a follow-up it never starts, or swallows the
             // `idle` that would end the turn: end it on the answer it already
             // gave instead of holding the client in "working".
-            _ = confirmation_due(idle_deadline), if !open_requests.outstanding() => {
-                idle_deadline = None;
-                let Some(result) = settled.take() else {
-                    continue;
-                };
+            _ = confirmation_due(wait.map(|wait| wait.due)), if !open_requests.outstanding() => {
+                let after_idle = wait.take().is_some_and(|wait| wait.after_idle);
                 if unreplayed.is_some() {
+                    let dropped = sink.oversized_line_count().saturating_sub(oversized_at_prompt);
+                    if dropped > 0 {
+                        // Its replay may be among them: a resend could put the
+                        // prompt into the conversation twice.
+                        return Err(AppError::ProviderUnavailable(format!(
+                            "Claude Code did not show taking the queued prompt, and {dropped} output line(s) over 4 MiB were dropped; please retry"
+                        )));
+                    }
                     if prompt_resends >= MAX_EMPTY_RESULT_RESENDS {
                         return Err(AppError::ProviderUnavailable(
                             "Claude Code never took the queued prompt; please retry".to_owned(),
                         ));
                     }
                     // The prompt never reached the model: send it again rather
-                    // than ending a turn that shows an answer to it.
+                    // than ending a turn that shows an answer to it. It stays
+                    // unreplayed until Claude replays it, so the resends add up.
                     prompt_resends += 1;
-                    unreplayed = None;
                     process.send(&user_message).await?;
+                    wait = Some(IdleWait::start(after_idle, &background_tasks));
                     continue;
                 }
+                let Some(result) = settled.take() else {
+                    // Only an `idle` starts a wait without a settled `result`:
+                    // Claude is done and this turn's answer never came, or
+                    // was dropped.
+                    tracing::warn!(
+                        oversized_lines = sink.oversized_line_count(),
+                        "Claude Code went idle without a result for this turn"
+                    );
+                    if adopt {
+                        return Ok(runtime::nothing_to_adopt(requested_session_id.clone()));
+                    }
+                    return Err(idle_without_result(sink));
+                };
                 tracing::warn!(
                     grace_ms = idle_confirm_grace(&background_tasks).as_millis() as u64,
                     background_tasks = background_tasks.pending(),
@@ -2818,7 +2841,7 @@ async fn run_claude_turn(
                 }
                 if session_states {
                     settled = Some(message);
-                    idle_deadline = Some(Instant::now() + idle_confirm_grace(&background_tasks));
+                    wait = Some(IdleWait::start(false, &background_tasks));
                     continue;
                 }
                 // No session state events (an older CLI): only outstanding
@@ -2827,7 +2850,7 @@ async fn run_claude_turn(
                     break message;
                 }
                 settled = Some(message);
-                idle_deadline = Some(Instant::now() + idle_confirm_grace(&background_tasks));
+                wait = Some(IdleWait::start(false, &background_tasks));
                 continue;
             }
             Some("stream_event") => {
@@ -2951,25 +2974,31 @@ async fn run_claude_turn(
                     match state {
                         // Claude waits on the user (a parked permission
                         // prompt): no deadline covers a person's decision.
-                        Some("requires_action") => idle_deadline = None,
+                        Some("requires_action") => wait = None,
                         // A new invocation began: the previous answer no longer
                         // ends this turn.
                         Some("running") => {
                             settled = None;
-                            idle_deadline = None;
+                            wait = None;
                         }
-                        // An `idle` before any successful `result` follows a
-                        // zero-turn `result` whose prompt was just resent.
                         Some("idle") => {
-                            if unreplayed.is_some() {
-                                // Behind Claude's own invocation the prompt is
-                                // queued in its input and taken next, so this
-                                // `idle` answers nothing of this turn's. A
-                                // prompt it never takes is resent once the
-                                // turn has waited for `idle` too long.
-                            } else if let Some(result) = settled.take() {
-                                break result;
+                            // Behind Claude's own invocation the prompt is
+                            // queued in its input and taken next, so that
+                            // invocation's `idle` answers nothing of this
+                            // turn's.
+                            if unreplayed.is_none() {
+                                if let Some(result) = settled.take() {
+                                    break result;
+                                }
                             }
+                            // No answer yet: an `idle` after a zero-turn
+                            // `result` whose prompt was just resent, before
+                            // Claude takes a queued prompt, or after a dropped
+                            // `result`. The next invocation's `running` stops
+                            // the wait; silence resends the queued prompt or
+                            // ends the turn.
+                            wait = (!open_requests.outstanding())
+                                .then(|| IdleWait::start(true, &background_tasks));
                         }
                         _ => {}
                     }
@@ -3107,9 +3136,9 @@ async fn run_claude_turn(
         // Any frame while a deadline waits for `idle` resets it: only real
         // silence ends a turn without the frame. A prompt waiting on the user
         // is never on a deadline.
-        if idle_deadline.is_some() {
-            idle_deadline = (!open_requests.outstanding())
-                .then(|| Instant::now() + idle_confirm_grace(&background_tasks));
+        if let Some(current) = wait {
+            wait = (!open_requests.outstanding())
+                .then(|| IdleWait::start(current.after_idle, &background_tasks));
         }
     };
     if session_states {
@@ -3511,6 +3540,41 @@ fn idle_confirm_grace(background_tasks: &BackgroundTasks) -> Duration {
     } else {
         IDLE_CONFIRM_GRACE
     }
+}
+
+/// A turn waiting on silence: for `idle` after a settled `result`, or, once
+/// Claude reported `idle`, for a `result` or the queued prompt's replay. A
+/// frame restarts it with the same kind.
+#[derive(Clone, Copy)]
+struct IdleWait {
+    after_idle: bool,
+    due: Instant,
+}
+
+impl IdleWait {
+    /// After `idle` Claude has drained its input and background work, so
+    /// pending tasks that TodeX still counts do not stretch the wait.
+    fn start(after_idle: bool, background_tasks: &BackgroundTasks) -> Self {
+        let grace = if after_idle {
+            IDLE_CONFIRM_GRACE
+        } else {
+            idle_confirm_grace(background_tasks)
+        };
+        Self {
+            after_idle,
+            due: Instant::now() + grace,
+        }
+    }
+}
+
+/// The turn's failure when Claude went idle without answering it.
+fn idle_without_result(sink: &DriverEventSink) -> AppError {
+    let dropped = sink.oversized_line_count();
+    AppError::ProviderUnavailable(if dropped > 0 {
+        format!("Claude Code went idle without a result for this turn, and {dropped} output line(s) over 4 MiB were dropped; please retry")
+    } else {
+        "Claude Code went idle without a result for this turn; please retry".to_owned()
+    })
 }
 
 /// Resolves when `deadline` passes; never when there is none, so the select
