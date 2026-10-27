@@ -1122,8 +1122,14 @@ impl DriverEventSink {
         Ok(Some(Value::Null))
     }
 
-    /// Lines this turn (or runtime scope) dropped for size: unlike a
-    /// banner, each was a frame the provider meant to send.
+    /// Provider lines this turn (or runtime scope) could not use: every
+    /// unparseable line, reported or not.
+    pub fn unparsed_line_count(&self) -> usize {
+        self.unparsed_lines.load(Ordering::Relaxed)
+    }
+
+    /// The lines among [`Self::unparsed_line_count`] dropped for size: unlike
+    /// a banner, each was a frame the provider meant to send.
     pub fn oversized_line_count(&self) -> usize {
         self.oversized_lines.load(Ordering::Relaxed)
     }

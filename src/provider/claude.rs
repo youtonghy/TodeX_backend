@@ -1795,6 +1795,27 @@ mod tests {
     }
 
     #[test]
+    fn only_main_thread_calls_without_a_result_are_unanswered() {
+        let mut tools = ClaudeToolCalls::default();
+        for id in ["toolu_open", "toolu_done", "toolu_sub"] {
+            tools.record(
+                &json!({ "type": "tool_use", "id": id, "name": "Bash" }),
+                None,
+            );
+        }
+        tools.record(
+            &json!({ "type": "tool_use", "id": "toolu_sub", "name": "Read" }),
+            Some("toolu_agent"),
+        );
+        tools.complete(
+            &json!({ "type": "tool_result", "tool_use_id": "toolu_done", "content": "ok" }),
+            None,
+        );
+
+        assert_eq!(tools.unanswered_main_thread(), ["toolu_open"]);
+    }
+
+    #[test]
     fn foreground_agent_finishes_with_its_tool_result() {
         let mut subagents = ClaudeSubagents::default();
         subagents.start_from_tool(
@@ -2565,8 +2586,60 @@ enum TurnStart {
 /// session's background work across turns. A cancelled turn returns at once
 /// with the process still mid-turn; the caller interrupts or stops it.
 /// `subagents` follows the process's subagent runs across turns.
+///
+/// However the turn ends, lines it had to drop are summed up in one
+/// `stream_anomaly` event: the per-line reports stop after a few.
 #[allow(clippy::too_many_arguments)]
 async fn run_claude_turn(
+    process: &mut JsonLineProcess,
+    usage_ledger: &mut ClaudeUsageLedger,
+    mode: &mut permission_mode::ModeReport,
+    context: DriverContext,
+    prompt: DriverPrompt,
+    requested_session_id: String,
+    sink: &DriverEventSink,
+    catalogs: &Catalogs,
+    cancel: &mut watch::Receiver<bool>,
+    work: &mut session_work::SessionWork,
+    subagents: &mut ClaudeSubagents,
+    start: TurnStart,
+) -> Result<DriverTurnResult, AppError> {
+    let outcome = read_claude_turn(
+        process,
+        usage_ledger,
+        mode,
+        context,
+        prompt,
+        requested_session_id,
+        sink,
+        catalogs,
+        cancel,
+        work,
+        subagents,
+        start,
+    )
+    .await;
+    let unparsed = sink.unparsed_line_count();
+    if unparsed > 0 {
+        let oversized = sink.oversized_line_count();
+        let summary = json!({
+            "provider": "claude-code",
+            "providerMethod": "stream_anomaly",
+            "metadata": {
+                "invalidLines": unparsed - oversized,
+                "oversizedLines": oversized,
+            },
+        });
+        // The turn's own outcome matters more than its diagnostics.
+        if let Err(error) = sink.emit("provider.event", summary).await {
+            tracing::warn!(%error, "could not journal the Claude Code stream anomaly summary");
+        }
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_claude_turn(
     process: &mut JsonLineProcess,
     usage_ledger: &mut ClaudeUsageLedger,
     mode: &mut permission_mode::ModeReport,
@@ -2691,7 +2764,9 @@ async fn run_claude_turn(
     let mut auto_fallback = AutoFallback::Active;
     // Model from this invocation's `init` frame, for that report.
     let mut init_model: Option<String> = None;
-    let result = loop {
+    // Whether the turn ended where Claude says it is done, so a main-thread
+    // tool still without a result will never get one.
+    let (result, ended_done) = loop {
         let message = tokio::select! {
             message = process.read_frame() => sink.provider_frame(message?).await?,
             response = response_rx.recv() => {
@@ -2759,7 +2834,7 @@ async fn run_claude_turn(
                     }),
                 )
                 .await?;
-                break result;
+                break (result, false);
             }
                 changed = cancel.changed() => {
                     let _ = changed;
@@ -2847,7 +2922,7 @@ async fn run_claude_turn(
                 // No session state events (an older CLI): only outstanding
                 // work keeps the turn open.
                 if !background_tasks.pending() {
-                    break message;
+                    break (message, true);
                 }
                 settled = Some(message);
                 wait = Some(IdleWait::start(false, &background_tasks));
@@ -2988,7 +3063,7 @@ async fn run_claude_turn(
                             // turn's.
                             if unreplayed.is_none() {
                                 if let Some(result) = settled.take() {
-                                    break result;
+                                    break (result, true);
                                 }
                             }
                             // No answer yet: an `idle` after a zero-turn
@@ -3151,6 +3226,23 @@ async fn run_claude_turn(
         return Err(AppError::ProviderUnavailable(
             "Claude Code completed without producing output; please retry".to_owned(),
         ));
+    }
+    if ended_done {
+        // Claude is done, so a main-thread tool without a result lost it,
+        // most likely to an oversized line; left open, its card would read
+        // as finished with no output. Subagent tools can outlive the turn.
+        let dropped = sink.oversized_line_count();
+        let reason = if dropped > 0 {
+            format!("Claude Code did not return this tool's result; {dropped} output line(s) over 4 MiB were dropped in this turn.")
+        } else {
+            "Claude Code did not return this tool's result in this turn.".to_owned()
+        };
+        for id in tools.unanswered_main_thread() {
+            let mut payload = tools.payload(&id, &prompt.turn_id, "completed");
+            payload["result"] = json!(reason);
+            payload["isError"] = json!(true);
+            sink.emit("tool.completed", payload).await?;
+        }
     }
     let native_session_id = result
         .get("session_id")
@@ -4145,6 +4237,18 @@ impl ClaudeToolCalls {
                 .unwrap_or(false),
         );
         Some(id)
+    }
+
+    /// Main-thread calls still without a result, in a stable order.
+    fn unanswered_main_thread(&self) -> Vec<String> {
+        let mut ids = self
+            .0
+            .iter()
+            .filter(|(_, call)| call.subagent_id.is_none() && call.result.is_none())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
     }
 
     fn payload(&self, id: &str, turn_id: &str, phase: &str) -> Value {

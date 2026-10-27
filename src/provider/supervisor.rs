@@ -6260,6 +6260,12 @@ mod tests {
         let message = failed.payload["message"].as_str().unwrap();
         assert!(message.contains("idle without a result"), "{message}");
         assert!(message.contains("1 output line(s) over 4 MiB"), "{message}");
+        let anomaly = history
+            .iter()
+            .find(|event| event.payload["providerMethod"] == "stream_anomaly")
+            .unwrap_or_else(|| panic!("{history:?}"));
+        assert_eq!(anomaly.payload["metadata"]["oversizedLines"], 1);
+        assert_eq!(anomaly.payload["metadata"]["invalidLines"], 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6288,6 +6294,56 @@ mod tests {
         );
         let stdin = fs::read_to_string(root.join("stdin.log")).unwrap();
         assert_eq!(stdin.matches("answer it").count(), 2, "{stdin}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_main_thread_tool_whose_result_was_dropped_ends_failed() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-dropped-tool-result").await;
+        fs::write(root.join("dropped-tool-result"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "run it".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|event| event.event_type == "turn.completed"
+                    && event.payload["turnId"] == turn_id),
+            "{history:?}"
+        );
+        let closed = history
+            .iter()
+            .filter(|event| event.event_type == "tool.completed")
+            .collect::<Vec<_>>();
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        let tool = &closed[0].payload;
+        assert_eq!(tool["toolCallId"], "toolu_lost");
+        assert_eq!(tool["toolName"], "Bash");
+        assert_eq!(tool["isError"], true);
+        assert!(
+            tool["result"]
+                .as_str()
+                .unwrap()
+                .contains("1 output line(s) over 4 MiB"),
+            "{tool}"
+        );
+        // The anomaly summary comes once, after the closed tool.
+        let anomalies = history
+            .iter()
+            .filter(|event| event.payload["providerMethod"] == "stream_anomaly")
+            .collect::<Vec<_>>();
+        assert_eq!(anomalies.len(), 1, "{anomalies:?}");
+        assert_eq!(anomalies[0].payload["metadata"]["oversizedLines"], 1);
+        assert!(anomalies[0].sequence > closed[0].sequence);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7748,6 +7804,25 @@ elif [ -f "$(dirname "$0")/zero-turn-idle" ]; then
     printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
     printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"answered on resend"}}}\n'
     printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"answered on resend"}\n'
+    printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+  done
+elif [ -f "$(dirname "$0")/dropped-tool-result" ]; then
+  # A main-thread tool whose `tool_result` line is over 4 MiB and dropped; the
+  # turn still ends normally. A subagent's call without a result stays open.
+  while IFS= read -r line; do
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
+        continue
+        ;;
+    esac
+    printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+    printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_lost","name":"Bash","input":{"command":"cat huge.log"}}]}}\n'
+    printf '{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"content":[{"type":"tool_use","id":"toolu_sub","name":"Read","input":{"file_path":"a.txt"}}]}}\n'
+    head -c 4194400 /dev/zero | tr '\0' x
+    printf '\n'
+    printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"done anyway"}}}\n'
+    printf '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"claude-native","result":"done anyway"}\n'
     printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
   done
 elif [ -f "$(dirname "$0")/withheld-idle" ]; then

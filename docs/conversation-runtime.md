@@ -74,6 +74,13 @@ optional and canonical aliases are recomputed when old journals are replayed.
   invocation that Claude never replays is resent on the same 30 s windows, up
   to three times, then the turn fails; it is not resent once a line over 4 MiB
   was dropped after it was sent, since that line may have been its replay.
+- A turn that ends on Claude's `idle` (or, without session state events, on a
+  `result` with no background work) closes every main-thread tool call still
+  without a result with a `tool.completed` carrying `isError: true` and a
+  reason: Claude is done, so that result was lost. Turns ending on the 30 s /
+  10 min ceiling, failed or cancelled leave open tools to the turn's terminal
+  event, and subagent calls are never closed this way. A result that does come
+  later lands in the turn reading it, as its own tool card.
 - Subagent runs are normalized to `subagent.*` events carrying a stable
   `subagentId`, `title`, `task`, `status` and optional `parentId`, `turnId`,
   `providerItemId`, `agentKind`, `agentId`, `result`, `error` and `metadata`.
@@ -129,6 +136,11 @@ optional and canonical aliases are recomputed when old journals are replayed.
   preview}` (redacted, at most 512 bytes) or `{kind: "oversized_line", bytes}`
   and continue; further lines, and lines read outside a turn loop, are only
   logged. An oversized line is discarded up to its next newline unbuffered.
+  A Claude Code turn that dropped any such line, however it ends, adds one
+  `provider.event` `{providerMethod: "stream_anomaly", metadata: {invalidLines,
+  oversizedLines}}` with the full counts. It covers only lines TodeX dropped:
+  Claude Code itself can drop `stream_event` frames under backpressure, which
+  no count here shows.
 - Claude Code control requests (tool permissions and `AskUserQuestion`) are
   answered by detached tasks while the turn's read loop keeps draining
   stdout, so an open prompt cannot fill the pipe and freeze the provider —
