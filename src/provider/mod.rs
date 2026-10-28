@@ -11,6 +11,7 @@ mod discovery;
 mod doctor;
 mod grok;
 pub(crate) mod mcp_injection;
+mod omp;
 mod opencode;
 mod pi;
 pub(crate) mod process;

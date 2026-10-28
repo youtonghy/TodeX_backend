@@ -218,8 +218,10 @@ impl OpencodeDriver {
             .get_or_fetch(&key, || async {
                 let (mut process, session, updates) = self.session_probe(workspace).await?;
                 let mut models = super::devin::parse_devin_models(&session);
-                let complete = probe_efforts(&mut process, &session, &mut models).await;
-                close_probe_session(&mut process, &session).await;
+                let complete =
+                    probe_efforts(&mut process, OPENCODE_RPC, "effort", &session, &mut models)
+                        .await;
+                close_probe_session(&mut process, OPENCODE_RPC, &session).await;
                 process.terminate().await;
                 let commands = updates
                     .iter()
@@ -248,11 +250,13 @@ impl OpencodeDriver {
     }
 }
 
-/// OpenCode only exposes an `effort` config option for the currently selected
-/// model, so each model is selected once to learn its effort levels. Returns
-/// whether every model answered.
-async fn probe_efforts(
+/// OpenCode (`effort`) and omp (`thinking`) only expose the effort config
+/// option of the currently selected model, so each model is selected once to
+/// learn its effort levels. Returns whether every model answered.
+pub(super) async fn probe_efforts(
     process: &mut JsonLineProcess,
+    peer: RpcPeer,
+    effort_config: &str,
     session: &Value,
     models: &mut [ProviderModelDescriptor],
 ) -> bool {
@@ -262,14 +266,14 @@ async fn probe_efforts(
         .unwrap_or_default();
     let mut complete = true;
     for model in models {
-        let response = control_request(
-            process,
-            "probe:model",
-            "session/set_config_option",
-            json!({"sessionId": session_id, "configId": "model", "value": model.id}),
-            Some(CONTROL_TIMEOUT),
-        )
-        .await;
+        let response = RpcClient::new(process, peer)
+            .request(
+                "probe:model",
+                "session/set_config_option",
+                json!({"sessionId": session_id, "configId": "model", "value": model.id}),
+                Some(CONTROL_TIMEOUT),
+            )
+            .await;
         let Ok(response) = response else {
             complete = false;
             continue;
@@ -279,7 +283,7 @@ async fn probe_efforts(
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .find(|option| option.get("id").and_then(Value::as_str) == Some("effort"))
+            .find(|option| option.get("id").and_then(Value::as_str) == Some(effort_config))
         else {
             continue;
         };
@@ -308,18 +312,22 @@ async fn probe_efforts(
 
 /// Best-effort close for a probe session; failures are ignored because the
 /// process is terminated immediately afterwards either way.
-async fn close_probe_session(process: &mut JsonLineProcess, session: &Value) {
+pub(super) async fn close_probe_session(
+    process: &mut JsonLineProcess,
+    peer: RpcPeer,
+    session: &Value,
+) {
     let Some(session_id) = session.get("sessionId").and_then(Value::as_str) else {
         return;
     };
-    let _ = control_request(
-        process,
-        "session:close",
-        "session/close",
-        json!({ "sessionId": session_id }),
-        None,
-    )
-    .await;
+    let _ = RpcClient::new(process, peer)
+        .request(
+            "session:close",
+            "session/close",
+            json!({ "sessionId": session_id }),
+            None,
+        )
+        .await;
 }
 
 #[async_trait]

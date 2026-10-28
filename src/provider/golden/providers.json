@@ -832,5 +832,59 @@
       "extensionUi": []
     },
     "models": []
+  },
+  {
+    "id": "omp",
+    "displayName": "omp",
+    "available": false,
+    "unavailableReason": "executable '/nonexistent/todex-golden/omp' was not found; install omp from https://omp.sh",
+    "profiles": [],
+    "capabilities": {
+      "permissionConfig": {
+        "modes": [
+          "ask",
+          "auto",
+          "full-access"
+        ],
+        "defaultMode": "auto",
+        "supportsPlan": true,
+        "sandboxModes": [],
+        "approvalPolicies": [],
+        "permissionProfiles": [],
+        "enforcement": "agent-policy",
+        "description": "omp runs with --approval-mode always-ask: ask mediates each write and exec approval, auto/full-access approve client-side; plan maps to omp's plan mode"
+      },
+      "nativeFork": true,
+      "nativeCompact": false,
+      "nativeResume": true,
+      "cancel": true,
+      "permissions": true,
+      "toolEvents": true,
+      "nativeSkills": true,
+      "nativeMcp": true,
+      "managedMcp": true,
+      "modelSelection": true,
+      "imageInput": true,
+      "imageInputMode": "always",
+      "controlActions": [
+        "steer",
+        "cancel",
+        "interrupt",
+        "followUp",
+        "retry",
+        "fork"
+      ],
+      "steering": true,
+      "liveConfiguration": true,
+      "followUpQueue": false,
+      "backendQueue": true,
+      "backendQueueControl": true,
+      "scheduledConversations": true,
+      "runtimeStop": true,
+      "sessionCommands": true,
+      "extensionMessages": false,
+      "extensionUi": []
+    },
+    "models": []
   }
 ]

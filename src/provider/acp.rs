@@ -184,6 +184,8 @@ pub(super) struct AcpQuirks {
     pub effort_config: &'static str,
     /// The `mode` config option requested for a prompt.
     pub session_mode: Option<fn(&DriverPrompt) -> Option<&'static str>>,
+    /// Whether a steering request's result confirms the message was taken.
+    pub steer_acknowledged: fn(&Value) -> bool,
 }
 
 /// Whether an auth method runs headless, and the sign-in hint otherwise.
@@ -225,7 +227,13 @@ pub(super) const PLAIN_ACP: AcpQuirks = AcpQuirks {
     headless_auth: None,
     effort_config: "reasoning_effort",
     session_mode: None,
+    steer_acknowledged: steer_queued,
 };
+
+/// The `{"status":"queued"}` acknowledgement of Grok's `_x.ai/interject`.
+fn steer_queued(result: &Value) -> bool {
+    result.get("status").and_then(Value::as_str) == Some("queued")
+}
 
 /// Configured ACP profiles: plain ACP, reattaching with `session/resume`
 /// when the agent advertises it.
@@ -240,6 +248,7 @@ fn quirks(provider: ProviderKind) -> &'static AcpQuirks {
         ProviderKind::Devin => &super::devin::ACP_QUIRKS,
         ProviderKind::Opencode => &super::opencode::ACP_QUIRKS,
         ProviderKind::DeepseekHarness => &super::deepseek_harness::ACP_QUIRKS,
+        ProviderKind::Omp => &super::omp::ACP_QUIRKS,
         ProviderKind::Acp => &GENERIC_ACP,
         ProviderKind::Codex
         | ProviderKind::Pi
@@ -1229,6 +1238,52 @@ fn opencode_control_requests(
     }
 }
 
+/// omp: `_session/steering` injects into the running turn, and the `model`
+/// and `thinking` config options carry the live configuration. omp's
+/// follow-up queue is not exposed.
+pub(super) fn omp_control_commands(
+    request: &PendingProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    match &request.control {
+        ProviderControl::Steer { text } => Ok(vec![(
+            "_session/steering".to_owned(),
+            json!({"sessionId":session_id,"prompt":[{"type":"text","text":text}]}),
+        )]),
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => Ok([("model", model), ("thinking", reasoning_effort)]
+            .into_iter()
+            .filter_map(|(id, value)| {
+                value.as_ref().map(|value| {
+                    (
+                        "session/set_config_option".to_owned(),
+                        json!({"sessionId":session_id,"configId":id,"value":value}),
+                    )
+                })
+            })
+            .collect()),
+        _ => Err(AppError::Unsupported(
+            "omp does not expose native prompt queue controls".to_owned(),
+        )),
+    }
+}
+
+/// omp answers `_session/steering` with `outcome: "injected"` once the text
+/// joined the running turn; `promptRequired` means no turn was running.
+pub(super) fn omp_steer_acknowledged(result: &Value) -> bool {
+    result.get("outcome").and_then(Value::as_str) == Some("injected")
+}
+
+pub(super) fn omp_session_mode(prompt: &DriverPrompt) -> Option<&'static str> {
+    Some(if prompt.work_mode.as_deref() == Some("plan") {
+        "plan"
+    } else {
+        "default"
+    })
+}
+
 /// DeepSeek Harness: `model` before `reasoning_effort`, because the effort
 /// choices belong to the selected model. dsh has no steering or queue.
 pub(super) fn dsh_control_commands(
@@ -1373,7 +1428,7 @@ async fn complete_live_control(
         _ => false,
     };
     let unknown_steer = matches!(control.request.control, ProviderControl::Steer { .. })
-        && result.get("status").and_then(Value::as_str) != Some("queued");
+        && !(quirks(provider).steer_acknowledged)(result);
     if missing_effective || unknown_steer {
         let message = format!(
             "{} control acknowledgement does not confirm its effective result",
@@ -1443,7 +1498,7 @@ fn config_effective(options: &Value) -> Option<Value> {
     for option in options.as_array()? {
         let key = match option.get("id").and_then(Value::as_str) {
             Some("model") => "model",
-            Some("reasoning_effort" | "effort" | "thought_level") => "reasoningEffort",
+            Some("reasoning_effort" | "effort" | "thought_level" | "thinking") => "reasoningEffort",
             Some("mode") => "mode",
             _ => continue,
         };

@@ -219,6 +219,7 @@ pub fn profile(kind: ProviderKind) -> &'static ProviderProfile {
         ProviderKind::Opencode => &super::opencode::PROFILE,
         ProviderKind::Antigravity => &super::antigravity::PROFILE,
         ProviderKind::DeepseekHarness => &super::deepseek_harness::PROFILE,
+        ProviderKind::Omp => &super::omp::PROFILE,
     };
     debug_assert_eq!(profile.kind, kind);
     profile

@@ -24,10 +24,11 @@ pub enum ProviderKind {
     Opencode,
     Antigravity,
     DeepseekHarness,
+    Omp,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Acp,
         Self::Codex,
         Self::Pi,
@@ -37,6 +38,7 @@ impl ProviderKind {
         Self::Opencode,
         Self::Antigravity,
         Self::DeepseekHarness,
+        Self::Omp,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -50,6 +52,7 @@ impl ProviderKind {
             Self::Opencode => "opencode",
             Self::Antigravity => "antigravity",
             Self::DeepseekHarness => "deepseek-harness",
+            Self::Omp => "omp",
         }
     }
 }
@@ -68,6 +71,7 @@ impl std::str::FromStr for ProviderKind {
             "opencode" | "open-code" | "open_code" => Ok(Self::Opencode),
             "antigravity" | "agy" | "antigravity-cli" => Ok(Self::Antigravity),
             "deepseek-harness" | "deepseek_harness" | "dsh" => Ok(Self::DeepseekHarness),
+            "omp" | "oh-my-pi" | "oh_my_pi" => Ok(Self::Omp),
             other => Err(format!("unsupported provider: {other}")),
         }
     }

@@ -37,11 +37,12 @@ pub enum ManagedCli {
     Opencode,
     Antigravity,
     DeepseekHarness,
+    Omp,
 }
 
 impl ManagedCli {
     /// In declaration order: `cli as usize` indexes it.
-    pub const ALL: [ManagedCli; 8] = [
+    pub const ALL: [ManagedCli; 9] = [
         Self::Codex,
         Self::Pi,
         Self::ClaudeCode,
@@ -50,6 +51,7 @@ impl ManagedCli {
         Self::Opencode,
         Self::Antigravity,
         Self::DeepseekHarness,
+        Self::Omp,
     ];
 
     pub fn id(self) -> &'static str {
@@ -62,6 +64,7 @@ impl ManagedCli {
             Self::Opencode => "opencode",
             Self::Antigravity => "antigravity",
             Self::DeepseekHarness => "deepseek-harness",
+            Self::Omp => "omp",
         }
     }
 
@@ -75,6 +78,7 @@ impl ManagedCli {
             Self::Opencode => "OpenCode",
             Self::Antigravity => "Antigravity CLI",
             Self::DeepseekHarness => "DeepSeek Harness",
+            Self::Omp => "omp",
         }
     }
 
@@ -88,6 +92,7 @@ impl ManagedCli {
             Self::Opencode => ProviderKind::Opencode,
             Self::Antigravity => ProviderKind::Antigravity,
             Self::DeepseekHarness => ProviderKind::DeepseekHarness,
+            Self::Omp => ProviderKind::Omp,
         }
     }
 
@@ -107,6 +112,7 @@ impl ManagedCli {
             Self::Opencode => &config.agent.opencode_bin,
             Self::Antigravity => &config.agent.antigravity_bin,
             Self::DeepseekHarness => &config.agent.dsh_bin,
+            Self::Omp => &config.agent.omp_bin,
         }
     }
 
@@ -121,6 +127,8 @@ impl ManagedCli {
             Self::Antigravity => &["update"],
             // No self-update command; `npm_package` reinstalls instead.
             Self::DeepseekHarness => &[],
+            // Updates the prebuilt binary in place; `--check` only reports.
+            Self::Omp => &["update"],
         }
     }
 
@@ -154,42 +162,75 @@ impl ManagedCli {
             Self::Codex => InstallScript {
                 url: "https://chatgpt.com/codex/install.sh",
                 shell: "sh",
+                args: &[],
                 // Skips the "start Codex now?" and npm-cleanup prompts.
                 env: &[("CODEX_NON_INTERACTIVE", "1")],
             },
             Self::Pi => InstallScript {
                 url: "https://pi.dev/install.sh",
                 shell: "sh",
+                args: &[],
                 env: &[],
             },
             Self::ClaudeCode => InstallScript {
                 url: "https://claude.ai/install.sh",
                 shell: "bash",
+                args: &[],
                 env: &[],
             },
             Self::GrokBuild => InstallScript {
                 url: "https://x.ai/cli/install.sh",
                 shell: "bash",
+                args: &[],
                 env: &[],
             },
             Self::Devin => InstallScript {
                 url: "https://cli.devin.ai/install.sh",
                 shell: "bash",
+                args: &[],
                 env: &[],
             },
             Self::Opencode => InstallScript {
                 url: "https://opencode.ai/install",
                 shell: "bash",
+                args: &[],
                 env: &[],
             },
             Self::Antigravity => InstallScript {
                 url: "https://antigravity.google/cli/install.sh",
                 shell: "bash",
+                args: &[],
+                env: &[],
+            },
+            // `--binary` installs the prebuilt `~/.local/bin/omp` even where
+            // bun is on PATH (the script would otherwise `bun install -g`).
+            Self::Omp => InstallScript {
+                url: "https://omp.sh/install",
+                shell: "sh",
+                args: &["--binary"],
                 env: &[],
             },
             Self::DeepseekHarness => return None,
         })
     }
+}
+
+/// The shell pipeline running `script`. `-L` follows redirects; every hop
+/// stays on HTTPS so a redirect cannot downgrade the script the shell runs to
+/// plain HTTP.
+fn install_command(script: &InstallScript) -> String {
+    let mut command = format!(
+        "curl --proto '=https' --proto-redir '=https' -fsSL '{}' | {} -s",
+        script.url, script.shell
+    );
+    if !script.args.is_empty() {
+        command.push_str(" --");
+        for arg in script.args {
+            command.push(' ');
+            command.push_str(arg);
+        }
+    }
+    command
 }
 
 /// Whether `program` resolves (as it would be launched) to a file under one
@@ -227,6 +268,8 @@ pub const MANAGED_BY_IMAGE: &str = "image";
 struct InstallScript {
     url: &'static str,
     shell: &'static str,
+    /// Arguments for the script (`sh -s -- <args>`).
+    args: &'static [&'static str],
     env: &'static [(&'static str, &'static str)],
 }
 
@@ -701,12 +744,7 @@ pub async fn run_install(
             provider.name()
         ))
     })?;
-    // `-L` follows redirects; keep every hop on HTTPS so a redirect cannot
-    // downgrade the script the shell runs to plain HTTP.
-    let command = format!(
-        "curl --proto '=https' --proto-redir '=https' -fsSL '{}' | {} -s",
-        script.url, script.shell
-    );
+    let command = install_command(&script);
     let mut spec = CommandSpec::new("bash", &config.data_dir);
     // pipefail: a failed download must not look like an empty, successful script.
     spec.args = vec![
@@ -949,6 +987,11 @@ async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<
             "https://registry.npmjs.org/@deepseek-ai%2fdsh/latest",
             "version",
         ),
+        // The prebuilt binaries are published with the npm package's version.
+        ManagedCli::Omp => (
+            "https://registry.npmjs.org/@oh-my-pi%2fpi-coding-agent/latest",
+            "version",
+        ),
         // The per-platform manifest the official installer and `agy update` read.
         ManagedCli::Antigravity => {
             antigravity_manifest = antigravity_manifest_url();
@@ -1156,8 +1199,8 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        compare_versions, extract_version, npm_install_args, strip_ansi, CliLocks, CliManager,
-        CliOperationAction, LatestRelease, ManagedCli, ProviderKind, ROW_CACHE_TTL,
+        compare_versions, extract_version, install_command, npm_install_args, strip_ansi, CliLocks,
+        CliManager, CliOperationAction, LatestRelease, ManagedCli, ProviderKind, ROW_CACHE_TTL,
     };
 
     #[test]
@@ -1170,6 +1213,19 @@ mod tests {
             extract_version("v2.1.259 (Claude Code)"),
             Some("2.1.259".to_owned())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omp_installs_the_prebuilt_binary() {
+        let script = ManagedCli::Omp.install_script().unwrap();
+        assert_eq!(
+            install_command(&script),
+            "curl --proto '=https' --proto-redir '=https' -fsSL 'https://omp.sh/install' | sh -s -- --binary"
+        );
+        let codex = ManagedCli::Codex.install_script().unwrap();
+        assert!(install_command(&codex).ends_with("| sh -s"));
+        assert_eq!(ManagedCli::Omp.provider_kind(), ProviderKind::Omp);
     }
 
     #[test]

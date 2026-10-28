@@ -44,6 +44,8 @@ fn golden_config(root: &Path, executable: Option<&str>) -> Config {
             opencode_env_allowlist: Vec::new(),
             dsh_bin: bin("dsh"),
             dsh_env_allowlist: Vec::new(),
+            omp_bin: bin("omp"),
+            omp_env_allowlist: Vec::new(),
             antigravity_bin: bin("agy"),
             antigravity_env_allowlist: Vec::new(),
             acp_profiles: BTreeMap::from([(
@@ -168,7 +170,7 @@ fn permission_mapping_matches_golden() {
 
 /// How each provider receives TodeX's agent MCP servers; `None` when it
 /// cannot load servers TodeX supplies.
-pub(super) const MCP_INJECTION: [(ProviderKind, Option<&str>); 8] = [
+pub(super) const MCP_INJECTION: [(ProviderKind, Option<&str>); 9] = [
     (ProviderKind::Acp, Some("acp-servers")),
     (ProviderKind::Codex, Some("codex-config")),
     (ProviderKind::Pi, Some("pi-extension")),
@@ -177,6 +179,7 @@ pub(super) const MCP_INJECTION: [(ProviderKind, Option<&str>); 8] = [
     (ProviderKind::Devin, Some("acp-servers")),
     (ProviderKind::Opencode, Some("acp-servers")),
     (ProviderKind::DeepseekHarness, Some("acp-servers")),
+    (ProviderKind::Omp, Some("acp-servers")),
 ];
 
 #[cfg(unix)]

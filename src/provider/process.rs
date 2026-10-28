@@ -71,6 +71,9 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
+    /// Allowlisted variables of the daemon's environment this child must not
+    /// inherit; `env` still sets any of them explicitly.
+    pub env_remove: Vec<String>,
     /// Start the child in a new session without a controlling terminal, so
     /// installer scripts that prompt on `/dev/tty` fall back to their
     /// non-interactive defaults. Honored by `run_bounded_command` on Unix.
@@ -98,6 +101,7 @@ impl CommandSpec {
             args: Vec::new(),
             cwd: cwd.into(),
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
             detach_terminal: false,
         }
     }
@@ -224,6 +228,9 @@ impl JsonLineProcess {
         }
         let mut command = provider_command(&spec.program);
         command.args(&spec.args).current_dir(&spec.cwd);
+        for key in &spec.env_remove {
+            command.env_remove(key);
+        }
         for (key, value) in &spec.env {
             command.env(key, value);
         }
@@ -460,6 +467,9 @@ pub async fn run_bounded_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    for key in &spec.env_remove {
+        command.env_remove(key);
+    }
     for (key, value) in &spec.env {
         command.env(key, value);
     }

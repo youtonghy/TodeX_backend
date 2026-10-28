@@ -92,6 +92,8 @@ dsh --version
 | `TODEX_AGENTD_ANTIGRAVITY_ENV_ALLOWLIST` | 允许传给 Antigravity 的逗号分隔环境变量名 |
 | `TODEX_AGENTD_DSH_BIN` | `dsh`（DeepSeek Harness）命令路径 |
 | `TODEX_AGENTD_DSH_ENV_ALLOWLIST` | 允许传给 DeepSeek Harness 的逗号分隔环境变量名 |
+| `TODEX_AGENTD_OMP_BIN` | `omp`（oh-my-pi）命令路径 |
+| `TODEX_AGENTD_OMP_ENV_ALLOWLIST` | 允许传给 omp 的逗号分隔环境变量名（默认空） |
 | `TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES` | Provider 空闲超时分钟数（默认 60，`0` 关闭） |
 | `TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS` | 常驻 Provider 进程无 turn 时的保活秒数（默认 300，最小 30） |
 | `TODEX_AGENTD_PROVIDER_PREWARM` | 是否允许 `conversation.warm` 预先启动会话的 Provider 进程（默认 `true`） |
@@ -141,8 +143,10 @@ antigravity_bin = "agy"
 antigravity_env_allowlist = ["GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL"]
 dsh_bin = "dsh"
 dsh_env_allowlist = ["DSH_HOME", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_SEARCH_BASE_URL"]
+omp_bin = "omp"
+omp_env_allowlist = []                # omp 的凭据在 ~/.omp/agent/agent.db；需要转发环境变量里的 provider key 时列在这里
 provider_idle_timeout_minutes = 60   # Provider 连续无输出超过该分钟数时停止当前 turn（PROVIDER_IDLE_TIMEOUT）；0 关闭
-provider_keepalive_seconds = 300     # 常驻 Provider 进程（Codex/Pi/OpenCode/Grok/Devin/dsh/ACP profile）无 turn 多久后停止；最小 30
+provider_keepalive_seconds = 300     # 常驻 Provider 进程（Codex/Pi/OpenCode/Grok/Devin/dsh/omp/ACP profile）无 turn 多久后停止；最小 30
 provider_prewarm = true              # 允许客户端经 conversation.warm 在提交 prompt 前预先启动会话的 Provider 进程
 
 [agent.acp_profiles.example]
@@ -206,6 +210,8 @@ Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。`d
 
 OpenCode 通过 `opencode acp` 接入，每个对话对应一个常驻 ACP 进程（空闲超过 `[agent].provider_keepalive_seconds`（默认 300 秒，最小 30 秒）后回收，上限 32 个）。与 Devin 不同，`opencode acp` 直接读取 `opencode auth login` 保存的本地凭据，其 `opencode-login` authMethod 仅是指向该终端命令的说明，daemon 不发送 ACP `authenticate`；首次使用前用 daemon 用户执行一次 `opencode auth login` 即可。权限模式支持 `ask`/`auto`/`full-access`：`ask` 把每个 `session/request_permission` 转交用户逐条决定；`auto` 自动选 `allow_once`，`full-access` 优先 `allow_always`，自动批准写入 `permission.resolved`（`autoApproved: true`）事件留痕。OpenCode 原生 `permission` 配置（`opencode.json` 或白名单转发的 `OPENCODE_PERMISSION`）仍先生效。plan 工作模式经 `configOptions.mode` 映射为 `plan`/`build`。模型目录与 slash 命令来自真实 ACP 会话探测（探测会话随后 `session/close`）；模型以 `provider/model` 形式选择并支持会话内切换；reasoning effort 经 `configOptions.effort` 下发，仅当所选模型有 variant 时可用，模型探测会逐个读取各模型的 `supportedReasoningEfforts`。恢复对话优先用 `session/resume`（不回放历史），会话分叉走 `session/fork`。默认环境白名单转发 `OPENCODE_CONFIG*`、`OPENCODE_AUTH_CONTENT`、`OPENCODE_API_KEY` 等 `OPENCODE_*` 变量；进程固定注入 `OPENCODE_DISABLE_AUTOUPDATE=1`，自升级走 `POST /v2/providers/opencode/upgrade`（`opencode upgrade`）。
 
+omp（oh-my-pi）通过 `omp acp --approval-mode always-ask` 接入（`curl -fsSL https://omp.sh/install | sh -s -- --binary`，或在 TodeX 的 CLI 管理中一键安装），每个对话对应一个常驻 ACP 进程。首次使用前用 daemon 用户运行一次 `omp`，用 `/login` 登录或在 `~/.omp/agent/models.yml` 配置模型；TodeX 不发送 ACP `authenticate`。omp 的每次写文件与执行命令都经 TodeX 权限模式决定（`ask` 逐条询问，`auto`/`full-access` 自动允许一次）。daemon 不把为 Pi 设置的 `PI_CODING_AGENT_DIR` 传给 omp。行为细节见 [API 文档](API.md)。
+
 DeepSeek Harness 通过 `dsh --profile acp` 接入（`npm install -g @deepseek-ai/dsh`，daemon 的 PATH 中需要有 Node.js），每个对话对应一个常驻 ACP 进程。Node.js 需为 22.19+ 或 24+；在 TodeX 中安装或移除 dsh 插件还需要 PATH 中有 `pnpm`。首次使用前在 TodeX 的“Agent 供应商 → DeepSeek Harness”中添加 DeepSeek 官方账户（API key 保存到 `$DSH_HOME/.credentials.yaml`，dsh 优先使用它），也可以设置 `DEEPSEEK_API_KEY`（已在默认白名单中）。daemon 启动 dsh 时叠加 `$TODEX_AGENTD_DATA_DIR/providers/deepseek-harness/todex.patch.yml`，禁用 dsh 默认开启的会话日志与插件清单上传（`session-log-deepseek`、`plugin-package-inventory-deepseek`）。其他 provider 路由（Anthropic、OpenAI 兼容网关等）、插件与 MCP 服务器可在 TodeX 中管理，写入 `$DSH_HOME/profiles/acp/cordis.patch.yml`；手写的路由若引用环境变量中的 key，需把变量名加入 `TODEX_AGENTD_DSH_ENV_ALLOWLIST`。行为细节见 [API 文档](API.md)。
 
 Antigravity 通过 `agy` 的 stream-json print 模式接入，每个 turn 一个进程，结束后以 `--conversation` 续接同一会话。先在 daemon 所属用户的终端运行一次 `agy` 完成登录；也可把 `GEMINI_API_KEY` 加入 `antigravity_env_allowlist` 并在 `~/.gemini/antigravity-cli/settings.json` 设置 `modelProvider: "gemini"`。headless `agy` 无法请求审批，TodeX 以 `--dangerously-skip-permissions` 运行 ask/full-access 的 implement turn，并在 `~/.gemini/config` 写入 `todex-approval` hook（`hooks.json` + `todex-agy-hook.sh`）与 `todex_ssh`/`todex_desktop` MCP 条目，由 daemon 按 ask/full-access 审批每个工具；auto 使用 `agy --mode auto` 的自有审核（账号需开通 Auto 预览，否则按 ask 运行并提示）；这些文件与 Antigravity 桌面应用和 IDE 共用，TodeX 之外的会话中 hook 直接放行、MCP 条目不提供工具。可在 CLI 管理页或 `DELETE /v2/providers/antigravity/integration` 移除它们。Plan turn 用 `--mode plan` 且只允许读取。
@@ -263,7 +269,7 @@ cargo clippy
 以下命令检查 Codex/Pi 二进制、版本、现有登录、RPC 初始化、模型和命令发现，不发送 prompt，也不会消耗模型推理额度：
 
 ```bash
-cargo run -- doctor providers --provider codex,pi,opencode --format json
+cargo run -- doctor providers --provider codex,pi,opencode,omp --format json
 ```
 
 报告中的 `success` 只有在所请求 provider 的全部阶段通过时才为 `true`。命令不会自动登录，也不会输出 credential 或原始 provider payload。
@@ -366,7 +372,7 @@ todex-agentd devices revoke <deviceId>               # 吊销设备，无需重�
 todex-agentd providers install <id>... [--if-missing] # 用与 App 相同的安装器安装 Agent CLI
 ```
 
-`pair approve|reject` 的退出码：`0` 成功；`2` 没有匹配的申请、已过期或验证码匹配到多个申请；`3` 当前用户不是数据目录属主。参数是 `requestId` 时需要交互确认或 `--yes`（细节见 [device-verification.md](device-verification.md)）。`devices revoke` 找不到设备时退出码为 `2`。`providers install` 接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode`、`antigravity`、`deepseek-harness`（空格或逗号分隔），依次同步执行与 `POST /v2/providers/{p}/install` 相同的安装器并打印结果；镜像管理的 CLI 直接跳过；`--if-missing` 跳过已安装的 CLI，不加时已安装算失败；任一安装失败则以非 0 退出。它在 daemon 之外运行，不占用 daemon 的 CLI 锁，也不写 daemon 的审计日志，适合在启动 daemon 之前执行（例如容器入口脚本）。
+`pair approve|reject` 的退出码：`0` 成功；`2` 没有匹配的申请、已过期或验证码匹配到多个申请；`3` 当前用户不是数据目录属主。参数是 `requestId` 时需要交互确认或 `--yes`（细节见 [device-verification.md](device-verification.md)）。`devices revoke` 找不到设备时退出码为 `2`。`providers install` 接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode`、`antigravity`、`deepseek-harness`、`omp`（空格或逗号分隔），依次同步执行与 `POST /v2/providers/{p}/install` 相同的安装器并打印结果；镜像管理的 CLI 直接跳过；`--if-missing` 跳过已安装的 CLI，不加时已安装算失败；任一安装失败则以非 0 退出。它在 daemon 之外运行，不占用 daemon 的 CLI 锁，也不写 daemon 的审计日志，适合在启动 daemon 之前执行（例如容器入口脚本）。
 
 ### 默认运行
 

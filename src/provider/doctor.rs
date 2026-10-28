@@ -8,6 +8,7 @@ use crate::{config::Config, conversation::ProviderKind, error::AppError};
 
 use super::{
     codex::CodexDriver,
+    omp::OmpDriver,
     opencode::OpencodeDriver,
     pi::PiDriver,
     process::{run_bounded_command, CommandSpec},
@@ -77,10 +78,10 @@ pub async fn inspect_providers(
             .map_err(AppError::InvalidRequest)?;
         if !matches!(
             provider,
-            ProviderKind::Codex | ProviderKind::Pi | ProviderKind::Opencode
+            ProviderKind::Codex | ProviderKind::Pi | ProviderKind::Opencode | ProviderKind::Omp
         ) {
             return Err(AppError::Unsupported(format!(
-                "provider doctor currently supports codex, pi and opencode, got {}",
+                "provider doctor currently supports codex, pi, opencode and omp, got {}",
                 provider.as_str()
             )));
         }
@@ -108,12 +109,14 @@ async fn inspect_provider(
         ProviderKind::Codex => config.agent.codex_bin.clone(),
         ProviderKind::Pi => config.agent.pi_bin.clone(),
         ProviderKind::Opencode => config.agent.opencode_bin.clone(),
+        ProviderKind::Omp => config.agent.omp_bin.clone(),
         _ => unreachable!("provider was validated by inspect_providers"),
     };
     let driver: Box<dyn ProviderDriver> = match provider {
         ProviderKind::Codex => Box::new(CodexDriver::new(&config.agent)),
         ProviderKind::Pi => Box::new(PiDriver::new(&config.agent)),
         ProviderKind::Opencode => Box::new(OpencodeDriver::new(&config.agent)),
+        ProviderKind::Omp => Box::new(OmpDriver::new(&config.agent)),
         _ => unreachable!("provider was validated by inspect_providers"),
     };
     let mut report = ProviderProbeReport {
@@ -179,7 +182,12 @@ async fn inspect_provider(
             report.stages.push(fail_stage(
                 "models",
                 "MODEL_UNAVAILABLE",
-                "provider returned no models".to_owned(),
+                if provider == ProviderKind::Omp {
+                    // omp lists only models it holds credentials for.
+                    "provider returned no models; run `omp` and sign in with /login".to_owned()
+                } else {
+                    "provider returned no models".to_owned()
+                },
                 started,
             ));
         }

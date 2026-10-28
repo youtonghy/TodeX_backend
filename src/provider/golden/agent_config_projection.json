@@ -349,5 +349,41 @@
       }
     },
     "tomlHeaderTables": null
+  },
+  "omp": {
+    "managed": false,
+    "additive": false,
+    "readLive": {
+      "error": "unsupported capability: omp is not an exclusive-mode agent"
+    },
+    "additiveNodes": {
+      "error": "unsupported capability: omp is not an additive-mode agent"
+    },
+    "additiveSelection": {
+      "error": "unsupported capability: omp is not an additive-mode agent"
+    },
+    "firstModel": null,
+    "liveMatchesItself": false,
+    "ownedPart": null,
+    "masked": {
+      "auth": {
+        "OPENAI_API_KEY": "__TODEX_MASKED__"
+      },
+      "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"Bearer t\"\n",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "__TODEX_MASKED__",
+        "ANTHROPIC_MODEL": "m"
+      },
+      "options": {
+        "apiKey": "__TODEX_MASKED__",
+        "baseURL": "https://example.test"
+      },
+      "models": {
+        "model-a": {
+          "name": "A"
+        }
+      }
+    },
+    "tomlHeaderTables": null
   }
 }

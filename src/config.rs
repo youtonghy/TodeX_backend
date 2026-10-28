@@ -259,6 +259,8 @@ pub struct AgentConfig {
     pub antigravity_env_allowlist: Vec<String>,
     pub dsh_bin: String,
     pub dsh_env_allowlist: Vec<String>,
+    pub omp_bin: String,
+    pub omp_env_allowlist: Vec<String>,
     pub acp_profiles: BTreeMap<String, AcpProfileConfig>,
     /// OpenSSH client used for remote hosts; `ssh-add` is looked up next to it.
     pub ssh_bin: String,
@@ -445,6 +447,8 @@ struct PartialAgentConfig {
     antigravity_env_allowlist: Option<Vec<String>>,
     dsh_bin: Option<String>,
     dsh_env_allowlist: Option<Vec<String>>,
+    omp_bin: Option<String>,
+    omp_env_allowlist: Option<Vec<String>>,
     acp_profiles: Option<BTreeMap<String, AcpProfileConfig>>,
     ssh_bin: Option<String>,
     provider_idle_timeout_minutes: Option<u64>,
@@ -751,6 +755,15 @@ impl Config {
                 dsh_env_allowlist: env_list("TODEX_AGENTD_DSH_ENV_ALLOWLIST")
                     .or(agent_file.dsh_env_allowlist)
                     .unwrap_or(defaults.agent.dsh_env_allowlist),
+                omp_bin: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_OMP_BIN").ok(),
+                    agent_file.omp_bin,
+                    defaults.agent.omp_bin,
+                ),
+                omp_env_allowlist: env_list("TODEX_AGENTD_OMP_ENV_ALLOWLIST")
+                    .or(agent_file.omp_env_allowlist)
+                    .unwrap_or(defaults.agent.omp_env_allowlist),
                 acp_profiles: agent_file
                     .acp_profiles
                     .unwrap_or(defaults.agent.acp_profiles),
@@ -1054,6 +1067,10 @@ impl Default for Config {
                 antigravity_env_allowlist: default_antigravity_env_allowlist(),
                 dsh_bin: "dsh".to_owned(),
                 dsh_env_allowlist: default_dsh_env_allowlist(),
+                omp_bin: "omp".to_owned(),
+                // omp keeps credentials in its own agent.db; provider keys in
+                // the environment reach it only when listed here.
+                omp_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
                 provider_idle_timeout_minutes: DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
                 provider_keepalive_seconds: DEFAULT_PROVIDER_KEEPALIVE_SECONDS,
@@ -1184,6 +1201,11 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
         replace_some!(
             base_agent.dsh_env_allowlist,
             overlay_agent.dsh_env_allowlist
+        );
+        replace_some!(base_agent.omp_bin, overlay_agent.omp_bin);
+        replace_some!(
+            base_agent.omp_env_allowlist,
+            overlay_agent.omp_env_allowlist
         );
         replace_some!(base_agent.acp_profiles, overlay_agent.acp_profiles);
         replace_some!(

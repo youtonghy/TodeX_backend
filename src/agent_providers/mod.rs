@@ -1041,7 +1041,9 @@ fn projection(agent: ProviderKind) -> Option<ConfigProjection> {
         ProviderKind::Opencode => Some(ConfigProjection::Additive(&opencode::Projection)),
         ProviderKind::Pi => Some(ConfigProjection::Additive(&pi::Projection)),
         ProviderKind::DeepseekHarness => Some(ConfigProjection::Additive(&dsh::Projection)),
-        ProviderKind::Acp | ProviderKind::Devin | ProviderKind::Antigravity => None,
+        ProviderKind::Acp | ProviderKind::Devin | ProviderKind::Antigravity | ProviderKind::Omp => {
+            None
+        }
     }
 }
 

@@ -13,7 +13,7 @@
 
 ## Overview
 
-`todex-agentd` is the core backend service of the TodeX ecosystem. Built with Rust, Tokio, and Axum, it orchestrates multiple AI coding assistants—including **Codex app-server**, **Agent Client Protocol (ACP 2.0)**, **Pi RPC**, **Claude Code stream-json**, **Grok Build**, **Devin** (`devin acp`), **OpenCode** (`opencode acp`), the **Antigravity CLI** (`agy` stream-json), and **DeepSeek Harness** (`dsh --profile acp`)—behind a unified, secure, and persistent API.
+`todex-agentd` is the core backend service of the TodeX ecosystem. Built with Rust, Tokio, and Axum, it orchestrates multiple AI coding assistants—including **Codex app-server**, **Agent Client Protocol (ACP 2.0)**, **Pi RPC**, **Claude Code stream-json**, **Grok Build**, **Devin** (`devin acp`), **OpenCode** (`opencode acp`), the **Antigravity CLI** (`agy` stream-json), **DeepSeek Harness** (`dsh --profile acp`), and **omp** (oh-my-pi, `omp acp`)—behind a unified, secure, and persistent API.
 
 In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST endpoints and a unified `/v2/ws` WebSocket). Conversation folders serve as the single source of truth for message histories, journals, snapshots, and native provider sessions.
 
@@ -104,7 +104,7 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
                                           |
                       +-------------------+-------------------+
                       | Native Agent CLI Processes / Subtools |
-                      | (codex, acp profile, pi, claude, devin, opencode, agy) |
+                      | (codex, acp, pi, claude, devin, opencode, agy, omp)    |
                       +---------------------------------------+
 ```
 
@@ -210,7 +210,7 @@ Configuration values are resolved using the following precedence:
 | **Port** | `--port` | `TODEX_AGENTD_PORT` | `7345` | TCP port for HTTP and WebSocket. |
 | **Data Dir** | `--data-dir` | `TODEX_AGENTD_DATA_DIR` | `~/.todex-agent` | Storage directory for configs, manifests, and logs. |
 | **Workspace Root** | `--workspace-root` (repeatable) | `TODEX_AGENTD_WORKSPACE_ROOT`, `TODEX_AGENTD_WORKSPACE_ROOTS` (path-list) | `~/projects` | Root boundaries for authorized project directories; the first is the primary root. |
-| **Default Agent** | — | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` | Default provider (`codex`, `acp`, `pi`, `claude-code`, `grok-build`, `devin`, `opencode`, `antigravity`, `deepseek-harness`). |
+| **Default Agent** | — | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` | Default provider (`codex`, `acp`, `pi`, `claude-code`, `grok-build`, `devin`, `opencode`, `antigravity`, `deepseek-harness`, `omp`). |
 | **Codex Binary** | — | `TODEX_AGENTD_CODEX_BIN` | `codex` | Path or executable name for Codex CLI. |
 | **Claude Binary** | — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Path or executable name for Claude Code CLI. |
 | **Pi Binary** | — | `TODEX_AGENTD_PI_BIN` | `pi` | Path or executable name for Pi CLI. |
@@ -287,7 +287,7 @@ When the external API listener is enabled, the daemon also serves REST + SSE on 
 - `GET /v2/workspace/file?path=...`: Read file contents within sandbox root.
 - `GET /v2/browser/fetch?url=...`: Proxy web resource fetching.
 - `GET /v2/providers`: List available agent providers and their active states.
-- `GET /v2/providers/versions`: Inspect the configured backend host's Codex, Pi, Claude Code, Grok Build, Devin, OpenCode, Antigravity, DeepSeek Harness, and external ACP CLI versions.
+- `GET /v2/providers/versions`: Inspect the configured backend host's Codex, Pi, Claude Code, Grok Build, Devin, OpenCode, Antigravity, DeepSeek Harness, omp, and external ACP CLI versions.
 - `POST /v2/providers/{provider}/upgrade`: Start a single-flight self-update for a managed CLI; active Agent work blocks upgrades.
 - `POST /v2/providers/{provider}/install`: Install a missing managed CLI with the vendor's official install script (Unix); shares the upgrade operation, gate and audit trail.
 - `GET /v2/providers/upgrades/{operationId}`: Read asynchronous CLI install/upgrade progress and the verified resulting version.
@@ -330,8 +330,8 @@ cargo clippy --locked --all-targets --all-features
 # Run unit tests
 cargo test
 
-# Read-only Codex/Pi/OpenCode installation, login, and RPC discovery
-cargo run -- doctor providers --provider codex,pi,opencode --format json
+# Read-only Codex/Pi/OpenCode/omp installation, login, and RPC discovery
+cargo run -- doctor providers --provider codex,pi,opencode,omp --format json
 
 # Run the billable Codex/Pi smoke explicitly
 TODEX_REAL_E2E=1 TODEX_REAL_ALLOW_BILLABLE=1 TODEX_REAL_PROVIDERS=codex,pi \
