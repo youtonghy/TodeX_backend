@@ -193,7 +193,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 `/v2/agent-providers` 实现 cc-switch 同款的多供应商/账户管理，当前覆盖 `codex`、`claude-code`、`grok-build`、`pi`、`opencode`、`deepseek-harness`。档案库持久化在 `$TODEX_AGENTD_DATA_DIR/agent-providers.json`（owner-only 0600），`settingsConfig` 是不透明的按 Agent 配置：Claude Code 为 `settings.json` 形状的对象，但档案只托管身份键：`env` 中全部 `ANTHROPIC_*`（`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL` 等）与 `CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_VERTEX`/`CLAUDE_CODE_USE_FOUNDRY`，以及顶层 `model`、`apiKeyHelper`；档案里的其他键照常保存但不写入 live，Codex 为 `{auth, config}`（分别对应 `~/.codex/auth.json` 与 `config.toml` 文本），Grok Build 同为 `{auth, config}`（`$GROK_HOME/auth.json`——设置 `GROK_AUTH_PATH` 时取该路径——与 `$GROK_HOME/config.toml`，`GROK_HOME` 缺省为 `~/.grok`）：官方订阅档案携带 `grok login` 写入 `auth.json` 的会话（通常经 `import-live` 捕获），API 档案不带 `auth`，由 `[models].default` 指向带 `api_key`（可选 `base_url`、`api_backend`）的 `[model.<id>]`，Grok 会优先使用该密钥而非会话。Pi/OpenCode 为各自 `models.json`/`opencode.json` 中的 provider 节点。DeepSeek Harness 为 `acp` profile 补丁层中的一条 dsh 模型路由，外加虚拟字段 `apiKey`（存入 `$DSH_HOME/.credentials.yaml`，0600，不进补丁文件）：id 为 `deepseek-official` 的档案是 dsh 内置的 DeepSeek 路由，`apiKey` 写入凭据引用 `DEEPSEEK_API_KEY`（联网搜索共用），其余字段（如 `baseURL`）为 `llm-deepseek` 行的 config；其他 id（小写字母、数字与 `-`，不得为 `deepseek-official`/`deepseek-account`）为 `llm-pi-ai` 行 `config.providers.<id>` 下的 OpenAI/Anthropic 兼容路由，形如 `{ "displayName"?, "api": "openai-completions" | "openai-responses" | "anthropic-messages", "baseURL", "apiKey"?, "headers"?, "compat"?, "models": [{ "id", "name"?, "contextWindow"?, "maxTokens"?, "input"?, "reasoningEfforts"? }] }`（`baseURL` 须为 http(s)，至少一个带 id 的模型），`apiKey` 存为凭据引用 `TODEX_DSH_<ID>_API_KEY` 并在路由中写 `apiKeyEnv`（dsh 会把名称含 `KEY` 的变量从它运行的命令的环境中剔除）；不带 `apiKey` 的路由保留自己的 `apiKeyEnv`。dsh 的路由 `config` 整行替换，TodeX 写入完整的 `llm-pi-ai`/`llm-deepseek` 行配置；家目录层覆盖这些行时返回 `409 CONFLICT`。
 
-激活（`activate`）改写该 Agent 的全局配置文件，对 TodeX 拉起的会话和终端里直接运行的 CLI 同时生效；运行中的会话不受影响。独占型 Agent（Claude Code、Codex、Grok Build）先把当前 live 配置回填进旧档案再写入新档案，外部编辑与凭据（含 Codex/Grok `auth.json`）因此被保留可恢复；`auth` 缺失的 Codex/Grok 档案仅在回填成功后删除 `auth.json`。Claude Code 改为合并写入 `settings.json`：读取 live 及其 revision（文件字节的 SHA-256，与 `/v2/cli-settings` 相同）→ 删除 live 中的托管键 → 写入档案的托管键 → 写前复核 revision → 原子替换；其余键（hooks、permissions、statusLine、其他 `env` 变量等）属于本机配置，激活、保存当前档案、重新激活与删除档案都不会改动它们，也不会被回填进任何档案（切换时只回填托管键）。读写之间文件被外部修改则返回 `409 CONFLICT` 且 live 不变。写入会丢弃不存在于任何档案中的托管值时，先在同目录生成 `settings.json.todex-backup-<UTC 时间戳>`（0600，保留最近 5 份）。没有当前档案时首次激活，若 live 中有不属于任何档案的托管值，先备份，再按 `import-live` 的方式自动导入为 id `imported`（已占用则 `imported-2`…）、名称 `Imported` 的档案（已达 100 个档案上限则只备份）。删除当前 Claude 档案会从 live 剥离托管键并清空当前选中，删除非当前档案不动 live；Codex/Grok 删除档案仍保留 live。Grok 会在后台刷新 `auth.json` 中的会话令牌：`matchesCurrent` 只比较登录账户（各 scope 的 `auth_mode`/`user_id`，API key scope 另比较密钥）与 `config.toml`，令牌刷新不算漂移；编辑或重新激活当前档案且 `auth` 未改动时，沿用 live 中同账户的新令牌，避免写回已轮换的旧令牌。叠加型 Agent（Pi、OpenCode、DeepSeek Harness）在保存时即把 provider 节点同步进 live 文件，`activate` 只移动原生默认选中（Pi 写 `settings.json` 的 `defaultProvider`/`defaultModel`；OpenCode 写顶层 `model`；DeepSeek Harness 写 `acp` 行的 `{provider, model}`，对 `deepseek-official` 不指定模型时删除该覆盖、恢复 dsh 自带默认；可经请求体 `{"modelId": "..."}` 指定，缺省取首个声明模型）。删除叠加型档案同时移除 live 节点，并清理指向它的默认选中。
+激活（`activate`）改写该 Agent 的全局配置文件，对 TodeX 拉起的会话和终端里直接运行的 CLI 同时生效；运行中的会话不受影响。独占型 Agent（Claude Code、Codex、Grok Build）先把当前 live 配置回填进旧档案再写入新档案，外部编辑与凭据（含 Codex/Grok `auth.json`）因此被保留可恢复；`auth` 缺失的 Codex/Grok 档案仅在回填成功后删除 `auth.json`。Claude Code 改为合并写入 `settings.json`：读取 live 及其 revision（文件字节的 SHA-256，与 `GET /v2/providers/claude-code/settings` 返回的 `revision` 相同）→ 删除 live 中的托管键 → 写入档案的托管键 → 写前复核 revision → 原子替换；其余键（hooks、permissions、statusLine、其他 `env` 变量等）属于本机配置，激活、保存当前档案、重新激活与删除档案都不会改动它们，也不会被回填进任何档案（切换时只回填托管键）。读写之间文件被外部修改则返回 `409 CONFLICT` 且 live 不变。写入会丢弃不存在于任何档案中的托管值时，先在同目录生成 `settings.json.todex-backup-<UTC 时间戳>`（0600，保留最近 5 份）。没有当前档案时首次激活，若 live 中有不属于任何档案的托管值，先备份，再按 `import-live` 的方式自动导入为 id `imported`（已占用则 `imported-2`…）、名称 `Imported` 的档案（已达 100 个档案上限则只备份）。删除当前 Claude 档案会从 live 剥离托管键并清空当前选中，删除非当前档案不动 live；Codex/Grok 删除档案仍保留 live。Grok 会在后台刷新 `auth.json` 中的会话令牌：`matchesCurrent` 只比较登录账户（各 scope 的 `auth_mode`/`user_id`，API key scope 另比较密钥）与 `config.toml`，令牌刷新不算漂移；编辑或重新激活当前档案且 `auth` 未改动时，沿用 live 中同账户的新令牌，避免写回已轮换的旧令牌。叠加型 Agent（Pi、OpenCode、DeepSeek Harness）在保存时即把 provider 节点同步进 live 文件，`activate` 只移动原生默认选中（Pi 写 `settings.json` 的 `defaultProvider`/`defaultModel`；OpenCode 写顶层 `model`；DeepSeek Harness 写 `acp` 行的 `{provider, model}`，对 `deepseek-official` 不指定模型时删除该覆盖、恢复 dsh 自带默认；可经请求体 `{"modelId": "..."}` 指定，缺省取首个声明模型）。删除叠加型档案同时移除 live 节点，并清理指向它的默认选中。
 
 `GET /v2/agent-providers/{agent}/export` 导出该 Agent 的全部档案，用于在多台主机间同步：`{format: "todex.agent-providers", version: 1, agent, exportedAt, providers: [{id, name, settingsConfig, websiteUrl?, category?, notes?, icon?, iconColor?, sortIndex?}]}`，**密钥为明文**（其余接口一律打码），不含时间戳与当前选中。`POST /v2/agent-providers/{agent}/import` 接受同一文件：按 `id` 覆盖同名档案、新增其余档案，文件中没有的档案保留，当前选中不变（导入与当前档案同 id 的内容会像编辑一样重写 live 配置；叠加型 Agent 的节点同步进 live 文件）。整份文件先校验（格式与版本、`agent` 与路径一致、id 唯一、名称与大小限制、不得含 `__TODEX_MASKED__`、导入后不超过 100 个档案）再写入。两者与 CLI 升级一样要求有效设备签名，并写入 `agent_providers.transfer.audit` 审计事件。
 
@@ -428,7 +428,9 @@ Claude 自身保留期：`GET`/`PUT /v2/native-history/claude-code/native-retent
 
 `conversation.subscribe` 的 `limit` 只是 replay 分页大小。可选 `detail`（`full` 默认 | `summary`）按 HTTP `detail=summary` 同样的规则折叠首次 replay 的过程事件；实时事件与缺口/滞后补放始终完整。可选 `backfillLimit` 限制首次 replay 的事件数：从 `afterSequence` 之后按 sequence 升序最多发送 `backfillLimit` 条，不跳过也不只发最新事件。结果为 `{ "conversationId", "subscribed": true, "nextSequence", "hasMore", "lastSequence" }`：`nextSequence` 是最后一条已 replay 的 sequence（未截断时等于高水位），`hasMore` 表示 `nextSequence` 与 `lastSequence`（订阅时的 journal 高水位）之间仍有未发送事件，实时推送从 `lastSequence` 之后继续。`hasMore: true` 时客户端用 HTTP `afterSequence=nextSequence` 翻页补齐 `(nextSequence, lastSequence]`，服务端不会把这段当作序号缺口补放。两个字段都省略时行为与之前完全一致（`hasMore` 恒为 `false`）。
 
-支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.queue.add` / `remove` / `clear` / `resume` / `list`、`conversation.schedule`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.warm`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call`、`server.ping` 和 `history.*`（见下文「历史加密密钥」）。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
+支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.queue.add` / `remove` / `clear` / `resume` / `list`、`conversation.schedule`、`conversation.resume`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.warm`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call`、`server.ping` 和 `history.*`（见下文「历史加密密钥」）。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
+
+`conversation.resume` 的 payload 为 `{ "conversationId" }`。daemon 不实现原生恢复：会话存在且属于当前租户时总是以 `server.error` `UNSUPPORTED` 应答，提示改为提交显式的 follow-up 继续对话，会话状态与 journal 都不变；`conversationId` 不是 UUID v4 时返回 `INVALID_REQUEST`，会话不存在或不属于当前租户时返回 `NOT_FOUND`，payload 缺少 `conversationId` 时与其他会话命令一样返回 `SERIALIZATION_FAILED`。断线后恢复事件流请用 `session.resume`（见「统一 WebSocket 命令面」）或带 `afterSequence` 的 `conversation.subscribe`。
 
 命令执行顺序：`server.ping`、`conversation.subscribe`、`conversation.unsubscribe` 与 `session.resume` 由读循环按到达顺序直接处理；`mcp.refresh`、`mcp.call`、`conversation.control`、`conversation.warm` 在后台并发执行（每条 socket 最多 16 个，超出返回 `RESOURCE_EXHAUSTED`）；其余命令按 payload 的 `conversationId` 分道执行——同一会话的命令严格按到达顺序逐条执行，不带 `conversationId` 的命令共用一条通道，不同通道互不等待。因此某个会话的慢命令（如等待 Agent 启动）不会延迟 `server.ping` 或其他会话的命令。每条通道最多 16 条命令排队或执行中，超出时该命令立即返回 `RESOURCE_EXHAUSTED`，不会阻塞读循环；每条 socket 合计最多 64 条分道命令排队或执行中，超出时服务端暂停读取后续消息直到有空位，不返回错误。`conversation.cancel` / `interrupt` / `stop` 不排在所属会话的通道后面：立即执行并据此应答，同时在该会话通道中按顺序追加一次同样 payload 的静默取消（不另发应答），使排在它之前、尚未登记 turn 的 prompt 也会被取消；socket 已满 64 条时退回普通分道排队。`conversation.permission.respond` 不进入通道，立即执行（计入 64 条，已满时返回 `RESOURCE_EXHAUSTED`）。响应可能不按请求顺序到达，客户端须按 `id` 匹配。连接断开时已开始的分道命令会执行完毕，只是结果不再送达；仍在排队、尚未开始的命令不再执行。
 
@@ -1186,6 +1188,102 @@ Content-Type: application/json
 ```
 
 `output` 是 Git 的 stdout/stderr 文本；Git 没有输出时为空字符串，客户端自行显示本地化的完成提示。`/v2/git/operation` 的成功响应同理。
+
+#### 工作区快照、Pull Request 与固定 Git 操作
+
+Git 操作面板先读取工作区的分支与 worktree 快照：
+
+```http
+GET /v2/git/workspace?workspacePath=/home/user/projects/demo
+```
+
+```json
+{
+  "repositoryPath": "/home/user/projects/demo",
+  "initialized": true,
+  "currentBranch": "main",
+  "branches": [
+    { "name": "main", "current": true, "remote": false, "worktreePath": "/home/user/projects/demo" },
+    { "name": "feature", "current": false, "remote": false, "worktreePath": "/home/user/projects/demo-feature" },
+    { "name": "origin/main", "current": false, "remote": true }
+  ],
+  "worktrees": [
+    { "path": "/home/user/projects/demo", "branch": "main", "current": true, "main": true, "locked": false, "dirty": false, "accessible": true },
+    { "path": "/home/user/projects/demo-feature", "branch": "feature", "current": false, "main": false, "locked": false, "dirty": false, "accessible": true }
+  ],
+  "dirty": false
+}
+```
+
+`workspacePath` 必须是仓库根目录本身：目录不在任何仓库中时返回 `initialized: false`、`currentBranch: ""`、空的 `branches` / `worktrees` 与 `dirty: false`；指向仓库的子目录返回 `400 INVALID_REQUEST`。`currentBranch` 在分离 HEAD 时为空字符串。`branches` 依次列出 `refs/heads`（`remote: false`）与 `refs/remotes`（`remote: true`，名称带远端前缀，如 `origin/main`）中的分支，跳过 `origin/HEAD` 这类符号引用；`current` 只会出现在本地分支上；`worktreePath` 只在本地分支被某个 worktree 检出时出现。`worktrees` 按 `git worktree list` 顺序返回，第一项为主 worktree（`main: true`），分离 HEAD 的 worktree `branch` 为空字符串；`current` 标出 `workspacePath` 本身；`accessible` 为 `false` 表示该 worktree 不在 `workspace_roots` 内或其 Git 元数据没有通过校验；worktree 的 `dirty` 把被忽略的文件也算作改动（删除 worktree 会一并删除它们），不可访问的 worktree 恒为 `dirty: true`。顶层 `dirty` 按普通 Git 语义统计已跟踪改动与未忽略的未跟踪文件。引用超过 2,000 个或 worktree 超过 128 个时返回 `400 INVALID_REQUEST`。
+
+当前分支对应的 GitHub Pull Request 摘要：
+
+```http
+GET /v2/git/pull-request?workspacePath=/home/user/projects/demo
+```
+
+```json
+{
+  "repositoryPath": "/home/user/projects/demo",
+  "initialized": true,
+  "branch": "feature",
+  "pullRequest": {
+    "number": 12,
+    "title": "Add feature",
+    "url": "https://github.com/owner/demo/pull/12",
+    "state": "open",
+    "draft": false,
+    "headRef": "feature",
+    "baseRef": "main",
+    "headSha": "3f2a…（完整 40 位）",
+    "mergeable": "mergeable",
+    "mergeState": "clean",
+    "autoMergeMethod": "squash",
+    "reviews": { "approved": 1, "changesRequested": 0, "commented": 2 },
+    "checks": { "passing": 5, "failing": 0, "pending": 1 }
+  }
+}
+```
+
+`workspacePath` 的要求与快照相同；不是仓库时返回 `initialized: false`、`branch: ""`、`pullRequest: null`，分离 HEAD 时 `branch` 为空字符串、`pullRequest` 为 `null`。否则服务端解析当前分支的上游（必须是某个远端的 `refs/heads/*` 分支），远端 URL 须为 `https://<host>/<owner>/<repo>`、`ssh://git@<host>/<owner>/<repo>` 或 `git@<host>:<owner>/<repo>` 形式（可带 `.git`）；没有上游、上游不是分支或 URL 不是这些形式时返回 `400 INVALID_REQUEST`。查询通过 daemon 主机上的 GitHub CLI（`gh api --hostname <host>`，只继承 `PATH`、`HOME`、`GH_CONFIG_DIR`、`GH_TOKEN`、`GITHUB_TOKEN`、`GH_ENTERPRISE_TOKEN`、`GITHUB_ENTERPRISE_TOKEN`、代理与证书等白名单环境变量，`GH_PROMPT_DISABLED=1`）进行，`gh` 失败返回 `500 GIT_PROCESS_ERROR`。服务端在 `head=<owner>:<上游分支>` 最近的 30 个 PR（任意状态）中优先取打开的，否则取最新的一个；没有时 `pullRequest` 为 `null`。字段：`title` 最多 512 bytes；`state` 为 `open`、`closed` 或 `merged`；`mergeable` 为 `mergeable`、`unmergeable` 或 `unknown`（GitHub 仍在计算）；`mergeState` 原样透传 GitHub 的 `mergeable_state`（如 `clean`、`blocked`、`behind`、`dirty`、`unstable`、`unknown`）；`autoMergeMethod`（`merge` / `squash` / `rebase`）只在已开启自动合并时出现；`reviews` 只统计每位评审者最新一次已提交的评审；`checks` 合计 head 提交的 check run（未完成计 `pending`，结论为 `success` / `neutral` / `skipped` / `stale` 计 `passing`，其余结论计 `failing`）与 commit status（`success` / `pending` / 其余分别计入 `passing` / `pending` / `failing`）。
+
+快照与 PR 摘要都是只读接口，与扫描共享 2 个并发名额（排队超过 2 秒返回 `409 CONFLICT`），单次请求超过 30 秒返回 `GIT_COMMAND_TIMED_OUT`，并执行与状态摘要相同的仓库元数据检查。
+
+分支、worktree 与 PR 的变更只能通过固定动作执行：
+
+```http
+POST /v2/git/operation
+Content-Type: application/json
+
+{
+  "workspacePath": "/home/user/projects/demo",
+  "operation": { "action": "create-worktree", "path": "/home/user/projects/demo-feature", "branchName": "feature", "startPoint": "main" }
+}
+```
+
+成功响应与 `/v2/git/run` 相同：`{ "repositoryPath", "action", "output" }`，`action` 回显动作名。请求体与 `operation` 都拒绝未知字段，`operation` 只能带所选动作的字段；JSON 无法按下表解析时返回 `400 INVALID_REQUEST`（`invalid Git operation: …`）。`action` 共 14 个：
+
+| `action` | 字段 | 行为与前置条件 |
+| --- | --- | --- |
+| `init` | 无 | 仅用于不在任何仓库中的目录，执行 `git init --template=`；已初始化返回 `400`，目录下已有无效的 `.git` 元数据也返回 `400`。 |
+| `push` | 无 | 把 `HEAD` 推到当前分支上游的同名远端分支（`HEAD:<上游 ref>`，不 force、不推标签）。当前分支须有分支上游；远端名只能含字母、数字、`.`、`_`、`-`、`/`。 |
+| `create-branch` | `branchName`，`startPoint`? | 从 `startPoint`（缺省 `HEAD`，先解析为提交 id）创建分支，不切换。 |
+| `switch-branch` | `branchName` | 工作区有改动或该分支已在其他 worktree 检出时返回 `400`；`git switch --no-guess`，不会从远端分支隐式创建本地分支。 |
+| `create-worktree` | `path`，`branchName`，`startPoint`? | 新建分支并在 `path` 检出新 worktree。`path` 须为不含 `.` / `..` 的绝对路径且尚不存在，最近的已有上级目录须在 `workspace_roots` 内，缺失的中间目录逐级创建。 |
+| `remove-worktree` | `path` | 只删除登记在本仓库、可访问、未锁定、干净（含被忽略文件）且不是主 worktree 或 `workspacePath` 本身的 linked worktree，其余情况返回 `400`。 |
+| `create-pr` | `title`，`body`，`baseBranch`，`draft`，`repository` | 全部必填。`title` 非空、最多 256 bytes、不含控制字符；`body` 最多 60,000 bytes，除换行、回车与制表符外不含控制字符；`repository` 为 `[host/]owner/repo`（缺省 host 为 `github.com`），必须与当前分支上游的仓库一致（fork 工作流交给 Agent）；`baseBranch` 须是合法分支名且不同于上游分支；远端上游分支须已指向本地 `HEAD`（先推送）。已有同一 head/base 的打开 PR 时直接返回其 URL，否则创建（`draft` 决定是否为草稿）。`output` 为 PR URL。 |
+| `close-pr` | 无 | 关闭打开的 PR。 |
+| `reopen-pr` | 无 | 重新打开已关闭（未合并）的 PR。 |
+| `draft-pr` | 无 | 把打开的 PR 转为草稿。 |
+| `ready-pr` | 无 | 把草稿 PR 标为可评审。 |
+| `merge-pr` | `method`，`headSha` | `method` 为 `merge`、`squash` 或 `rebase`；`headSha` 须与 PR 当前 head 一致（不区分大小写），否则返回 `400`（`PR head changed; refresh before merging`）；合并请求绑定该 sha。 |
+| `enable-pr-auto-merge` | `method` | 为打开且尚未开启自动合并的 PR 开启自动合并，`method` 同上。 |
+| `disable-pr-auto-merge` | 无 | 关闭已开启的自动合并。 |
+
+`branchName` 最多 240 bytes，不能以 `-` 开头、不能含 `@` 或控制字符，并须通过 `git check-ref-format --branch`；`startPoint` 同样限制长度与字符，无法解析为提交时返回 `422 GIT_COMMAND_FAILED`。PR 动作作用于 `GET /v2/git/pull-request` 选中的那个 PR（没有时返回 `400`），每次写入前重新读取 PR 状态，状态不满足前置条件（例如 PR 未打开、已是草稿、已合并的 PR 不能重开）时返回 `400` 且不写入；`create-pr` 以外的 PR 动作 `output` 为一行说明加 PR URL（如 `Closed PR #12\nhttps://github.com/owner/demo/pull/12`）。
+
+所有动作都要求 `workspacePath` 是仓库根目录本身（子目录返回 `400`），除 `init` 外目录不是仓库时返回 `404 GIT_REPOSITORY_NOT_FOUND`；非 Unix 平台返回 `501 UNSUPPORTED`。该租户有处于运行或等待权限状态的会话、且其工作目录位于 `workspacePath`（或 `remove-worktree` 的目标）之内时返回 `409 CONFLICT`，要求等待 Agent 结束。变更与 `/v2/git/run` 共用一把写锁，排队超过 2 秒返回 `409 CONFLICT`；整个动作超过 120 秒返回 `502 GIT_PARTIAL_SUCCESS`。本地 Git 命令以非零状态退出且可以确定没有改变状态时返回 `422 GIT_COMMAND_FAILED`（push 的判定见下文）；结果可能已生效时返回 `502 GIT_PARTIAL_SUCCESS`，包括 PR 写请求失败、超时或 GitHub 响应没有确认新状态——客户端应刷新状态后再决定，不能自动重试。GitHub GraphQL 返回顶层错误表示变更被拒绝而未生效，返回 `500 GIT_PROCESS_ERROR`；写入之前的 `gh` 查询失败同样返回 `500 GIT_PROCESS_ERROR`。
 
 Git 进程不经过 shell，stdin 关闭并设置 `GIT_TERMINAL_PROMPT=0`；子进程只继承必要的基础运行环境，不继承 `TODEX_AGENTD_*` 或 `GIT_DIR`/`GIT_WORK_TREE` 等路径覆盖变量。所有命令显式关闭 fsmonitor 与 untracked cache，差异统计禁用 external diff/textconv。写操作会再次确认 worktree、git-dir 和 git-common-dir 全部位于 `workspace_roots` 内，拒绝写入相关 Git 元数据树中的符号链接和 object alternates，并使用 daemon 管理的空 hooks 目录、关闭 commit/push 签名和 `ext`/`file` transport；local 与 worktree 级配置都会展开 `include` 后检查，包含 clean/process filter、askpass、local credential helper、`core.sshCommand`、自定义 GPG program、自定义 remote helper 或仓库级 URL 重写时直接拒绝。推送（`push`、`commit-push` 及工作区 Git 操作的 push）固定传入 `-c submodule.recurse=false` 与 `--recurse-submodules=no`，不会递归推送子模块；仓库级配置含 `push.recurseSubmodules` 或 `submodule.recurse`（要求递归推送）时拒绝推送；`git submodule init` 写入的 `submodule.<name>.*` 等普通条目不影响推送（`INVALID_REQUEST`，提示移除该设置或在终端推送），提交等其他写操作不受影响。上游远端名只接受 `[A-Za-z0-9._/-]` 字符，不能以 `-` 开头，按 `/` 分隔的每一段不能为空或以 `.` 开头（允许 `upstream/fork`，拒绝 `..`）。所有写操作都拒绝选择自定义 transport 的远端 URL（`<helper>::…`、未知 scheme）与仓库级 URL 重写。会联系远端的操作（`push`、`commit-push` 及工作区 Git 操作的 push）还要求仓库的每个远端只使用 HTTP(S)、SSH、Git URL 与 SCP-like SSH 写法：远端指向本地路径或 `file://` 时返回 `400 INVALID_REQUEST`，信息为 `remote '<name>' points to a local path; TodeX does not push to local-path remotes (push from a terminal, or point the remote at an http(s), ssh or git URL)`；`commit-push` 在提交之前就做此检查，因此不会只提交不推送。不联系远端的写操作（`initial`、`commit`、init、创建/切换分支、创建/删除 worktree）在这类仓库中照常可用，只读接口同样不受此限制。daemon 账户自己的全局 credential/SSH 配置仍可用于正常的非本地远端推送。同一 daemon 内的 Git 写操作串行执行，排队超过 2 秒返回 `409 CONFLICT`，单次写请求总计超过 120 秒返回 `GIT_PARTIAL_SUCCESS`，提醒客户端状态可能已改变、刷新后再决定后续动作。每条命令 15 秒超时；超时、输出超限或外层请求取消都会终止 Git 进程组并回收直接子进程。完整进程组清理依赖 Unix，因此非 Unix 平台的 Git 写 API 返回 `501 UNSUPPORTED`；Git 扫描仍可使用。
 
