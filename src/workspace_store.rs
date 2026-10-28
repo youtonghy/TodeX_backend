@@ -64,6 +64,12 @@ pub struct WorkspaceRecord {
     /// Sidebar group display name, copied onto every member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_name: Option<String>,
+    /// Sidebar group tags, copied onto every member like `group_name`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_tags: Vec<String>,
+    /// The workspace's own sidebar tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// A workspace record rejected during normalization (for example because its
@@ -267,6 +273,8 @@ fn normalize_workspaces(
         workspace.local_adapter_state = None;
         workspace.group_id = normalize_group_field(workspace.group_id.take());
         workspace.group_name = normalize_group_field(workspace.group_name.take());
+        workspace.group_tags = normalize_tags(std::mem::take(&mut workspace.group_tags));
+        workspace.tags = normalize_tags(std::mem::take(&mut workspace.tags));
         let key = (workspace.tenant_id.clone(), workspace.id.clone());
         match normalized.get(&key) {
             Some(existing) if existing.updated_at > workspace.updated_at => {}
@@ -291,6 +299,38 @@ fn normalize_group_field(value: Option<String>) -> Option<String> {
         .take(WORKSPACE_GROUP_FIELD_MAX)
         .collect::<String>();
     (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// Max characters kept per tag and tags kept per list, matching the protocol.
+const WORKSPACE_TAG_MAX: usize = 32;
+const WORKSPACE_TAGS_MAX: usize = 16;
+
+/// Trims each tag (dropping control characters), caps its length, drops
+/// empties and case-insensitive duplicates (the first spelling wins), and
+/// keeps at most `WORKSPACE_TAGS_MAX`.
+fn normalize_tags(values: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut tags = Vec::new();
+    for value in values {
+        let tag = value
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .collect::<String>()
+            .trim()
+            .chars()
+            .take(WORKSPACE_TAG_MAX)
+            .collect::<String>()
+            .trim_end()
+            .to_owned();
+        if tag.is_empty() || !seen.insert(tag.to_lowercase()) {
+            continue;
+        }
+        tags.push(tag);
+        if tags.len() == WORKSPACE_TAGS_MAX {
+            break;
+        }
+    }
+    tags
 }
 
 fn validate_workspace_record(
@@ -363,6 +403,13 @@ mod tests {
                     sort_order: Some(3),
                     group_id: Some(" wsg_1 ".to_owned()),
                     group_name: Some("x".repeat(80)),
+                    group_tags: vec![" Team ".to_owned(), "team".to_owned()],
+                    tags: vec![
+                        "Rust".to_owned(),
+                        String::new(),
+                        "a\u{1}b".to_owned(),
+                        "y".repeat(40),
+                    ],
                 }],
             )
             .await
@@ -395,6 +442,15 @@ mod tests {
                 .as_deref()
                 .map(|name| name.chars().count()),
             Some(WORKSPACE_GROUP_FIELD_MAX)
+        );
+        assert_eq!(reloaded.workspaces[0].group_tags, vec!["Team".to_owned()]);
+        assert_eq!(
+            reloaded.workspaces[0].tags,
+            vec![
+                "Rust".to_owned(),
+                "ab".to_owned(),
+                "y".repeat(WORKSPACE_TAG_MAX)
+            ]
         );
         assert_eq!(reloaded.workspaces[0].icon.as_deref(), Some("rocket"));
         assert_eq!(
@@ -439,6 +495,8 @@ mod tests {
             sort_order: None,
             group_id: None,
             group_name: None,
+            group_tags: Vec::new(),
+            tags: Vec::new(),
         };
 
         let snapshot = store
@@ -588,6 +646,8 @@ mod tests {
             sort_order: None,
             group_id: None,
             group_name: None,
+            group_tags: Vec::new(),
+            tags: Vec::new(),
         }
     }
 
