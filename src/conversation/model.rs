@@ -425,6 +425,9 @@ pub fn redact_secrets(value: &mut Value) {
                             | "contexttokens"
                             | "prompttokens"
                             | "completiontokens"
+                            // Codex goal (`thread/goal/*`) accounting.
+                            | "tokensused"
+                            | "tokenbudget"
                     );
                 let usage_container = (value.is_object() || value.is_array())
                     && matches!(
@@ -475,6 +478,13 @@ mod provider_kind_tests {
         assert_eq!(value["tokenUsage"]["cachedInputTokens"], 12);
         assert_eq!(value["tokenUsage"]["authToken"], "[REDACTED]");
         assert_eq!(value["access_token"], "[REDACTED]");
+        let mut goal =
+            serde_json::json!({ "tokensUsed": 1200, "tokenBudget": 50000, "token": "secret" });
+        super::redact_secrets(&mut goal);
+        assert_eq!(
+            goal,
+            serde_json::json!({ "tokensUsed": 1200, "tokenBudget": 50000, "token": "[REDACTED]" })
+        );
         assert_eq!(value["promptTokens"], "[REDACTED]");
     }
 

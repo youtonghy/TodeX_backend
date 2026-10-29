@@ -181,6 +181,7 @@ impl ProviderDriver for CodexDriver {
     async fn compact_session(
         &self,
         context: DriverContext,
+        _instructions: Option<String>,
         mut cancel: watch::Receiver<bool>,
     ) -> Result<(), AppError> {
         self.sessions.stop(&context.manifest.id).await;
@@ -465,6 +466,30 @@ impl ProviderDriver for CodexDriver {
                     context,
                     settings,
                     sink,
+                },
+            )
+            .await
+    }
+
+    fn supports_goal(&self) -> bool {
+        true
+    }
+
+    async fn goal(
+        &self,
+        context: DriverContext,
+        settings: DriverPrompt,
+        sink: DriverEventSink,
+        request: super::types::GoalRequest,
+    ) -> Result<Value, AppError> {
+        self.sessions
+            .goal(
+                &self.binary,
+                runtime::GoalRun {
+                    context,
+                    settings,
+                    sink,
+                    request,
                 },
             )
             .await
@@ -2104,7 +2129,10 @@ done
         };
         let fork = driver.fork_session(context.clone()).await.unwrap();
         assert_eq!(fork.native_session_id.as_deref(), Some("forked"));
-        driver.compact_session(context, cancel_rx).await.unwrap();
+        driver
+            .compact_session(context, None, cancel_rx)
+            .await
+            .unwrap();
         let wire = tokio::fs::read_to_string(root.join("wire.jsonl"))
             .await
             .unwrap();

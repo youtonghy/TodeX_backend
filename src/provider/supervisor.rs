@@ -40,10 +40,10 @@ use super::profile::{profile, FileAttachmentStyle, McpInjection, SkillInjection}
 use super::types::ProviderDescriptor;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,
-    DriverTurnResult, ImageInputMode, PermissionBroker, PermissionDecision, PermissionOutcome,
-    ProviderActivity, ProviderCommandDescriptor, ProviderControl, ProviderDriver,
-    ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot, ProviderWork,
-    ProviderWorkHandle, TurnHandles, TurnModeHandle,
+    DriverTurnResult, GoalRequest, ImageInputMode, PermissionBroker, PermissionDecision,
+    PermissionOutcome, ProviderActivity, ProviderCommandDescriptor, ProviderControl,
+    ProviderDriver, ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot,
+    ProviderWork, ProviderWorkHandle, TurnHandles, TurnModeHandle,
 };
 
 mod follow_ups;
@@ -1776,6 +1776,7 @@ impl ConversationSupervisor {
         owner_id: &str,
         conversation_id: &str,
         client_request_id: &str,
+        instructions: Option<String>,
     ) -> Result<String, AppError> {
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         let manifest = self.writable_owned(owner_id, conversation_id).await?;
@@ -1783,6 +1784,15 @@ impl ConversationSupervisor {
         if !driver.supports_native_compact() {
             return Err(AppError::Unsupported(
                 "Native compaction is not supported by this provider.".to_owned(),
+            ));
+        }
+        // Blank instructions mean none; the provider's own summary prompt applies.
+        let instructions = instructions
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty());
+        if instructions.is_some() && !driver.supports_compact_instructions() {
+            return Err(AppError::Unsupported(
+                "This provider's native compaction takes no instructions.".to_owned(),
             ));
         }
         let _cli_permit = self
@@ -1837,6 +1847,7 @@ impl ConversationSupervisor {
                         agent_mcp: None,
                         handles: Default::default(),
                     },
+                    instructions,
                     cancel_rx,
                 )
                 .await;
@@ -2594,33 +2605,8 @@ impl ConversationSupervisor {
                 &effective_permissions.work_mode,
             );
         }
-        let provider_work = {
-            let supervisor = self.clone();
-            let conversation_id = conversation_id.clone();
-            let lost = (
-                supervisor.clone(),
-                conversation_id.clone(),
-                manifest.provider,
-            );
-            ProviderWorkHandle::new(move |work| {
-                let supervisor = supervisor.clone();
-                let owner_id = owner_id.clone();
-                let conversation_id = conversation_id.clone();
-                Box::pin(async move {
-                    supervisor
-                        .start_provider_turn(&owner_id, &conversation_id, work)
-                        .await
-                })
-            })
-            .with_lost(move |work| {
-                let (supervisor, conversation_id, provider) = lost.clone();
-                Box::pin(async move {
-                    supervisor
-                        .journal_lost_work(&conversation_id, provider, &work.task_ids, work.reason)
-                        .await;
-                })
-            })
-        };
+        let provider_work =
+            self.provider_work_handle(owner_id, conversation_id.clone(), manifest.provider);
         let supervisor = self.clone();
         let spawned_turn_id = turn_id;
         let cleanup = ActiveTurnCleanup {
@@ -2693,6 +2679,108 @@ impl ConversationSupervisor {
             drop(cleanup);
             supervisor.schedule_after_turn(conversation_id, Some(spawned_turn_id), terminal);
         });
+    }
+
+    /// Lets a driver open provider-initiated turns for the conversation and
+    /// report the background work its process lost.
+    fn provider_work_handle(
+        &self,
+        owner_id: String,
+        conversation_id: String,
+        provider: ProviderKind,
+    ) -> ProviderWorkHandle {
+        let supervisor = self.clone();
+        let lost = (supervisor.clone(), conversation_id.clone(), provider);
+        ProviderWorkHandle::new(move |work| {
+            let supervisor = supervisor.clone();
+            let owner_id = owner_id.clone();
+            let conversation_id = conversation_id.clone();
+            Box::pin(async move {
+                supervisor
+                    .start_provider_turn(&owner_id, &conversation_id, work)
+                    .await
+            })
+        })
+        .with_lost(move |work| {
+            let (supervisor, conversation_id, provider) = lost.clone();
+            Box::pin(async move {
+                supervisor
+                    .journal_lost_work(&conversation_id, provider, &work.task_ids, work.reason)
+                    .await;
+            })
+        })
+    }
+
+    /// `conversation.goal`: reads or changes the goal the provider pursues on
+    /// its own, and returns it (`null` when none is set). Allowed while a
+    /// turn runs, so a goal can be paused mid-work; the turns the provider
+    /// starts for it are journalled as provider-initiated turns.
+    pub async fn goal_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        request: GoalRequest,
+    ) -> Result<Value, AppError> {
+        let request = match request {
+            GoalRequest::Set { objective } if objective.trim().is_empty() => {
+                return Err(AppError::InvalidRequest(
+                    "A goal needs an objective.".to_owned(),
+                ))
+            }
+            GoalRequest::Set { objective } => GoalRequest::Set {
+                objective: objective.trim().to_owned(),
+            },
+            other => other,
+        };
+        let manifest = if request == GoalRequest::Get {
+            self.get_owned(owner_id, conversation_id).await?
+        } else {
+            self.writable_owned(owner_id, conversation_id).await?
+        };
+        let driver = self.registry.driver(manifest.provider)?;
+        if !driver.supports_goal() {
+            return Err(AppError::Unsupported(
+                "This provider has no native goal.".to_owned(),
+            ));
+        }
+        let provider_state = self.store.provider_state(conversation_id).await?;
+        // Reading needs no provider: without a native session there is no goal.
+        if request == GoalRequest::Get && provider_state.native_session_id.is_none() {
+            return Ok(Value::Null);
+        }
+        self.validate_workspace(&manifest.workspace)?;
+        let _cli_permit = self
+            .start_permits(manifest.provider, manifest.provider_profile.as_deref())
+            .await;
+        let settings = self.warm_settings(&manifest).await?;
+        let agent_mcp = self.turn_agent_mcp(&manifest).await;
+        let sink = DriverEventSink::new(
+            self.store.clone(),
+            self.hub.clone(),
+            self.permissions.clone(),
+            conversation_id,
+        );
+        let provider_work = self.provider_work_handle(
+            owner_id.to_owned(),
+            conversation_id.to_owned(),
+            manifest.provider,
+        );
+        driver
+            .goal(
+                DriverContext {
+                    manifest,
+                    provider_state,
+                    agent_mcp,
+                    handles: TurnHandles {
+                        provider_work: Some(provider_work),
+                        ..Default::default()
+                    },
+                },
+                settings,
+                sink,
+                request,
+            )
+            .await
     }
 
     /// Opens a turn for work the provider started on its own after the
@@ -3967,7 +4055,7 @@ mod tests {
         read_only(
             "compact",
             supervisor
-                .compact_owned("local", &id, "compact-1")
+                .compact_owned("local", &id, "compact-1", None)
                 .await
                 .unwrap_err(),
         );
@@ -4457,8 +4545,20 @@ mod tests {
                 .as_deref(),
             Some("codex-native")
         );
+        // Codex compaction takes no instructions; blank ones are none.
+        assert!(matches!(
+            supervisor
+                .compact_owned(
+                    "local",
+                    &manifest.id,
+                    "compact-0",
+                    Some("keep the API notes".to_owned())
+                )
+                .await,
+            Err(AppError::Unsupported(_))
+        ));
         supervisor
-            .compact_owned("local", &manifest.id, "compact-1")
+            .compact_owned("local", &manifest.id, "compact-1", Some("  ".to_owned()))
             .await
             .unwrap();
         wait_until_idle(&supervisor).await;
@@ -4472,6 +4572,104 @@ mod tests {
             store.get(&manifest.id).await.unwrap().status,
             ConversationStatus::Idle
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_goal_journals_the_turns_codex_starts_for_it() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-codex-goal").await;
+        let manifest = supervisor
+            .create(ProviderKind::Codex, workspace, None, None)
+            .await
+            .unwrap();
+        // Without a native session there is no goal to read, and none starts.
+        assert_eq!(
+            supervisor
+                .goal_owned("local", &manifest.id, GoalRequest::Get)
+                .await
+                .unwrap(),
+            Value::Null
+        );
+        assert!(matches!(
+            supervisor
+                .goal_owned(
+                    "local",
+                    &manifest.id,
+                    GoalRequest::Set {
+                        objective: "  ".to_owned()
+                    }
+                )
+                .await,
+            Err(AppError::InvalidRequest(_))
+        ));
+        let goal = supervisor
+            .goal_owned(
+                "local",
+                &manifest.id,
+                GoalRequest::Set {
+                    objective: "ship it".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(goal["status"], "active");
+        // The new thread was saved before Codex started working on the goal.
+        assert_eq!(
+            store
+                .provider_state(&manifest.id)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("codex-native")
+        );
+        let history = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let history = store.complete_history(&manifest.id).await.unwrap();
+                if history
+                    .iter()
+                    .any(|event| event.event_type == "turn.completed")
+                {
+                    return history;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Codex's own turn was not journalled");
+        let started = history
+            .iter()
+            .find(|event| event.event_type == "turn.started")
+            .unwrap();
+        assert_eq!(started.payload["trigger"], "provider");
+        assert_eq!(started.payload["triggerDetail"]["kind"], "goal");
+        let turn = started.payload["turnId"].clone();
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "message.delta"
+                && event.payload["turnId"] == turn
+                && event.payload.to_string().contains("working on the goal")));
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "goal.updated"
+                && event.payload["goal"]["objective"] == "ship it"));
+        wait_until_idle(&supervisor).await;
+        assert_eq!(
+            supervisor
+                .goal_owned("local", &manifest.id, GoalRequest::Clear)
+                .await
+                .unwrap(),
+            Value::Null
+        );
+        let last_goal = store
+            .complete_history(&manifest.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .rfind(|event| event.event_type == "goal.updated")
+            .unwrap();
+        assert!(last_goal.payload["goal"].is_null());
+        supervisor.shutdown_all().await;
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7725,6 +7923,21 @@ elif [ "$mode" = "app-server" ]; then
         ;;
       *'"method":"thread/fork"'*)
         printf '{"id":"fork","result":{"thread":{"id":"codex-fork-native"}}}\n'
+        ;;
+      *'"method":"thread/goal/set"'*)
+        # Like Codex, an active goal starts a turn of its own at once.
+        id=$(extract_id "$line")
+        goal='{"threadId":"codex-native","objective":"ship it","status":"active","tokenBudget":null,"tokensUsed":0,"timeUsedSeconds":0,"createdAt":1,"updatedAt":1}'
+        printf '{"id":"%s","result":{"goal":%s}}\n' "$id" "$goal"
+        printf '{"method":"thread/goal/updated","params":{"threadId":"codex-native","turnId":null,"goal":%s}}\n' "$goal"
+        printf '{"method":"turn/started","params":{"threadId":"codex-native","turn":{"id":"goal-turn","status":"inProgress"}}}\n'
+        printf '{"method":"item/agentMessage/delta","params":{"threadId":"codex-native","turnId":"goal-turn","itemId":"goal-item","delta":"working on the goal"}}\n'
+        printf '{"method":"turn/completed","params":{"threadId":"codex-native","turn":{"id":"goal-turn","status":"completed"}}}\n'
+        ;;
+      *'"method":"thread/goal/clear"'*)
+        id=$(extract_id "$line")
+        printf '{"id":"%s","result":{"cleared":true}}\n' "$id"
+        printf '{"method":"thread/goal/cleared","params":{"threadId":"codex-native"}}\n'
         ;;
       *'"method":"thread/compact/start"'*)
         printf '{"id":"compact","result":{}}\n'

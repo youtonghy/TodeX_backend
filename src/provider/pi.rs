@@ -534,9 +534,14 @@ impl ProviderDriver for PiDriver {
         true
     }
 
+    fn supports_compact_instructions(&self) -> bool {
+        true
+    }
+
     async fn compact_session(
         &self,
         context: DriverContext,
+        instructions: Option<String>,
         mut cancel: watch::Receiver<bool>,
     ) -> Result<(), AppError> {
         self.ensure_no_background(&context.manifest.id).await?;
@@ -548,7 +553,11 @@ impl ProviderDriver for PiDriver {
             rpc.process.send(&json!({"id":"state","type":"get_state"})).await?;
             let state = rpc.wait_response("state").await?;
             verify_pi_session(&state, context.provider_state.native_session_id.as_deref())?;
-            rpc.process.send(&json!({"id":"compact","type":"compact"})).await?;
+            let mut compact = json!({"id":"compact","type":"compact"});
+            if let Some(instructions) = instructions {
+                compact["customInstructions"] = json!(instructions);
+            }
+            rpc.process.send(&compact).await?;
             tokio::select! {
                 response = rpc.wait_response_for("compact", super::process::compact_timeout()?) => { response?; Ok(()) },
                 _ = cancel.changed() => Err(AppError::TurnCancelled),
@@ -4601,9 +4610,20 @@ mod tests {
         let (_cancel, cancel) = watch::channel(false);
         fixture
             .driver
-            .compact_session(context.clone(), cancel)
+            .compact_session(
+                context.clone(),
+                Some("Keep the API notes".to_owned()),
+                cancel,
+            )
             .await
             .unwrap();
+        let commands = tokio::fs::read_to_string(fixture.root.join("pi-commands"))
+            .await
+            .unwrap();
+        assert!(commands.lines().any(|line| {
+            let command: Value = serde_json::from_str(line).unwrap();
+            command["type"] == "compact" && command["customInstructions"] == "Keep the API notes"
+        }));
         let cloned = fixture.driver.fork_session(context).await.unwrap();
         assert_eq!(cloned.native_session_id.as_deref(), Some("cloned-session"));
         let mut missing = fixture
@@ -5201,7 +5221,10 @@ mod tests {
         let (context, _) = fixture.turn_parts("unused", "unused").await;
         let (_cancel, receiver) = watch::channel(false);
         assert!(matches!(
-            fixture.driver.compact_session(context, receiver).await,
+            fixture
+                .driver
+                .compact_session(context, None, receiver)
+                .await,
             Err(AppError::Conflict(_))
         ));
         let lost_work = tokio::time::timeout(Duration::from_secs(5), lost.recv())

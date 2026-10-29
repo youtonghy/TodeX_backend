@@ -38,6 +38,7 @@
         "followUp",
         "retry"
       ],
+      "compactInstructions": false,
       "steering": false,
       "liveConfiguration": false,
       "followUpQueue": false,
@@ -98,8 +99,10 @@
         "followUp",
         "retry",
         "fork",
-        "compact"
+        "compact",
+        "goal"
       ],
+      "compactInstructions": false,
       "controlProbe": {
         "status": "unavailable",
         "source": "installed-schema",
@@ -155,6 +158,7 @@
         "fork",
         "compact"
       ],
+      "compactInstructions": true,
       "steering": true,
       "liveConfiguration": true,
       "followUpQueue": true,
@@ -230,6 +234,7 @@
         "retry",
         "fork"
       ],
+      "compactInstructions": false,
       "steering": false,
       "liveConfiguration": false,
       "followUpQueue": false,
@@ -617,6 +622,7 @@
         "retry",
         "fork"
       ],
+      "compactInstructions": false,
       "steering": true,
       "liveConfiguration": true,
       "followUpQueue": false,
@@ -665,6 +671,7 @@
         "followUp",
         "retry"
       ],
+      "compactInstructions": false,
       "steering": true,
       "liveConfiguration": true,
       "followUpQueue": false,
@@ -719,6 +726,7 @@
         "retry",
         "fork"
       ],
+      "compactInstructions": false,
       "steering": true,
       "liveConfiguration": true,
       "followUpQueue": false,
@@ -771,6 +779,7 @@
         "followUp",
         "retry"
       ],
+      "compactInstructions": false,
       "steering": false,
       "liveConfiguration": false,
       "followUpQueue": false,
@@ -820,6 +829,7 @@
         "followUp",
         "retry"
       ],
+      "compactInstructions": false,
       "steering": true,
       "liveConfiguration": true,
       "followUpQueue": false,
@@ -874,6 +884,7 @@
         "retry",
         "fork"
       ],
+      "compactInstructions": false,
       "steering": true,
       "liveConfiguration": true,
       "followUpQueue": false,

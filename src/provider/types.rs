@@ -174,6 +174,8 @@ pub struct ProviderCapabilitySnapshot {
     #[serde(flatten)]
     pub declared: ProviderCapabilities,
     pub control_actions: Vec<&'static str>,
+    /// `conversation.compact` accepts `instructions` for the summary.
+    pub compact_instructions: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_probe: Option<Value>,
     pub steering: bool,
@@ -235,7 +237,12 @@ impl ProviderSnapshot {
             if driver.supports_native_compact() {
                 actions.push("compact");
             }
+            if driver.supports_goal() {
+                actions.push("goal");
+            }
         }
+        let compact_instructions =
+            actions.contains(&"compact") && driver.supports_compact_instructions();
         Self {
             id: descriptor.id,
             display_name: descriptor.display_name,
@@ -244,6 +251,7 @@ impl ProviderSnapshot {
             profiles: descriptor.profiles,
             capabilities: ProviderCapabilitySnapshot {
                 declared: descriptor.capabilities,
+                compact_instructions,
                 control_actions: actions,
                 control_probe: driver.control_probe(),
                 steering: live_controls,
@@ -308,6 +316,18 @@ impl std::fmt::Debug for TurnHandles {
             .field("adopt", &self.adopt)
             .finish()
     }
+}
+
+/// `conversation.goal`: the long-running objective a provider pursues
+/// across turns on its own (Codex `thread/goal/*`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub enum GoalRequest {
+    Get,
+    Set { objective: String },
+    Pause,
+    Resume,
+    Clear,
 }
 
 /// Work a provider started on its own between turns, to be journalled as a
@@ -1396,9 +1416,16 @@ pub trait ProviderDriver: Send + Sync {
         false
     }
 
+    /// Whether `compact_session` honours summarization instructions.
+    fn supports_compact_instructions(&self) -> bool {
+        false
+    }
+
+    /// `instructions` is only `Some` when `supports_compact_instructions`.
     async fn compact_session(
         &self,
         _context: DriverContext,
+        _instructions: Option<String>,
         _cancel: watch::Receiver<bool>,
     ) -> Result<(), AppError> {
         Err(AppError::Unsupported(
@@ -1408,6 +1435,28 @@ pub trait ProviderDriver: Send + Sync {
 
     fn supports_native_fork(&self) -> bool {
         false
+    }
+
+    /// Whether `goal` runs: the provider keeps working toward a goal on its
+    /// own, through provider-initiated turns.
+    fn supports_goal(&self) -> bool {
+        false
+    }
+
+    /// Reads or changes the conversation's goal and returns it (`null`
+    /// when none is set). `context.handles.provider_work` opens the turns
+    /// the provider starts for it; `settings` are the launch settings those
+    /// turns report; `sink` journals goal changes.
+    async fn goal(
+        &self,
+        _context: DriverContext,
+        _settings: DriverPrompt,
+        _sink: DriverEventSink,
+        _request: GoalRequest,
+    ) -> Result<Value, AppError> {
+        Err(AppError::Unsupported(
+            "This provider has no native goal.".to_owned(),
+        ))
     }
 
     async fn fork_session(&self, _context: DriverContext) -> Result<ProviderState, AppError> {

@@ -108,6 +108,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.resume"
             | "conversation.fork"
             | "conversation.compact"
+            | "conversation.goal"
             | "conversation.control"
             | "conversation.cancel"
             | "conversation.interrupt"
@@ -4091,11 +4092,31 @@ async fn dispatch_lane_command(
             let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             let operation_id = state
                 .conversations
-                .compact_owned(owner_id, &request.conversation_id, &command.id)
+                .compact_owned(
+                    owner_id,
+                    &request.conversation_id,
+                    &command.id,
+                    request.instructions,
+                )
                 .await?;
             Ok(
                 json!({ "conversationId": request.conversation_id, "operationId": operation_id, "started": true }),
             )
+        }
+        "conversation.goal" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct GoalCommand {
+                conversation_id: String,
+                #[serde(flatten)]
+                request: crate::provider::types::GoalRequest,
+            }
+            let request: GoalCommand = Deserialize::deserialize(&command.payload)?;
+            let goal = state
+                .conversations
+                .goal_owned(owner_id, &request.conversation_id, request.request)
+                .await?;
+            Ok(json!({ "conversationId": request.conversation_id, "goal": goal }))
         }
         "conversation.fork" => {
             let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
@@ -4799,6 +4820,10 @@ struct WsConversationRequest {
     /// `conversation.cancel` / `interrupt` / `stop`: stop only this turn.
     #[serde(default)]
     turn_id: Option<String>,
+    /// `conversation.compact`: instructions for the summary, where the
+    /// provider's `compactInstructions` capability allows them.
+    #[serde(default)]
+    instructions: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

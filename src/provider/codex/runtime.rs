@@ -1,5 +1,8 @@
 //! One process and one stdout consumer per native Codex session.
-use super::super::types::{PendingProviderControl, ProviderControl, ProviderPrewarm};
+use super::super::types::{
+    GoalRequest, PendingProviderControl, ProviderControl, ProviderPrewarm, ProviderWork,
+    ProviderWorkHandle,
+};
 use super::*;
 use std::{
     collections::{HashMap, VecDeque},
@@ -27,9 +30,19 @@ pub(super) struct Warm {
     pub sink: DriverEventSink,
 }
 
+/// `conversation.goal`: prepares the thread if needed, then reads or changes
+/// its goal.
+pub(super) struct GoalRun {
+    pub context: DriverContext,
+    pub settings: DriverPrompt,
+    pub sink: DriverEventSink,
+    pub request: GoalRequest,
+}
+
 enum Command {
     Run(Run, oneshot::Sender<Result<DriverTurnResult, AppError>>),
     Warm(Warm, oneshot::Sender<Result<(), AppError>>),
+    Goal(GoalRun, oneshot::Sender<Result<Value, AppError>>),
     Control(PendingProviderControl),
     Shutdown(oneshot::Sender<()>),
 }
@@ -63,6 +76,32 @@ impl Sessions {
         let (tx, rx) = oneshot::channel();
         sender
             .send(Command::Run(run, tx))
+            .await
+            .map_err(|_| unavailable())?;
+        rx.await.map_err(|_| unavailable())?
+    }
+
+    /// Runs a goal command on the conversation's worker, starting one if
+    /// needed: an active goal keeps Codex working after the command.
+    pub async fn goal(&self, binary: &str, goal: GoalRun) -> Result<Value, AppError> {
+        let id = goal.context.manifest.id.clone();
+        let sender = {
+            let mut workers = self.workers.lock().await;
+            workers.retain(|_, worker| !worker.is_closed());
+            if workers.len() >= MAX_WORKERS && !workers.contains_key(&id) {
+                return Err(AppError::Unsupported(
+                    "Codex has reached the active worker limit; close an idle session first"
+                        .to_owned(),
+                ));
+            }
+            workers
+                .entry(id)
+                .or_insert_with(|| spawn_worker(binary.to_owned()))
+                .clone()
+        };
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(Command::Goal(goal, tx))
             .await
             .map_err(|_| unavailable())?;
         rx.await.map_err(|_| unavailable())?
@@ -196,16 +235,40 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
     // The prewarm's thread response and settings: the next turn journals
     // its `turn.configuration` (a muted warm journals nothing).
     let mut warm_configuration: Option<(Value, DriverPrompt)> = None;
+    // A turn Codex starts on its own (an active goal continues) opens a
+    // provider-initiated turn with these: the handle and launch settings of
+    // the last user turn or goal command.
+    let mut provider_work: Option<(ProviderWorkHandle, DriverPrompt)> = None;
+    // Offered to the supervisor: the turn's frames stay unread until the
+    // provider-initiated turn takes it over or the offer expires.
+    let mut awaiting: Option<AwaitedTurn> = None;
+    // A Codex turn no TodeX turn took over, journalled between turns.
+    let mut unadopted: Option<String> = None;
+    // Journals goal changes that arrive between turns.
+    let mut goal_sink: Option<DriverEventSink> = None;
     loop {
         let command = if let Some(process) = process.as_mut() {
+            let offer_deadline = awaiting.as_ref().map(|turn| turn.deadline);
             tokio::select! {
                 command = commands.recv() => command,
-                message = process.read() => {
+                message = process.read(), if awaiting.is_none() => {
                     match message {
                         Ok(Some(message)) => {
+                            if message.get("method").and_then(Value::as_str) == Some("turn/started") {
+                                let turn = message.pointer("/params/turn/id").and_then(Value::as_str).map(ToOwned::to_owned);
+                                if let Some(offer) = turn.filter(|turn| unadopted.as_ref() != Some(turn)).and_then(|turn| offer_codex_turn(provider_work.as_ref(), turn)) {
+                                    process.unread([message]);
+                                    awaiting = Some(offer);
+                                    continue;
+                                }
+                            }
                             if message.get("id").is_some() && message.get("method").is_some() {
                                 // No active user turn exists to own a new permission dialog.
                                 let _ = process.send(&json!({"id":message["id"],"error":{"code":-32000,"message":"TodeX session is idle"}})).await;
+                            } else if let Some(goal) = codex_goal_event(&message) {
+                                if let Some(sink) = goal_sink.as_ref().or(last_sink.as_ref()) {
+                                    let _ = sink.emit("goal.updated", goal).await;
+                                }
                             } else if let Some(sink) = &last_sink {
                                 let _ = sink.emit("provider.event", json!({"provider":"codex", "providerMethod":message.get("method"), "metadata":message.get("params")})).await;
                             }
@@ -214,7 +277,14 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                         _ => break,
                     }
                 }
-                _ = tokio::time::sleep(idle_timeout) => break,
+                _ = tokio::time::sleep_until(offer_deadline.unwrap_or_else(tokio::time::Instant::now)), if offer_deadline.is_some() => {
+                    if let Some(turn) = awaiting.take() {
+                        tracing::warn!("no turn took over Codex's own turn; journalling it between turns");
+                        unadopted = Some(turn.native_turn);
+                    }
+                    continue;
+                }
+                _ = tokio::time::sleep(idle_timeout), if awaiting.is_none() => break,
             }
         } else {
             commands.recv().await
@@ -230,6 +300,37 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                 if *cancel.borrow() {
                     let _ = respond.send(Err(AppError::TurnCancelled));
                     continue;
+                }
+                let adopt = match (&context.handles.adopt, &awaiting) {
+                    (Some(token), Some(turn)) if *token == turn.adoption => {
+                        awaiting = None;
+                        true
+                    }
+                    // The turn it was opened for is gone (journalled without
+                    // one, or the process restarted): nothing to take over.
+                    (Some(_), _) => {
+                        let _ = respond.send(Ok(DriverTurnResult {
+                            native_session_id: native_thread.clone(),
+                            stop_reason: "no_work".to_owned(),
+                            cancelled: false,
+                        }));
+                        continue;
+                    }
+                    (None, Some(_)) => {
+                        let _ = respond.send(Err(AppError::Conflict(
+                            "Codex started a turn of its own; wait for it to finish".to_owned(),
+                        )));
+                        continue;
+                    }
+                    (None, None) => false,
+                };
+                if !adopt {
+                    provider_work = context
+                        .handles
+                        .provider_work
+                        .clone()
+                        .map(|handle| (handle, provider_turn_settings(&prompt)))
+                        .or(provider_work.take());
                 }
                 if process.is_none() {
                     match spawn_app_server(&binary, &context).await {
@@ -273,6 +374,7 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                         &mut cancel,
                         &mut commands,
                         &mut known_queue,
+                        adopt,
                     )
                     .await
                 }
@@ -325,6 +427,62 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                     }
                 }
             }
+            Some(Command::Goal(goal, respond)) => {
+                let GoalRun {
+                    context,
+                    settings,
+                    sink,
+                    request,
+                } = goal;
+                if process.is_none() {
+                    match spawn_app_server(&binary, &context).await {
+                        Ok(child) => process = Some(child),
+                        Err(error) => {
+                            let _ = respond.send(Err(error));
+                            break;
+                        }
+                    }
+                }
+                let child = process.as_mut().expect("spawned process");
+                if let Some(handle) = context.handles.provider_work.clone() {
+                    provider_work = Some((handle, provider_turn_settings(&settings)));
+                }
+                if native_thread.is_none() {
+                    let (_cancel_tx, mut cancel) = watch::channel(false);
+                    match super::prepare_codex_thread(child, context, &settings, &sink, &mut cancel)
+                        .await
+                    {
+                        Ok(prepared) => {
+                            native_thread = Some(prepared.thread);
+                            native_model = prepared.model;
+                            warm_state = prepared.state;
+                        }
+                        Err(error) => {
+                            let _ = respond.send(Err(error));
+                            break;
+                        }
+                    }
+                }
+                // An active goal starts a turn at once, which resumes this
+                // thread: a new one is saved first.
+                if let Some(state) = warm_state.take() {
+                    if let Err(error) = sink.save_provider_state(state).await {
+                        let _ = respond.send(Err(error));
+                        continue;
+                    }
+                }
+                goal_sink = Some(sink.clone());
+                let thread = native_thread.clone().expect("prepared thread");
+                let result = codex_goal(child, &thread, &request).await;
+                if let Ok(goal) = &result {
+                    if request != GoalRequest::Get {
+                        let _ = sink
+                            .emit("goal.updated", json!({"provider":"codex","goal":goal}))
+                            .await;
+                    }
+                }
+                let _ = respond.send(result);
+            }
             Some(Command::Control(control)) => {
                 let _ = control.respond_to.send(Err(inactive()));
             }
@@ -347,6 +505,9 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                 let _ = reply.send(Err(unavailable()));
             }
             Command::Warm(_, reply) => {
+                let _ = reply.send(Err(unavailable()));
+            }
+            Command::Goal(_, reply) => {
                 let _ = reply.send(Err(unavailable()));
             }
             Command::Control(control) => {
@@ -387,6 +548,9 @@ async fn active_turn(
     cancel: &mut watch::Receiver<bool>,
     commands: &mut mpsc::Receiver<Command>,
     known_queue: &mut VecDeque<Value>,
+    // Take over the turn Codex started on its own, whose `turn/started` is
+    // the next frame, instead of starting one.
+    adopt: bool,
 ) -> Result<DriverTurnResult, AppError> {
     let controls = resolve_execution_config(
         ProviderKind::Codex,
@@ -396,44 +560,55 @@ async fn active_turn(
         prompt.sandbox_mode.as_deref(),
         prompt.approval_policy.as_deref(),
     )?;
-    let start_id = format!("todex-start-{}", uuid::Uuid::new_v4());
-    let mut params = json!({
-        "threadId": thread, "input": codex_prompt_input(prompt), "model": prompt.model,
-        "effort": prompt.reasoning_effort, "approvalPolicy": controls.approval_policy,
-        "approvalsReviewer": controls.approvals_reviewer,
-        "sandboxPolicy": codex_sandbox_policy(controls.sandbox_mode.as_deref())
-    });
-    let selected_model = prompt.model.as_ref().or(native_model.as_ref());
-    if let Some(model) = selected_model.filter(|_| prompt.work_mode.is_some()) {
-        params["collaborationMode"] = json!({
-            "mode": if controls.work_mode == "plan" { "plan" } else { "default" },
-            "settings": { "model": model, "reasoning_effort": prompt.reasoning_effort, "developer_instructions": null }
-        });
-    } else if controls.work_mode == "plan" {
-        return Err(AppError::Unsupported(
-            "Codex Plan mode requires a provider-confirmed or selected model".to_owned(),
-        ));
-    }
-    if let Some(model) = &prompt.model {
-        *native_model = Some(model.clone());
-    }
-    let start = json!({"id": start_id, "method": "turn/start", "params": params});
-    match state_to_save {
-        // A new native thread is saved while the provider gets the turn.
-        Some(state) => {
-            let (sent, saved) = tokio::join!(process.send(&start), sink.save_provider_state(state));
-            saved?;
-            sent?;
+    let mut start_request = None;
+    if adopt {
+        if let Some(state) = state_to_save {
+            sink.save_provider_state(state).await?;
         }
-        None => process.send(&start).await?,
+    } else {
+        let start_id = format!("todex-start-{}", uuid::Uuid::new_v4());
+        let mut params = json!({
+            "threadId": thread, "input": codex_prompt_input(prompt), "model": prompt.model,
+            "effort": prompt.reasoning_effort, "approvalPolicy": controls.approval_policy,
+            "approvalsReviewer": controls.approvals_reviewer,
+            "sandboxPolicy": codex_sandbox_policy(controls.sandbox_mode.as_deref())
+        });
+        let selected_model = prompt.model.as_ref().or(native_model.as_ref());
+        if let Some(model) = selected_model.filter(|_| prompt.work_mode.is_some()) {
+            params["collaborationMode"] = json!({
+                "mode": if controls.work_mode == "plan" { "plan" } else { "default" },
+                "settings": { "model": model, "reasoning_effort": prompt.reasoning_effort, "developer_instructions": null }
+            });
+        } else if controls.work_mode == "plan" {
+            return Err(AppError::Unsupported(
+                "Codex Plan mode requires a provider-confirmed or selected model".to_owned(),
+            ));
+        }
+        if let Some(model) = &prompt.model {
+            *native_model = Some(model.clone());
+        }
+        let start = json!({"id": start_id, "method": "turn/start", "params": params});
+        match state_to_save {
+            // A new native thread is saved while the provider gets the turn.
+            Some(state) => {
+                let (sent, saved) =
+                    tokio::join!(process.send(&start), sink.save_provider_state(state));
+                saved?;
+                sent?;
+            }
+            None => process.send(&start).await?,
+        }
+        start_request = Some(start_id);
     }
-    let mut start_request = Some(start_id);
     let mut queued_start: Option<Value> = None;
     let mut start_deadline =
         tokio::time::Instant::now() + super::super::process::control_timeout()?;
     let mut native_turn: Option<String> = None;
     let mut terminal: Option<String> = None;
     let mut pending = HashMap::<String, Pending>::new();
+    // Goal commands sent during the turn, by request id.
+    let mut goals =
+        HashMap::<String, (GoalRequest, oneshot::Sender<Result<Value, AppError>>)>::new();
     let mut queue = VecDeque::<Value>::new();
     let mut control_ordinal = 0_u64;
     let mut queue_order = HashMap::<String, u64>::new();
@@ -454,6 +629,7 @@ async fn active_turn(
         if start_request.is_none()
             && terminal.is_some()
             && pending.is_empty()
+            && goals.is_empty()
             && (!interrupted || interrupt_ack)
         {
             let status = terminal.take().unwrap();
@@ -528,6 +704,15 @@ async fn active_turn(
                     process.terminate().await; let _ = done.send(()); return Err(AppError::TurnCancelled);
                 }
                 Some(Command::Run(_, reply)) => { let _ = reply.send(Err(AppError::Unsupported("Codex session already has an active turn".to_owned()))); }
+                // A goal can be paused or changed while Codex works on it.
+                Some(Command::Goal(goal, reply)) => {
+                    let id = format!("todex-goal-{}", uuid::Uuid::new_v4());
+                    let (method, params) = goal_method(thread, &goal.request);
+                    if let Err(error) = process.send(&json!({"id":id,"method":method,"params":params})).await {
+                        let _ = reply.send(Err(error)); return Err(unavailable());
+                    }
+                    goals.insert(id, (goal.request, reply));
+                }
                 // The thread is already prepared.
                 Some(Command::Warm(_, reply)) => { let _ = reply.send(Ok(())); }
                 None => return Err(unavailable()),
@@ -579,6 +764,13 @@ async fn active_turn(
                             sink.emit("provider.event",json!({"provider":"codex","providerMethod":"turn/interrupt","metadata":{"error":error}})).await?;
                         }
                         interrupt_ack = true; continue;
+                    }
+                    if let Some((request, reply)) = goals.remove(id) {
+                        let result = goal_result(&request, &message);
+                        if let (Ok(goal), false) = (&result, request == GoalRequest::Get) {
+                            sink.emit("goal.updated", json!({"provider":"codex","goal":goal})).await?;
+                        }
+                        let _ = reply.send(result); continue;
                     }
                     if let Some(mut p) = pending.remove(id) {
                         let result = if let Some(error) = message.get("error") { Err(rpc_error(error)) } else {
@@ -656,6 +848,10 @@ async fn active_turn(
                     } else { process.send(&json!({"id":request_id,"error":{"code":-32601,"message":"request is not supported by TodeX"}})).await?; }
                     continue;
                 }
+                if let Some(goal) = codex_goal_event(&message) {
+                    sink.emit("goal.updated", goal).await?;
+                    continue;
+                }
                 if matches!(method, "item/started" | "item/completed") {
                     if let (Some(id), Some(phase)) = (params.pointer("/item/id").and_then(Value::as_str),params.pointer("/item/phase").and_then(Value::as_str)) {
                         item_phases.insert(id.to_owned(),phase.to_owned());
@@ -671,6 +867,128 @@ async fn active_turn(
             }
         }
     }
+}
+
+/// A turn Codex started on its own, offered as a provider-initiated turn.
+struct AwaitedTurn {
+    adoption: String,
+    native_turn: String,
+    deadline: tokio::time::Instant,
+}
+
+/// How long an offered turn waits for the supervisor to open its TodeX turn.
+const ADOPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Asks the supervisor to open a provider-initiated turn for `native_turn`;
+/// `None` when no turn can be opened (no handle yet).
+fn offer_codex_turn(
+    provider_work: Option<&(ProviderWorkHandle, DriverPrompt)>,
+    native_turn: String,
+) -> Option<AwaitedTurn> {
+    let (handle, settings) = provider_work?;
+    let adoption = uuid::Uuid::new_v4().simple().to_string();
+    let work = ProviderWork {
+        adoption: adoption.clone(),
+        settings: settings.clone(),
+        trigger: json!({ "kind": "goal" }),
+    };
+    let handle = handle.clone();
+    tokio::spawn(async move {
+        if let Err(error) = handle.start(work).await {
+            tracing::warn!(%error, "could not open a turn for Codex's own turn");
+        }
+    });
+    Some(AwaitedTurn {
+        adoption,
+        native_turn,
+        deadline: tokio::time::Instant::now() + ADOPT_TIMEOUT,
+    })
+}
+
+/// The launch settings a later provider-initiated turn reports.
+fn provider_turn_settings(prompt: &DriverPrompt) -> DriverPrompt {
+    DriverPrompt {
+        text: String::new(),
+        content: Vec::new(),
+        skills: Vec::new(),
+        ..prompt.clone()
+    }
+}
+
+/// `goal.updated` for a Codex goal notification.
+fn codex_goal_event(message: &Value) -> Option<Value> {
+    match message.get("method").and_then(Value::as_str)? {
+        "thread/goal/updated" => Some(json!({
+            "provider": "codex",
+            "goal": message.pointer("/params/goal"),
+            "nativeTurnId": message.pointer("/params/turnId"),
+        })),
+        "thread/goal/cleared" => Some(json!({ "provider": "codex", "goal": null })),
+        _ => None,
+    }
+}
+
+fn goal_method(thread: &str, request: &GoalRequest) -> (&'static str, Value) {
+    let set = |fields: Value| {
+        let mut params = json!({ "threadId": thread, "origin": "user" });
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        ("thread/goal/set", params)
+    };
+    match request {
+        GoalRequest::Get => ("thread/goal/get", json!({ "threadId": thread })),
+        GoalRequest::Clear => ("thread/goal/clear", json!({ "threadId": thread })),
+        GoalRequest::Set { objective } => {
+            set(json!({ "objective": objective, "status": "active" }))
+        }
+        GoalRequest::Pause => set(json!({ "status": "paused" })),
+        GoalRequest::Resume => set(json!({ "status": "active" })),
+    }
+}
+
+/// The goal a goal response leaves (`null` when none or cleared).
+fn goal_result(request: &GoalRequest, message: &Value) -> Result<Value, AppError> {
+    if let Some(error) = message.get("error") {
+        return Err(rpc_error(error));
+    }
+    if *request == GoalRequest::Clear {
+        return Ok(Value::Null);
+    }
+    Ok(message
+        .pointer("/result/goal")
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+/// Runs a goal command while no turn is active. Frames that arrive before
+/// its response (an active goal starts a turn at once) are handed back for
+/// the worker to read.
+async fn codex_goal(
+    process: &mut JsonLineProcess,
+    thread: &str,
+    request: &GoalRequest,
+) -> Result<Value, AppError> {
+    let id = format!("todex-goal-{}", uuid::Uuid::new_v4());
+    let (method, params) = goal_method(thread, request);
+    process
+        .send(&json!({ "id": id, "method": method, "params": params }))
+        .await?;
+    let deadline = tokio::time::Instant::now() + super::super::process::control_timeout()?;
+    let mut held = Vec::new();
+    let result = loop {
+        match process.read_control_until(deadline).await {
+            Ok(Some(message)) if message.get("id").and_then(Value::as_str) == Some(id.as_str()) => {
+                break goal_result(request, &message);
+            }
+            Ok(Some(message)) => held.push(message),
+            Ok(None) => break Err(unavailable()),
+            Err(error) => break Err(error),
+        }
+    };
+    process.unread(held);
+    result
 }
 
 fn cancelled_permission(method: &str, params: &Value) -> Value {

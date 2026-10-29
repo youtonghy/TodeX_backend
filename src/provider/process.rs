@@ -204,6 +204,8 @@ pub struct JsonLineProcess {
     stdout_pending: Vec<u8>,
     /// Bytes skipped so far of an oversized line whose end has not arrived.
     stdout_discarding: Option<usize>,
+    /// Frames handed back with [`Self::unread`], read again before stdout.
+    unread: VecDeque<Value>,
     /// The last MAX_STDERR_BYTES of stderr, as a ring buffer.
     stderr: Arc<Mutex<VecDeque<u8>>>,
     stderr_task: JoinHandle<()>,
@@ -277,6 +279,7 @@ impl JsonLineProcess {
             stdout: BufReader::new(stdout),
             stdout_pending: Vec::new(),
             stdout_discarding: None,
+            unread: VecDeque::new(),
             stderr,
             stderr_task,
             pid,
@@ -386,6 +389,9 @@ impl JsonLineProcess {
     /// The next stdout line, classified. `None` is end of stream. Cancel-safe:
     /// partial lines and oversized-line progress stay with the process.
     pub async fn read_frame(&mut self) -> Result<Option<ProviderRead>, AppError> {
+        if let Some(frame) = self.unread.pop_front() {
+            return Ok(Some(ProviderRead::Frame(frame)));
+        }
         let line = read_bounded_line(
             &mut self.stdout,
             &mut self.stdout_pending,
@@ -394,6 +400,17 @@ impl JsonLineProcess {
         )
         .await?;
         Ok(line.map(classify_line))
+    }
+
+    /// Puts frames already read back in front of stdout, in their order, for
+    /// the next reader (e.g. the turn that takes over work they belong to).
+    pub fn unread(
+        &mut self,
+        frames: impl IntoIterator<Item = Value, IntoIter: DoubleEndedIterator>,
+    ) {
+        for frame in frames.into_iter().rev() {
+            self.unread.push_front(frame);
+        }
     }
 
     /// Stops the provider and, on Unix, every process in its group.
