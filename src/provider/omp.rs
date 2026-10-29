@@ -472,7 +472,10 @@ mod tests {
             std::env::temp_dir().join(format!("todex-omp-launch-{}", uuid::Uuid::new_v4()));
         let driver = OmpDriver::new(&crate::config::Config::default().agent, &data_dir);
         let spec = driver.command_spec(Path::new("/workspace")).unwrap();
-        let overlay = data_dir.join("providers/omp/todex.config.yml");
+        let overlay = data_dir
+            .join("providers")
+            .join("omp")
+            .join("todex.config.yml");
         assert_eq!(
             spec.args,
             [
