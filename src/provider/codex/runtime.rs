@@ -1458,8 +1458,21 @@ done
             let cancel = cancel.clone();
             tokio::spawn(async move { driver.run_turn(context, prompt, sink, cancel).await })
         };
+        // `ready` only says the fake wrote the turn; the commentary delta is
+        // journalled after the worker read the start acknowledgement, which
+        // is when controls can target the native turn.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !root.join("ready").exists() {
+            loop {
+                let started = root.join("ready").exists()
+                    && store
+                        .complete_history(&manifest.id)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|event| event.event_type == "message.delta");
+                if started {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
