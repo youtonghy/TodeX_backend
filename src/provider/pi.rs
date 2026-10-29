@@ -1334,8 +1334,13 @@ async fn pi_session_worker(
                 }
             }
             // The turn's prompt is now the last user entry on Pi's branch:
-            // its id is where a later fork from this reply restarts.
-            if !adopt
+            // its id is where a later fork from this reply restarts. Skipped
+            // while background subagents may start Pi's own runs: that
+            // exchange must not interleave with them.
+            let quiet =
+                !rpc.subagents.running() && rpc.subagents.report_due_until(REPORT_GRACE).is_none();
+            if quiet
+                && !adopt
                 && shutdown.borrow().is_none()
                 && result.as_ref().is_ok_and(|done| !done.cancelled)
             {
