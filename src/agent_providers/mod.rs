@@ -16,6 +16,7 @@ mod dsh;
 pub(crate) mod files;
 mod grok;
 mod model_fetch;
+mod omp;
 mod opencode;
 pub(crate) mod pi;
 mod store;
@@ -53,13 +54,14 @@ pub const MAX_PROVIDER_TRANSFER_BYTES: usize =
     MAX_PROVIDERS_PER_AGENT * (MAX_PROVIDER_SETTINGS_BYTES + 16 * 1024);
 
 /// Agents that support managed providers in this first pass.
-pub const SUPPORTED_AGENTS: [ProviderKind; 6] = [
+pub const SUPPORTED_AGENTS: [ProviderKind; 7] = [
     ProviderKind::Codex,
     ProviderKind::ClaudeCode,
     ProviderKind::GrokBuild,
     ProviderKind::Pi,
     ProviderKind::Opencode,
     ProviderKind::DeepseekHarness,
+    ProviderKind::Omp,
 ];
 
 /// Sentinel written into responses in place of secret values. A write that
@@ -147,6 +149,8 @@ pub(crate) struct AgentDirs {
     /// `~/.omp/agent`. omp's directory overrides reuse Pi's variable names
     /// (`PI_CODING_AGENT_DIR`), which are set for Pi, so none is read.
     omp_dir: PathBuf,
+    /// The omp binary `omp config` runs through (`[agent].omp_bin`).
+    omp_bin: String,
     opencode_dir: PathBuf,
     dsh_home: PathBuf,
 }
@@ -171,6 +175,7 @@ impl AgentDirs {
             grok_home,
             pi_dir: env_dir("PI_CODING_AGENT_DIR", home.join(".pi").join("agent")),
             omp_dir: home.join(".omp").join("agent"),
+            omp_bin: "omp".to_owned(),
             opencode_dir: env_dir("XDG_CONFIG_HOME", home.join(".config")).join("opencode"),
             dsh_home: env_dir("DSH_HOME", home.join(".dsh")),
         }
@@ -188,6 +193,7 @@ impl AgentDirs {
             opencode_dir: root.join("opencode"),
             dsh_home: root.join("dsh"),
             omp_dir: root.join("omp"),
+            omp_bin: "omp".to_owned(),
             pi_dir,
         }
     }
@@ -203,6 +209,11 @@ impl AgentDirs {
     /// DeepSeek Harness's home (`$DSH_HOME` or `~/.dsh`).
     pub(crate) fn dsh_home(&self) -> &std::path::Path {
         &self.dsh_home
+    }
+
+    /// The configured omp binary.
+    pub(crate) fn omp_bin(&self) -> &str {
+        &self.omp_bin
     }
 
     /// omp's agent directory (`~/.omp/agent`).
@@ -345,6 +356,7 @@ pub struct AgentProviderService {
     store: AgentProviderStore,
     locks: [std::sync::Arc<Mutex<()>>; SUPPORTED_AGENTS.len()],
     dirs_override: Option<AgentDirs>,
+    omp_bin: Option<String>,
 }
 
 impl AgentProviderService {
@@ -357,11 +369,22 @@ impl AgentProviderService {
             store: AgentProviderStore::new(data_dir).await?,
             locks: std::array::from_fn(|_| std::sync::Arc::new(Mutex::new(()))),
             dirs_override: dirs,
+            omp_bin: None,
         })
     }
 
     fn dirs(&self) -> AgentDirs {
-        self.dirs_override.clone().unwrap_or_else(AgentDirs::detect)
+        let mut dirs = self.dirs_override.clone().unwrap_or_else(AgentDirs::detect);
+        if let Some(bin) = &self.omp_bin {
+            dirs.omp_bin = bin.clone();
+        }
+        dirs
+    }
+
+    /// The omp binary activation runs `omp config set` through.
+    pub fn with_omp_bin(mut self, omp_bin: String) -> Self {
+        self.omp_bin = Some(omp_bin);
+        self
     }
 
     fn lock_for(&self, agent: ProviderKind) -> &Mutex<()> {
@@ -1051,9 +1074,8 @@ fn projection(agent: ProviderKind) -> Option<ConfigProjection> {
         ProviderKind::Opencode => Some(ConfigProjection::Additive(&opencode::Projection)),
         ProviderKind::Pi => Some(ConfigProjection::Additive(&pi::Projection)),
         ProviderKind::DeepseekHarness => Some(ConfigProjection::Additive(&dsh::Projection)),
-        ProviderKind::Acp | ProviderKind::Devin | ProviderKind::Antigravity | ProviderKind::Omp => {
-            None
-        }
+        ProviderKind::Omp => Some(ConfigProjection::Additive(&omp::Projection)),
+        ProviderKind::Acp | ProviderKind::Devin | ProviderKind::Antigravity => None,
     }
 }
 
@@ -1411,6 +1433,7 @@ mod tests {
             grok_auth_path: root.join("grok").join("auth.json"),
             pi_dir: root.join("pi"),
             omp_dir: root.join("omp"),
+            omp_bin: "omp".to_owned(),
             opencode_dir: root.join("opencode"),
             dsh_home: root.join("dsh"),
         }

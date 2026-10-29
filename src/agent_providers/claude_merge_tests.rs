@@ -34,6 +34,7 @@ fn dirs_in(root: &Path) -> AgentDirs {
         grok_auth_path: root.join("grok").join("auth.json"),
         pi_dir: root.join("pi"),
         omp_dir: root.join("omp"),
+        omp_bin: "omp".to_owned(),
         opencode_dir: root.join("opencode"),
         dsh_home: root.join("dsh"),
     }

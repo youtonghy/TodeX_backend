@@ -351,17 +351,13 @@
     "tomlHeaderTables": null
   },
   "omp": {
-    "managed": false,
-    "additive": false,
+    "managed": true,
+    "additive": true,
     "readLive": {
       "error": "unsupported capability: omp is not an exclusive-mode agent"
     },
-    "additiveNodes": {
-      "error": "unsupported capability: omp is not an additive-mode agent"
-    },
-    "additiveSelection": {
-      "error": "unsupported capability: omp is not an additive-mode agent"
-    },
+    "additiveNodes": {},
+    "additiveSelection": null,
     "firstModel": null,
     "liveMatchesItself": false,
     "ownedPart": null,

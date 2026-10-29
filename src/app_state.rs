@@ -124,7 +124,9 @@ impl AppState {
         let workspaces =
             WorkspaceStore::new(config.data_dir.clone(), config.workspace_roots.clone()).await?;
         let kanban_tasks = KanbanTaskStore::new(config.data_dir.clone()).await?;
-        let agent_providers = AgentProviderService::new(config.data_dir.clone()).await?;
+        let agent_providers = AgentProviderService::new(config.data_dir.clone())
+            .await?
+            .with_omp_bin(config.agent.omp_bin.clone());
         remove_retired_workspace_trust(&config.data_dir).await;
         let ssh = SshService::new(&config.data_dir, config.agent.ssh_bin.clone()).await?;
         ssh.set_reserved_listeners(reserved_listeners(&config));
