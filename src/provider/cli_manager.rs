@@ -1199,8 +1199,8 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        compare_versions, extract_version, install_command, npm_install_args, strip_ansi, CliLocks,
-        CliManager, CliOperationAction, LatestRelease, ManagedCli, ProviderKind, ROW_CACHE_TTL,
+        compare_versions, extract_version, npm_install_args, strip_ansi, CliLocks, CliManager,
+        CliOperationAction, LatestRelease, ManagedCli, ProviderKind, ROW_CACHE_TTL,
     };
 
     #[test]
@@ -1218,6 +1218,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn omp_installs_the_prebuilt_binary() {
+        use super::install_command;
         let script = ManagedCli::Omp.install_script().unwrap();
         assert_eq!(
             install_command(&script),
