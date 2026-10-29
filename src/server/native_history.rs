@@ -281,6 +281,7 @@ mod tests {
         state.native_history.roots_override = Some(NativeRoots {
             claude_dir: claude_dir.clone(),
             pi_session_dir: pi_dir.clone(),
+            omp_session_dir: root.join("omp").join("sessions"),
             codex_home: root.join("codex"),
             grok_home: root.join("grok"),
             devin_dir: root.join("devin").join("cli"),
@@ -326,7 +327,10 @@ mod tests {
             .iter()
             .map(|provider| provider["provider"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["claude-code", "pi", "codex", "grok-build", "devin"]);
+        assert_eq!(
+            ids,
+            ["claude-code", "pi", "codex", "grok-build", "devin", "omp"]
+        );
         for (index, view, sizes) in [
             (0, true, true),
             (2, true, true),

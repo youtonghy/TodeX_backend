@@ -144,6 +144,9 @@ pub(crate) struct AgentDirs {
     grok_home: PathBuf,
     grok_auth_path: PathBuf,
     pi_dir: PathBuf,
+    /// `~/.omp/agent`. omp's directory overrides reuse Pi's variable names
+    /// (`PI_CODING_AGENT_DIR`), which are set for Pi, so none is read.
+    omp_dir: PathBuf,
     opencode_dir: PathBuf,
     dsh_home: PathBuf,
 }
@@ -167,6 +170,7 @@ impl AgentDirs {
             grok_auth_path: env_dir("GROK_AUTH_PATH", grok_home.join("auth.json")),
             grok_home,
             pi_dir: env_dir("PI_CODING_AGENT_DIR", home.join(".pi").join("agent")),
+            omp_dir: home.join(".omp").join("agent"),
             opencode_dir: env_dir("XDG_CONFIG_HOME", home.join(".config")).join("opencode"),
             dsh_home: env_dir("DSH_HOME", home.join(".dsh")),
         }
@@ -183,6 +187,7 @@ impl AgentDirs {
             grok_auth_path: root.join("grok").join("auth.json"),
             opencode_dir: root.join("opencode"),
             dsh_home: root.join("dsh"),
+            omp_dir: root.join("omp"),
             pi_dir,
         }
     }
@@ -198,6 +203,11 @@ impl AgentDirs {
     /// DeepSeek Harness's home (`$DSH_HOME` or `~/.dsh`).
     pub(crate) fn dsh_home(&self) -> &std::path::Path {
         &self.dsh_home
+    }
+
+    /// omp's agent directory (`~/.omp/agent`).
+    pub(crate) fn omp_dir(&self) -> &std::path::Path {
+        &self.omp_dir
     }
 
     /// Pi's agent directory (`$PI_CODING_AGENT_DIR` or `~/.pi/agent`).
@@ -1400,6 +1410,7 @@ mod tests {
             grok_home: root.join("grok"),
             grok_auth_path: root.join("grok").join("auth.json"),
             pi_dir: root.join("pi"),
+            omp_dir: root.join("omp"),
             opencode_dir: root.join("opencode"),
             dsh_home: root.join("dsh"),
         }

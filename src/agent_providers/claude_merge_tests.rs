@@ -33,6 +33,7 @@ fn dirs_in(root: &Path) -> AgentDirs {
         grok_home: root.join("grok"),
         grok_auth_path: root.join("grok").join("auth.json"),
         pi_dir: root.join("pi"),
+        omp_dir: root.join("omp"),
         opencode_dir: root.join("opencode"),
         dsh_home: root.join("dsh"),
     }

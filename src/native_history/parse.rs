@@ -45,6 +45,7 @@ pub(super) fn session_meta(
     match provider {
         NativeProvider::ClaudeCode => Some(claude_meta(head, tail)),
         NativeProvider::Pi => pi_meta(head, tail),
+        NativeProvider::Omp => omp_meta(head, tail),
         NativeProvider::Codex => codex_meta(head),
         // Grok reads `summary.json`, Devin lists through its CLI.
         NativeProvider::GrokBuild | NativeProvider::Devin => None,
@@ -59,7 +60,7 @@ pub(super) fn record_messages(
 ) {
     match provider {
         NativeProvider::ClaudeCode => claude_messages(record, out),
-        NativeProvider::Pi => pi_messages(record, out),
+        NativeProvider::Pi | NativeProvider::Omp => pi_messages(record, out),
         NativeProvider::Codex => codex_messages(record, out),
         // Grok merges chunks across records: see [`GrokTranscript`].
         NativeProvider::GrokBuild | NativeProvider::Devin => {}
@@ -159,6 +160,30 @@ fn pi_meta(head: &[String], tail: &[String]) -> Option<SessionMeta> {
         }
     }
     meta.title = name.or(first_user).and_then(|title| title_text(&title));
+    Some(meta)
+}
+
+/// An omp session file: Pi's layout behind a fixed-width
+/// `{"type":"title",…}` slot (legacy files start with the header). A title
+/// in the slot or the header wins over the first prompt.
+fn omp_meta(head: &[String], tail: &[String]) -> Option<SessionMeta> {
+    let slot = head
+        .first()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("title"));
+    let head = if slot.is_some() { &head[1..] } else { head };
+    let header_title = head
+        .first()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .and_then(|header| non_empty_str(header.get("title")));
+    let mut meta = pi_meta(head, tail)?;
+    if let Some(title) = slot
+        .and_then(|slot| non_empty_str(slot.get("title")))
+        .or(header_title)
+        .and_then(|title| title_text(&title))
+    {
+        meta.title = Some(title);
+    }
     Some(meta)
 }
 

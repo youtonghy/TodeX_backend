@@ -25,6 +25,7 @@ async fn fixture() -> Fixture {
     let roots = NativeRoots {
         claude_dir: root.join("claude"),
         pi_session_dir: root.join("pi").join("sessions"),
+        omp_session_dir: root.join("omp").join("sessions"),
         codex_home: root.join("codex"),
         grok_home: root.join("grok"),
         devin_dir: root.join("devin").join("cli"),
@@ -1189,4 +1190,108 @@ async fn cleanup_keeps_sessions_while_a_reference_is_unreadable() {
         .all(|skip| skip.code == "CONFLICT" && skip.message.contains("could not be read")));
     assert!(plain_path.exists());
     assert!(resumed_path.exists());
+}
+
+fn omp_session(fixture: &Fixture, id: &str, title: Option<&str>, prompt: &str) -> PathBuf {
+    let path = fixture
+        .roots
+        .omp_session_dir
+        .join("-work-c")
+        .join(format!("2026-10-01T08-00-00-000Z_{id}.jsonl"));
+    let mut records = Vec::new();
+    if let Some(title) = title {
+        // Current files open with a padded title slot (omp 18.13).
+        records.push(json!({"type": "title", "v": 1, "title": title, "updatedAt": "2026-10-01T08:00:00.000Z", "pad": "    "}));
+    }
+    records.push(json!({"type": "session", "version": 3, "id": id, "timestamp": "2026-10-01T08:00:00.000Z", "cwd": "/work/c"}));
+    records.push(json!({"type": "model_change", "id": "c0", "parentId": null, "timestamp": "2026-10-01T08:00:00.100Z", "model": "mock/mock"}));
+    records.push(json!({"type": "message", "id": "m1", "parentId": "c0", "timestamp": "2026-10-01T08:00:01.000Z",
+                        "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}}));
+    records.push(json!({"type": "custom_message", "customType": "async-result", "id": "a1", "parentId": "m1"}));
+    records.push(json!({"type": "message", "id": "m2", "parentId": "m1", "timestamp": "2026-10-01T08:00:02.000Z",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}}));
+    write_lines(&path, &records);
+    age(&path, DAY);
+    path
+}
+
+#[tokio::test]
+async fn omp_sessions_are_listed_viewed_and_deleted_with_their_artifacts() {
+    let fixture = fixture().await;
+    let native = &fixture.state.native_history;
+    let titled = new_id();
+    let legacy = new_id();
+    let referenced = new_id();
+    let titled_path = omp_session(&fixture, &titled, Some("Named by omp"), "first prompt");
+    omp_session(&fixture, &legacy, None, "legacy prompt");
+    omp_session(&fixture, &referenced, None, "kept");
+    // The artifacts directory beside a transcript; blobs are shared.
+    let artifacts = titled_path.with_extension("");
+    fs::create_dir_all(artifacts.join("ScoutOne")).unwrap();
+    fs::write(artifacts.join("ScoutOne.jsonl"), b"{}\n").unwrap();
+    let blobs = fixture
+        .roots
+        .omp_session_dir
+        .parent()
+        .unwrap()
+        .join("blobs");
+    fs::create_dir_all(&blobs).unwrap();
+    fs::write(blobs.join("abc"), b"blob").unwrap();
+    write_lines(
+        &fixture
+            .roots
+            .omp_session_dir
+            .join("-work-c")
+            .join("junk.jsonl"),
+        &[json!({"type": "message"})],
+    );
+    reference(&fixture, ProviderKind::Omp, &referenced).await;
+
+    let listing = list(&fixture, NativeProvider::Omp).await;
+    assert_eq!(listing["count"], 3);
+    let by_id = |id: &str| {
+        listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_id(&titled)["title"], "Named by omp");
+    assert_eq!(by_id(&legacy)["title"], "legacy prompt");
+    assert_eq!(by_id(&legacy)["cwd"], "/work/c");
+    assert!(by_id(&titled)["bytes"].as_u64().unwrap() > fs::metadata(&titled_path).unwrap().len());
+
+    let transcript = native
+        .transcript(NativeProvider::Omp, &titled, 10)
+        .await
+        .unwrap();
+    let texts: Vec<(&str, &str)> = transcript["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| {
+            (
+                message["role"].as_str().unwrap(),
+                message["text"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(texts, [("user", "first prompt"), ("assistant", "done")]);
+
+    let report = native
+        .cleanup(
+            &fixture.state.conversations,
+            NativeProvider::Omp,
+            &[titled.clone(), referenced.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, vec![titled.clone()]);
+    assert_eq!(report.skipped[0].code, "CONFLICT");
+    assert!(!titled_path.exists());
+    assert!(!artifacts.exists());
+    assert!(blobs.join("abc").exists());
+    assert_eq!(list(&fixture, NativeProvider::Omp).await["count"], 2);
 }

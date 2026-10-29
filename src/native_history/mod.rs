@@ -1,11 +1,11 @@
-//! Native session history of Claude Code, Pi, Codex, Grok Build and Devin:
+//! Native session history of Claude Code, Pi, omp, Codex, Grok Build and Devin:
 //! the agents' own sessions, outside TodeX's conversation store. Lists them
 //! (with their disk usage where it is known), shows a bounded transcript,
 //! deletes chosen sessions, and applies a TodeX-managed age / capacity
 //! policy per provider (saved in `$data_dir/native-history-cleanup.json`,
 //! run by the history cleanup scheduler in [`crate::history_cleanup`]).
 //!
-//! Claude Code and Pi sessions are files TodeX removes itself. Codex rollouts
+//! Claude Code, Pi and omp sessions are files TodeX removes itself. Codex rollouts
 //! and Grok Build session directories are read from disk but deleted only
 //! through the provider's own CLI; Devin's sessions live in its SQLite
 //! database and are both listed and deleted through its CLI ([`cli`]).
@@ -79,6 +79,7 @@ pub enum NativeProvider {
     Codex,
     GrokBuild,
     Devin,
+    Omp,
 }
 
 /// What a provider's native history supports.
@@ -91,15 +92,16 @@ pub struct Capabilities {
 }
 
 impl NativeProvider {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::ClaudeCode,
         Self::Pi,
         Self::Codex,
         Self::GrokBuild,
         Self::Devin,
+        Self::Omp,
     ];
 
-    /// `claude-code`, `pi`, `codex`, `grok-build` or `devin`; anything else
+    /// `claude-code`, `pi`, `codex`, `grok-build`, `devin` or `omp`; anything else
     /// is `INVALID_REQUEST`.
     pub fn parse(value: &str) -> Result<Self, AppError> {
         Self::ALL
@@ -107,7 +109,7 @@ impl NativeProvider {
             .find(|provider| provider.as_str() == value)
             .ok_or_else(|| {
                 AppError::InvalidRequest(format!(
-                    "native history supports claude-code, pi, codex, grok-build and devin, not {value}"
+                    "native history supports claude-code, pi, codex, grok-build, devin and omp, not {value}"
                 ))
             })
     }
@@ -119,6 +121,7 @@ impl NativeProvider {
             Self::Codex => "codex",
             Self::GrokBuild => "grok-build",
             Self::Devin => "devin",
+            Self::Omp => "omp",
         }
     }
 
@@ -129,6 +132,7 @@ impl NativeProvider {
             Self::Codex => "Codex",
             Self::GrokBuild => "Grok Build",
             Self::Devin => "Devin",
+            Self::Omp => "omp",
         }
     }
 
@@ -139,6 +143,7 @@ impl NativeProvider {
             Self::Codex => ProviderKind::Codex,
             Self::GrokBuild => ProviderKind::GrokBuild,
             Self::Devin => ProviderKind::Devin,
+            Self::Omp => ProviderKind::Omp,
         }
     }
 
@@ -178,6 +183,10 @@ impl NativeProvider {
 pub struct NativeRoots {
     pub claude_dir: PathBuf,
     pub pi_session_dir: PathBuf,
+    /// `~/.omp/agent/sessions`; omp's `<session>/` artifact directories sit
+    /// beside the transcripts. Its session-dir variables are Pi's names, set
+    /// for Pi, so they are not read.
+    pub omp_session_dir: PathBuf,
     /// `$CODEX_HOME` (`~/.codex`).
     pub codex_home: PathBuf,
     /// `$GROK_HOME` (`~/.grok`).
@@ -205,6 +214,7 @@ impl NativeRoots {
         Self {
             claude_dir: dirs.claude_dir().to_owned(),
             pi_session_dir: dirs.pi_session_dir(),
+            omp_session_dir: dirs.omp_dir().join("sessions"),
             codex_home: dirs.codex_home().to_owned(),
             grok_home: dirs.grok_home().to_owned(),
             devin_dir: data_home.join("devin").join("cli"),
@@ -219,6 +229,7 @@ impl NativeRoots {
             NativeProvider::Codex => self.codex_home.join("sessions"),
             NativeProvider::GrokBuild => self.grok_home.join("sessions"),
             NativeProvider::Devin => self.devin_dir.clone(),
+            NativeProvider::Omp => self.omp_session_dir.clone(),
         }
     }
 
@@ -226,6 +237,7 @@ impl NativeRoots {
     fn side_root(&self, provider: NativeProvider) -> &Path {
         match provider {
             NativeProvider::ClaudeCode => &self.claude_dir,
+            NativeProvider::Omp => &self.omp_session_dir,
             _ => &self.pi_session_dir,
         }
     }
@@ -324,7 +336,7 @@ pub struct NativeHistory {
     /// Serializes deletions (manual and policy) and settings edits, one
     /// lock per provider so a slow CLI (Devin's `rm` can take seconds per
     /// session) never holds up another agent's cleanup.
-    locks: Arc<[tokio::sync::Mutex<()>; 5]>,
+    locks: Arc<[tokio::sync::Mutex<()>; 6]>,
     /// Fixed roots for tests; otherwise detected per call so environment
     /// changes after start still apply.
     pub(crate) roots_override: Option<NativeRoots>,
@@ -412,6 +424,7 @@ impl NativeHistory {
             NativeProvider::Codex => 2,
             NativeProvider::GrokBuild => 3,
             NativeProvider::Devin => 4,
+            NativeProvider::Omp => 5,
         };
         &self.locks[index]
     }
@@ -962,7 +975,9 @@ fn scan(
                 }
             }
         }
-        NativeProvider::Pi => {
+        // `<bucket>/<session>.jsonl`; omp's `<bucket>/<session>/` artifact
+        // directories hold no transcripts of their own.
+        NativeProvider::Pi | NativeProvider::Omp => {
             let is_jsonl = |entry: &fs::DirEntry| {
                 entry
                     .file_name()
@@ -1016,8 +1031,9 @@ fn scan(
                     Err(error) => {
                         tracing::debug!(path = %path.display(), %error, "could not read native session");
                         // Claude and Codex files are sessions by name; Pi
-                        // needs a header.
-                        (provider != NativeProvider::Pi).then(SessionMeta::default)
+                        // and omp need a header.
+                        (!matches!(provider, NativeProvider::Pi | NativeProvider::Omp))
+                            .then(SessionMeta::default)
                     }
                 };
                 cache.insert(
@@ -1071,6 +1087,7 @@ fn scan(
             NativeProvider::ClaudeCode => {
                 claude_side_entries(&roots.claude_dir, &id, &files, &todos)
             }
+            NativeProvider::Omp => omp_artifact_dirs(&files),
             _ => Vec::new(),
         };
         let bytes = group
@@ -1290,6 +1307,16 @@ fn claude_side_entries(
         .filter(|path| {
             fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.file_type().is_symlink())
         })
+        .collect()
+}
+
+/// omp's artifact directory of each transcript: its path without `.jsonl`
+/// (tool outputs, subagent transcripts). Symlinks are left out.
+fn omp_artifact_dirs(transcripts: &[PathBuf]) -> Vec<PathBuf> {
+    transcripts
+        .iter()
+        .filter_map(|path| path.to_str()?.strip_suffix(".jsonl").map(PathBuf::from))
+        .filter(|path| is_real_dir(path))
         .collect()
 }
 
