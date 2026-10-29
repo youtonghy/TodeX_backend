@@ -9,6 +9,7 @@
 - 保护：TodeX 数据目录被盗、被备份或泄露；事后攻破后端时读取已写入的历史。
 - 不保护：后端运行 agent 时看到的明文（它必须处理模型输出）；provider 自身在后端保存的明文 transcript（`~/.claude/projects`、`~/.codex/sessions` 等）；排队中的追加 prompt（daemon 内存中的明文候选消息，投递前不落盘，daemon 重启即丢失；`queue.json` 不再写入，旧版遗留的文件在启动时导入内存并删除；定时会话扣留到指定时刻的 prompt 同样只在内存中，重启即丢失，manifest 只记录时刻）；元数据（sequence、时间、事件类型、大小、下文 §5.2 的信封字段）。
 - 强制加密之前写下的明文历史不迁移、不改写，标记为 `legacyPlaintext` 后只读（§8）。
+- 客户端缓存：客户端可以在本机缓存收到的历史，但只能缓存原样的密文（事件 `$enc`、引用的封存帧）和发给本设备 `rid` 的封装，不得缓存解密后的内容；读取缓存仍需本设备的私钥。缓存按后端与 `rid` 区分，本设备被吊销（`myAccess: revoked`）、换钥或删除该后端时必须清除。缓存的事件在使用前须与 journal 核对（同一 sequence 的 `eventId` 一致），不一致即丢弃。Desktop 的实现见 `TodeX_desktop/docs/conversation-runtime.md`。
 - 范围是机密性，不是顺序与完整性：AEAD 只保证单条事件密文或单个内容帧未被篡改且属于该会话、`kid`、stream 与 counter。封存分片的帧头位置（首 sequence、条数）与信封流（stream 0，明文 raw DEFLATE）不在 AEAD 内，journal 行与帧的先后也没有链式校验；能改写数据目录的人可以删除、截断、重排记录或帧，或改动信封字段而不被发现，只是读不到内容。
 
 ## 2. 密码学原语（history crypto v1）
