@@ -14,6 +14,7 @@ mod history_cleanup;
 mod history_keys;
 mod local_admin;
 mod native_history;
+mod omp_plugins;
 mod pi_agent_templates;
 mod pi_mcp;
 mod pi_plugins;
