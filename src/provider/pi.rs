@@ -216,6 +216,63 @@ fn pi_closing_error() -> AppError {
 }
 
 impl PiDriver {
+    /// A new session with Pi's branch before user entry `entry`, or all of it.
+    async fn fork_before(
+        &self,
+        context: DriverContext,
+        entry: Option<&str>,
+    ) -> Result<crate::conversation::ProviderState, AppError> {
+        self.ensure_no_background(&context.manifest.id).await?;
+        self.close_session(&context.manifest.id, "maintenance_clone")
+            .await;
+        let mut process = self.open_existing(&context).await?;
+        let result = async {
+            let (_cancel, receiver) = watch::channel(false);
+            let mut rpc = PiRpc::new(&mut process, None, receiver);
+            rpc.process
+                .send(&json!({"id":"state","type":"get_state"}))
+                .await?;
+            let state = rpc.wait_response("state").await?;
+            verify_pi_session(&state, context.provider_state.native_session_id.as_deref())?;
+            // clone keeps the full current leaf, while fork(entryId) restarts
+            // from a selected user message.
+            let command = match entry {
+                Some(entry) => json!({"id":"clone","type":"fork","entryId":entry}),
+                None => json!({"id":"clone","type":"clone"}),
+            };
+            rpc.process.send(&command).await?;
+            let response = rpc.wait_response("clone").await?;
+            if response.pointer("/data/cancelled").and_then(Value::as_bool) != Some(false) {
+                return Err(AppError::ProviderUnavailable(
+                    "Pi clone was cancelled or returned an invalid result".to_owned(),
+                ));
+            }
+            rpc.process
+                .send(&json!({"id":"cloned-state","type":"get_state"}))
+                .await?;
+            let state = rpc.wait_response("cloned-state").await?;
+            let native = state
+                .pointer("/data/sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| {
+                    !id.is_empty()
+                        && Some(*id) != context.provider_state.native_session_id.as_deref()
+                })
+                .ok_or_else(|| {
+                    AppError::ProviderUnavailable(
+                        "Pi clone did not create a new session".to_owned(),
+                    )
+                })?;
+            let mut result = crate::conversation::ProviderState::new(ProviderKind::Pi);
+            result.native_session_id = Some(native.to_owned());
+            result.recoverable = true;
+            Ok(result)
+        }
+        .await;
+        process.terminate().await;
+        result
+    }
+
     /// The command line of a runtime serving `context` with `prompt`'s model
     /// and thinking level.
     fn launch(
@@ -575,52 +632,21 @@ impl ProviderDriver for PiDriver {
         &self,
         context: DriverContext,
     ) -> Result<crate::conversation::ProviderState, AppError> {
-        self.ensure_no_background(&context.manifest.id).await?;
-        self.close_session(&context.manifest.id, "maintenance_clone")
-            .await;
-        let mut process = self.open_existing(&context).await?;
-        let result = async {
-            let (_cancel, receiver) = watch::channel(false);
-            let mut rpc = PiRpc::new(&mut process, None, receiver);
-            rpc.process
-                .send(&json!({"id":"state","type":"get_state"}))
-                .await?;
-            let state = rpc.wait_response("state").await?;
-            verify_pi_session(&state, context.provider_state.native_session_id.as_deref())?;
-            // clone keeps the full current leaf, while fork(entryId) edits from a selected node.
-            rpc.process
-                .send(&json!({"id":"clone","type":"clone"}))
-                .await?;
-            let response = rpc.wait_response("clone").await?;
-            if response.pointer("/data/cancelled").and_then(Value::as_bool) != Some(false) {
-                return Err(AppError::ProviderUnavailable(
-                    "Pi clone was cancelled or returned an invalid result".to_owned(),
-                ));
-            }
-            rpc.process
-                .send(&json!({"id":"cloned-state","type":"get_state"}))
-                .await?;
-            let state = rpc.wait_response("cloned-state").await?;
-            let native = state
-                .pointer("/data/sessionId")
-                .and_then(Value::as_str)
-                .filter(|id| {
-                    !id.is_empty()
-                        && Some(*id) != context.provider_state.native_session_id.as_deref()
-                })
-                .ok_or_else(|| {
-                    AppError::ProviderUnavailable(
-                        "Pi clone did not create a new session".to_owned(),
-                    )
-                })?;
-            let mut result = crate::conversation::ProviderState::new(ProviderKind::Pi);
-            result.native_session_id = Some(native.to_owned());
-            result.recoverable = true;
-            Ok(result)
-        }
-        .await;
-        process.terminate().await;
-        result
+        self.fork_before(context, None).await
+    }
+
+    fn supports_fork_at(&self) -> bool {
+        true
+    }
+
+    /// Pi forks from a user message, keeping what came before it: through a
+    /// reply is just before the next turn's prompt, or a clone for the latest.
+    async fn fork_session_at(
+        &self,
+        context: DriverContext,
+        point: &super::types::ForkPoint,
+    ) -> Result<crate::conversation::ProviderState, AppError> {
+        self.fork_before(context, point.next.as_deref()).await
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -1307,6 +1333,16 @@ async fn pi_session_worker(
                     rpc.reusable = pi_is_idle(&state);
                 }
             }
+            // The turn's prompt is now the last user entry on Pi's branch:
+            // its id is where a later fork from this reply restarts.
+            if !adopt
+                && shutdown.borrow().is_none()
+                && result.as_ref().is_ok_and(|done| !done.cancelled)
+            {
+                if let Err(error) = record_pi_fork_point(&mut rpc, &sink).await {
+                    tracing::warn!(error = %error, "could not record Pi's fork point for the turn");
+                }
+            }
             let requested_shutdown = shutdown.borrow().clone();
             let closing = requested_shutdown.is_some()
                 || !rpc.reusable
@@ -1414,6 +1450,33 @@ async fn pi_session_worker(
             retry,
         });
     }
+}
+
+/// Journals the id of the last user entry on Pi's branch (`get_fork_messages`)
+/// as the turn's `nativeTurnId`.
+async fn record_pi_fork_point(rpc: &mut PiRpc<'_>, sink: &DriverEventSink) -> Result<(), AppError> {
+    rpc.process
+        .send(&json!({"id":"fork-point","type":"get_fork_messages"}))
+        .await?;
+    let response = rpc
+        .wait_response_for("fork-point", super::process::control_timeout()?)
+        .await?;
+    let Some(entry) = response
+        .pointer("/data/messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.last())
+        .and_then(|message| message.get("entryId"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(());
+    };
+    sink.emit(
+        "provider.event",
+        json!({"provider":"pi","providerMethod":"fork_point","nativeTurnId":entry}),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Offers a run Pi just started on its own (`start`, its `agent_start`) to
@@ -4589,6 +4652,73 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "queue.updated"
                 && event.payload.to_string().contains("consumed")));
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn rpc_turns_record_fork_points_and_fork_before_the_next_prompt() {
+        let fixture = Fixture::new().await;
+        fixture.run("normal", "first").await.unwrap();
+        fixture.run("normal", "second").await.unwrap();
+        let history = fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap();
+        let points: Vec<(Value, Value)> = history
+            .iter()
+            .filter(|event| event.payload["providerMethod"] == "fork_point")
+            .map(|event| {
+                (
+                    event.payload["turnId"].clone(),
+                    event.payload["nativeTurnId"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            points,
+            vec![
+                (json!("first"), json!("entry-1")),
+                (json!("second"), json!("entry-2"))
+            ]
+        );
+        let context = || async {
+            DriverContext {
+                manifest: fixture.manifest.clone(),
+                provider_state: fixture
+                    .store
+                    .provider_state(&fixture.manifest.id)
+                    .await
+                    .unwrap(),
+                agent_mcp: None,
+                handles: Default::default(),
+            }
+        };
+        let through_first = super::super::types::ForkPoint {
+            through: "entry-1".to_owned(),
+            next: Some("entry-2".to_owned()),
+        };
+        let forked = fixture
+            .driver
+            .fork_session_at(context().await, &through_first)
+            .await
+            .unwrap();
+        assert_eq!(
+            forked.native_session_id.as_deref(),
+            Some("forked-before-entry-2")
+        );
+        // Through the latest reply is all of the branch.
+        let latest = super::super::types::ForkPoint {
+            through: "entry-2".to_owned(),
+            next: None,
+        };
+        let cloned = fixture
+            .driver
+            .fork_session_at(context().await, &latest)
+            .await
+            .unwrap();
+        assert_eq!(cloned.native_session_id.as_deref(), Some("cloned-session"));
         fixture.finish().await;
     }
 

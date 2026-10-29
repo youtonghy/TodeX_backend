@@ -4122,7 +4122,12 @@ async fn dispatch_lane_command(
             let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             let fork = state
                 .conversations
-                .fork_owned(owner_id, &request.conversation_id, request.title)
+                .fork_owned(
+                    owner_id,
+                    &request.conversation_id,
+                    request.title,
+                    request.through_turn_id,
+                )
                 .await?;
             Ok(json!({ "conversationId": fork.id, "forkedFrom": request.conversation_id }))
         }
@@ -4820,6 +4825,10 @@ struct WsConversationRequest {
     /// `conversation.cancel` / `interrupt` / `stop`: stop only this turn.
     #[serde(default)]
     turn_id: Option<String>,
+    /// `conversation.fork`: keep only the history through this finished
+    /// turn, where the provider's `forkAt` control action allows it.
+    #[serde(default)]
+    through_turn_id: Option<String>,
     /// `conversation.compact`: instructions for the summary, where the
     /// provider's `compactInstructions` capability allows them.
     #[serde(default)]

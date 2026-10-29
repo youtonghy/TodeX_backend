@@ -257,35 +257,19 @@ impl ProviderDriver for CodexDriver {
         &self,
         context: DriverContext,
     ) -> Result<crate::conversation::ProviderState, AppError> {
-        let original = context
-            .provider_state
-            .native_session_id
-            .as_deref()
-            .ok_or_else(|| {
-                AppError::Unsupported("conversation has no native Codex session to fork".to_owned())
-            })?;
-        let mut spec = CommandSpec::new(&self.binary, &context.manifest.workspace);
-        spec.args = vec![
-            "app-server".to_owned(),
-            "--listen".to_owned(),
-            "stdio://".to_owned(),
-        ];
-        let mut process = JsonLineProcess::spawn(&spec).await?;
-        let result = async {
-            process.send(&json!({ "id": "initialize", "method": "initialize", "params": { "clientInfo": { "name": "todex-agentd", "version": crate::version::APP_VERSION }, "capabilities": { "experimentalApi": true } } })).await?;
-            read_rpc_response(&mut process, "initialize").await?;
-            process.send(&json!({ "method": "initialized" })).await?;
-            process.send(&json!({ "id": "fork", "method": "thread/fork", "params": { "threadId": original, "cwd": context.manifest.workspace, "excludeTurns": true, "ephemeral": false } })).await?;
-            let response = read_rpc_response(&mut process, "fork").await?;
-            let native = response.pointer("/thread/id").and_then(Value::as_str).filter(|id| !id.is_empty() && *id != original)
-                .ok_or_else(|| AppError::ProviderUnavailable("Codex fork did not return a new thread id".to_owned()))?;
-            let mut state = ProviderState::new(ProviderKind::Codex);
-            state.native_session_id = Some(native.to_owned());
-            state.recoverable = true;
-            Ok(state)
-        }.await;
-        process.terminate().await;
-        result
+        codex_fork_thread(&self.binary, context, None).await
+    }
+
+    fn supports_fork_at(&self) -> bool {
+        true
+    }
+
+    async fn fork_session_at(
+        &self,
+        context: DriverContext,
+        point: &super::types::ForkPoint,
+    ) -> Result<crate::conversation::ProviderState, AppError> {
+        codex_fork_thread(&self.binary, context, Some(&point.through)).await
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -514,6 +498,44 @@ impl ProviderDriver for CodexDriver {
             )
             .await
     }
+}
+
+/// `thread/fork` of the conversation's native thread into a new one, keeping
+/// turns only through `last_turn` (inclusive) when given.
+async fn codex_fork_thread(
+    binary: &str,
+    context: DriverContext,
+    last_turn: Option<&str>,
+) -> Result<crate::conversation::ProviderState, AppError> {
+    let original = context
+        .provider_state
+        .native_session_id
+        .as_deref()
+        .ok_or_else(|| {
+            AppError::Unsupported("conversation has no native Codex session to fork".to_owned())
+        })?;
+    let mut spec = CommandSpec::new(binary, &context.manifest.workspace);
+    spec.args = vec![
+        "app-server".to_owned(),
+        "--listen".to_owned(),
+        "stdio://".to_owned(),
+    ];
+    let mut process = JsonLineProcess::spawn(&spec).await?;
+    let result = async {
+        process.send(&json!({ "id": "initialize", "method": "initialize", "params": { "clientInfo": { "name": "todex-agentd", "version": crate::version::APP_VERSION }, "capabilities": { "experimentalApi": true } } })).await?;
+        read_rpc_response(&mut process, "initialize").await?;
+        process.send(&json!({ "method": "initialized" })).await?;
+        process.send(&json!({ "id": "fork", "method": "thread/fork", "params": { "threadId": original, "cwd": context.manifest.workspace, "excludeTurns": true, "ephemeral": false, "lastTurnId": last_turn } })).await?;
+        let response = read_rpc_response(&mut process, "fork").await?;
+        let native = response.pointer("/thread/id").and_then(Value::as_str).filter(|id| !id.is_empty() && *id != original)
+            .ok_or_else(|| AppError::ProviderUnavailable("Codex fork did not return a new thread id".to_owned()))?;
+        let mut state = ProviderState::new(ProviderKind::Codex);
+        state.native_session_id = Some(native.to_owned());
+        state.recoverable = true;
+        Ok(state)
+    }.await;
+    process.terminate().await;
+    result
 }
 
 async fn read_rpc_response_cancellable(

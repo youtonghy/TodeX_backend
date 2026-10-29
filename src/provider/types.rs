@@ -233,6 +233,9 @@ impl ProviderSnapshot {
             // Resume requires native continuation semantics, not prompt replay.
             if driver.supports_native_fork() {
                 actions.push("fork");
+                if driver.supports_fork_at() {
+                    actions.push("forkAt");
+                }
             }
             if driver.supports_native_compact() {
                 actions.push("compact");
@@ -316,6 +319,16 @@ impl std::fmt::Debug for TurnHandles {
             .field("adopt", &self.adopt)
             .finish()
     }
+}
+
+/// Where `conversation.fork` with `throughTurnId` cuts the native session:
+/// the native id of that turn and of the next turn that has one (`None`
+/// when it is the latest). Codex forks through the first, Pi just before the
+/// second (its fork restarts from a user message).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkPoint {
+    pub through: String,
+    pub next: Option<String>,
 }
 
 /// `conversation.goal`: the long-running objective a provider pursues
@@ -1435,6 +1448,23 @@ pub trait ProviderDriver: Send + Sync {
 
     fn supports_native_fork(&self) -> bool {
         false
+    }
+
+    /// Whether `fork_session_at` runs: a fork that keeps the native history
+    /// only up to a given turn.
+    fn supports_fork_at(&self) -> bool {
+        false
+    }
+
+    /// Forks the native session through the turn `point` names, inclusive.
+    async fn fork_session_at(
+        &self,
+        _context: DriverContext,
+        _point: &ForkPoint,
+    ) -> Result<ProviderState, AppError> {
+        Err(AppError::Unsupported(
+            "This provider can only fork the whole conversation.".to_owned(),
+        ))
     }
 
     /// Whether `goal` runs: the provider keeps working toward a goal on its

@@ -40,7 +40,7 @@ use super::profile::{profile, FileAttachmentStyle, McpInjection, SkillInjection}
 use super::types::ProviderDescriptor;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,
-    DriverTurnResult, GoalRequest, ImageInputMode, PermissionBroker, PermissionDecision,
+    DriverTurnResult, ForkPoint, GoalRequest, ImageInputMode, PermissionBroker, PermissionDecision,
     PermissionOutcome, ProviderActivity, ProviderCommandDescriptor, ProviderControl,
     ProviderDriver, ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot,
     ProviderWork, ProviderWorkHandle, TurnHandles, TurnModeHandle,
@@ -1672,11 +1672,15 @@ impl ConversationSupervisor {
         self.prompt_inner(owner_id, conversation_id, prompt).await
     }
 
+    /// Forks the conversation into a new one, with all of its history or,
+    /// with `through_turn_id`, only through that finished turn (the native
+    /// session is forked at the same point; see `forkAt`).
     pub async fn fork_owned(
         &self,
         owner_id: &str,
         conversation_id: &str,
         title: Option<String>,
+        through_turn_id: Option<String>,
     ) -> Result<ConversationManifest, AppError> {
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         // A fork of legacy plaintext history would copy plaintext into a
@@ -1717,16 +1721,34 @@ impl ConversationSupervisor {
             agent_mcp: None,
         };
         self.validate_workspace(&source.workspace)?;
+        let through = match through_turn_id {
+            Some(turn_id) => {
+                if !driver.supports_fork_at() {
+                    return Err(AppError::Unsupported(
+                        "This provider can only fork the whole conversation.".to_owned(),
+                    ));
+                }
+                Some(self.turn_fork_point(conversation_id, &turn_id).await?)
+            }
+            None => None,
+        };
         let provider_state = self.store.provider_state(conversation_id).await?;
-        let request = self.store.last_request(conversation_id).await?;
-        let native_fork = driver
-            .fork_session(DriverContext {
-                manifest: source.clone(),
-                provider_state,
-                agent_mcp: None,
-                handles: Default::default(),
-            })
-            .await?;
+        // The last request belongs to a later turn: a partial fork has
+        // nothing to retry until its first prompt.
+        let request = match through {
+            Some(_) => None,
+            None => self.store.last_request(conversation_id).await?,
+        };
+        let context = DriverContext {
+            manifest: source.clone(),
+            provider_state,
+            agent_mcp: None,
+            handles: Default::default(),
+        };
+        let native_fork = match &through {
+            Some((_, point)) => driver.fork_session_at(context, point).await?,
+            None => driver.fork_session(context).await?,
+        };
         let mut fork = ConversationManifest::new(
             source.provider,
             source.workspace.clone(),
@@ -1740,12 +1762,14 @@ impl ConversationSupervisor {
         let fork_id = fork.id.clone();
         let provider = source.provider;
         let source_id = source.id.clone();
+        let through_sequence = through.as_ref().map(|(sequence, _)| *sequence);
         self.store
-            .create_from_journal(
+            .create_from_journal_through(
                 conversation_id,
                 fork,
                 Some(native_fork),
                 request,
+                through_sequence,
                 |event, sequence| {
                     let mut next = crate::conversation::ConversationEvent::new(
                         &fork_id,
@@ -1769,6 +1793,82 @@ impl ConversationSupervisor {
                 },
             )
             .await
+    }
+
+    /// The sequence of `turn_id`'s terminal event and its native turn id,
+    /// read from the plaintext envelope (`turnId`, `nativeTurnId`).
+    async fn turn_fork_point(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<(u64, ForkPoint), AppError> {
+        const TERMINAL: [&str; 4] = [
+            "turn.completed",
+            "turn.failed",
+            "turn.cancelled",
+            "turn.interrupted",
+        ];
+        let mut native_turn = None;
+        let mut after = 0;
+        loop {
+            let page = self.store.replay(conversation_id, after, 1000).await?;
+            for event in &page.events {
+                after = event.sequence;
+                if event.payload.get("turnId").and_then(Value::as_str) != Some(turn_id) {
+                    continue;
+                }
+                if native_turn.is_none() {
+                    native_turn = event
+                        .payload
+                        .get("nativeTurnId")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(ToOwned::to_owned);
+                }
+                if TERMINAL.contains(&event.event_type.as_str()) {
+                    let through = native_turn.ok_or_else(|| {
+                        AppError::Unsupported(
+                            "This reply was recorded before forking from a reply was possible; fork the whole conversation instead.".to_owned(),
+                        )
+                    })?;
+                    let next = self
+                        .next_native_turn(conversation_id, event.sequence, turn_id)
+                        .await?;
+                    return Ok((event.sequence, ForkPoint { through, next }));
+                }
+            }
+            if !page.has_more || page.events.is_empty() {
+                return Err(AppError::InvalidRequest(format!(
+                    "Turn {turn_id} has not finished in this conversation."
+                )));
+            }
+        }
+    }
+
+    /// The native id of the first turn after sequence `after` other than
+    /// `turn_id` that has one.
+    async fn next_native_turn(
+        &self,
+        conversation_id: &str,
+        mut after: u64,
+        turn_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        loop {
+            let page = self.store.replay(conversation_id, after, 1000).await?;
+            for event in &page.events {
+                after = event.sequence;
+                let native = event.payload.get("nativeTurnId").and_then(Value::as_str);
+                let turn = event.payload.get("turnId").and_then(Value::as_str);
+                if let (Some(native), Some(turn)) = (native, turn) {
+                    if turn != turn_id && !native.is_empty() {
+                        return Ok(Some(native.to_owned()));
+                    }
+                }
+            }
+            if !page.has_more || page.events.is_empty() {
+                return Ok(None);
+            }
+        }
     }
 
     pub async fn compact_owned(
@@ -4061,7 +4161,10 @@ mod tests {
         );
         read_only(
             "fork",
-            supervisor.fork_owned("local", &id, None).await.unwrap_err(),
+            supervisor
+                .fork_owned("local", &id, None, None)
+                .await
+                .unwrap_err(),
         );
         read_only(
             "rename",
@@ -4175,6 +4278,82 @@ mod tests {
             after.last().unwrap().sequence,
             store.get(&manifest.id).await.unwrap().last_sequence
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn e2e_fork_from_a_reply_keeps_history_and_native_turns_through_it() {
+        let (root, store, supervisor, workspace, _keys) =
+            encrypted_control_fixture("todex-fork-at").await;
+        let manifest = supervisor
+            .create_owned("local", ProviderKind::Codex, workspace.clone(), None, None)
+            .await
+            .unwrap();
+        let prompt = |text: &str| ConversationPrompt {
+            client_request_id: Some(text.to_owned()),
+            text: text.to_owned(),
+            model: Some("fixture-model".to_owned()),
+            reasoning_effort: None,
+            skills: Vec::new(),
+            content: Vec::new(),
+            permission_mode: None,
+            work_mode: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+        };
+        let mut turns = Vec::new();
+        for text in ["first", "second"] {
+            turns.push(
+                supervisor
+                    .prompt_owned("local", &manifest.id, prompt(text))
+                    .await
+                    .unwrap(),
+            );
+            wait_until_idle(&supervisor).await;
+        }
+        let source = store.complete_history(&manifest.id).await.unwrap();
+        let first_end = source
+            .iter()
+            .find(|event| {
+                event.event_type == "turn.completed" && event.payload["turnId"] == turns[0]
+            })
+            .unwrap()
+            .sequence;
+        // The envelope carries the native turn id the fork needs.
+        let native_first = source
+            .iter()
+            .find_map(|event| {
+                (event.payload["turnId"] == turns[0])
+                    .then(|| {
+                        event.payload["nativeTurnId"]
+                            .as_str()
+                            .map(ToOwned::to_owned)
+                    })
+                    .flatten()
+            })
+            .expect("no plaintext nativeTurnId");
+        assert!(matches!(
+            supervisor
+                .fork_owned("local", &manifest.id, None, Some("missing-turn".to_owned()))
+                .await,
+            Err(AppError::InvalidRequest(_))
+        ));
+        let fork = supervisor
+            .fork_owned("local", &manifest.id, None, Some(turns[0].clone()))
+            .await
+            .unwrap();
+        let forked = store.complete_history(&fork.id).await.unwrap();
+        assert_eq!(forked.len() as u64, first_end + 1);
+        assert_eq!(forked.last().unwrap().event_type, "conversation.forked");
+        assert!(!forked
+            .iter()
+            .any(|event| event.payload["turnId"] == turns[1]));
+        let requests = fs::read_to_string(workspace.join("fork-requests.log")).unwrap();
+        let request: Value = serde_json::from_str(requests.lines().last().unwrap()).unwrap();
+        assert_eq!(request["params"]["lastTurnId"], json!(native_first));
+        // A partial fork has no request of its own to retry yet.
+        assert!(store.last_request(&fork.id).await.unwrap().is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4339,7 +4518,7 @@ mod tests {
         wait_until_idle(&supervisor).await;
         // A fork copies the ciphertext and the keys that read it.
         let fork = supervisor
-            .fork_owned("local", &manifest.id, None)
+            .fork_owned("local", &manifest.id, None, None)
             .await
             .unwrap();
         assert!(fork.title.is_none());
@@ -4518,7 +4697,7 @@ mod tests {
             .await
             .unwrap();
         let fork = supervisor
-            .fork_owned("local", &manifest.id, None)
+            .fork_owned("local", &manifest.id, None, None)
             .await
             .unwrap();
         assert_eq!(fork.last_sequence, 1202);
@@ -4694,7 +4873,7 @@ mod tests {
             .unwrap();
 
         let fork = supervisor
-            .fork_owned("local", &manifest.id, None)
+            .fork_owned("local", &manifest.id, None, None)
             .await
             .unwrap();
         assert_eq!(fork.provider_profile.as_deref(), Some("fixture"));
@@ -4733,7 +4912,7 @@ mod tests {
             .unwrap();
 
         let fork = supervisor
-            .fork_owned("local", &manifest.id, None)
+            .fork_owned("local", &manifest.id, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -4762,7 +4941,9 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            supervisor.fork_owned("local", &manifest.id, None).await,
+            supervisor
+                .fork_owned("local", &manifest.id, None, None)
+                .await,
             Err(AppError::Unsupported(_))
         ));
         fs::remove_dir_all(root).unwrap();
@@ -7922,6 +8103,7 @@ elif [ "$mode" = "app-server" ]; then
         printf '{"id":"%s","result":{}}\n' "$id"
         ;;
       *'"method":"thread/fork"'*)
+        printf '%s\n' "$line" >> fork-requests.log
         printf '{"id":"fork","result":{"thread":{"id":"codex-fork-native"}}}\n'
         ;;
       *'"method":"thread/goal/set"'*)
@@ -7945,9 +8127,9 @@ elif [ "$mode" = "app-server" ]; then
         ;;
       *'"method":"turn/start"'*)
         id=$(extract_id "$line")
-        printf '{"id":"%s","result":{"turn":{"id":"codex-turn"}}}\n' "$id"
-        printf '{"method":"item/agentMessage/delta","params":{"delta":"codex fixture"}}\n'
-        printf '{"method":"turn/completed","params":{"turn":{"id":"codex-turn","status":"completed"}}}\n'
+        printf '{"id":"%s","result":{"turn":{"id":"native-%s"}}}\n' "$id" "$id"
+        printf '{"method":"item/agentMessage/delta","params":{"turnId":"native-%s","delta":"codex fixture"}}\n' "$id"
+        printf '{"method":"turn/completed","params":{"turn":{"id":"native-%s","status":"completed"}}}\n' "$id"
         ;;
     esac
   done
@@ -7971,6 +8153,10 @@ elif [ "$mode" = "--mode" ]; then
         printf '{"id":"%s","type":"response","success":true}\n' "$id"
         printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"pi fixture"}}\n'
         printf '{"type":"agent_settled"}\n'
+        ;;
+      *'"type":"get_fork_messages"'*)
+        id=$(extract_id "$line")
+        printf '{"id":"%s","type":"response","success":true,"data":{"messages":[]}}\n' "$id"
         ;;
     esac
   done
@@ -8338,6 +8524,10 @@ while IFS= read -r line; do
       printf '{{"id":"%s","type":"response","success":true}}\n' "$id"
       printf '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","delta":"pi fixture"}}}}\n'
       printf '{{"type":"agent_settled"}}\n'
+      ;;
+    *'"type":"get_fork_messages"'*)
+      id=$(extract_id "$line")
+      printf '{{"id":"%s","type":"response","success":true,"data":{{"messages":[]}}}}\n' "$id"
       ;;
   esac
 done

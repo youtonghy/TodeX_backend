@@ -173,7 +173,7 @@ manifest.json  snapshot.json  provider-state.json  last-request.json
 
 e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容全部在密文中：
 
-- 通用标识：`turnId`、`clientRequestId`、`requestId`、`permissionId`、`runtimeId`、`operationId`、`itemId`、`messageId`、`toolCallId`、`subagentId`。
+- 通用标识：`turnId`、`nativeTurnId`（Provider 自己的 turn id，从某条回复分叉时需要）、`clientRequestId`、`requestId`、`permissionId`、`runtimeId`、`operationId`、`itemId`、`messageId`、`toolCallId`、`subagentId`。
 - `role`（`message.*`）、`status`（`provider.runtime`、`turn.*`、`subagent.*`）、`scope`（`permission.*`、`tool.awaitingApproval`，决定会话状态是否变化）、`code`（`control.*` 的结果码，不含 message 与 result）。
 - `block`：仅 `{category, id, turnId}`。
 - `control`：仅 `{action, itemId}`；文本类 control 另带 `textMac`。

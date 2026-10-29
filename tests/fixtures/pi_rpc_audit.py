@@ -203,6 +203,9 @@ def background_subagent(settles):
 def update_queue():
     out({'type': 'queue_update', 'steering': steering[:], 'followUp': queue[:]})
 
+# User messages on the branch, as (entryId, text), for get_fork_messages.
+user_entries = []
+
 for line in sys.stdin:
     cmd = json.loads(line)
     kind = cmd['type']
@@ -254,6 +257,7 @@ for line in sys.stdin:
         ack(cmd, {'disposition': 'queued'})
     elif kind == 'prompt':
         scenario = cmd['message']
+        user_entries.append(('entry-%d' % (len(user_entries) + 1), scenario))
         streaming = scenario not in ['pure', 'preack', 'preack-dialog', 'extension-error', 'ui', 'schedule-idle', 'stall-catalog', 'buffer-idle', 'rejected']
         if scenario == 'extension-error':
             out({'type': 'extension_error', 'error': 'fixture extension failed'})
@@ -344,6 +348,11 @@ for line in sys.stdin:
     elif kind == 'clone':
         session = 'cloned-session'
         ack(cmd, {'cancelled': False})
+    elif kind == 'get_fork_messages':
+        ack(cmd, {'messages': [{'entryId': entry, 'text': text} for entry, text in user_entries]})
+    elif kind == 'fork':
+        session = 'forked-before-' + cmd['entryId']
+        ack(cmd, {'text': dict(user_entries).get(cmd['entryId'], ''), 'cancelled': False})
     elif kind == 'compact':
         out({'type': 'compaction_start', 'reason': 'manual'})
         out({'type': 'compaction_end', 'result': {'summary': 'compact summary'}})

@@ -99,6 +99,7 @@
         "followUp",
         "retry",
         "fork",
+        "forkAt",
         "compact",
         "goal"
       ],
@@ -156,6 +157,7 @@
         "followUp",
         "retry",
         "fork",
+        "forkAt",
         "compact"
       ],
       "compactInstructions": true,

@@ -64,8 +64,10 @@ const COMPACTED_RECORD_PREFIX: &[u8] = b"{\"sequence\":";
 pub(super) const JOURNAL_COMPACTED_EVENT: &str = "journal.compacted";
 
 /// Identity fields the e2e envelope keeps in plaintext (§5.2).
-const ENVELOPE_ID_KEYS: [&str; 10] = [
+const ENVELOPE_ID_KEYS: [&str; 11] = [
     "turnId",
+    // The provider's own turn id (Codex), which forking from a reply needs.
+    "nativeTurnId",
     "clientRequestId",
     "requestId",
     "permissionId",

@@ -852,21 +852,48 @@ impl ConversationStore {
     /// Copied ciphertext keeps its `$enc` (the source's keys are copied
     /// along); every plaintext record — new trailer events included — is
     /// encrypted under the new conversation's own key.
+    #[cfg(test)]
     pub async fn create_from_journal(
+        &self,
+        source_id: &str,
+        manifest: ConversationManifest,
+        provider_state: Option<ProviderState>,
+        request: Option<Value>,
+        copy: impl FnMut(ConversationEvent, u64) -> ConversationEvent,
+        trailer: impl FnOnce(u64) -> Vec<ConversationEvent>,
+    ) -> Result<ConversationManifest, AppError> {
+        self.create_from_journal_through(
+            source_id,
+            manifest,
+            provider_state,
+            request,
+            None,
+            copy,
+            trailer,
+        )
+        .await
+    }
+
+    /// [`Self::create_from_journal`] copying only the source's events up to
+    /// sequence `through` (all of them when `None`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_from_journal_through(
         &self,
         source_id: &str,
         mut manifest: ConversationManifest,
         provider_state: Option<ProviderState>,
         request: Option<Value>,
+        through: Option<u64>,
         mut copy: impl FnMut(ConversationEvent, u64) -> ConversationEvent,
         trailer: impl FnOnce(u64) -> Vec<ConversationEvent>,
     ) -> Result<ConversationManifest, AppError> {
         validate_id(&manifest.id)?;
-        let end = self
+        let tail = self
             .journal_tail(source_id)
             .await?
             .0
             .map_or(0, |event| event.sequence);
+        let end = through.map_or(tail, |through| through.min(tail));
         let mut draft = self.begin_conversation(&manifest).await?;
         let temporary = draft.temporary.clone();
         let filled = async {
