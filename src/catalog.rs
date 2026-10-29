@@ -623,13 +623,22 @@ impl CatalogService {
             remove_mcp_entry(&origin)
         })
         .await;
-        self.cache.invalidate();
+        self.mcp_written(provider);
         removed.map_err(|error| AppError::Anyhow(error.into()))??;
         Ok(McpServerDeletion {
             resource_id: descriptor.resource_id,
             name: descriptor.name,
             path: descriptor.origin.path.to_string_lossy().into_owned(),
         })
+    }
+
+    /// After an MCP file write: omp reads its `mcp.json` only at startup, so
+    /// its resident processes restart before their next turn.
+    fn mcp_written(&self, provider: ProviderKind) {
+        self.cache.invalidate();
+        if provider == ProviderKind::Omp {
+            crate::agent_providers::bump_config_revision();
+        }
     }
 
     /// Adds a new MCP entry to the first config file of `scope`, creating
@@ -661,7 +670,7 @@ impl CatalogService {
             insert_mcp_entry(&path, &entry_name, config)
         })
         .await;
-        self.cache.invalidate();
+        self.mcp_written(provider);
         inserted.map_err(|error| AppError::Anyhow(error.into()))??;
         let resource_id = resource_id_for_mcp(&name, &source.path);
         self.mcp_config(provider, workspace, &resource_id).await
@@ -695,7 +704,7 @@ impl CatalogService {
             replace_mcp_entry(&origin, &entry_name, config)
         })
         .await;
-        self.cache.invalidate();
+        self.mcp_written(provider);
         replaced.map_err(|error| AppError::Anyhow(error.into()))??;
         let resource_id = resource_id_for_mcp(&name, &descriptor.origin.path);
         self.mcp_config(provider, workspace, &resource_id).await
@@ -2941,6 +2950,59 @@ mod tests {
         assert!(toml.starts_with("# keep me\nmodel = \"x\"\n"));
         assert!(!toml.contains("gone"));
         assert!(toml.contains("[mcp_servers.stay]"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn omp_mcp_servers_come_from_its_own_mcp_json_files() {
+        let root = temp_dir("todex-catalog-mcp-omp");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(workspace.join(".omp")).unwrap();
+        fs::create_dir_all(home.join(".omp/agent")).unwrap();
+        let user = home.join(".omp/agent/mcp.json");
+        fs::write(
+            &user,
+            r#"{"$schema":"https://example.test/mcp-schema.json","mcpServers":{"github":{"type":"stdio","command":"npx","args":["-y","gh"]},"off":{"command":"off","enabled":false}},"disabledServers":["other"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(".omp/mcp.json"),
+            r#"{"mcpServers":{"docs":{"type":"http","url":"https://docs.test/mcp"}}}"#,
+        )
+        .unwrap();
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home));
+
+        let catalog = service
+            .mcp(ProviderKind::Omp, workspace.clone())
+            .await
+            .unwrap();
+        let by_name = |name: &str| {
+            catalog
+                .servers
+                .iter()
+                .find(|server| server.name == name)
+                .unwrap_or_else(|| panic!("{name} listed"))
+        };
+        assert_eq!(by_name("github").source, "omp-user");
+        assert!(!by_name("off").enabled);
+        assert_eq!(by_name("docs").source, "omp-project");
+
+        let github = by_name("github").resource_id.clone();
+        let revision = crate::agent_providers::config_revision();
+        service
+            .delete_mcp(ProviderKind::Omp, workspace.clone(), &github)
+            .await
+            .unwrap();
+        let rewritten: Value = serde_json::from_str(&fs::read_to_string(&user).unwrap()).unwrap();
+        assert_eq!(rewritten["$schema"], "https://example.test/mcp-schema.json");
+        assert_eq!(rewritten["disabledServers"], json!(["other"]));
+        assert!(rewritten["mcpServers"].get("github").is_none());
+        assert!(rewritten["mcpServers"]["off"].is_object());
+        // omp reads mcp.json at startup: its resident processes restart.
+        assert!(crate::agent_providers::config_revision() > revision);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -21,8 +21,8 @@ use super::discovery::{DiscoveryCache, DiscoveryKey, DiscoverySnapshot};
 use super::opencode::{close_probe_session, probe_efforts};
 use super::process::{executable_available, CommandSpec, JsonLineProcess};
 use super::profile::{
-    CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
-    SkillInjection,
+    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
+    ProviderProfile, SkillInjection, UserConfigFile,
 };
 use super::resident::{allowlisted_environment, initialize_acp, ResidentLaunch, ResidentSessions};
 use super::rpc::{FailureWording, RpcClient, RpcPeer};
@@ -118,13 +118,20 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         max_sessions: 32,
     },
     discovery_cache_ttl: Some(Duration::from_secs(300)),
-    catalog: CatalogProfile::skills_only(
-        ConfigHome {
+    // omp also reads other tools' MCP configs and its `disabledServers`
+    // list; the catalog shows and edits only omp's own files.
+    catalog: CatalogProfile {
+        source: CatalogSource::Filesystem,
+        config_home: ConfigHome {
             env: None,
             home_relative: ".omp/agent",
         },
-        ".omp/skills",
-    ),
+        project_skills: ".omp/skills",
+        mcp_user_files: &[UserConfigFile::ConfigHome("mcp.json")],
+        mcp_project_files: &[".omp/mcp.json"],
+        mcp_user_source: "omp-user",
+        mcp_project_source: "omp-project",
+    },
 };
 
 pub struct OmpDriver {
@@ -141,8 +148,10 @@ impl OmpDriver {
             binary: config.omp_bin.clone(),
             env_allowlist: config.omp_env_allowlist.clone(),
             overlay_path: overlay_path(data_dir),
+            // omp reads models.yml, plugins and mcp.json only at startup.
             sessions: ResidentSessions::new(&PROFILE, "omp")
-                .with_idle_timeout(config.provider_keepalive()),
+                .with_idle_timeout(config.provider_keepalive())
+                .with_config_restart(),
             discovery: DiscoveryCache::new(),
         }
     }

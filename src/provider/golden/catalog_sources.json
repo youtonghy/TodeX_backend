@@ -502,7 +502,20 @@
         "priority": 20
       }
     ],
-    "mcpSources": [],
+    "mcpSources": [
+      {
+        "path": "<workspace>/.omp/mcp.json",
+        "scope": "project",
+        "source": "omp-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.omp/agent/mcp.json",
+        "scope": "user",
+        "source": "omp-user",
+        "priority": 20
+      }
+    ],
     "skills": 0,
     "mcp": [],
     "mcpTarget": {
