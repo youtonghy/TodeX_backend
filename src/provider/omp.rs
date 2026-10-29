@@ -80,6 +80,7 @@ pub(super) const ACP_QUIRKS: AcpQuirks = AcpQuirks {
     session_mode: Some(super::acp::omp_session_mode),
     steer_acknowledged: super::acp::omp_steer_acknowledged,
     form_elicitation: true,
+    task_subagents: true,
     ..PLAIN_ACP
 };
 
@@ -1037,6 +1038,73 @@ mod tests {
                 && event.payload["kind"] == "elicitation"));
         cancel.send(true).unwrap();
         assert!(task.await.unwrap().unwrap().cancelled);
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_task_subagents_become_subagent_runs_beside_the_tool_card() {
+        let fixture = Fixture::new().await;
+        let (_cancel, task) = fixture
+            .start("turn-spawn", "spawn", None, None, None, None)
+            .await;
+        assert_eq!(Fixture::finished(task).await.stop_reason, "end_turn");
+        let events = fixture.events().await;
+        let subagent: Vec<(String, String, String)> = events
+            .iter()
+            .filter(|event| event.event_type.starts_with("subagent."))
+            .map(|event| {
+                (
+                    event.event_type.clone(),
+                    event.payload["subagentId"].as_str().unwrap().to_owned(),
+                    event.payload["status"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            })
+            .collect();
+        let s = |event: &str, id: &str, status: &str| {
+            (
+                event.to_owned(),
+                format!("call_task/{id}"),
+                status.to_owned(),
+            )
+        };
+        assert_eq!(
+            subagent,
+            [
+                s("subagent.started", "Alpha", "running"),
+                s("subagent.updated", "Alpha", "running"),
+                s("subagent.started", "Beta", "running"),
+                s("subagent.updated", "Beta", "running"),
+                // The repeated progress frame emits nothing.
+                s("subagent.updated", "Alpha", "running"),
+                s("subagent.updated", "Beta", "running"),
+                s("subagent.completed", "Alpha", "completed"),
+                s("subagent.failed", "Beta", "failed"),
+            ]
+        );
+        let started = events
+            .iter()
+            .find(|event| event.event_type == "subagent.started")
+            .unwrap();
+        assert_eq!(started.payload["title"], "Alpha");
+        assert_eq!(started.payload["task"], "List files");
+        assert_eq!(started.payload["providerItemId"], "call_task");
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "subagent.completed")
+            .unwrap();
+        assert_eq!(completed.payload["result"], "a.txt b.txt");
+        let failed = events
+            .iter()
+            .find(|event| event.event_type == "subagent.failed")
+            .unwrap();
+        assert_eq!(failed.payload["error"], "model refused");
+        // The task card itself is still journalled.
+        assert!(events.iter().any(|event| event.event_type == "tool.started"
+            && event.payload["toolCallId"] == "call_task"));
         fixture.finish().await;
     }
 }

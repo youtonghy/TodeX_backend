@@ -112,7 +112,29 @@ for line in sys.stdin:
         active = request_id
         text = params["prompt"][0]["text"]
         update("agent_message_chunk", messageId="msg_fixture", content={"type": "text", "text": "ok"})
-        if text in ("approve", "question"):
+        if text == "spawn":
+            # A `task` call running two subagents inline (omp 18.13.3 capture
+            # with async.enabled: false); Beta fails.
+            def progress(status_a, status_b):
+                return [{"index": 0, "id": "Alpha", "agent": "task", "status": status_a, "task": "Complete:\n\nList files",
+                         "assignment": "List files", "description": "list", "lastIntent": "Listing", "recentTools": [],
+                         "toolCount": 1, "tokens": 13, "cost": 0, "durationMs": 40},
+                        {"index": 1, "id": "Beta", "agent": "explore", "status": status_b, "task": "Read docs",
+                         "assignment": "Read docs", "recentTools": [], "toolCount": 0, "tokens": 0, "cost": 0, "durationMs": 0}]
+            update("tool_call", toolCallId="call_task", name="task", title="task", kind="other", status="pending",
+                   rawInput={"tasks": [{"name": "Alpha"}, {"name": "Beta"}]})
+            for statuses in (("running", "pending"), ("running", "pending"), ("completed", "running")):
+                update("tool_call_update", toolCallId="call_task", status="in_progress",
+                       rawOutput={"content": [{"type": "text", "text": "Running..."}],
+                                  "details": {"results": [], "progress": progress(*statuses)}})
+            update("tool_call_update", toolCallId="call_task", status="completed",
+                   rawOutput={"content": [{"type": "text", "text": "<task-result>"}], "details": {"progress": [], "results": [
+                       {"index": 0, "id": "Alpha", "agent": "task", "exitCode": 0, "aborted": False, "output": "a.txt b.txt",
+                        "durationMs": 88, "tokens": 13},
+                       {"index": 1, "id": "Beta", "agent": "explore", "exitCode": 1, "aborted": False, "output": "",
+                        "error": "model refused", "durationMs": 20, "tokens": 2}]}})
+            finish()
+        elif text in ("approve", "question"):
             # Tool approvals other than bash, and `ask` questions, arrive as
             # form elicitations (omp 18.13.3 capture).
             elicitation_pending = text

@@ -189,6 +189,9 @@ pub(super) struct AcpQuirks {
     /// Advertises form-mode `elicitation/create`: the agent asks its tool
     /// approvals and questions through it instead of failing them.
     pub form_elicitation: bool,
+    /// omp's `task` tool reports its subagents in `rawOutput.details`; they
+    /// become `subagent.*` events next to the tool card.
+    pub task_subagents: bool,
 }
 
 /// Whether an auth method runs headless, and the sign-in hint otherwise.
@@ -232,6 +235,7 @@ pub(super) const PLAIN_ACP: AcpQuirks = AcpQuirks {
     session_mode: None,
     steer_acknowledged: steer_queued,
     form_elicitation: false,
+    task_subagents: false,
 };
 
 /// The `{"status":"queued"}` acknowledgement of Grok's `_x.ai/interject`.
@@ -698,6 +702,10 @@ pub(super) struct AcpConnectionState {
     /// and `subagent_completed` `_meta` markers map to `subagent.updated`
     /// instead of tool progress.
     subagents: BTreeSet<String>,
+    /// omp `task` tool calls of this connection, and per subagent the last
+    /// snapshot emitted for it (`None` once it settled).
+    task_calls: BTreeSet<String>,
+    task_subagents: BTreeMap<String, Option<Value>>,
     /// Set when the last turn's cancel completed cleanly; see
     /// [`AcpConnectionState::take_clean_cancel`].
     clean_cancel: bool,
@@ -2306,6 +2314,11 @@ pub(super) async fn handle_acp_message(
                 return Ok(());
             }
         }
+        if quirks.task_subagents {
+            for (event_type, payload) in omp_task_subagents(update_type, &update, connection) {
+                sink.emit(event_type, payload).await?;
+            }
+        }
         let provider_id = provider.as_str();
         let (event_type, mut payload) = match update_type {
             "agent_message_chunk" => (
@@ -2937,6 +2950,210 @@ fn devin_subagent_update(
             "metadata": update,
         }),
     ))
+}
+
+/// omp's `task` tool reports its subagents in `rawOutput.details`:
+/// `progress[]` (`id`, `agent`, `status`, `assignment`,
+/// `lastIntent`, `toolCount`, `tokens`, `cost`, `durationMs`) while they run
+/// and `results[]` (`exitCode`, `aborted`, `error`, `output`) once the call
+/// returns (omp 18.13). Each subagent becomes `subagent.started`, deduplicated
+/// `subagent.updated` snapshots, and one terminal event; the tool card stays.
+/// Shapes omp does not send yet leave the plain card.
+fn omp_task_subagents(
+    update_type: &str,
+    update: &Value,
+    connection: &mut AcpConnectionState,
+) -> Vec<(&'static str, Value)> {
+    let Some(tool_id) = update.get("toolCallId").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    if update_type == "tool_call" {
+        if update.get("name").and_then(Value::as_str) == Some("task") {
+            connection.task_calls.insert(tool_id.to_owned());
+        }
+        return Vec::new();
+    }
+    if update_type != "tool_call_update" || !connection.task_calls.contains(tool_id) {
+        return Vec::new();
+    }
+    let provider = ProviderKind::Omp.as_str();
+    let details = update.pointer("/rawOutput/details");
+    let list = |key: &str| {
+        details
+            .and_then(|details| details.get(key))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut events = Vec::new();
+    let base = |agent: &Value, subagent_id: &str| {
+        json!({
+            "provider": provider, "source": "provider", "scope": "message",
+            "subagentId": subagent_id, "providerItemId": tool_id,
+            "agentId": agent.get("id"), "agentKind": agent.get("agent"),
+        })
+    };
+    let usage = |agent: &Value| {
+        let mut usage = serde_json::Map::new();
+        for (key, field) in [
+            ("total", "tokens"),
+            ("cost", "cost"),
+            ("durationMs", "durationMs"),
+            ("toolUses", "toolCount"),
+        ] {
+            if let Some(value) = agent.get(field).filter(|value| value.is_number()) {
+                usage.insert(key.to_owned(), value.clone());
+            }
+        }
+        Value::Object(usage)
+    };
+    let results = list("results");
+    for result in &results {
+        let Some(id) = result.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let subagent_id = format!("{tool_id}/{id}");
+        omp_task_start(
+            &mut connection.task_subagents,
+            base(result, &subagent_id),
+            result,
+            &mut events,
+        );
+        if connection.task_subagents.get(&subagent_id) == Some(&None) {
+            continue;
+        }
+        connection.task_subagents.insert(subagent_id.clone(), None);
+        let mut payload = base(result, &subagent_id);
+        payload["usage"] = usage(result);
+        let event = if result.get("aborted").and_then(Value::as_bool) == Some(true) {
+            payload["status"] = json!("cancelled");
+            "subagent.cancelled"
+        } else if result
+            .get("exitCode")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 0)
+        {
+            payload["status"] = json!("failed");
+            payload["error"] = result
+                .get("error")
+                .or_else(|| result.get("stderr"))
+                .filter(|error| error.as_str().is_some_and(|error| !error.is_empty()))
+                .cloned()
+                .unwrap_or_else(|| json!("subagent failed"));
+            "subagent.failed"
+        } else {
+            payload["status"] = json!("completed");
+            payload["result"] = result.get("output").cloned().unwrap_or(Value::Null);
+            "subagent.completed"
+        };
+        events.push((event, payload));
+    }
+    for agent in list("progress") {
+        let Some(id) = agent.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let subagent_id = format!("{tool_id}/{id}");
+        omp_task_start(
+            &mut connection.task_subagents,
+            base(&agent, &subagent_id),
+            &agent,
+            &mut events,
+        );
+        let snapshot = json!({
+            "status": agent.get("status"), "lastIntent": agent.get("lastIntent"),
+            "toolCount": agent.get("toolCount"), "tokens": agent.get("tokens"),
+        });
+        match connection.task_subagents.get(&subagent_id) {
+            // Settled from `results[]`, or the progress repeats itself.
+            Some(None) => continue,
+            Some(Some(previous)) if *previous == snapshot => continue,
+            _ => {}
+        }
+        let terminal = match agent.get("status").and_then(Value::as_str) {
+            Some("completed") => Some(("subagent.completed", "completed")),
+            Some("failed") => Some(("subagent.failed", "failed")),
+            Some("aborted") => Some(("subagent.cancelled", "cancelled")),
+            _ => None,
+        };
+        let mut payload = base(&agent, &subagent_id);
+        payload["usage"] = usage(&agent);
+        payload["metadata"] = json!({ "lastIntent": agent.get("lastIntent"), "recentTools": agent.get("recentTools") });
+        match terminal {
+            // `results[]` settles it with the output once the call returns.
+            Some(_)
+                if results.is_empty()
+                    && update.get("status").and_then(Value::as_str) == Some("in_progress") =>
+            {
+                connection
+                    .task_subagents
+                    .insert(subagent_id, Some(snapshot));
+                payload["status"] = json!("running");
+                events.push(("subagent.updated", payload));
+            }
+            Some((event, status)) => {
+                connection.task_subagents.insert(subagent_id, None);
+                payload["status"] = json!(status);
+                events.push((event, payload));
+            }
+            None => {
+                connection
+                    .task_subagents
+                    .insert(subagent_id, Some(snapshot));
+                payload["status"] = json!("running");
+                events.push(("subagent.updated", payload));
+            }
+        }
+    }
+    // The call ended: whatever never settled did not finish.
+    if matches!(
+        update.get("status").and_then(Value::as_str),
+        Some("completed" | "failed")
+    ) {
+        connection.task_calls.remove(tool_id);
+        let prefix = format!("{tool_id}/");
+        let open: Vec<String> = connection
+            .task_subagents
+            .iter()
+            .filter(|(id, state)| id.starts_with(&prefix) && state.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for subagent_id in open {
+            connection.task_subagents.insert(subagent_id.clone(), None);
+            events.push((
+                "subagent.cancelled",
+                json!({
+                    "provider": provider, "source": "provider", "scope": "message",
+                    "subagentId": subagent_id, "providerItemId": tool_id, "status": "cancelled",
+                }),
+            ));
+        }
+    }
+    events
+}
+
+/// The `subagent.started` of an omp `task` subagent the first time it shows.
+fn omp_task_start(
+    states: &mut BTreeMap<String, Option<Value>>,
+    mut payload: Value,
+    agent: &Value,
+    events: &mut Vec<(&'static str, Value)>,
+) {
+    let Some(subagent_id) = payload["subagentId"].as_str().map(str::to_owned) else {
+        return;
+    };
+    if states.contains_key(&subagent_id) {
+        return;
+    }
+    states.insert(subagent_id, Some(Value::Null));
+    // The subagent's name: omp rewrites `description` with its latest output.
+    payload["title"] = agent.get("id").cloned().unwrap_or(Value::Null);
+    payload["task"] = agent
+        .get("assignment")
+        .or_else(|| agent.get("task"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    payload["status"] = json!("running");
+    events.push(("subagent.started", payload));
 }
 
 pub(super) fn grok_activity_event(params: &Value) -> Option<(&'static str, Value)> {
