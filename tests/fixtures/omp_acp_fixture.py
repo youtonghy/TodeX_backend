@@ -17,6 +17,7 @@ thinking = "off"
 session = "01a1816a-fixture"
 active = None
 permission_pending = False
+elicitation_pending = None
 
 
 def write(value):
@@ -111,7 +112,18 @@ for line in sys.stdin:
         active = request_id
         text = params["prompt"][0]["text"]
         update("agent_message_chunk", messageId="msg_fixture", content={"type": "text", "text": "ok"})
-        if text == "permission":
+        if text in ("approve", "question"):
+            # Tool approvals other than bash, and `ask` questions, arrive as
+            # form elicitations (omp 18.13.3 capture).
+            elicitation_pending = text
+            enum = (["Approve", "Approve write for this session", "Deny"] if text == "approve"
+                    else ["Postgres", "SQLite"])
+            message = "Allow tool: write\nPath: w.txt\nContent:\nhi" if text == "approve" else "Which database?"
+            write({"jsonrpc": "2.0", "id": 1, "method": "elicitation/create", "params": {
+                "mode": "form", "sessionId": session, "message": message,
+                "requestedSchema": {"type": "object", "properties": {"value": {"type": "string", "enum": enum}},
+                                    "required": ["value"]}}})
+        elif text == "permission":
             permission_pending = True
             # omp numbers its own requests from 0.
             write({"jsonrpc": "2.0", "id": 0, "method": "session/request_permission", "params": {
@@ -131,6 +143,9 @@ for line in sys.stdin:
         result(request_id, {})
     elif method is not None:
         write({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}})
+    elif request_id == 1 and elicitation_pending and active is not None:
+        elicitation_pending = None
+        finish()
     elif request_id == 0 and permission_pending and active is not None:
         # The client answered the permission request; the tool ran.
         permission_pending = False

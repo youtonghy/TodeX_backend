@@ -116,7 +116,7 @@ async fn inspect_provider(
         ProviderKind::Codex => Box::new(CodexDriver::new(&config.agent)),
         ProviderKind::Pi => Box::new(PiDriver::new(&config.agent)),
         ProviderKind::Opencode => Box::new(OpencodeDriver::new(&config.agent)),
-        ProviderKind::Omp => Box::new(OmpDriver::new(&config.agent)),
+        ProviderKind::Omp => Box::new(OmpDriver::new(&config.agent, &config.data_dir)),
         _ => unreachable!("provider was validated by inspect_providers"),
     };
     let mut report = ProviderProbeReport {

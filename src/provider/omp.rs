@@ -5,7 +5,7 @@
 //! process per conversation, as for OpenCode.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -50,6 +50,22 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Pi's agent directory override; omp reads the same variable, so a value
 /// meant for Pi would point omp at Pi's directory.
 const PI_AGENT_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
+const CONFIG_OVERLAY_FILE: &str = "todex.config.yml";
+/// Settings overlay (`omp acp --config`) for TodeX's launches. omp's ACP
+/// server forwards nothing once a prompt has returned, so a background task
+/// or auto-backgrounded command would finish, and omp would answer on it,
+/// where TodeX never sees it: background execution stays in the turn.
+const CONFIG_OVERLAY: &str = "\
+# Written by TodeX for the omp processes it launches; rewritten before each launch.
+async:
+  enabled: false
+bash:
+  autoBackground:
+    enabled: false
+eval:
+  autoBackground:
+    enabled: false
+";
 
 /// Where omp deviates from plain ACP.
 pub(super) const ACP_QUIRKS: AcpQuirks = AcpQuirks {
@@ -63,6 +79,7 @@ pub(super) const ACP_QUIRKS: AcpQuirks = AcpQuirks {
     effort_config: "thinking",
     session_mode: Some(super::acp::omp_session_mode),
     steer_acknowledged: super::acp::omp_steer_acknowledged,
+    form_elicitation: true,
     ..PLAIN_ACP
 };
 
@@ -113,15 +130,17 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 pub struct OmpDriver {
     binary: String,
     env_allowlist: Vec<String>,
+    overlay_path: PathBuf,
     sessions: ResidentSessions,
     discovery: DiscoveryCache<DiscoveryKey, DiscoverySnapshot>,
 }
 
 impl OmpDriver {
-    pub fn new(config: &AgentConfig) -> Self {
+    pub fn new(config: &AgentConfig, data_dir: &Path) -> Self {
         Self {
             binary: config.omp_bin.clone(),
             env_allowlist: config.omp_env_allowlist.clone(),
+            overlay_path: overlay_path(data_dir),
             sessions: ResidentSessions::new(&PROFILE, "omp")
                 .with_idle_timeout(config.provider_keepalive()),
             discovery: DiscoveryCache::new(),
@@ -135,7 +154,7 @@ impl OmpDriver {
         _prompt: &DriverPrompt,
     ) -> Result<ResidentLaunch, AppError> {
         Ok(ResidentLaunch {
-            spec: self.command_spec(&context.manifest.workspace),
+            spec: self.command_spec(&context.manifest.workspace)?,
             runtime: AcpRuntimeOptions {
                 suppress_load_replay: true,
                 ..Default::default()
@@ -147,14 +166,17 @@ impl OmpDriver {
     /// permission mode of each turn decides them (omp's own default would
     /// run most calls unasked). omp keeps credentials in its own store; its
     /// `agent` auth method only names them, so `authenticate` is never sent.
-    fn command_spec(&self, workspace: &Path) -> CommandSpec {
+    fn command_spec(&self, workspace: &Path) -> Result<CommandSpec, AppError> {
+        write_overlay(&self.overlay_path)?;
         let mut spec = CommandSpec::new(&self.binary, workspace);
-        spec.args = ["acp", "--approval-mode", "always-ask"]
+        spec.args = ["acp", "--approval-mode", "always-ask", "--config"]
             .map(str::to_owned)
             .to_vec();
+        spec.args
+            .push(self.overlay_path.to_string_lossy().into_owned());
         spec.env = omp_environment(&self.env_allowlist);
         spec.env_remove = vec![PI_AGENT_DIR_ENV.to_owned()];
-        spec
+        Ok(spec)
     }
 
     /// Models and slash commands live behind `session/new`. The session is
@@ -163,7 +185,7 @@ impl OmpDriver {
         &self,
         workspace: &Path,
     ) -> Result<(JsonLineProcess, Value, Vec<Value>), AppError> {
-        let mut process = JsonLineProcess::spawn(&self.command_spec(workspace)).await?;
+        let mut process = JsonLineProcess::spawn(&self.command_spec(workspace)?).await?;
         let result = async {
             initialize_acp(&mut process, OMP_RPC, None, None).await?;
             let mut updates = Vec::new();
@@ -328,7 +350,7 @@ impl ProviderDriver for OmpDriver {
             .as_deref()
             .ok_or_else(|| AppError::InvalidRequest("omp session has not started".to_owned()))?;
         let mut process =
-            JsonLineProcess::spawn(&self.command_spec(&context.manifest.workspace)).await?;
+            JsonLineProcess::spawn(&self.command_spec(&context.manifest.workspace)?).await?;
         let result = async {
             initialize_acp(&mut process, OMP_RPC, None, None).await?;
             let response = RpcClient::new(&mut process, OMP_RPC)
@@ -405,6 +427,22 @@ impl ProviderDriver for OmpDriver {
     }
 }
 
+fn overlay_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("providers")
+        .join(ProviderKind::Omp.as_str())
+        .join(CONFIG_OVERLAY_FILE)
+}
+
+fn write_overlay(path: &Path) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::ProviderUnavailable("omp settings overlay path has no parent".to_owned())
+    })?;
+    crate::secure_fs::ensure_owner_only_dir(parent)?;
+    crate::secure_fs::write_owner_only_atomic_if_changed(path, CONFIG_OVERLAY.as_bytes())?;
+    Ok(())
+}
+
 /// `PI_NO_TITLE` skips the extra model call omp spends on a session title;
 /// TodeX titles conversations itself.
 fn omp_environment(allowlist: &[String]) -> BTreeMap<String, String> {
@@ -419,16 +457,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn launch_asks_for_every_write_and_drops_pi_agent_dir() {
-        let driver = OmpDriver::new(&AgentConfig {
-            omp_env_allowlist: vec!["OMP_TEST_ALLOWED".to_owned()],
-            ..crate::config::Config::default().agent
-        });
-        let spec = driver.command_spec(Path::new("/workspace"));
-        assert_eq!(spec.args, ["acp", "--approval-mode", "always-ask"]);
+    fn launch_asks_for_every_write_keeps_work_in_the_turn_and_drops_pi_agent_dir() {
+        let data_dir =
+            std::env::temp_dir().join(format!("todex-omp-launch-{}", uuid::Uuid::new_v4()));
+        let driver = OmpDriver::new(&crate::config::Config::default().agent, &data_dir);
+        let spec = driver.command_spec(Path::new("/workspace")).unwrap();
+        let overlay = data_dir.join("providers/omp/todex.config.yml");
+        assert_eq!(
+            spec.args,
+            [
+                "acp",
+                "--approval-mode",
+                "always-ask",
+                "--config",
+                &overlay.to_string_lossy()
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(&overlay).unwrap(), CONFIG_OVERLAY);
+        // An edited overlay is restored before the next launch.
+        std::fs::write(&overlay, "async:\n  enabled: true\n").unwrap();
+        driver.command_spec(Path::new("/workspace")).unwrap();
+        assert_eq!(std::fs::read_to_string(&overlay).unwrap(), CONFIG_OVERLAY);
+        let parsed: serde_json::Value = serde_yaml_ng::from_str(CONFIG_OVERLAY).unwrap();
+        for pointer in [
+            "/async/enabled",
+            "/bash/autoBackground/enabled",
+            "/eval/autoBackground/enabled",
+        ] {
+            assert_eq!(parsed.pointer(pointer), Some(&json!(false)), "{pointer}");
+        }
         assert_eq!(spec.env_remove, [PI_AGENT_DIR_ENV]);
         assert_eq!(spec.env.get("PI_NO_TITLE").map(String::as_str), Some("1"));
         assert_eq!(spec.env.get("NO_COLOR").map(String::as_str), Some("1"));
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 
     #[test]
@@ -470,6 +531,7 @@ mod tests {
             let driver = std::sync::Arc::new(OmpDriver {
                 binary: binary.to_string_lossy().to_string(),
                 env_allowlist: vec![],
+                overlay_path: overlay_path(&root.join("data")),
                 sessions: ResidentSessions::new(&PROFILE, "omp"),
                 discovery: DiscoveryCache::new(),
             });
@@ -609,9 +671,24 @@ mod tests {
         assert_eq!(fixture.count("authenticate"), 0);
         assert_eq!(fixture.count("session/new"), 1);
         let first = &fixture.requests()[0];
+        let argv = first["argv"].as_array().unwrap();
         assert_eq!(
-            first["argv"],
-            json!(["acp", "--approval-mode", "always-ask"])
+            argv[..4],
+            [
+                json!("acp"),
+                json!("--approval-mode"),
+                json!("always-ask"),
+                json!("--config")
+            ]
+        );
+        assert!(argv[4]
+            .as_str()
+            .unwrap()
+            .ends_with("providers/omp/todex.config.yml"));
+        // Tool approvals and questions arrive as form elicitations.
+        assert_eq!(
+            first["params"]["clientCapabilities"]["elicitation"],
+            json!({"form": {}})
         );
         assert_eq!(first["noTitle"], "1");
         // omp already reports the default mode, so nothing is re-sent.
@@ -848,6 +925,109 @@ mod tests {
             .iter()
             .any(|request| request["method"] == "session/fork"
                 && request["params"]["sessionId"] == "01a1816a-fixture"));
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_approval_elicitations_follow_the_permission_mode() {
+        for mode in ["auto", "full-access"] {
+            let fixture = Fixture::new().await;
+            let (_cancel, task) = fixture
+                .start("turn-approve", "approve", None, None, Some(mode), None)
+                .await;
+            assert_eq!(Fixture::finished(task).await.stop_reason, "end_turn");
+            let answer = fixture
+                .requests()
+                .into_iter()
+                .find(|request| request["id"] == 1 && request.get("result").is_some())
+                .expect("elicitation answer recorded");
+            // `Approve` only: the session-wide grant would outlive a switch to ask.
+            assert_eq!(
+                answer["result"],
+                json!({"action": "accept", "content": {"value": "Approve"}})
+            );
+            assert!(fixture
+                .events()
+                .await
+                .iter()
+                .any(|event| event.event_type == "permission.resolved"
+                    && event.payload["autoApproved"] == true));
+            fixture.finish().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_ask_mode_brokers_approval_elicitations_and_cancel_answers_cancel() {
+        let fixture = Fixture::new().await;
+        let (cancel, task) = fixture
+            .start("turn-approve-ask", "approve", None, None, Some("ask"), None)
+            .await;
+        fixture.wait_for_method("session/prompt").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let requested = fixture
+            .events()
+            .await
+            .into_iter()
+            .find(|event| event.event_type == "permission.requested")
+            .expect("approval brokered");
+        let kinds: Vec<_> = requested.payload["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| (option["optionId"].clone(), option["kind"].clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (json!("Approve"), json!("allow_once")),
+                (
+                    json!("Approve write for this session"),
+                    json!("allow_always")
+                ),
+                (json!("Deny"), json!("reject_once")),
+            ]
+        );
+        cancel.send(true).unwrap();
+        assert!(task.await.unwrap().unwrap().cancelled);
+        let answer = fixture
+            .requests()
+            .into_iter()
+            .find(|request| request["id"] == 1 && request.get("result").is_some())
+            .expect("elicitation answer recorded");
+        assert_eq!(answer["result"], json!({"action": "cancel"}));
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_questions_go_to_the_user_even_in_full_access() {
+        let fixture = Fixture::new().await;
+        let (cancel, task) = fixture
+            .start(
+                "turn-question",
+                "question",
+                None,
+                None,
+                Some("full-access"),
+                None,
+            )
+            .await;
+        fixture.wait_for_method("session/prompt").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(fixture
+            .requests()
+            .iter()
+            .all(|request| request["id"] != 1 || request.get("result").is_none()));
+        assert!(fixture
+            .events()
+            .await
+            .iter()
+            .any(|event| event.event_type == "permission.requested"
+                && event.payload["kind"] == "elicitation"));
+        cancel.send(true).unwrap();
+        assert!(task.await.unwrap().unwrap().cancelled);
         fixture.finish().await;
     }
 }

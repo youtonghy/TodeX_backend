@@ -350,7 +350,8 @@ impl DriverRegistry {
             ),
             (
                 ProviderKind::Omp,
-                Arc::new(super::omp::OmpDriver::new(&config.agent)) as Arc<dyn ProviderDriver>,
+                Arc::new(super::omp::OmpDriver::new(&config.agent, &config.data_dir))
+                    as Arc<dyn ProviderDriver>,
             ),
         ]);
         Self {

@@ -5,12 +5,12 @@ use std::time::Duration;
 use agent_client_protocol::schema::{
     v1::{
         CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
-        ImageContent, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-        NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
-        PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-        RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption,
-        SessionConfigOptionsCapabilities, SessionNotification, SetSessionConfigOptionResponse,
-        TextContent,
+        ElicitationCapabilities, ElicitationFormCapabilities, ImageContent, Implementation,
+        InitializeRequest, InitializeResponse, LoadSessionRequest, NewSessionRequest,
+        NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+        SelectedPermissionOutcome, SessionConfigOption, SessionConfigOptionsCapabilities,
+        SessionNotification, SetSessionConfigOptionResponse, TextContent,
     },
     ProtocolVersion,
 };
@@ -186,6 +186,9 @@ pub(super) struct AcpQuirks {
     pub session_mode: Option<fn(&DriverPrompt) -> Option<&'static str>>,
     /// Whether a steering request's result confirms the message was taken.
     pub steer_acknowledged: fn(&Value) -> bool,
+    /// Advertises form-mode `elicitation/create`: the agent asks its tool
+    /// approvals and questions through it instead of failing them.
+    pub form_elicitation: bool,
 }
 
 /// Whether an auth method runs headless, and the sign-in hint otherwise.
@@ -228,6 +231,7 @@ pub(super) const PLAIN_ACP: AcpQuirks = AcpQuirks {
     effort_config: "reasoning_effort",
     session_mode: None,
     steer_acknowledged: steer_queued,
+    form_elicitation: false,
 };
 
 /// The `{"status":"queued"}` acknowledgement of Grok's `_x.ai/interject`.
@@ -648,9 +652,13 @@ const ACP_RPC: RpcPeer = RpcPeer {
 };
 
 fn initialize_request(provider: ProviderKind) -> InitializeRequest {
-    let capabilities = ClientCapabilities::new().session(
+    let mut capabilities = ClientCapabilities::new().session(
         ClientSessionCapabilities::new().config_options(SessionConfigOptionsCapabilities::new()),
     );
+    if quirks(provider).form_elicitation {
+        capabilities = capabilities
+            .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
+    }
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(if quirks(provider).subagents {
             // Subagent lifecycle (`subagent_started` / `subagent_completed`)
@@ -2126,6 +2134,7 @@ async fn wait_for_response_with_timeout(
                     matches!(
                         extension_method(method),
                         "session/request_permission"
+                            | "elicitation/create"
                             | "x.ai/ask_user_question"
                             | "x.ai/exit_plan_mode"
                             | "x.ai/mcp/elicit"
@@ -2182,6 +2191,7 @@ fn is_client_request(message: &Value) -> bool {
                 matches!(
                     extension_method(method),
                     "session/request_permission"
+                        | "elicitation/create"
                         | "x.ai/ask_user_question"
                         | "x.ai/exit_plan_mode"
                         | "x.ai/mcp/elicit"
@@ -2526,7 +2536,7 @@ async fn handle_client_request(
             "session/request_permission" => serde_json::to_value(RequestPermissionResponse::new(
                 RequestPermissionOutcome::Cancelled,
             ))?,
-            "x.ai/mcp/elicit" => json!({"action":"cancel"}),
+            "x.ai/mcp/elicit" | "elicitation/create" => json!({"action":"cancel"}),
             _ => json!({"outcome":"cancelled"}),
         };
         send_result(process, id, response).await?;
@@ -2539,7 +2549,18 @@ async fn handle_client_request(
         return handle_exit_plan_mode(process, message, params, sink, cancel).await;
     }
     if extension_method(method) == "x.ai/mcp/elicit" {
-        return handle_mcp_elicit(process, message, params, sink, cancel).await;
+        return handle_mcp_elicit(
+            process,
+            message,
+            params,
+            sink,
+            cancel,
+            "Grok Build needs additional input",
+        )
+        .await;
+    }
+    if method == "elicitation/create" {
+        return handle_form_elicitation(process, message, params, sink, cancel, auto_approve).await;
     }
     if method == "session/request_permission" {
         let request_id = message.get("id").cloned().ok_or_else(|| {
@@ -2549,72 +2570,167 @@ async fn handle_client_request(
             serde_json::from_value(params.clone()).map_err(|error| {
                 AppError::InvalidRequest(format!("invalid ACP permission request: {error}"))
             })?;
-        if auto_approve != AutoApprove::Mediate {
-            if let Some(selected) = auto_select_permission_option(&request, auto_approve) {
-                let outcome = if selected.kind == PermissionOptionKind::AllowAlways {
-                    "allow_always"
-                } else {
-                    "allow_once"
-                };
-                emit_auto_permission(
-                    sink,
-                    &request,
-                    request_id_text(&request_id),
-                    outcome,
-                    selected.option_id.0.as_ref(),
-                )
-                .await?;
-                let response = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
-                    SelectedPermissionOutcome::new(selected.option_id.0),
-                ));
-                process
-                    .write_response(
-                        json!({ "jsonrpc": "2.0", "id": request_id, "result": response }),
-                    )
-                    .await?;
-                return Ok(());
-            }
-            // No allow-style option offered; fall through and ask the user.
-        }
-        let options = serde_json::to_value(&request.options)?;
-        let decision = match sink
-            .request_permission(
-                request_id_text(&request_id),
-                "tool",
-                "Allow ACP tool call?",
-                serde_json::to_value(&request.tool_call)?,
-                options,
-                cancel,
-            )
-            .await
-        {
-            Ok(decision) => decision,
-            Err(error) => {
-                let response = RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
-                process
-                    .write_response(
-                        json!({ "jsonrpc": "2.0", "id": request_id, "result": response }),
-                    )
-                    .await?;
-                // An expired or closed broker request already answered the agent
-                // with `cancelled`; let the turn continue without the tool rather
-                // than failing it. A user-initiated cancel still ends the turn.
-                return match error {
-                    AppError::TurnCancelled => Err(error),
-                    _ => Ok(()),
-                };
-            }
+        let decided = decide_permission(&request, &request_id, sink, cancel, auto_approve).await;
+        let outcome = match &decided {
+            Ok(Some(option_id)) => RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new(option_id.clone()),
+            ),
+            _ => RequestPermissionOutcome::Cancelled,
         };
-        let selected = select_acp_option(&request, &decision)?;
-        let response = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
-            SelectedPermissionOutcome::new(selected),
-        ));
+        let response = RequestPermissionResponse::new(outcome);
         process
             .write_response(json!({ "jsonrpc": "2.0", "id": request_id, "result": response }))
             .await?;
-        return Ok(());
+        return decided.map(|_| ());
     }
     Ok(())
+}
+
+/// The option a tool permission request is answered with: chosen client-side
+/// in `auto`/`full-access`, otherwise by the user. `None` when the request
+/// lapsed (expired or closed broker request), so the turn continues without
+/// the tool; a user-initiated cancel is an error that ends the turn.
+async fn decide_permission(
+    request: &RequestPermissionRequest,
+    request_id: &Value,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+    auto_approve: AutoApprove,
+) -> Result<Option<String>, AppError> {
+    if auto_approve != AutoApprove::Mediate {
+        if let Some(selected) = auto_select_permission_option(request, auto_approve) {
+            let outcome = if selected.kind == PermissionOptionKind::AllowAlways {
+                "allow_always"
+            } else {
+                "allow_once"
+            };
+            emit_auto_permission(
+                sink,
+                request,
+                request_id_text(request_id),
+                outcome,
+                selected.option_id.0.as_ref(),
+            )
+            .await?;
+            return Ok(Some(selected.option_id.0.to_string()));
+        }
+        // No allow-style option offered; ask the user.
+    }
+    let decision = match sink
+        .request_permission(
+            request_id_text(request_id),
+            "tool",
+            "Allow ACP tool call?",
+            serde_json::to_value(&request.tool_call)?,
+            serde_json::to_value(&request.options)?,
+            cancel,
+        )
+        .await
+    {
+        Ok(decision) => decision,
+        Err(AppError::TurnCancelled) => return Err(AppError::TurnCancelled),
+        Err(_) => return Ok(None),
+    };
+    select_acp_option(request, &decision).map(Some)
+}
+
+/// omp's tool approvals arrive as a form elicitation: one required string
+/// `value` whose choices include `Deny` and an `Approve…` label.
+const ELICITATION_APPROVE_ONCE: [&str; 2] = ["Approve", "Approve Once"];
+const ELICITATION_DENY: &str = "Deny";
+const ELICITATION_SESSION_SUFFIX: &str = " for this session";
+
+fn approval_choices(params: &Value) -> Option<Vec<String>> {
+    let properties = params.pointer("/requestedSchema/properties")?.as_object()?;
+    if properties.len() != 1 {
+        return None;
+    }
+    let choices: Vec<String> = properties
+        .get("value")?
+        .get("enum")?
+        .as_array()?
+        .iter()
+        .map(|choice| choice.as_str().map(str::to_owned))
+        .collect::<Option<_>>()?;
+    let has_approve = choices
+        .iter()
+        .any(|choice| ELICITATION_APPROVE_ONCE.contains(&choice.as_str()));
+    (has_approve && choices.iter().any(|choice| choice == ELICITATION_DENY)).then_some(choices)
+}
+
+/// The approval elicitation as an ACP permission request whose option ids
+/// are the labels to answer with. Grants that remember files or folders
+/// across sessions are not offered.
+fn elicitation_permission_request(
+    params: &Value,
+    request_id: &Value,
+    choices: &[String],
+) -> Result<RequestPermissionRequest, AppError> {
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let options: Vec<Value> = choices
+        .iter()
+        .filter_map(|label| {
+            let kind = if ELICITATION_APPROVE_ONCE.contains(&label.as_str()) {
+                "allow_once"
+            } else if label == ELICITATION_DENY {
+                "reject_once"
+            } else if label.ends_with(ELICITATION_SESSION_SUFFIX) {
+                "allow_always"
+            } else {
+                return None;
+            };
+            Some(json!({ "optionId": label, "name": label, "kind": kind }))
+        })
+        .collect();
+    serde_json::from_value(json!({
+        "sessionId": params.get("sessionId").cloned().unwrap_or(json!("")),
+        "toolCall": {
+            "toolCallId": format!("elicitation-{}", request_id_text(request_id)),
+            "title": message.lines().next().unwrap_or("Allow tool call?"),
+            "content": [{ "type": "content", "content": { "type": "text", "text": message } }],
+        },
+        "options": options,
+    }))
+    .map_err(|error| AppError::InvalidRequest(format!("invalid approval elicitation: {error}")))
+}
+
+/// Form-mode `elicitation/create`. Tool approvals follow the turn's
+/// permission mode like `session/request_permission`; every other form is a
+/// question only the user answers, whatever the mode.
+async fn handle_form_elicitation(
+    process: &mut (impl AcpWriter + ?Sized),
+    message: &Value,
+    params: Value,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+    auto_approve: AutoApprove,
+) -> Result<(), AppError> {
+    let request_id = required_request_id(message, "ACP elicitation")?;
+    if params.get("mode").and_then(Value::as_str) != Some("form") {
+        return send_result(process, request_id, json!({ "action": "decline" })).await;
+    }
+    let Some(choices) = approval_choices(&params) else {
+        return handle_mcp_elicit(
+            process,
+            message,
+            params,
+            sink,
+            cancel,
+            "The agent needs additional input",
+        )
+        .await;
+    };
+    let request = elicitation_permission_request(&params, request_id, &choices)?;
+    let decided = decide_permission(&request, request_id, sink, cancel, auto_approve).await;
+    let result = match &decided {
+        Ok(Some(label)) => json!({ "action": "accept", "content": { "value": label } }),
+        _ => json!({ "action": "cancel" }),
+    };
+    send_result(process, request_id, result).await?;
+    decided.map(|_| ())
 }
 
 /// Grok's prompt ledger includes cached input, while individual response usage excludes it.
@@ -2987,8 +3103,9 @@ async fn handle_mcp_elicit(
     params: Value,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
+    default_title: &str,
 ) -> Result<(), AppError> {
-    let request_id = required_request_id(message, "Grok Build MCP elicitation")?;
+    let request_id = required_request_id(message, "MCP elicitation")?;
     if !params.is_object() {
         return send_invalid_params(
             process,
@@ -3000,7 +3117,7 @@ async fn handle_mcp_elicit(
     let title = params
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or("Grok Build needs additional input")
+        .unwrap_or(default_title)
         .to_owned();
     let decision = match sink
         .request_permission(
