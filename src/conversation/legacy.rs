@@ -69,6 +69,9 @@ impl ConversationStore {
             return Ok(());
         }
         let manifest = self.get(conversation_id).await?;
+        if manifest.ephemeral {
+            return Ok(());
+        }
         let legacy = if manifest.legacy_plaintext {
             true
         } else if manifest.history_encrypted_at.is_some() {
@@ -174,6 +177,10 @@ impl ConversationStore {
         let mut scan = LegacyScan::default();
         let mut legacy_total = 0;
         for manifest in self.list().await? {
+            if manifest.ephemeral {
+                // In memory only: no history on disk to classify.
+                continue;
+            }
             scan.conversations += 1;
             if manifest.legacy_plaintext || manifest.history_encrypted_at.is_some() {
                 scan.already_decided += 1;

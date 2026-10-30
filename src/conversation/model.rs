@@ -143,6 +143,12 @@ pub struct ConversationManifest {
     /// unless `includeChildren=true`. Omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_conversation_id: Option<String>,
+    /// Private conversation: it lives only in daemon memory (no
+    /// conversation folder, no journal, no keyring entry) and is gone after
+    /// a daemon restart. Fork, compaction and schedules are refused.
+    /// Omitted while `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
 }
 
 /// `manifest.schedule`. The held prompts live in daemon memory only, so a
@@ -201,6 +207,7 @@ impl ConversationManifest {
             legacy_plaintext: false,
             schedule: None,
             parent_conversation_id: None,
+            ephemeral: false,
         }
     }
 }

@@ -2,6 +2,7 @@ mod coalesce;
 mod digest;
 #[cfg(test)]
 pub(crate) mod e2e_support;
+mod ephemeral;
 mod hub;
 mod legacy;
 mod maintenance;

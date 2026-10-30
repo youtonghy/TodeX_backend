@@ -112,7 +112,7 @@ const MIN_JOURNAL_RECORD_BYTES: usize = 64;
 /// this (records reach ~1 MiB, so 1000 of them could otherwise approach the
 /// whole journal). A page always holds at least one record. Sealed records
 /// count the length of their v3 line, as if they were still plaintext.
-const MAX_REPLAY_PAGE_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_REPLAY_PAGE_BYTES: u64 = 8 * 1024 * 1024;
 /// Appends that leave the status unchanged only mark the cached manifest
 /// dirty; it reaches `manifest.json` at most this often per conversation.
 const MANIFEST_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -219,7 +219,9 @@ pub struct ConversationStore {
     /// Authoritative in-memory manifests. Every writer holds the
     /// conversation lock; loads on a cache miss take it too, so a stale disk
     /// read can never overwrite a newer entry or resurrect a deleted one.
-    manifests: Arc<DashMap<String, CachedManifest>>,
+    pub(super) manifests: Arc<DashMap<String, CachedManifest>>,
+    /// Private (RAM-only) conversations; see [`super::ephemeral`].
+    pub(super) ephemeral: super::ephemeral::EphemeralTable,
     /// Whole-journal digests (see [`super::digest`]): the merge of every
     /// sealed segment's persisted digest plus the plaintext files paged
     /// through, then folded forward by every append under the conversation
@@ -244,7 +246,7 @@ pub struct ConversationStore {
     free_space_override: Arc<AtomicU64>,
     /// In-memory plaintext taps (see [`super::tap`]); each gets the
     /// projection of its conversation's committed events before sealing.
-    taps: super::tap::LiveTaps,
+    pub(super) taps: super::tap::LiveTaps,
     /// Crash-injection point for segment commits in tests.
     #[cfg(test)]
     commit_stop: Arc<std::sync::Mutex<Option<CommitStep>>>,
@@ -259,13 +261,13 @@ struct CachedDigest {
     digest: Arc<JournalDigest>,
 }
 
-struct CachedManifest {
-    manifest: ConversationManifest,
+pub(super) struct CachedManifest {
+    pub(super) manifest: ConversationManifest,
     /// The entry is newer than `manifest.json`. Only appends that keep the
     /// status set this; see [`ConversationStore::append_locked`].
-    dirty: bool,
+    pub(super) dirty: bool,
     /// A debounced flush timer is pending for this conversation.
-    flush_scheduled: bool,
+    pub(super) flush_scheduled: bool,
 }
 
 struct StoreDelta {
@@ -455,14 +457,14 @@ enum PageError {
 
 /// Byte budget of one replay page: every record is admitted until the
 /// total would exceed the limit, but the first always is.
-struct PageBudget {
+pub(super) struct PageBudget {
     used: u64,
     limit: u64,
     admitted: bool,
 }
 
 impl PageBudget {
-    fn new(limit: u64) -> Self {
+    pub(super) fn new(limit: u64) -> Self {
         Self {
             used: 0,
             limit,
@@ -470,7 +472,7 @@ impl PageBudget {
         }
     }
 
-    fn admit(&mut self, bytes: u64) -> bool {
+    pub(super) fn admit(&mut self, bytes: u64) -> bool {
         let used = self.used.saturating_add(bytes);
         if self.admitted && used > self.limit {
             return false;
@@ -561,6 +563,7 @@ impl ConversationStore {
             pending_deltas: Arc::new(DashMap::new()),
             delta_generation: Arc::new(AtomicU64::new(0)),
             manifests: Arc::new(DashMap::new()),
+            ephemeral: Arc::default(),
             digests: Arc::new(LruMap::new(DIGEST_CACHE_ENTRIES)),
             frames: Arc::new(FrameCache::new(FRAME_CACHE_BYTES)),
             reconciled: Arc::new(DashMap::new()),
@@ -801,6 +804,11 @@ impl ConversationStore {
         let Some(title) = title else {
             return Ok(());
         };
+        if manifest.ephemeral {
+            // Kept in memory only, so there is nothing to seal it against.
+            manifest.title = Some(title);
+            return Ok(());
+        }
         match self.seal_title(&manifest.id, &title).await? {
             Some(sealed) => manifest.title_enc = Some(sealed),
             None => manifest.title = Some(title),
@@ -825,6 +833,11 @@ impl ConversationStore {
         provider_state: Option<ProviderState>,
         request: Option<Value>,
     ) -> Result<ConversationManifest, AppError> {
+        if manifest.ephemeral {
+            return self
+                .create_ephemeral(manifest, events, provider_state, request)
+                .await;
+        }
         validate_id(&manifest.id)?;
         for (index, event) in events.iter().enumerate() {
             validate_event(event, &manifest.id, index as u64 + 1)?;
@@ -888,6 +901,11 @@ impl ConversationStore {
         trailer: impl FnOnce(u64) -> Vec<ConversationEvent>,
     ) -> Result<ConversationManifest, AppError> {
         validate_id(&manifest.id)?;
+        if manifest.ephemeral || self.is_ephemeral(source_id) {
+            return Err(AppError::InvalidRequest(
+                "private conversations cannot be forked".to_owned(),
+            ));
+        }
         let tail = self
             .journal_tail(source_id)
             .await?
@@ -1157,6 +1175,7 @@ impl ConversationStore {
                 }
             }
         }
+        manifests.extend(self.ephemeral_manifests());
         manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.updated_at));
         Ok((manifests, unreadable))
     }
@@ -1226,6 +1245,10 @@ impl ConversationStore {
 
     pub async fn delete(&self, conversation_id: &str) -> Result<(), AppError> {
         let _guard = self.lock(conversation_id).await;
+        if self.remove_ephemeral_locked(conversation_id) {
+            self.forget_locked(conversation_id);
+            return Ok(());
+        }
         let directory = self.directory(conversation_id)?;
         if !tokio::fs::try_exists(&directory).await? {
             return Err(AppError::NotFound(format!(
@@ -1242,6 +1265,9 @@ impl ConversationStore {
     /// entries that vanish during the walk (a concurrent rewrite) are
     /// skipped. Runs on the blocking pool.
     pub async fn disk_usage(&self, conversation_id: &str) -> Result<u64, AppError> {
+        if self.is_ephemeral(conversation_id) {
+            return Ok(0);
+        }
         let directory = self.directory(conversation_id)?;
         Ok(
             tokio::task::spawn_blocking(move || directory_bytes(&directory))
@@ -1271,7 +1297,9 @@ impl ConversationStore {
         {
             return Ok(None);
         }
-        tokio::fs::remove_dir_all(self.directory(conversation_id)?).await?;
+        if !self.remove_ephemeral_locked(conversation_id) {
+            tokio::fs::remove_dir_all(self.directory(conversation_id)?).await?;
+        }
         self.forget_locked(conversation_id);
         Ok(Some(current))
     }
@@ -1561,6 +1589,11 @@ impl ConversationStore {
             }
             encode_blocking |= bounded.bytes >= BLOCKING_ENCODE_BYTES;
             prepared.push((event_type, payload));
+        }
+        if self.is_ephemeral(conversation_id) {
+            return self
+                .append_ephemeral_locked(conversation_id, prepared, hub)
+                .await;
         }
         let directory = self.directory(conversation_id)?;
         let mut manifest = self.get_unlocked(conversation_id).await?;
@@ -1908,6 +1941,10 @@ impl ConversationStore {
         conversation_id: &str,
         request: &Value,
     ) -> Result<(), AppError> {
+        if self.is_ephemeral(conversation_id) {
+            let _guard = self.lock(conversation_id).await;
+            return self.ephemeral_save_request(conversation_id, request);
+        }
         // Legacy plaintext history is refused before the lock: classifying
         // it takes the lock itself, and the answer never flips back.
         self.ensure_not_legacy(conversation_id).await?;
@@ -1961,6 +1998,9 @@ impl ConversationStore {
 
     pub async fn last_request(&self, conversation_id: &str) -> Result<Option<Value>, AppError> {
         let _guard = self.lock(conversation_id).await;
+        if self.is_ephemeral(conversation_id) {
+            return self.ephemeral_last_request(conversation_id);
+        }
         let path = self.directory(conversation_id)?.join(LAST_REQUEST_FILE);
         if !tokio::fs::try_exists(&path).await? {
             return Ok(None);
@@ -2010,6 +2050,9 @@ impl ConversationStore {
         {
             let _guard = self.lock(conversation_id).await;
             self.flush_pending_delta_logged(conversation_id).await;
+            if self.is_ephemeral(conversation_id) {
+                return self.ephemeral_events(conversation_id);
+            }
             let directory = self.directory(conversation_id)?;
             if self
                 .files_locked(conversation_id, &directory)
@@ -2091,6 +2134,10 @@ impl ConversationStore {
         conversation_id: &str,
         read: impl FnOnce(&JournalDigest) -> R,
     ) -> Result<R, AppError> {
+        if self.is_ephemeral(conversation_id) {
+            let digest = self.ephemeral_digest(conversation_id)?;
+            return Ok(read(&digest));
+        }
         let directory = self.directory(conversation_id)?;
         let files = self.files_locked(conversation_id, &directory).await?;
         if files.is_empty() {
@@ -2227,6 +2274,9 @@ impl ConversationStore {
         let _guard = self.lock(conversation_id).await;
         // Readers see every fragment emitted so far.
         self.flush_pending_delta_logged(conversation_id).await;
+        if self.is_ephemeral(conversation_id) {
+            return self.ephemeral_replay(conversation_id, after_sequence, limit);
+        }
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let directory = self.replay_journal(conversation_id).await?;
         let page = self
@@ -2285,6 +2335,9 @@ impl ConversationStore {
         let _guard = self.lock(conversation_id).await;
         // Readers see every fragment emitted so far.
         self.flush_pending_delta_logged(conversation_id).await;
+        if self.is_ephemeral(conversation_id) {
+            return self.ephemeral_replay_before(conversation_id, before_sequence, limit);
+        }
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let directory = self.replay_journal(conversation_id).await?;
         let page = self
@@ -2856,6 +2909,9 @@ impl ConversationStore {
     ) -> Result<(Option<ConversationEvent>, bool), AppError> {
         let _guard = self.lock(conversation_id).await;
         self.flush_pending_delta_logged(conversation_id).await;
+        if self.is_ephemeral(conversation_id) {
+            return Ok((self.ephemeral_last_event(conversation_id)?, true));
+        }
         self.read_last_event(conversation_id).await
     }
 
@@ -2881,6 +2937,9 @@ impl ConversationStore {
         let _guard = self.lock(conversation_id).await;
         self.flush_pending_delta_logged(conversation_id).await;
         let mut manifest = self.get_unlocked(conversation_id).await?;
+        if manifest.ephemeral {
+            return self.ephemeral_recover_locked(conversation_id, manifest);
+        }
         let (last_sequence, last_time, mut status) = self
             .ensure_digest_locked(conversation_id, |digest| {
                 (
@@ -2911,6 +2970,9 @@ impl ConversationStore {
     }
 
     pub async fn provider_state(&self, conversation_id: &str) -> Result<ProviderState, AppError> {
+        if self.is_ephemeral(conversation_id) {
+            return self.ephemeral_provider_state(conversation_id);
+        }
         let directory = self.directory(conversation_id)?;
         read_json(&directory.join(PROVIDER_STATE_FILE), "provider state").await
     }
@@ -2928,6 +2990,9 @@ impl ConversationStore {
             ));
         }
         state.updated_at = Utc::now();
+        if manifest.ephemeral {
+            return self.ephemeral_save_provider_state(conversation_id, state);
+        }
         let directory = self.directory(conversation_id)?;
         write_atomic_json(&directory.join(PROVIDER_STATE_FILE), &state).await
     }
@@ -2963,6 +3028,10 @@ impl ConversationStore {
         &self,
         manifest: &ConversationManifest,
     ) -> Result<(), AppError> {
+        if manifest.ephemeral {
+            self.cache_ephemeral_manifest(manifest);
+            return Ok(());
+        }
         let directory = self.directory(&manifest.id)?;
         let written = async {
             #[cfg(test)]
@@ -2999,6 +3068,10 @@ impl ConversationStore {
     /// Cache a manifest newer than `manifest.json` and make sure a flush is
     /// pending. Callers hold the conversation lock.
     fn mark_manifest_dirty_locked(&self, manifest: ConversationManifest) {
+        if manifest.ephemeral {
+            self.cache_ephemeral_manifest(&manifest);
+            return;
+        }
         let conversation_id = manifest.id.clone();
         let mut cached = self
             .manifests
@@ -4072,7 +4145,7 @@ pub fn seal_request_snapshot(request: &mut Value, key: &FingerprintKey) {
 }
 
 /// Drop the sub-microsecond part v3 records do not store.
-fn truncate_to_micros(time: DateTime<Utc>) -> DateTime<Utc> {
+pub(super) fn truncate_to_micros(time: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::from_timestamp_micros(time.timestamp_micros()).unwrap_or(time)
 }
 
@@ -4661,7 +4734,7 @@ fn serialized_prefix_len(text: &str, limit: usize) -> usize {
     text.len()
 }
 
-fn validate_id(id: &str) -> Result<(), AppError> {
+pub(super) fn validate_id(id: &str) -> Result<(), AppError> {
     match Uuid::parse_str(id) {
         Ok(parsed) if parsed.get_version_num() == 4 => Ok(()),
         _ => Err(AppError::InvalidRequest(
@@ -4690,7 +4763,7 @@ fn validate_manifest(manifest: &ConversationManifest, expected_id: &str) -> Resu
     Ok(())
 }
 
-fn validate_event(
+pub(super) fn validate_event(
     event: &ConversationEvent,
     conversation_id: &str,
     expected_sequence: u64,
