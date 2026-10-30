@@ -288,7 +288,11 @@ impl ConversationSupervisor {
                 None => self.measured_bytes(&manifest.id).await,
             };
             candidates.push(PolicyCandidate {
-                protected: active.contains(&manifest.id) || is_running(&manifest),
+                // Private conversations hold no disk history and leave with
+                // the daemon; cleanup policies never pick them.
+                protected: active.contains(&manifest.id)
+                    || is_running(&manifest)
+                    || manifest.ephemeral,
                 id: manifest.id,
                 updated_at: manifest.updated_at,
                 bytes,

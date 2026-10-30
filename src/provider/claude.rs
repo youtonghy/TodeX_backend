@@ -435,6 +435,13 @@ impl ClaudeDriver {
 
 #[async_trait]
 impl ProviderDriver for ClaudeDriver {
+    /// `--no-session-persistence` keeps the transcript, prompt history and
+    /// file checkpoints off the disk; its leftover `session-env` folder is
+    /// removed with the process.
+    fn private_conversations(&self) -> Option<super::types::PrivateConversations> {
+        Some(super::types::PrivateConversations::Native)
+    }
+
     fn descriptor(&self) -> ProviderDescriptor {
         let available = executable_available(&self.binary);
         ProviderDescriptor {
@@ -713,6 +720,29 @@ async fn claude_launch_spec(
     // `CLAUDE_CONFIG_DIR` change all orphan a recorded `native_session_id`
     // this way, and retrying the same `--resume` can never recover. Only a
     // transcript that exists and parses justifies `--resume`.
+    if context.manifest.ephemeral {
+        // Private conversation: no transcript, no prompt history, no file
+        // checkpoints. Nothing to resume either, so a new process always
+        // starts a fresh session (the supervisor journals the lost context).
+        spec.private = true;
+        spec.args.push("--no-session-persistence".to_owned());
+        spec.env
+            .insert("CLAUDE_CODE_SKIP_PROMPT_HISTORY".to_owned(), "1".to_owned());
+        spec.env.insert(
+            "CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING".to_owned(),
+            "1".to_owned(),
+        );
+        // Background task output and other scratch files go to the
+        // conversation's private folder instead of `/tmp/claude-<uid>`.
+        let scratch = crate::private_dirs::private_temp_env(&mut spec, &context.manifest.id)?;
+        spec.env.insert(
+            "CLAUDE_CODE_TMPDIR".to_owned(),
+            scratch.to_string_lossy().into_owned(),
+        );
+        spec.args.push("--session-id".to_owned());
+        spec.args.push(requested_session_id.clone());
+        return finish_claude_launch_spec(spec, context, prompt, requested_session_id).await;
+    }
     let session_path = claude_session_path_at(
         &crate::agent_providers::claude_config_dir(),
         &context.manifest.workspace,
@@ -742,6 +772,16 @@ async fn claude_launch_spec(
         spec.args.push("--session-id".to_owned());
     }
     spec.args.push(requested_session_id.clone());
+    finish_claude_launch_spec(spec, context, prompt, requested_session_id).await
+}
+
+/// The flags every Claude launch adds after its session flags.
+async fn finish_claude_launch_spec(
+    mut spec: CommandSpec,
+    context: &DriverContext,
+    prompt: &DriverPrompt,
+    requested_session_id: String,
+) -> Result<(CommandSpec, String), AppError> {
     if let Some(model) = &prompt.model {
         spec.push_flag_value("--model", model)?;
     }
@@ -757,7 +797,37 @@ async fn claude_launch_spec(
     if let Some(uploads) = crate::prompt_uploads::readable_root().await {
         spec.push_flag_value("--add-dir", &uploads.to_string_lossy())?;
     }
+    // A private conversation's uploads sit in its private folder.
+    if context.manifest.ephemeral {
+        let uploads = crate::private_dirs::root()
+            .ensure_subdir(&context.manifest.id, crate::private_dirs::UPLOADS_DIR)
+            .map_err(|error| {
+                AppError::Io(std::io::Error::other(format!(
+                    "the private conversation folder is unavailable: {error}"
+                )))
+            })?;
+        spec.push_flag_value("--add-dir", &uploads.to_string_lossy())?;
+    }
     Ok((spec, requested_session_id))
+}
+
+/// What Claude Code leaves of a session even with
+/// `--no-session-persistence`: an (empty) `session-env/<session id>`
+/// folder under its config directory. Removed once a private
+/// conversation's process is gone.
+pub(super) fn remove_private_session_leftovers(config_dir: &Path, session_id: &str) {
+    if uuid::Uuid::parse_str(session_id).is_err() {
+        return;
+    }
+    let folder = config_dir.join("session-env").join(session_id);
+    match std::fs::remove_dir_all(&folder) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            error = %error,
+            "could not remove the Claude Code session folder of a private conversation"
+        ),
+    }
 }
 
 /// Spawns Claude for `context` with `prompt`'s launch settings. Returns the

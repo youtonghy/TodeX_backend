@@ -114,7 +114,8 @@
       "followUpQueue": false,
       "backendQueue": true,
       "backendQueueControl": true,
-      "scheduledConversations": true
+      "scheduledConversations": true,
+      "privateConversations": "native"
     },
     "models": []
   },
@@ -167,6 +168,7 @@
       "backendQueue": true,
       "backendQueueControl": true,
       "scheduledConversations": true,
+      "privateConversations": "native",
       "runtimeStop": true,
       "sessionCommands": true,
       "extensionMessages": true,
@@ -242,7 +244,8 @@
       "followUpQueue": false,
       "backendQueue": true,
       "backendQueueControl": true,
-      "scheduledConversations": true
+      "scheduledConversations": true,
+      "privateConversations": "native"
     },
     "models": [
       {

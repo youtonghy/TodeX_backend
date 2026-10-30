@@ -178,6 +178,13 @@ impl ProviderDriver for CodexDriver {
         true
     }
 
+    /// `thread/start` with `ephemeral: true` writes no rollout; the
+    /// app-server's state and log databases go to the conversation's
+    /// private folder.
+    fn private_conversations(&self) -> Option<super::types::PrivateConversations> {
+        Some(super::types::PrivateConversations::Native)
+    }
+
     async fn compact_session(
         &self,
         context: DriverContext,
@@ -627,7 +634,15 @@ async fn prepare_codex_thread(
         prompt.approval_policy.as_deref(),
     )?;
     let mut effective_model = prompt.model.clone();
-    let (native_session_id, response) = match context.provider_state.native_session_id.as_deref() {
+    let ephemeral = context.manifest.ephemeral;
+    // A private conversation's thread is never stored, so there is nothing
+    // to resume: a new process starts a new thread.
+    let resumable = context
+        .provider_state
+        .native_session_id
+        .as_deref()
+        .filter(|_| !ephemeral);
+    let (native_session_id, response) = match resumable {
         Some(thread_id) => {
             let mut resume_params = json!({
                 "threadId": thread_id,
@@ -671,6 +686,10 @@ async fn prepare_codex_thread(
             if let Some(effort) = &prompt.reasoning_effort {
                 params["config"] = json!({ "model_reasoning_effort": effort });
             }
+            if ephemeral {
+                // No rollout file, no thread history rows.
+                params["ephemeral"] = json!(true);
+            }
             add_agent_mcp_config(&mut params, &context);
             process
                 .send(&json!({
@@ -694,6 +713,12 @@ async fn prepare_codex_thread(
                     )
                 })?
                 .to_owned();
+            if ephemeral {
+                disable_codex_memories(process, &thread, sink, cancel).await?;
+                if super::types::private_context_lost(&context) {
+                    super::types::journal_context_lost(sink, context.manifest.provider).await;
+                }
+            }
             (thread, response)
         }
     };
@@ -718,6 +743,36 @@ async fn prepare_codex_thread(
         state: state_to_save,
         response,
     })
+}
+
+/// Keeps a private conversation's thread out of Codex's memories
+/// (`thread/memoryMode/set`). A Codex that refuses the request (an older
+/// version) still runs the turn: the thread is ephemeral and its state
+/// database lives in the conversation's private folder.
+async fn disable_codex_memories(
+    process: &mut JsonLineProcess,
+    thread: &str,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    process
+        .send(&json!({
+            "id": "memory",
+            "method": "thread/memoryMode/set",
+            "params": { "threadId": thread, "mode": "disabled" },
+        }))
+        .await?;
+    match wait_for_response(process, "memory", sink, cancel).await {
+        Ok(_) => Ok(()),
+        Err(AppError::TurnCancelled) => Err(AppError::TurnCancelled),
+        Err(error) => {
+            tracing::warn!(
+                code = error.code(),
+                "Codex did not disable memories for a private conversation's thread"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Adds TodeX's MCP servers to a `thread/start|resume` `config` override.

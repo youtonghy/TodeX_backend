@@ -534,15 +534,19 @@ impl AgentCalls {
             })
         };
         drop(reservation);
-        self.inner
-            .persist_running(RunningCall {
-                parent_conversation_id: parent.id.clone(),
-                child_conversation_id: child.id.clone(),
-                child_turn_id: turn_id.clone(),
-                agent: child.provider,
-                started_at,
-            })
-            .await;
+        // A private conversation's calls leave no record on disk; a restart
+        // forgets both conversations anyway.
+        if !parent.ephemeral && !child.ephemeral {
+            self.inner
+                .persist_running(RunningCall {
+                    parent_conversation_id: parent.id.clone(),
+                    child_conversation_id: child.id.clone(),
+                    child_turn_id: turn_id.clone(),
+                    agent: child.provider,
+                    started_at,
+                })
+                .await;
+        }
         let mut payload = json!({
             "childConversationId": child.id,
             "childTurnId": turn_id,

@@ -38,6 +38,7 @@ mod pi_agent_templates;
 mod pi_mcp;
 mod pi_plugins;
 mod privacy_filter;
+mod private_dirs;
 mod prompt_uploads;
 mod provider;
 mod quota_store;

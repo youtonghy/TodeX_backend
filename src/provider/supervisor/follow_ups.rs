@@ -345,6 +345,7 @@ impl ConversationSupervisor {
         prepare_prompt_content(
             manifest.provider,
             &manifest.workspace,
+            manifest.ephemeral.then_some(manifest.id.as_str()),
             prompt.content.clone(),
         )
         .await?;
@@ -507,7 +508,10 @@ impl ConversationSupervisor {
             let snapshot = self.cancel_schedule(conversation_id).await?;
             return Ok((snapshot, None));
         };
-        self.writable_owned(owner_id, conversation_id).await?;
+        let manifest = self.writable_owned(owner_id, conversation_id).await?;
+        // A schedule outlives the client session that set it, which a
+        // private conversation is not meant to.
+        super::refuse_private(&manifest, "scheduled")?;
         let now = Utc::now();
         if at <= now {
             return Err(AppError::InvalidRequest(

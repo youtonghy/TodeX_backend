@@ -13,9 +13,7 @@ use crate::conversation::{DeltaFragment, PendingDelta, ProviderKind};
 use crate::error::AppError;
 
 use super::discovery::CatalogCache;
-use super::process::{
-    executable_available, provider_exit_error, CommandSpec, JsonLineProcess, ProviderRead,
-};
+use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
     ProviderProfile, SkillInjection, UserConfigFile,
@@ -294,10 +292,13 @@ impl PiDriver {
             .clone()
             .unwrap_or_else(|| context.manifest.id.clone());
         let mut spec = CommandSpec::new(&self.binary, &context.manifest.workspace);
+        let ephemeral = context.manifest.ephemeral;
         spec.args = vec![
             "--mode".to_owned(),
             "rpc".to_owned(),
-            if context.provider_state.native_session_id.is_some() {
+            // A private conversation's session is never stored, so every
+            // process starts it anew under the same id.
+            if context.provider_state.native_session_id.is_some() && !ephemeral {
                 "--session"
             } else {
                 "--session-id"
@@ -306,6 +307,25 @@ impl PiDriver {
             native_session_id,
             "--approve".to_owned(),
         ];
+        if ephemeral {
+            spec.private = true;
+            spec.args.push("--no-session".to_owned());
+            // Extensions (pi-subagents) persist their own sessions even with
+            // `--no-session`; they land in the private folder.
+            let sessions = crate::private_dirs::root()
+                .ensure_subdir(&context.manifest.id, "pi-sessions")
+                .map_err(|error| {
+                    AppError::Io(std::io::Error::other(format!(
+                        "the private conversation folder is unavailable: {error}"
+                    )))
+                })?;
+            spec.env.insert(
+                "PI_CODING_AGENT_SESSION_DIR".to_owned(),
+                sessions.to_string_lossy().into_owned(),
+            );
+            // pi-subagents writes task output under `$TMPDIR`.
+            crate::private_dirs::private_temp_env(&mut spec, &context.manifest.id)?;
+        }
         if let Some(model) = &prompt.model {
             spec.push_flag_value("--model", model)?;
         }
@@ -329,6 +349,7 @@ impl PiDriver {
         spec: &CommandSpec,
         sink: &DriverEventSink,
         agent_mcp: Option<crate::agent_mcp::AgentMcpLaunch>,
+        pinned: bool,
     ) -> Result<PiSessionHandle, AppError> {
         let process = JsonLineProcess::spawn(spec).await?;
         let (turns, turn_rx) = mpsc::channel(1);
@@ -358,7 +379,12 @@ impl PiDriver {
             shutdown_rx,
             stopping,
             background,
-            self.idle_timeout,
+            // A private conversation's process holds its only context.
+            if pinned {
+                super::types::PINNED_IDLE_TIMEOUT
+            } else {
+                self.idle_timeout
+            },
             self.background_hold,
         ));
         let mut sessions = self.sessions.lock().await;
@@ -591,6 +617,12 @@ impl ProviderDriver for PiDriver {
         true
     }
 
+    /// `--no-session` keeps the session file off the disk; what extensions
+    /// still persist goes to the conversation's private folder.
+    fn private_conversations(&self) -> Option<super::types::PrivateConversations> {
+        Some(super::types::PrivateConversations::Native)
+    }
+
     fn supports_compact_instructions(&self) -> bool {
         true
     }
@@ -771,8 +803,14 @@ impl ProviderDriver for PiDriver {
             starting: &self.starting,
             conversation_id: &conversation_id,
         };
-        self.start_runtime(&conversation_id, &spec, &sink, context.agent_mcp)
+        let pinned = context.manifest.ephemeral;
+        let context_lost = super::types::private_context_lost(&context);
+        self.start_runtime(&conversation_id, &spec, &sink, context.agent_mcp, pinned)
             .await?;
+        if context_lost {
+            // Held by the muted sink until the next turn takes it over.
+            super::types::journal_context_lost(&sink, ProviderKind::Pi).await;
+        }
         Ok(ProviderPrewarm::Warmed)
     }
 
@@ -879,8 +917,19 @@ impl ProviderDriver for PiDriver {
                     if let Some(gate) = &self.spawn_gate {
                         let _ = gate.acquire().await;
                     }
-                    self.start_runtime(&conversation_id, &spec, &sink, context.agent_mcp.clone())
-                        .await?
+                    let handle = self
+                        .start_runtime(
+                            &conversation_id,
+                            &spec,
+                            &sink,
+                            context.agent_mcp.clone(),
+                            context.manifest.ephemeral,
+                        )
+                        .await?;
+                    if super::types::private_context_lost(&context) {
+                        super::types::journal_context_lost(&sink, ProviderKind::Pi).await;
+                    }
+                    handle
                 }
             };
             let (result, response) = oneshot::channel();
@@ -2778,7 +2827,10 @@ impl<'a> PiRpc<'a> {
                     }
                 } => match &self.sink {
                     Some(sink) => sink.provider_frame(value?).await?,
-                    None => value?.map(ProviderRead::into_logged_frame),
+                    None => {
+                        let private = self.process.is_private();
+                        value?.map(|read| read.into_frame_logged(private))
+                    }
                 },
                 _ = async {
                     match self.cancel.as_mut() {

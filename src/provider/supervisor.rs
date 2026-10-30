@@ -1263,6 +1263,30 @@ impl ConversationSupervisor {
             title,
             provider_profile,
             None,
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::create_owned`] for a private (RAM-only) conversation
+    /// (`ephemeral: true`): it needs a workspace and a provider that supports
+    /// private conversations ([`ProviderDriver::private_conversations`]).
+    pub async fn create_private_owned(
+        &self,
+        owner_id: &str,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        title: Option<String>,
+        provider_profile: Option<String>,
+    ) -> Result<ConversationManifest, AppError> {
+        self.create_inner(
+            owner_id,
+            provider,
+            Some(workspace),
+            title,
+            provider_profile,
+            None,
+            true,
         )
         .await
     }
@@ -1278,6 +1302,9 @@ impl ConversationSupervisor {
         provider_profile: Option<String>,
         parent_id: &str,
     ) -> Result<ConversationManifest, AppError> {
+        // A private conversation's children are private too: what it hands
+        // them must not reach the disk either.
+        let ephemeral = self.store.get(parent_id).await?.ephemeral;
         self.create_inner(
             owner_id,
             provider,
@@ -1285,6 +1312,7 @@ impl ConversationSupervisor {
             title,
             provider_profile,
             Some(parent_id.to_owned()),
+            ephemeral,
         )
         .await
     }
@@ -1298,10 +1326,19 @@ impl ConversationSupervisor {
         title: Option<String>,
         provider_profile: Option<String>,
     ) -> Result<ConversationManifest, AppError> {
-        self.create_inner(owner_id, provider, None, title, provider_profile, None)
-            .await
+        self.create_inner(
+            owner_id,
+            provider,
+            None,
+            title,
+            provider_profile,
+            None,
+            false,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_inner(
         &self,
         owner_id: &str,
@@ -1310,8 +1347,15 @@ impl ConversationSupervisor {
         title: Option<String>,
         provider_profile: Option<String>,
         parent_conversation_id: Option<String>,
+        ephemeral: bool,
     ) -> Result<ConversationManifest, AppError> {
         validate_owner_id(owner_id)?;
+        if ephemeral && workspace.is_none() {
+            return Err(AppError::InvalidRequest(
+                "a private conversation needs a workspace; scratchWorkspace cannot be private"
+                    .to_owned(),
+            ));
+        }
         let validate = |workspace: &Path| {
             validate_workspace_directory_text(
                 &self.config.workspace_access_roots(),
@@ -1321,7 +1365,14 @@ impl ConversationSupervisor {
             )
         };
         let validated = workspace.as_deref().map(validate).transpose()?;
-        let descriptor = self.registry.driver(provider)?.descriptor();
+        let driver = self.registry.driver(provider)?;
+        if ephemeral && driver.private_conversations().is_none() {
+            return Err(AppError::InvalidRequest(format!(
+                "provider {} does not support private conversations",
+                provider.as_str()
+            )));
+        }
+        let descriptor = driver.descriptor();
         if !descriptor.available {
             return Err(AppError::ProviderUnavailable(
                 descriptor
@@ -1347,6 +1398,7 @@ impl ConversationSupervisor {
         }
         manifest.owner_id = owner_id.to_owned();
         manifest.parent_conversation_id = parent_conversation_id;
+        manifest.ephemeral = ephemeral;
         manifest.workspace_id = Some(stable_workspace_id(&manifest.workspace));
         let scratch_folder = manifest
             .scratch_workspace
@@ -1392,6 +1444,27 @@ impl ConversationSupervisor {
 
     pub async fn get(&self, conversation_id: &str) -> Result<ConversationManifest, AppError> {
         self.store.get(conversation_id).await
+    }
+
+    /// `detail` for a log line, or only `code` for a private conversation:
+    /// provider errors can quote its content (stderr excerpts, prompts).
+    fn loggable(
+        &self,
+        conversation_id: &str,
+        code: &str,
+        detail: &dyn std::fmt::Display,
+    ) -> String {
+        if self.store.is_ephemeral(conversation_id) {
+            code.to_owned()
+        } else {
+            detail.to_string()
+        }
+    }
+
+    /// Whether `conversation_id` is a private (RAM-only) conversation that
+    /// still exists.
+    pub fn is_private(&self, conversation_id: &str) -> bool {
+        self.store.is_ephemeral(conversation_id)
     }
 
     pub async fn get_owned(
@@ -1506,6 +1579,9 @@ impl ConversationSupervisor {
         }
         self.follow_up_queues.remove(&manifest.id);
         self.prewarm_sinks.remove(&manifest.id);
+        if manifest.ephemeral {
+            crate::private_dirs::root().remove_conversation(&manifest.id);
+        }
         self.revoke_agent_mcp(&manifest.id).await;
         if let Some(hooks) = self.hooks() {
             hooks.conversation_removed(manifest);
@@ -1520,7 +1596,10 @@ impl ConversationSupervisor {
         cutoff: DateTime<Utc>,
     ) -> Result<Vec<ConversationManifest>, AppError> {
         let expired = |manifest: &ConversationManifest| {
-            manifest.updated_at < cutoff
+            // Private conversations leave with the daemon; retention, which
+            // is about disk history, never removes them.
+            !manifest.ephemeral
+                && manifest.updated_at < cutoff
                 && !matches!(
                     manifest.status,
                     ConversationStatus::Running | ConversationStatus::WaitingPermission
@@ -1686,6 +1765,7 @@ impl ConversationSupervisor {
         // A fork of legacy plaintext history would copy plaintext into a
         // writable conversation.
         let source = self.writable_owned(owner_id, conversation_id).await?;
+        refuse_private(&source, "forked")?;
         let driver = self.registry.driver(source.provider)?;
         // ACP-family drivers learn fork support by probing the installed
         // agent; refresh so a direct conversation.fork does not fail on an
@@ -1880,6 +1960,9 @@ impl ConversationSupervisor {
     ) -> Result<String, AppError> {
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         let manifest = self.writable_owned(owner_id, conversation_id).await?;
+        // Native compaction reopens the stored native session, which a
+        // private conversation does not have.
+        refuse_private(&manifest, "compacted")?;
         let driver = self.registry.driver(manifest.provider)?;
         if !driver.supports_native_compact() {
             return Err(AppError::Unsupported(
@@ -2479,8 +2562,13 @@ impl ConversationSupervisor {
                 ));
             }
         }
-        let (content_text, driver_content, content_hashes) =
-            prepare_prompt_content_hashed(manifest.provider, &manifest.workspace, content).await?;
+        let (content_text, driver_content, content_hashes) = prepare_prompt_content_hashed(
+            manifest.provider,
+            &manifest.workspace,
+            manifest.ephemeral.then_some(manifest.id.as_str()),
+            content,
+        )
+        .await?;
         let loaded_skills = self.load_prompt_skills(&manifest, &skills).await?;
         let mut user_text = if text.is_empty() && !skills.is_empty() {
             "请使用已选择的 Skill。".to_owned()
@@ -2978,9 +3066,11 @@ impl ConversationSupervisor {
                 match outcome {
                     Ok(Ok(_)) | Ok(Err(AppError::TurnCancelled)) => {}
                     Ok(Err(error)) => {
+                        let error = self.loggable(conversation_id, error.code(), &error);
                         tracing::warn!(conversation_id, turn_id, error = %error, "provider driver failed while stopping an idle turn")
                     }
                     Err(error) => {
+                        let error = self.loggable(conversation_id, "INTERNAL", &error);
                         tracing::warn!(conversation_id, turn_id, error = %error, "provider driver task ended abnormally while stopping an idle turn")
                     }
                 }
@@ -3035,11 +3125,12 @@ impl ConversationSupervisor {
             }
             (Err(error), None) => {
                 let (code, message) = driver_task_failure(error);
+                let logged = self.loggable(conversation_id, code, &message);
                 tracing::error!(
                     conversation_id,
                     turn_id,
                     code,
-                    message,
+                    message = %logged,
                     "provider driver task failed"
                 );
                 self.record_provider_error(conversation_id, provider_state, &message)
@@ -3612,18 +3703,22 @@ async fn fingerprint_file(path: &Path) -> Result<String, AppError> {
 async fn prepare_prompt_content(
     provider: ProviderKind,
     workspace: &Path,
+    private_conversation: Option<&str>,
     content: Vec<PromptContentRef>,
 ) -> Result<(String, Vec<DriverPromptContent>), AppError> {
-    prepare_prompt_content_hashed(provider, workspace, content)
+    prepare_prompt_content_hashed(provider, workspace, private_conversation, content)
         .await
         .map(|(text, content, _)| (text, content))
 }
 
 /// [`prepare_prompt_content`], also returning the SHA-256 of each local file
 /// it read, so the request snapshot need not read those files again.
+/// `private_conversation` names a private conversation, whose private
+/// upload folder prompt files may also come from.
 async fn prepare_prompt_content_hashed(
     provider: ProviderKind,
     workspace: &Path,
+    private_conversation: Option<&str>,
     content: Vec<PromptContentRef>,
 ) -> Result<(String, Vec<DriverPromptContent>, BTreeMap<PathBuf, String>), AppError> {
     if content.len() > MAX_PROMPT_CONTENT_ITEMS {
@@ -3644,12 +3739,12 @@ async fn prepare_prompt_content_hashed(
                 }
             }
             PromptContentRef::LocalImage { path } => {
-                let path = canonical_workspace_file(&workspace, path).await?;
+                let path = canonical_workspace_file(&workspace, private_conversation, path).await?;
                 // An uploaded image is also named by its path, so the agent
                 // can work with the file and not only look at it; agy names
                 // every image itself.
                 if provider != ProviderKind::Antigravity
-                    && crate::prompt_uploads::contains(&path).await
+                    && is_uploaded(private_conversation, &path).await
                 {
                     text.push(format!("Attached image: {}", path.display()));
                 }
@@ -3695,7 +3790,7 @@ async fn prepare_prompt_content_hashed(
                 });
             }
             PromptContentRef::File { path, name } => {
-                let path = canonical_workspace_file(&workspace, path).await?;
+                let path = canonical_workspace_file(&workspace, private_conversation, path).await?;
                 let fallback = path
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -3717,9 +3812,21 @@ async fn prepare_prompt_content_hashed(
     Ok((text.join("\n\n"), driver_content, hashes))
 }
 
+/// Whether `canonical` is a prompt upload: in the shared upload directory or
+/// in the private upload folder of `private_conversation`.
+async fn is_uploaded(private_conversation: Option<&str>, canonical: &Path) -> bool {
+    private_conversation
+        .is_some_and(|id| crate::private_dirs::root().contains_upload(id, canonical))
+        || crate::prompt_uploads::contains(canonical).await
+}
+
 /// `path` canonicalized, when it is a regular file inside `workspace` or
-/// the prompt upload directory.
-async fn canonical_workspace_file(workspace: &Path, path: PathBuf) -> Result<PathBuf, AppError> {
+/// the prompt upload directory (or `private_conversation`'s private one).
+async fn canonical_workspace_file(
+    workspace: &Path,
+    private_conversation: Option<&str>,
+    path: PathBuf,
+) -> Result<PathBuf, AppError> {
     let candidate = if path.is_absolute() {
         path
     } else {
@@ -3733,7 +3840,7 @@ async fn canonical_workspace_file(workspace: &Path, path: PathBuf) -> Result<Pat
     })?;
     // Files uploaded with the prompt live outside the workspace, in the
     // upload directory the drivers let the agents read.
-    if !canonical.starts_with(workspace) && !crate::prompt_uploads::contains(&canonical).await {
+    if !canonical.starts_with(workspace) && !is_uploaded(private_conversation, &canonical).await {
         return Err(AppError::InvalidRequest(
             "prompt files must stay inside the trusted workspace".to_owned(),
         ));
@@ -3887,6 +3994,17 @@ fn validate_provider_control(
     Ok(())
 }
 
+/// `INVALID_REQUEST` for an operation private conversations do not allow
+/// (`what`: "forked", "compacted", "scheduled", …).
+pub(crate) fn refuse_private(manifest: &ConversationManifest, what: &str) -> Result<(), AppError> {
+    if manifest.ephemeral {
+        return Err(AppError::InvalidRequest(format!(
+            "private conversations cannot be {what}"
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_owner(manifest: &ConversationManifest, owner_id: &str) -> Result<(), AppError> {
     validate_owner_id(owner_id)?;
     if manifest.owner_id != owner_id {
@@ -3926,6 +4044,7 @@ fn normalize_profile(
 mod tests {
     mod follow_up_queue;
     mod history_cleanup;
+    mod private_conversation;
     mod profile_golden;
 
     use std::collections::BTreeMap;
@@ -8102,6 +8221,10 @@ elif [ "$mode" = "app-server" ]; then
         id=$(extract_id "$line")
         printf '{"id":"%s","result":{}}\n' "$id"
         ;;
+      *'"method":"thread/memoryMode/set"'*)
+        printf '%s\n' "$line" >> memory-requests.log
+        printf '{"id":"memory","result":{}}\n'
+        ;;
       *'"method":"thread/fork"'*)
         printf '%s\n' "$line" >> fork-requests.log
         printf '{"id":"fork","result":{"thread":{"id":"codex-fork-native"}}}\n'
@@ -8591,6 +8714,7 @@ done
         let (text, content) = prepare_prompt_content(
             ProviderKind::Codex,
             &workspace,
+            None,
             vec![
                 PromptContentRef::Text {
                     text: "look here".to_owned(),
@@ -8609,6 +8733,7 @@ done
         let error = prepare_prompt_content(
             ProviderKind::Codex,
             &workspace,
+            None,
             vec![PromptContentRef::File {
                 path: outside,
                 name: None,
@@ -8636,6 +8761,7 @@ done
         let (text, content) = prepare_prompt_content(
             ProviderKind::ClaudeCode,
             &workspace,
+            None,
             vec![
                 PromptContentRef::File {
                     path: file.path.clone(),
@@ -8670,6 +8796,7 @@ done
         let error = prepare_prompt_content(
             ProviderKind::Codex,
             &workspace,
+            None,
             vec![PromptContentRef::File {
                 path: uploads.join(&file.upload_id).join("..").join(".."),
                 name: None,
@@ -8698,6 +8825,7 @@ done
             let (_, content) = prepare_prompt_content(
                 provider,
                 &root,
+                None,
                 vec![PromptContentRef::Image {
                     data: "cG5n".to_owned(),
                     mime_type: "image/png".to_owned(),

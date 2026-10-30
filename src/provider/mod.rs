@@ -30,8 +30,8 @@ pub(crate) use devin::devin_cli_environment;
 pub(crate) use doctor::inspect_providers;
 pub(crate) use grok::{grok_cli_environment, inspect_grok};
 pub(crate) use supervisor::{
-    plan_policy_deletions, CleanupSkip, ConversationHooks, NativeSessionRef, PolicyCandidate,
-    PolicyRule,
+    plan_policy_deletions, refuse_private, CleanupSkip, ConversationHooks, NativeSessionRef,
+    PolicyCandidate, PolicyRule,
 };
 pub use supervisor::{
     CancelOutcome, CleanupReport, CleanupThresholds, ConversationPrompt, ConversationSupervisor,

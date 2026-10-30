@@ -536,6 +536,7 @@ pub(super) async fn version(
             .collect(),
         scratch_workspace_root: state.config.scratch_workspace_root().display().to_string(),
         path_mappings: state.config.deployment.path_mappings.clone(),
+        private_conversation_storage: crate::private_dirs::root().storage(),
     });
     Json(VersionResponse {
         name: env!("CARGO_PKG_NAME"),
@@ -2504,7 +2505,7 @@ async fn replay_conversation(
     headers: HeaderMap,
     AxumPath(conversation_id): AxumPath<String>,
     Query(query): Query<ReplayQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let auth = require_auth(&state, &headers)?;
     ensure_history_client(
         query
@@ -2545,7 +2546,12 @@ async fn replay_conversation(
     for event in &mut replay.events {
         crate::conversation::present_event(event, summary);
     }
-    Ok(Json(serde_json::to_value(replay)?))
+    // History pages (a private conversation's in plaintext) must not land
+    // in an HTTP cache.
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::to_value(replay)?),
+    ))
 }
 
 fn replay_detail(summary: bool) -> ReplayDetail {
@@ -4426,6 +4432,11 @@ pub(super) struct VersionPaths {
     /// Client paths and their backend paths (`TODEX_AGENTD_PATH_MAPPINGS`).
     #[serde(rename = "pathMappings", skip_serializing_if = "Vec::is_empty")]
     path_mappings: Vec<crate::config::PathMapping>,
+    /// Where private conversations' folders live: `"memory"` (a RAM
+    /// filesystem) or `"disk"` (the temp directory fallback), so a client
+    /// can warn before starting one.
+    #[serde(rename = "privateConversationStorage")]
+    private_conversation_storage: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4574,6 +4585,10 @@ struct CreateConversationRequest {
     title: Option<String>,
     #[serde(default)]
     provider_profile: Option<String>,
+    /// Private (RAM-only) conversation; needs `workspace` and a provider
+    /// listing `privateConversations`.
+    #[serde(default)]
+    ephemeral: bool,
 }
 
 async fn create_requested_conversation(
@@ -4590,6 +4605,27 @@ async fn create_requested_conversation(
             .parse()
             .map_err(AppError::InvalidRequest)?,
     };
+    if request.ephemeral {
+        if request.scratch_workspace {
+            return Err(AppError::InvalidRequest(
+                "a private conversation needs a workspace; scratchWorkspace cannot be private"
+                    .to_owned(),
+            ));
+        }
+        let workspace = request.workspace.ok_or_else(|| {
+            AppError::InvalidRequest("a private conversation needs a workspace".to_owned())
+        })?;
+        return state
+            .conversations
+            .create_private_owned(
+                owner_id,
+                provider,
+                workspace,
+                request.title,
+                request.provider_profile,
+            )
+            .await;
+    }
     match (request.scratch_workspace, request.workspace) {
         (true, None) => {
             state
@@ -4875,6 +4911,62 @@ mod tests {
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use crate::conversation::{ConversationEventHub, ConversationStore};
     use crate::device_auth::test_support::TestDevice;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_create_needs_a_workspace_and_echoes_ephemeral() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("todex-v2-private-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspaces").join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let codex = root.join("codex");
+        std::fs::write(&codex, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..Config::default()
+        };
+        config.agent.codex_bin = codex.display().to_string();
+        let state = AppState::new_for_tests(config).await.unwrap();
+        let request =
+            |body: Value| -> CreateConversationRequest { serde_json::from_value(body).unwrap() };
+        for body in [
+            json!({"provider": "codex", "scratchWorkspace": true, "ephemeral": true}),
+            json!({"provider": "codex", "ephemeral": true}),
+            json!({"provider": "grok-build", "workspace": workspace, "ephemeral": true}),
+        ] {
+            let error = create_requested_conversation(&state, "local", request(body.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "INVALID_REQUEST", "{body}: {error}");
+        }
+        let manifest = create_requested_conversation(
+            &state,
+            "local",
+            request(json!({"provider": "codex", "workspace": workspace, "ephemeral": true})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(serde_json::to_value(&manifest).unwrap()["ephemeral"], true);
+        let normal = create_requested_conversation(
+            &state,
+            "local",
+            request(json!({"provider": "codex", "workspace": workspace})),
+        )
+        .await
+        .unwrap();
+        assert!(serde_json::to_value(&normal)
+            .unwrap()
+            .get("ephemeral")
+            .is_none());
+        state
+            .conversations
+            .delete_owned("local", &manifest.id)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// A websocket half whose peer never drains: every send stays pending.
     struct StalledSink;

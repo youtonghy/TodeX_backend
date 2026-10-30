@@ -76,6 +76,20 @@ impl PermissionConfigCapabilities {
     }
 }
 
+/// How a provider keeps a private (RAM-only) conversation off the disk
+/// (`capabilities.privateConversations`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PrivateConversations {
+    /// The CLI is started so it writes no session, history or state of its
+    /// own; what it cannot avoid goes to the conversation's private folder.
+    Native,
+    /// The CLI writes into the conversation's private folder, which the
+    /// daemon deletes.
+    #[allow(dead_code)]
+    Scrubbed,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ImageInputMode {
@@ -188,6 +202,10 @@ pub struct ProviderCapabilitySnapshot {
     pub backend_queue_control: bool,
     /// The queue can be held until a set time (`conversation.schedule`).
     pub scheduled_conversations: bool,
+    /// Private (RAM-only) conversations (`ephemeral: true` on create);
+    /// omitted when unsupported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_conversations: Option<PrivateConversations>,
     #[serde(flatten)]
     pub resident_runtime: Option<ResidentRuntimeCapabilities>,
 }
@@ -263,6 +281,7 @@ impl ProviderSnapshot {
                 backend_queue: true,
                 backend_queue_control: true,
                 scheduled_conversations: true,
+                private_conversations: driver.private_conversations(),
                 resident_runtime: driver.supports_runtime_stop().then_some(
                     ResidentRuntimeCapabilities {
                         runtime_stop: true,
@@ -278,6 +297,45 @@ impl ProviderSnapshot {
             },
             models: descriptor.models,
         }
+    }
+}
+
+/// Idle keepalive of a private conversation's resident process: in effect
+/// forever. The process holds the only copy of the agent's context, so it
+/// lives until the conversation is deleted, its process ends on its own or
+/// the daemon stops.
+pub(crate) const PINNED_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
+/// `providerMethod` of the notice journalled when a private conversation's
+/// agent process had to be started again: its earlier context is gone.
+pub(crate) const CONTEXT_LOST_NOTICE: &str = "context_lost";
+
+/// Whether a process started now for `context` replaces one that held a
+/// private conversation's context: the conversation is private and an
+/// earlier turn already ran in a native session.
+pub(crate) fn private_context_lost(context: &DriverContext) -> bool {
+    context.manifest.ephemeral && context.provider_state.native_session_id.is_some()
+}
+
+/// The `provider.event` notice for [`private_context_lost`].
+pub(crate) fn context_lost_event(provider: ProviderKind) -> Value {
+    json!({
+        "provider": provider,
+        "providerMethod": CONTEXT_LOST_NOTICE,
+        "metadata": {
+            "cause": "process_restarted",
+            "reason": "The agent process restarted; earlier context of this private conversation could not be restored.",
+        },
+    })
+}
+
+/// Journals [`context_lost_event`] into the turn `sink` belongs to.
+pub(crate) async fn journal_context_lost(sink: &DriverEventSink, provider: ProviderKind) {
+    if let Err(error) = sink
+        .emit("provider.event", context_lost_event(provider))
+        .await
+    {
+        tracing::warn!(%error, "could not journal the lost context of a private conversation");
     }
 }
 
@@ -1145,6 +1203,12 @@ impl DriverEventSink {
         let reported = self.unparsed_lines.fetch_add(1, Ordering::Relaxed);
         if reported < MAX_REPORTED_UNPARSED_LINES {
             self.emit("provider.event", payload).await?;
+        } else if self.store.is_ephemeral(&self.conversation_id) {
+            // A private conversation's content stays out of the logs.
+            tracing::warn!(
+                conversation_id = %self.conversation_id,
+                "skipping unparseable provider line beyond the reporting limit"
+            );
         } else {
             tracing::warn!(
                 conversation_id = %self.conversation_id,
@@ -1427,6 +1491,15 @@ pub trait ProviderDriver: Send + Sync {
 
     fn supports_native_compact(&self) -> bool {
         false
+    }
+
+    /// Whether (and how) this provider runs private conversations; `None`
+    /// refuses `ephemeral: true`. A driver returning `Some` must honour
+    /// `context.manifest.ephemeral`: no native session persistence, no
+    /// resume, and nothing of the conversation outside its private folder
+    /// ([`crate::private_dirs`]).
+    fn private_conversations(&self) -> Option<PrivateConversations> {
+        None
     }
 
     /// Whether `compact_session` honours summarization instructions.

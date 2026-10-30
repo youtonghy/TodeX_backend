@@ -65,11 +65,12 @@ impl Sessions {
                         .to_owned(),
                 ));
             }
+            let pinned = run.context.manifest.ephemeral;
             let worker = workers
                 .entry(id)
-                .or_insert_with(|| spawn_worker(binary.to_owned()));
+                .or_insert_with(|| spawn_worker(binary.to_owned(), pinned));
             if worker.is_closed() {
-                *worker = spawn_worker(binary.to_owned());
+                *worker = spawn_worker(binary.to_owned(), pinned);
             }
             worker.clone()
         };
@@ -94,9 +95,10 @@ impl Sessions {
                         .to_owned(),
                 ));
             }
+            let pinned = goal.context.manifest.ephemeral;
             workers
                 .entry(id)
-                .or_insert_with(|| spawn_worker(binary.to_owned()))
+                .or_insert_with(|| spawn_worker(binary.to_owned(), pinned))
                 .clone()
         };
         let (tx, rx) = oneshot::channel();
@@ -122,7 +124,7 @@ impl Sessions {
             if workers.len() >= MAX_WORKERS {
                 return Ok(ProviderPrewarm::Limit);
             }
-            let worker = spawn_worker(binary.to_owned());
+            let worker = spawn_worker(binary.to_owned(), warm.context.manifest.ephemeral);
             // Queued before any turn can find the worker.
             worker
                 .try_send(Command::Warm(warm, tx))
@@ -216,15 +218,21 @@ fn inactive() -> AppError {
     AppError::Unsupported("The target Codex turn is no longer active".to_owned())
 }
 
-fn spawn_worker(binary: String) -> mpsc::Sender<Command> {
+/// `pinned`: the worker serves a private conversation, whose process holds
+/// the only copy of the thread, so it never stops for being idle.
+fn spawn_worker(binary: String, pinned: bool) -> mpsc::Sender<Command> {
     let (tx, rx) = mpsc::channel(32);
-    tokio::spawn(worker(binary, rx));
+    tokio::spawn(worker(binary, pinned, rx));
     tx
 }
 
-async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
+async fn worker(binary: String, pinned: bool, mut commands: mpsc::Receiver<Command>) {
     // `[agent].provider_keepalive_seconds` of the loaded configuration.
-    let idle_timeout = crate::config::provider_keepalive();
+    let idle_timeout = if pinned {
+        super::super::types::PINNED_IDLE_TIMEOUT
+    } else {
+        crate::config::provider_keepalive()
+    };
     let mut process: Option<JsonLineProcess> = None;
     let mut native_thread = None;
     let mut native_model: Option<String> = None;
@@ -527,7 +535,40 @@ async fn spawn_app_server(
 ) -> Result<JsonLineProcess, AppError> {
     let mut spec = CommandSpec::new(binary, &context.manifest.workspace);
     spec.args = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
+    if context.manifest.ephemeral {
+        spec.private = true;
+        private_codex_storage(&mut spec, &context.manifest.id)?;
+    }
     JsonLineProcess::spawn(&spec).await
+}
+
+/// Points the app-server of a private conversation at its private folder
+/// for everything Codex keeps besides the (ephemeral) thread: the state,
+/// thread-history and goal databases (`sqlite_home`) and the log database
+/// (`log_dir`). `CODEX_HOME` stays, for the user's login and config.
+fn private_codex_storage(spec: &mut CommandSpec, conversation_id: &str) -> Result<(), AppError> {
+    let root = crate::private_dirs::root();
+    let folder = |name: &str| {
+        root.ensure_subdir(conversation_id, name).map_err(|error| {
+            AppError::Io(std::io::Error::other(format!(
+                "the private conversation folder is unavailable: {error}"
+            )))
+        })
+    };
+    crate::private_dirs::private_temp_env(spec, conversation_id)?;
+    let sqlite = folder("codex-sqlite")?;
+    let logs = folder("codex-log")?;
+    spec.env.insert(
+        "CODEX_SQLITE_HOME".to_owned(),
+        sqlite.to_string_lossy().into_owned(),
+    );
+    for (key, path) in [("sqlite_home", &sqlite), ("log_dir", &logs)] {
+        // A TOML string: `-c` parses the value as TOML.
+        let value = serde_json::to_string(&path.to_string_lossy())?;
+        spec.args.push("-c".to_owned());
+        spec.args.push(format!("{key}={value}"));
+    }
+    Ok(())
 }
 
 struct Pending {

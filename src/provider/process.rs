@@ -78,6 +78,9 @@ pub struct CommandSpec {
     /// installer scripts that prompt on `/dev/tty` fall back to their
     /// non-interactive defaults. Honored by `run_bounded_command` on Unix.
     pub detach_terminal: bool,
+    /// Serves a private conversation: stdout lines that are not JSON are
+    /// logged without their content.
+    pub private: bool,
 }
 
 impl CommandSpec {
@@ -103,6 +106,7 @@ impl CommandSpec {
             env: BTreeMap::new(),
             env_remove: Vec::new(),
             detach_terminal: false,
+            private: false,
         }
     }
 }
@@ -124,10 +128,15 @@ pub enum ProviderRead {
 }
 
 impl ProviderRead {
-    /// The frame, or `Value::Null` after logging a line nobody reports.
-    pub fn into_logged_frame(self) -> Value {
+    /// The frame, or `Value::Null` after logging a line nobody reports;
+    /// `private` leaves the line's content out of the log.
+    pub fn into_frame_logged(self, private: bool) -> Value {
         match self {
             Self::Frame(value) => value,
+            Self::Invalid { .. } if private => {
+                tracing::warn!("skipping provider stdout line that is not JSON");
+                Value::Null
+            }
             Self::Invalid { preview } => {
                 tracing::warn!(preview = %preview, "skipping provider stdout line that is not JSON");
                 Value::Null
@@ -212,6 +221,8 @@ pub struct JsonLineProcess {
     pid: Option<u32>,
     /// Crash-recovery record; dropped once the process group is gone.
     tracked: Option<TrackedProcess>,
+    /// See [`CommandSpec::private`].
+    private: bool,
 }
 
 impl JsonLineProcess {
@@ -284,7 +295,13 @@ impl JsonLineProcess {
             stderr_task,
             pid,
             tracked,
+            private: spec.private,
         })
+    }
+
+    /// Whether this process serves a private conversation.
+    pub fn is_private(&self) -> bool {
+        self.private
     }
 
     pub async fn send(&mut self, value: &Value) -> Result<(), AppError> {
@@ -356,10 +373,11 @@ impl JsonLineProcess {
         &mut self,
         deadline: Instant,
     ) -> Result<Option<Value>, AppError> {
+        let private = self.private;
         Ok(self
             .read_frame_until(deadline)
             .await?
-            .map(ProviderRead::into_logged_frame))
+            .map(|read| read.into_frame_logged(private)))
     }
 
     /// [`Self::read_control_until`] for loops that report unparseable lines.
@@ -380,10 +398,11 @@ impl JsonLineProcess {
     /// The next frame; unparseable lines are logged and surface as
     /// `Value::Null`, which every reader already skips like a blank line.
     pub async fn read(&mut self) -> Result<Option<Value>, AppError> {
+        let private = self.private;
         Ok(self
             .read_frame()
             .await?
-            .map(ProviderRead::into_logged_frame))
+            .map(|read| read.into_frame_logged(private)))
     }
 
     /// The next stdout line, classified. `None` is end of stream. Cancel-safe:

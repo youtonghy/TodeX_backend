@@ -88,6 +88,20 @@ impl AppState {
         tokio::fs::create_dir_all(&config.data_dir).await?;
         tokio::fs::create_dir_all(config.data_dir.join("logs")).await?;
         tokio::fs::create_dir_all(config.data_dir.join("audit")).await?;
+        // Private conversations do not survive a restart: drop what an earlier
+        // run left in their folders. Test processes share one namespace and
+        // never sweep it.
+        #[cfg(not(test))]
+        {
+            let data_dir = config.data_dir.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                crate::private_dirs::init(&data_dir);
+            })
+            .await
+            {
+                tracing::warn!(error = %error, "could not sweep private conversation folders");
+            }
+        }
         for root in &config.workspace_roots {
             if let Err(error) = tokio::fs::create_dir_all(root).await {
                 // An unavailable root (for example an unmounted volume) must not

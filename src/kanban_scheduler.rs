@@ -224,6 +224,15 @@ async fn execute(
             id
         }
     };
+    // A schedule is a record on disk that outlives the client session; a
+    // private conversation must not be driven by one.
+    let manifest = state
+        .conversations
+        .get_owned(tenant_id, &conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::provider::refuse_private(&manifest, "used by kanban schedules")
+        .map_err(|error| error.to_string())?;
     let prompt = ConversationPrompt {
         permission_mode: schedule.permission_mode.clone(),
         work_mode: schedule.work_mode.clone(),

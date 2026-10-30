@@ -248,6 +248,7 @@ async fn supervisor_provider_branches_are_frozen() {
         let (file_text, file_content) = prepare_prompt_content(
             provider,
             &workspace,
+            None,
             vec![PromptContentRef::File {
                 path: PathBuf::from("notes.txt"),
                 name: None,

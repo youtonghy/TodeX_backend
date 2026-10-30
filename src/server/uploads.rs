@@ -30,6 +30,11 @@ struct UploadQuery {
     upload_id: Option<String>,
     #[serde(default)]
     offset: u64,
+    /// A private conversation of the caller: the upload is stored in its
+    /// private folder and deleted with it. Any other conversation (or none)
+    /// uses the shared upload directory.
+    #[serde(default)]
+    conversation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,15 +53,42 @@ async fn upload(
     Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Result<Json<UploadResponse>, AppError> {
-    require_auth(&state, &headers)?;
+    let auth = require_auth(&state, &headers)?;
+    let private = match query.conversation_id.as_deref() {
+        Some(id) => state
+            .conversations
+            .get_owned(&auth.tenant_id, id)
+            .await
+            .ok()
+            .filter(|manifest| manifest.ephemeral)
+            .map(|manifest| manifest.id),
+        None => None,
+    };
+    let root = match &private {
+        Some(id) => crate::private_dirs::root()
+            .ensure_subdir(id, crate::private_dirs::UPLOADS_DIR)
+            .map_err(|error| {
+                AppError::Io(std::io::Error::other(format!(
+                    "the private upload directory is unavailable: {error}"
+                )))
+            })?,
+        None => upload_root(),
+    };
     let stored = write_chunk(
-        &upload_root(),
+        &root,
         query.upload_id.as_deref(),
         &query.name,
         query.offset,
         &body,
     )
     .await?;
+    if let Some(id) = &private {
+        // Deleted while the chunk was written: the folder must not outlive it.
+        if !state.conversations.is_private(id) {
+            crate::private_dirs::root().remove_conversation(id);
+            return Err(AppError::NotFound(format!("conversation {id}")));
+        }
+    }
     Ok(Json(UploadResponse {
         mime_type: mime_for_name(&stored.name),
         path: stored.path.to_string_lossy().into_owned(),
@@ -141,6 +173,90 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let _ = std::fs::remove_dir_all(upload_root().join(&id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uploads_of_a_private_conversation_live_and_die_with_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("todex-upload-private-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspaces").join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let codex = root.join("codex");
+        std::fs::write(&codex, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..Config::default()
+        };
+        config.agent.codex_bin = codex.display().to_string();
+        let state = AppState::new_for_tests(config).await.unwrap();
+        let conversation = state
+            .conversations
+            .create_private_owned(
+                "local",
+                crate::conversation::ProviderKind::Codex,
+                std::fs::canonicalize(&workspace).unwrap(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let normal = state
+            .conversations
+            .create_owned(
+                "local",
+                crate::conversation::ProviderKind::Codex,
+                std::fs::canonicalize(&workspace).unwrap(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let app = crate::server::loopback_test_router(state.clone());
+        let device = TestDevice::new(31);
+        device.enroll(&root.join("data"));
+        let put = |uri: String| {
+            let mut builder = Request::builder()
+                .method("PUT")
+                .uri(&uri)
+                .header("content-type", "application/octet-stream");
+            for (name, value) in device.sign("PUT", &uri, b"secret") {
+                builder = builder.header(name, value);
+            }
+            builder.body(Body::from(&b"secret"[..])).unwrap()
+        };
+        let upload = |id: &str| {
+            let app = app.clone();
+            let uri = format!("/v2/uploads?name=a.txt&offset=0&conversationId={id}");
+            let request = put(uri);
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                        .unwrap();
+                std::path::PathBuf::from(body["path"].as_str().unwrap())
+            }
+        };
+        let private = upload(&conversation.id).await;
+        let folder = crate::private_dirs::root().conversation_path(&conversation.id);
+        assert!(private.starts_with(std::fs::canonicalize(&folder).unwrap()));
+        assert_eq!(std::fs::read(&private).unwrap(), b"secret");
+        // A normal conversation keeps the shared upload directory.
+        let shared = upload(&normal.id).await;
+        assert!(shared.starts_with(std::fs::canonicalize(upload_root()).unwrap()));
+        state
+            .conversations
+            .delete_owned("local", &conversation.id)
+            .await
+            .unwrap();
+        assert!(!private.exists());
+        assert!(!folder.exists());
+        let _ = std::fs::remove_dir_all(shared.parent().unwrap());
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -63,7 +63,7 @@ pub(crate) async fn ensure_root(root: &Path) -> io::Result<PathBuf> {
     .map_err(io::Error::other)?
 }
 
-fn ensure_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
     match std::fs::create_dir(path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}

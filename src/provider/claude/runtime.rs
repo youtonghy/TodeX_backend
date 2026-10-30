@@ -165,6 +165,9 @@ struct Worker {
     shutdown: watch::Sender<Stop>,
     stopped: Exit,
     activity: Arc<std::sync::Mutex<Activity>>,
+    /// Serves a private conversation: its process holds the only copy of
+    /// the agent's context, so it never idles out and is never evicted.
+    pinned: bool,
 }
 
 impl Worker {
@@ -266,7 +269,8 @@ impl Sessions {
         let id = run.context.manifest.id.clone();
         let mut retried = false;
         loop {
-            let (worker, pending) = match self.acquire(&id, &launcher).await? {
+            let pinned = run.context.manifest.ephemeral;
+            let (worker, pending) = match self.acquire(&id, &launcher, pinned).await? {
                 Acquired::Worker(worker, pending) => (worker, pending),
                 Acquired::Detached(exited) => return run_once(&launcher, run, exited).await,
             };
@@ -309,9 +313,17 @@ impl Sessions {
 
     /// The conversation's worker, with the turn reserved on it, or a
     /// detached slot when every worker is running a turn. At the limit the
-    /// longest-idle worker is stopped to make room. Never returns while the
+    /// longest-idle worker is stopped to make room; private conversations'
+    /// workers are never stopped for it. A private conversation (`pinned`)
+    /// gets no detached slot: a one-off process would start without its
+    /// context, so the turn fails instead. Never returns while the
     /// conversation's previous process is still exiting.
-    async fn acquire(&self, id: &str, launcher: &Launcher) -> Result<Acquired, AppError> {
+    async fn acquire(
+        &self,
+        id: &str,
+        launcher: &Launcher,
+        pinned: bool,
+    ) -> Result<Acquired, AppError> {
         loop {
             let exiting = {
                 let mut table = self.table.lock().await;
@@ -329,13 +341,16 @@ impl Sessions {
                             let evict = table
                                 .workers
                                 .values()
-                                .filter(|worker| !worker.stopping())
+                                .filter(|worker| !worker.stopping() && !worker.pinned)
                                 .filter_map(|worker| Some((worker.idle_since()?, worker)))
                                 // Without background work first, then the
                                 // longest idle.
                                 .min_by_key(|(idle_since, _)| *idle_since)
                                 .map(|(_, worker)| worker);
                             let Some(evict) = evict else {
+                                if pinned {
+                                    return Err(no_private_slot());
+                                }
                                 let (exited, exit) = watch::channel(false);
                                 table.detached.insert(id.to_owned(), Exit(exit));
                                 return Ok(Acquired::Detached(exited));
@@ -346,7 +361,7 @@ impl Sessions {
                             // It stays in the table until its process is gone.
                             evict.stop(Stop::Evicted);
                         }
-                        let worker = spawn_worker(launcher.clone(), self.idle_timeout);
+                        let worker = spawn_worker(launcher.clone(), self.idle_timeout, pinned);
                         let pending = worker.reserve();
                         table.workers.insert(id.to_owned(), worker.clone());
                         return Ok(Acquired::Worker(worker, pending));
@@ -385,7 +400,8 @@ impl Sessions {
                     if table.slots_taken() >= self.max_workers {
                         return Ok(ProviderPrewarm::Limit);
                     }
-                    let worker = spawn_worker(launcher, self.idle_timeout);
+                    let worker =
+                        spawn_worker(launcher, self.idle_timeout, warm.context.manifest.ephemeral);
                     // Queued before any turn can find the worker.
                     worker
                         .turns
@@ -458,6 +474,15 @@ fn unavailable() -> AppError {
     )
 }
 
+fn no_private_slot() -> AppError {
+    AppError::ProviderUnavailable(
+        "Every Claude Code resident session is in use by a running turn or another private \
+         conversation; a private conversation needs a resident process of its own. Wait for a \
+         turn to finish or close a private conversation, then retry."
+            .to_owned(),
+    )
+}
+
 fn shutting_down() -> AppError {
     AppError::ProviderUnavailable("Claude Code sessions are shutting down".to_owned())
 }
@@ -488,6 +513,8 @@ pub(in crate::provider) struct LaunchKey {
     /// Digest of the user `settings.json`, which carries the active provider
     /// profile's environment (API key, base URL) and is read at start-up.
     settings: Option<[u8; 32]>,
+    /// A private conversation's process (`--no-session-persistence`).
+    ephemeral: bool,
 }
 
 impl LaunchKey {
@@ -522,6 +549,7 @@ impl LaunchKey {
                 .map(|launch| Sha256::digest(format!("{launch:?}")).into()),
             config_dir,
             settings,
+            ephemeral: context.manifest.ephemeral,
         })
     }
 }
@@ -544,6 +572,9 @@ struct Live {
     /// From the last turn: journals subagent progress while no turn runs,
     /// and the turn a run without one of its own is attributed to.
     idle_sink: Option<(DriverEventSink, String)>,
+    /// A private conversation's earlier process is gone with its context;
+    /// the next turn tells the user (see [`super::super::types::context_lost_event`]).
+    context_lost: bool,
 }
 
 impl Live {
@@ -558,6 +589,7 @@ impl Live {
             subagents: Default::default(),
             runtime_id,
             idle_sink: None,
+            context_lost: false,
         }
     }
 
@@ -597,6 +629,9 @@ impl Live {
         task_ids.sort();
         task_ids.dedup();
         self.process.terminate().await;
+        if self.key.ephemeral {
+            super::remove_private_session_leftovers(&self.key.config_dir, &self.key.session_id);
+        }
         let Some((handle, _)) = self.provider_work.filter(|_| !task_ids.is_empty()) else {
             return;
         };
@@ -636,7 +671,12 @@ enum Next {
     Stop,
 }
 
-fn spawn_worker(launcher: Launcher, idle_timeout: Duration) -> Worker {
+fn spawn_worker(launcher: Launcher, idle_timeout: Duration, pinned: bool) -> Worker {
+    let idle_timeout = if pinned {
+        super::super::types::PINNED_IDLE_TIMEOUT
+    } else {
+        idle_timeout
+    };
     let (turns, turn_rx) = mpsc::channel(1);
     let (shutdown, shutdown_rx) = watch::channel(Stop::Running);
     let (stopped_tx, stopped) = watch::channel(false);
@@ -658,6 +698,7 @@ fn spawn_worker(launcher: Launcher, idle_timeout: Duration) -> Worker {
         shutdown,
         stopped: Exit(stopped),
         activity,
+        pinned,
     }
 }
 
@@ -772,6 +813,8 @@ async fn worker(
                         // stopped by this worker, which stays in the table
                         // until it has exited.
                         let started = live.insert(Live::new(process, key, runtime_id.clone()));
+                        started.context_lost =
+                            super::super::types::private_context_lost(&context);
                         let expected = started.key.permission_mode.clone();
                         started.mode = super::initialize_session(
                             &mut started.process,
@@ -879,6 +922,7 @@ async fn worker(
                     let (process, runtime_id) =
                         super::spawn_claude(&launcher.binary, &context, &prompt).await?;
                     let started = live.insert(Live::new(process, key, runtime_id.clone()));
+                    started.context_lost = super::super::types::private_context_lost(&context);
                     let expected = started.key.permission_mode.clone();
                     started.mode = super::initialize_session(
                         &mut started.process,
@@ -894,6 +938,10 @@ async fn worker(
                     return Ok(None);
                 }
                 let started = live.as_mut().expect("started process");
+                if std::mem::take(&mut started.context_lost) {
+                    super::super::types::journal_context_lost(&sink, context.manifest.provider)
+                        .await;
+                }
                 if let Some(provider_work) = pending_provider_work.take() {
                     started.provider_work = Some(provider_work);
                 }
@@ -1754,6 +1802,67 @@ done
         second_result.unwrap();
         third_result.unwrap();
         assert_eq!(fixture.launches().len(), 4);
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn private_sessions_keep_their_slot_and_never_fall_back() {
+        let fixture = Fixture::new().await;
+        let sessions = Arc::new(sessions(1));
+        let private = |mut manifest: ConversationManifest| {
+            manifest.ephemeral = true;
+            manifest
+        };
+        // Private conversations live in memory; the fixture's store needs
+        // them registered there too.
+        let first = fixture
+            .store
+            .create(private(ConversationManifest::new(
+                ProviderKind::ClaudeCode,
+                fixture.root.clone(),
+                None,
+                None,
+            )))
+            .await
+            .unwrap();
+        let second = fixture
+            .store
+            .create(private(ConversationManifest::new(
+                ProviderKind::ClaudeCode,
+                fixture.root.clone(),
+                None,
+                None,
+            )))
+            .await
+            .unwrap();
+        let normal = fixture.conversation().await;
+        fixture.turn(&sessions, &first, "one").await;
+        assert!(sessions.holds(&first.id).await);
+        // The only slot is pinned: another private conversation fails
+        // instead of starting without context on a one-off process.
+        let (_cancel, cancel) = watch::channel(false);
+        let error = fixture
+            .run(&sessions, &second, "two", None, cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "PROVIDER_UNAVAILABLE", "{error}");
+        // A normal conversation runs on a process of its own and the
+        // private one keeps its process.
+        fixture.turn(&sessions, &normal, "three").await;
+        assert!(sessions.holds(&first.id).await);
+        assert!(!sessions.holds(&normal.id).await);
+        let launches = fixture.launches();
+        assert_eq!(launches.len(), 2, "{launches:?}");
+        assert!(
+            launches[0].contains("--no-session-persistence"),
+            "{launches:?}"
+        );
+        assert!(!launches[0].contains("--resume"), "{launches:?}");
+        assert!(
+            !launches[1].contains("--no-session-persistence"),
+            "{launches:?}"
+        );
         sessions.stop_all().await;
         cleanup(&fixture.root);
     }
