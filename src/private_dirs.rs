@@ -392,6 +392,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_namespace_is_refused() {
         let temp =
