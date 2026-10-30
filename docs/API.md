@@ -226,6 +226,8 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 不指定工作区（客户端的「None」选项）时省略 `workspace`，改传 `"scratchWorkspace": true`：后端为该对话创建 `$TODEX_AGENTD_DATA_DIR/workspace/<conversationId>` 并把它作为 workspace，返回的 manifest 带 `"scratchWorkspace": true`（为 `false` 时省略），`workspace` 是新目录的规范路径，`workspaceId` 照常按路径生成，因此每个对话各不相同，不会出现在 `/v2/workspaces` 中。`scratchWorkspace` 与 `workspace` 同时提供或都不提供时返回 `400 INVALID_REQUEST`。删除对话不会删除该目录。
 
+隐私对话（只存在于 daemon 内存，见下文「隐私对话」）在创建时传 `"ephemeral": true`：必须同时给出 `workspace`（与 `scratchWorkspace` 组合、或缺少 `workspace` 时返回 `400 INVALID_REQUEST`），且所选 Provider 的 `capabilities.privateConversations` 存在，否则同样返回 `400 INVALID_REQUEST`（`provider <id> does not support private conversations`）。WebSocket `conversation.create` 的 payload 相同。
+
 `GET /v2/conversations` 不列出 Agent 调用产生的子会话（manifest 带 `parentConversationId`，见 [Agent 调用（MCP `todex_agents`）](#agent-调用mcp-todex_agents)），除非加 `?includeChildren=true`；按 id 访问子会话不受影响。
 
 发送 prompt：
@@ -250,7 +252,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 `content` 可选，最多 16 项，支持 `text`、`localImage`、内联 `image`（`data` + `mimeType`）和 `file`。本地路径可相对 workspace，也可使用 workspace 内绝对路径，或 `PUT /v2/uploads` 返回的上传文件路径（见下文）；规范化后越出 workspace 和上传目录、符号链接逃逸和非普通文件都会拒绝。图片允许 PNG/JPEG/GIF/WebP，解码后合计最多 10 MiB。TodeX 不再按图片输入能力拦截提示：图片原样交给任何 Provider，所选 Agent 或模型不支持图片时由 Agent 自行报错（以 turn 失败或 Agent 消息呈现），daemon 不再返回 `UNSUPPORTED` 或 `IMAGE_INPUT_UNSUPPORTED`。`/v2/providers` 中的 `capabilities.imageInput` / `imageInputMode`、模型目录的 `imageInput` 以及 `/v2/providers/image-input` 仅供客户端提示参考（为兼容旧客户端保留），不影响请求是否被接受。Codex 把文件映射为原生 mention，其他 Provider 使用 workspace 相对 `@` 引用。
 
-上传 prompt 附件：`PUT /v2/uploads?name=<文件名>&offset=0`，请求体是原始字节（`application/octet-stream`），每块最多 8 MiB，单个文件最多 100 MiB。首块不带 `uploadId`，后端新建上传；后续块带首块返回的 `uploadId`，`offset` 必须等于已写入的字节数，否则返回 `409 CONFLICT`，未知的 `uploadId` 返回 `404`。每块的响应都是 `{ "uploadId", "path", "name", "mimeType", "sizeBytes" }`，`path` 是 daemon 所在机器上的绝对路径，`name` 是清理后的文件名（只保留最后一个路径分量、去掉控制字符和开头的点，最长 200 字节）。文件存放在 `/tmp/todex/file/<uploadId>/<name>`（Windows 为 `%TEMP%\todex\file`），目录为 0700、文件为 0600；`/tmp/todex` 或其下目录是符号链接或属于其他用户时上传失败。客户端把 `path` 放进 prompt 的 `file`（或 PNG/JPEG/GIF/WebP 图片的 `localImage`）中，不需要在 workspace 内；上传图片除照常作为图片交给模型外，还在 prompt 文本中追加一行 `Attached image: <path>`（Antigravity 本来就逐张列出图片路径）。Claude Code 与 Antigravity 启动时以 `--add-dir` 获得该目录的读取权限，Antigravity 的审批 hook 在询问模式下也直接放行其中的读取。上传在最后一次写入 7 天后由 daemon 清理（启动时及每 6 小时检查一次）；重试或排队的 prompt 在此之前都能找到文件，`/tmp` 被系统清空后引用它的 prompt 返回 `400 INVALID_REQUEST`。经 `/v2/sealed` 访问时同样适用，外层请求体上限见下文。
+上传 prompt 附件：`PUT /v2/uploads?name=<文件名>&offset=0`，请求体是原始字节（`application/octet-stream`），每块最多 8 MiB，单个文件最多 100 MiB。首块不带 `uploadId`，后端新建上传；后续块带首块返回的 `uploadId`，`offset` 必须等于已写入的字节数，否则返回 `409 CONFLICT`，未知的 `uploadId` 返回 `404`。每块的响应都是 `{ "uploadId", "path", "name", "mimeType", "sizeBytes" }`，`path` 是 daemon 所在机器上的绝对路径，`name` 是清理后的文件名（只保留最后一个路径分量、去掉控制字符和开头的点，最长 200 字节）。文件存放在 `/tmp/todex/file/<uploadId>/<name>`（Windows 为 `%TEMP%\todex\file`），目录为 0700、文件为 0600；`/tmp/todex` 或其下目录是符号链接或属于其他用户时上传失败。客户端把 `path` 放进 prompt 的 `file`（或 PNG/JPEG/GIF/WebP 图片的 `localImage`）中，不需要在 workspace 内；上传图片除照常作为图片交给模型外，还在 prompt 文本中追加一行 `Attached image: <path>`（Antigravity 本来就逐张列出图片路径）。Claude Code 与 Antigravity 启动时以 `--add-dir` 获得该目录的读取权限，Antigravity 的审批 hook 在询问模式下也直接放行其中的读取。上传在最后一次写入 7 天后由 daemon 清理（启动时及每 6 小时检查一次）；重试或排队的 prompt 在此之前都能找到文件，`/tmp` 被系统清空后引用它的 prompt 返回 `400 INVALID_REQUEST`。经 `/v2/sealed` 访问时同样适用，外层请求体上限见下文。可选查询参数 `conversationId` 指向调用者自己的隐私对话时，文件改存到该会话的私有目录并随会话删除（见「隐私对话」）。
 
 每个 conversation 同时只允许一个 mutating turn；并发 `conversation.prompt` 返回 `409 CONFLICT`，不会排队。运行中要追加的消息改用后端追加队列（见下文 `conversation.queue.add`），它对所有 Provider 可用。daemon 重启按 journal（而非 manifest 状态）判断未完成 turn：仍打开的 turn 追加 `conversation.interrupted`（已知时携带该 turn 的 `turnId`），状态标记为 `interrupted`，不会通过重放 prompt 猜测恢复；journal 中已结束但 manifest 仍为 `running` 的会话只按 journal 修正状态，不追加事件。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
 
@@ -489,6 +491,21 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 - manifest 字段 `schedule: { "at": <RFC 3339>, "interrupted"?: true }`（未定时时省略，`interrupted` 为 `false` 时省略）出现在会话列表、详情、创建/更新结果中，客户端据此在侧栏显示倒计时；它与标题、归档一样随会话列表刷新获得，不产生单独的事件。队列的变化（含到点发送）照常以 `followups.updated` 推送给订阅者。
 - 重启：daemon 启动时把所有仍生效的 `schedule` 标记为 `interrupted: true` 并写回（队列已随重启丢失）。中断的定时不扣留任何消息、没有计时器、不拒绝直接 prompt；客户端显示后由用户重新设定（`conversation.schedule` 给出新的 `at`，同时清除 `interrupted`）或取消。
 
+### 隐私对话（`ephemeral`）
+
+隐私对话只存在于 daemon 内存：manifest、事件、摘要、provider state 和最近一次请求都保存在进程内的表中，不写会话目录、journal、keyring，不生成 DEK，也没有 `titleEnc`（标题、事件均为明文，只在内存中）。daemon 重启后它们全部消失，列表中不再出现。客户端只能在 manifest 回显 `ephemeral: true` 时把会话视为隐私对话（旧 daemon 会忽略创建字段）。
+
+- 能力：`/v2/providers` 的 `capabilities.privateConversations` 为 `"native"`（CLI 以不落盘的方式启动，无法避免的文件写入会话的私有目录）或 `"scrubbed"`（CLI 写入私有目录，由 daemon 删除）；缺省表示不支持。目前 Claude Code、Codex、Pi 为 `"native"`，其余 Provider（Grok Build、Devin、OpenCode、Antigravity、DeepSeek Harness、omp、ACP 配置）都拒绝 `ephemeral: true`。
+- manifest：`ephemeral: true`（为 `false` 时省略），出现在创建结果、详情和列表中。`GET /v2/conversations/{id}/events` 对所有会话都带 `Cache-Control: no-store`；隐私对话的事件以明文返回（不带 `$enc`），与旧版明文会话一样不需要解密。
+- 拒绝的操作（`400 INVALID_REQUEST`，消息含 `private conversations cannot be …`）：`conversation.fork`（含 `throughTurnId` / forkAt）、`conversation.compact`（原生压缩需要重新打开已存储的原生会话；Claude Code 与 Pi 在常驻进程内执行的 `/compact` 命令照常可用）、`conversation.schedule`、任务看板定时向该会话发送。保留期清理与历史清理策略从不选中它们，`/v2/history/storage` 报告 0 字节。
+- Agent 调用：隐私对话经 `todex_agents` 创建的子会话同样是隐私对话；目标 Provider 不支持时调用失败。它们的调用记录不写入 `agent-calls.json`。
+- 私有目录：CLI 或上传无法避免的文件写入 `<root>/<namespace>/<conversationId>/`。`root` 优先为 `$XDG_RUNTIME_DIR/todex-private`，其次（Linux）`/dev/shm/todex-private-<uid>`，最后是系统临时目录下的 `todex-private`；`namespace` 由数据目录派生，不同数据目录的 daemon 互不干扰。目录均为 0700，符号链接或属于其他用户的目录会被拒绝。会话删除时删除该目录，daemon 启动时清空本 namespace。`/v2/version` 的 `privateConversationStorage`（鉴权后）为 `"memory"`（RAM 文件系统）或 `"disk"`（回退到磁盘上的临时目录），客户端可据此提示。
+- 上传：`PUT /v2/uploads` 带 `conversationId=<调用者自己的隐私对话>` 时文件存入该会话私有目录的 `uploads/`，随会话删除；其他会话或不带该参数时行为不变。prompt 只允许引用本会话自己的私有上传，Claude Code 以 `--add-dir` 获得读取权限。
+- Provider 启动方式：Claude Code 加 `--no-session-persistence`、`CLAUDE_CODE_SKIP_PROMPT_HISTORY=1`、`CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING=1`，`CLAUDE_CODE_TMPDIR` 指向私有目录，始终 `--session-id`、从不 `--resume`，进程退出后删除 `session-env/<sessionId>`；Codex 以 `thread/start` 的 `ephemeral: true` 开启线程并 `thread/memoryMode/set` 为 `disabled`，从不 `thread/resume`，app-server 的 `sqlite_home` / `CODEX_SQLITE_HOME` 与 `log_dir` 指向私有目录（`CODEX_HOME` 不变，以保留登录）；Pi 加 `--no-session`，`PI_CODING_AGENT_SESSION_DIR` 指向私有目录（pi-subagents 等扩展即使在 `--no-session` 下也保存子会话）。三者的 `TMPDIR` 都指向私有目录。
+- 上下文与常驻进程：隐私对话的常驻进程是上下文的唯一副本，因此不会因空闲而退出，也不会为其他会话让出槽位；Claude Code 槽位不足时先停止普通会话的空闲进程，仍无法为隐私对话取得常驻进程时该 turn 失败（`PROVIDER_UNAVAILABLE`），不会退回到每 turn 一个进程；Codex 与 Pi 本就不驱逐进程，达到上限时新会话的 turn 照旧失败。隐私对话占用的槽位一直保留到会话删除。进程仍然丢失时（崩溃、需要重启的启动设置变化、手动关闭 runtime），下一个 turn 开启新的原生会话，并在该 turn 中记录 `provider.event`：`{ "provider", "providerMethod": "context_lost", "metadata": { "cause": "process_restarted", "reason": "The agent process restarted; earlier context of this private conversation could not be restored." } }`。
+- 日志：隐私对话的不可解析输出行、驱动失败信息只记录 id 与错误码，不记录内容。
+- 仍然存在的限制：内存可能被换出到 swap 或写入 core dump；Provider（模型服务商）一侧可能按其策略保留请求；Agent 对 workspace 文件的修改照常持久保存；客户端自身的缓存由客户端负责。
+
 ### 历史加密密钥（`history.*`）
 
 规格见 [history-encryption.md](history-encryption.md) §3、§7。所有命令经 `/v2/ws` 发送，任一已注册设备都可调用；调用方身份取自连接的设备签名（`deviceId`），不读 payload。命令执行时设备已被吊销则返回 `UNAUTHENTICATED`。payload 拒绝未知字段，缺省 payload 视为 `{}`。
@@ -617,6 +634,8 @@ $DATA_DIR/conversations/<uuid-v4>/
   snapshot.json
   provider-state.json
 ```
+
+隐私对话（`ephemeral: true`）没有会话目录，以上文件都不存在，见「隐私对话」。
 
 journal 存储格式为 history v3（规格见 `docs/history-encryption.md` §4）：按段号排列的封存分片（`events.NNNNNN.seg` + `.idx`，或短暂存在、等待转换的 `events.NNNNNN.jsonl`），随后是唯一可写的 `events.jsonl`；`events.jsonl` 超过 16 MiB 后在下一次追加前被改名为下一个段号，后台任务把它转为 raw DEFLATE 分帧的 `.seg`；达到 `history_seal_min_bytes`（默认 2 MiB）的活动分片还会在 turn 结束、会话空闲 15 分钟或 DEK 因时长轮换前提前封存（见 `docs/history-encryption.md` §4.1）。新写入的行是短键 v3 记录，旧 v2 行照常读取；WebSocket 与 HTTP 返回的事件形状与 v2 完全相同。sequence 从 1 连续递增；损坏按文件（明文）或按分片（`.seg`）处理，以 `journal.recordLost` 占位，不再坍缩成单个文件。封存时，已有同 id 终态记录的 `message.delta`、`tool.updated`、`subagent.updated` 换成 `journal.compacted` 标记（sequence、eventId、time 不变）。旧 v2 会话不再迁移，按原样读取（它们都是旧版明文历史，只读，见「历史加密密钥」）；旧版本迁移留下的 `journal-v2-backup/` 在 7 天后删除。新会话的 manifest 带 `storageVersion: 3`，旧版 daemon 无法读取。
 
@@ -875,6 +894,7 @@ GET /v2/version
 | `workspace_root` | string | 主 workspace 根目录（根列表第一项，仅鉴权后） |
 | `workspace_roots` | string[] | 全部已配置的 workspace 根目录（仅鉴权后） |
 | `scratch_workspace_root` | string | 无工作区对话目录的父目录 `$DATA_DIR/workspace`（仅鉴权后）；不在 `workspace_roots` 中，客户端可在首次创建这类对话前用它做模型/命令发现 |
+| `privateConversationStorage` | string | 隐私对话私有目录所在存储：`"memory"`（RAM 文件系统）或 `"disk"`（回退的临时目录），仅鉴权后；见「隐私对话」 |
 | `pathMappings` | object[] | 客户端路径与后端路径的对应关系 `[{hostPath, backendPath}]`（`TODEX_AGENTD_PATH_MAPPINGS` / `[[workspace.path_mappings]]`，仅鉴权后；未配置时省略）。`backendPath` 位于某个 workspace 根目录内；客户端用它把本机选择的目录换成后端路径，把后端路径换回本机路径打开。后端自身不转换任何路径 |
 | `historyEncryption` | number | 后端支持的历史加密版本（当前 `1`），见「历史加密密钥」 |
 | `terminalReplay` | number | 终端输出序号与 `terminal.attach` / `terminal.clear` 的协议版本（当前 `1`），见「终端」；旧后端没有该字段 |
