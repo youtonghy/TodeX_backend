@@ -59,6 +59,29 @@ impl PrivateRoot {
         }
     }
 
+    /// Whether the root and the namespace folder are real directories of
+    /// this user (or missing), so removing below them cannot follow a
+    /// symlink planted in a shared folder such as `/dev/shm`. Logs refusals.
+    fn base_is_trusted(&self) -> bool {
+        let Some(root) = self.base.parent() else {
+            return false;
+        };
+        for path in [root, self.base.as_path()] {
+            match owned_directory(path) {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "refusing to clean up an untrusted private conversation folder"
+                    );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// The conversation's folder (not created).
     pub(crate) fn conversation_path(&self, conversation_id: &str) -> PathBuf {
         self.base.join(conversation_id)
@@ -91,6 +114,9 @@ impl PrivateRoot {
         if validate_conversation_id(conversation_id).is_err() {
             return;
         }
+        if !self.base_is_trusted() {
+            return;
+        }
         let folder = self.conversation_path(conversation_id);
         match std::fs::remove_dir_all(&folder) {
             Ok(()) => {}
@@ -106,6 +132,9 @@ impl PrivateRoot {
     /// Removes every folder of this daemon's namespace; run at startup,
     /// when no private conversation exists yet. Returns how many it removed.
     pub(crate) fn sweep(&self) -> usize {
+        if !self.base_is_trusted() {
+            return 0;
+        }
         let entries = match std::fs::read_dir(&self.base) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return 0,
@@ -201,6 +230,28 @@ pub(crate) fn init(data_dir: &Path) -> &'static PrivateRoot {
         }
     }
     root
+}
+
+/// `Ok(true)` when `path` is a directory (not a symlink) owned by this
+/// user, `Ok(false)` when it does not exist, an error otherwise.
+fn owned_directory(path: &Path) -> io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other("not a directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::other("belongs to another user"));
+        }
+    }
+    Ok(true)
 }
 
 fn validate_conversation_id(conversation_id: &str) -> io::Result<()> {
@@ -323,6 +374,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn sweep_and_remove_never_follow_a_symlinked_namespace() {
+        let temp =
+            std::env::temp_dir().join(format!("todex-private-test-{}", uuid::Uuid::new_v4()));
+        let victim = temp.join("victim");
+        let id = uuid::Uuid::new_v4().to_string();
+        std::fs::create_dir_all(victim.join(&id)).unwrap();
+        std::fs::write(victim.join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir_all(temp.join("root")).unwrap();
+        std::os::unix::fs::symlink(&victim, temp.join("root").join("ns")).unwrap();
+        let root = root_in(&temp.join("root"));
+        assert_eq!(root.sweep(), 0);
+        root.remove_conversation(&id);
+        assert!(victim.join("keep.txt").exists());
+        assert!(victim.join(&id).exists());
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
     #[test]
     fn a_symlinked_namespace_is_refused() {
         let temp =
