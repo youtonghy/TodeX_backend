@@ -163,8 +163,12 @@ impl OmpDriver {
         context: &DriverContext,
         _prompt: &DriverPrompt,
     ) -> Result<ResidentLaunch, AppError> {
+        let mut spec = self.command_spec(&context.manifest.workspace)?;
+        if context.manifest.ephemeral {
+            private_omp_storage(&mut spec, &context.manifest.id)?;
+        }
         Ok(ResidentLaunch {
-            spec: self.command_spec(&context.manifest.workspace)?,
+            spec,
             runtime: AcpRuntimeOptions {
                 suppress_load_replay: true,
                 ..Default::default()
@@ -349,6 +353,12 @@ impl ProviderDriver for OmpDriver {
         }
     }
 
+    /// omp writes into the conversation's private folder (`--session-dir`,
+    /// relocated XDG folders), which the daemon deletes.
+    fn private_conversations(&self) -> Option<super::types::PrivateConversations> {
+        cfg!(unix).then_some(super::types::PrivateConversations::Scrubbed)
+    }
+
     fn supports_native_fork(&self) -> bool {
         true
     }
@@ -437,6 +447,91 @@ impl ProviderDriver for OmpDriver {
     }
 }
 
+/// What a private conversation's omp process changes in its settings
+/// overlay: memory backends would keep what the conversation said.
+#[cfg(unix)]
+const PRIVATE_OVERLAY: &str = "\
+memory:
+  backend: \"off\"
+";
+
+/// Moves everything a private conversation's omp process stores into its
+/// private folder (see `docs/API.md`, "隐私对话"). `omp acp` ignores
+/// `--no-session`, so the session goes to `--session-dir`. omp keeps image
+/// blobs, the title / recap index, stats and logs beside its credentials in
+/// `~/.omp`, and moves each category to `$XDG_{DATA,STATE,CACHE}_HOME/omp`
+/// once that folder exists: all three point into the private folder, where
+/// the shared stores without conversation content (credentials and settings
+/// in `agent.db`, the model catalog, installed plugins) are linked back.
+/// The native addon stays shared through `PI_NATIVES_DIR`. omp honours the
+/// XDG folders on Linux and macOS only.
+#[cfg(unix)]
+fn private_omp_storage(spec: &mut CommandSpec, conversation_id: &str) -> Result<(), AppError> {
+    // Where omp keeps its shared stores outside a private conversation:
+    // `$XDG_DATA_HOME/omp` once omp moved there, else `~/.omp` (root
+    // stores) and `~/.omp/agent` (agent stores).
+    let home = crate::private_dirs::user_home();
+    let xdg_data = crate::private_dirs::absolute_env_dir("XDG_DATA_HOME")
+        .map(|dir| dir.join("omp"))
+        .filter(|dir| dir.is_dir());
+    let root_data = xdg_data.clone().unwrap_or_else(|| home.join(".omp"));
+    let agent_data = xdg_data.unwrap_or_else(|| home.join(".omp").join("agent"));
+    private_omp_storage_in(spec, conversation_id, &root_data, &agent_data)
+}
+
+/// [`private_omp_storage`] for omp's shared stores at `root_data` and
+/// `agent_data`.
+#[cfg(unix)]
+fn private_omp_storage_in(
+    spec: &mut CommandSpec,
+    conversation_id: &str,
+    root_data: &Path,
+    agent_data: &Path,
+) -> Result<(), AppError> {
+    use crate::private_dirs::{link_shared, private_subdir, private_xdg_home};
+
+    spec.private = true;
+    crate::private_dirs::private_temp_env(spec, conversation_id)?;
+    if !spec.env.contains_key("PI_NATIVES_DIR") {
+        spec.env.insert(
+            "PI_NATIVES_DIR".to_owned(),
+            root_data.join("natives").to_string_lossy().into_owned(),
+        );
+    }
+    let data = private_xdg_home(spec, conversation_id, "XDG_DATA_HOME", "data", "omp")?;
+    for name in ["agent.db", "models.db"] {
+        link_shared(&data, name, &agent_data.join(name))?;
+    }
+    for name in ["plugins", "marketplaces.json", "python-env"] {
+        link_shared(&data, name, &root_data.join(name))?;
+    }
+    private_xdg_home(spec, conversation_id, "XDG_STATE_HOME", "state", "omp")?;
+    private_xdg_home(spec, conversation_id, "XDG_CACHE_HOME", "cache", "omp")?;
+    let sessions = private_subdir(conversation_id, "omp-sessions")?;
+    spec.args.push("--session-dir".to_owned());
+    spec.args.push(sessions.to_string_lossy().into_owned());
+    // A second overlay for this conversation only, in its private folder.
+    let overlay = private_subdir(conversation_id, "omp")?.join(CONFIG_OVERLAY_FILE);
+    crate::secure_fs::write_owner_only_atomic_if_changed(
+        &overlay,
+        format!("{CONFIG_OVERLAY}{PRIVATE_OVERLAY}").as_bytes(),
+    )?;
+    let Some(position) = spec.args.iter().position(|arg| arg == "--config") else {
+        return Err(AppError::ProviderUnavailable(
+            "omp launch has no settings overlay".to_owned(),
+        ));
+    };
+    spec.args[position + 1] = overlay.to_string_lossy().into_owned();
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn private_omp_storage(_spec: &mut CommandSpec, _conversation_id: &str) -> Result<(), AppError> {
+    Err(AppError::Unsupported(
+        "omp private conversations need Linux or macOS".to_owned(),
+    ))
+}
+
 fn overlay_path(data_dir: &Path) -> PathBuf {
     data_dir
         .join("providers")
@@ -503,6 +598,79 @@ mod tests {
         assert_eq!(spec.env.get("PI_NO_TITLE").map(String::as_str), Some("1"));
         assert_eq!(spec.env.get("NO_COLOR").map(String::as_str), Some("1"));
         std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    /// Everything omp stores goes to the private folder; the shared stores
+    /// are linked back and removing the folder leaves them alone.
+    #[cfg(unix)]
+    #[test]
+    fn private_launch_moves_omp_storage_into_the_private_folder() {
+        let temp = std::env::temp_dir().join(format!("todex-omp-private-{}", uuid::Uuid::new_v4()));
+        let data_dir = temp.join("data");
+        let root_data = temp.join("home/.omp");
+        let agent_data = root_data.join("agent");
+        std::fs::create_dir_all(root_data.join("plugins")).unwrap();
+        std::fs::create_dir_all(&agent_data).unwrap();
+        std::fs::write(agent_data.join("agent.db"), "credentials").unwrap();
+        let driver = OmpDriver::new(&crate::config::Config::default().agent, &data_dir);
+        let mut spec = driver.command_spec(Path::new("/workspace")).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        private_omp_storage_in(&mut spec, &id, &root_data, &agent_data).unwrap();
+        let folder = crate::private_dirs::root().conversation_path(&id);
+        assert!(spec.private);
+        let arg = |flag: &str| {
+            let at = spec.args.iter().position(|arg| arg == flag).unwrap();
+            PathBuf::from(&spec.args[at + 1])
+        };
+        assert_eq!(arg("--session-dir"), folder.join("omp-sessions"));
+        let overlay = arg("--config");
+        assert_eq!(overlay, folder.join("omp").join(CONFIG_OVERLAY_FILE));
+        let parsed: serde_json::Value =
+            serde_yaml_ng::from_str(&std::fs::read_to_string(&overlay).unwrap()).unwrap();
+        assert_eq!(parsed.pointer("/memory/backend"), Some(&json!("off")));
+        assert_eq!(parsed.pointer("/async/enabled"), Some(&json!(false)));
+        for (variable, name) in [
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_CACHE_HOME", "cache"),
+        ] {
+            let home = folder.join("xdg").join(name);
+            assert_eq!(
+                spec.env.get(variable).map(PathBuf::from),
+                Some(home.clone())
+            );
+            assert!(home.join("omp").is_dir(), "{variable}");
+        }
+        assert_eq!(
+            spec.env.get("TMPDIR").map(PathBuf::from),
+            Some(folder.join("tmp"))
+        );
+        assert_eq!(
+            spec.env.get("PI_NATIVES_DIR").map(PathBuf::from),
+            Some(root_data.join("natives"))
+        );
+        let data = folder.join("xdg/data/omp");
+        assert_eq!(
+            std::fs::read_link(data.join("agent.db")).unwrap(),
+            agent_data.join("agent.db")
+        );
+        assert_eq!(
+            std::fs::read_link(data.join("plugins")).unwrap(),
+            root_data.join("plugins")
+        );
+        // Missing shared stores are not linked.
+        assert!(std::fs::symlink_metadata(data.join("models.db")).is_err());
+        // A second launch reuses the folder.
+        let mut again = driver.command_spec(Path::new("/workspace")).unwrap();
+        private_omp_storage_in(&mut again, &id, &root_data, &agent_data).unwrap();
+        crate::private_dirs::root().remove_conversation(&id);
+        assert!(!folder.exists());
+        assert_eq!(
+            std::fs::read_to_string(agent_data.join("agent.db")).unwrap(),
+            "credentials"
+        );
+        assert!(root_data.join("plugins").is_dir());
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

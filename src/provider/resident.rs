@@ -249,6 +249,7 @@ impl ResidentSessions {
                         let handle = self.spawn_session(
                             &turn.context.manifest.workspace,
                             launch(&turn.context, &turn.prompt)?,
+                            turn.context.manifest.ephemeral,
                         );
                         sessions.insert(conversation_id.to_owned(), handle.clone());
                         return Ok(handle);
@@ -297,7 +298,11 @@ impl ResidentSessions {
             if launched.runtime.interactive_auth() {
                 return Ok(ProviderPrewarm::AuthRequired);
             }
-            let handle = self.spawn_session(&context.manifest.workspace, launched);
+            let handle = self.spawn_session(
+                &context.manifest.workspace,
+                launched,
+                context.manifest.ephemeral,
+            );
             handle.warm_pending.store(true, Ordering::Release);
             // The actor's queue is new and empty: the prewarm is queued
             // before any turn can find the session.
@@ -326,8 +331,17 @@ impl ResidentSessions {
         }
     }
 
-    fn spawn_session(&self, workspace: &Path, launch: ResidentLaunch) -> SessionHandle {
-        let ResidentLaunch { spec, runtime } = launch;
+    /// Starts a session actor. A private conversation's session is
+    /// `pinned`: its process holds the only copy of the agent's context, so
+    /// it never idles out and is not restarted for a config change.
+    fn spawn_session(
+        &self,
+        workspace: &Path,
+        launch: ResidentLaunch,
+        pinned: bool,
+    ) -> SessionHandle {
+        let ResidentLaunch { mut spec, runtime } = launch;
+        spec.private |= pinned;
         let warm_pending = Arc::new(AtomicBool::new(false));
         let (turns, turn_rx) = mpsc::channel(1);
         let (controls, control_rx) = mpsc::channel(16);
@@ -337,12 +351,15 @@ impl ResidentSessions {
             SessionActor {
                 provider: self.provider,
                 label: self.label,
-                idle_timeout: self.idle_timeout,
+                idle_timeout: if pinned {
+                    super::types::PINNED_IDLE_TIMEOUT
+                } else {
+                    self.idle_timeout
+                },
                 spec,
                 runtime,
                 warm_pending: warm_pending.clone(),
-                config_revision: self
-                    .restart_on_config_change
+                config_revision: (self.restart_on_config_change && !pinned)
                     .then(crate::agent_providers::config_revision),
             }
             .run(turn_rx, control_rx, shutdown_rx, stopped_tx),

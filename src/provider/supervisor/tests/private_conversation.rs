@@ -146,7 +146,7 @@ async fn private_conversations_refuse_what_would_outlive_them() {
         ProviderKind::GrokBuild,
         ProviderKind::Devin,
         ProviderKind::Acp,
-        ProviderKind::Omp,
+        ProviderKind::Antigravity,
     ] {
         let error = supervisor
             .create_private_owned("local", provider, workspace.clone(), None, None)
@@ -369,9 +369,12 @@ async fn a_lost_private_process_is_reported_and_starts_a_fresh_thread() {
 /// HOME / config dirs; then grep them, the data directory and the private
 /// folder root for the canary after this test deleted the conversation.
 ///
-/// `TODEX_CANARY_PROVIDER` (claude-code | codex | pi), `TODEX_CANARY_BIN`,
-/// `TODEX_CANARY_ROOT` (data + workspace go here), `TODEX_CANARY_TEXT`,
-/// optional `TODEX_CANARY_MODEL` and `TODEX_CANARY_MODE`.
+/// `TODEX_CANARY_PROVIDER` (claude-code | codex | pi | omp | opencode |
+/// deepseek-harness), `TODEX_CANARY_BIN`, `TODEX_CANARY_ROOT` (data +
+/// workspace go here), `TODEX_CANARY_TEXT`, optional `TODEX_CANARY_MODEL`,
+/// `TODEX_CANARY_MODE`, `TODEX_CANARY_IMAGE` (a PNG sent with the prompt)
+/// and `TODEX_CANARY_ENV` (comma-separated variables the CLI also gets, such
+/// as a mock server's key).
 #[tokio::test]
 #[ignore = "drives a real agent CLI; run by hand with a mock model server"]
 async fn canary_private_conversation_with_a_real_cli() {
@@ -390,7 +393,23 @@ async fn canary_private_conversation_with_a_real_cli() {
     };
     config.agent.claude_bin = binary.clone();
     config.agent.codex_bin = binary.clone();
+    config.agent.omp_bin = binary.clone();
+    config.agent.opencode_bin = binary.clone();
+    config.agent.dsh_bin = binary.clone();
     config.agent.pi_bin = binary;
+    let forwarded: Vec<String> = std::env::var("TODEX_CANARY_ENV")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    for allowlist in [
+        &mut config.agent.omp_env_allowlist,
+        &mut config.agent.opencode_env_allowlist,
+        &mut config.agent.dsh_env_allowlist,
+    ] {
+        allowlist.extend(forwarded.iter().cloned());
+    }
     let config = Arc::new(config);
     let store = ConversationStore::new(config.data_dir.clone())
         .await
@@ -408,6 +427,17 @@ async fn canary_private_conversation_with_a_real_cli() {
             ConversationPrompt {
                 model: std::env::var("TODEX_CANARY_MODEL").ok(),
                 permission_mode: std::env::var("TODEX_CANARY_MODE").ok(),
+                content: std::env::var("TODEX_CANARY_IMAGE")
+                    .ok()
+                    .map(|path| {
+                        use base64::Engine;
+                        let bytes = fs::read(path).unwrap();
+                        vec![PromptContentRef::Image {
+                            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                            mime_type: "image/png".to_owned(),
+                        }]
+                    })
+                    .unwrap_or_default(),
                 ..prompt(&text)
             },
         )

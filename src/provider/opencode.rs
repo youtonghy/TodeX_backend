@@ -112,8 +112,12 @@ impl OpencodeDriver {
         context: &DriverContext,
         _prompt: &DriverPrompt,
     ) -> Result<ResidentLaunch, AppError> {
+        let mut spec = self.command_spec(&context.manifest.workspace);
+        if context.manifest.ephemeral {
+            private_opencode_storage(&mut spec, &context.manifest.id)?;
+        }
         Ok(ResidentLaunch {
-            spec: self.command_spec(&context.manifest.workspace),
+            spec,
             runtime: self.runtime_options(),
         })
     }
@@ -389,6 +393,12 @@ impl ProviderDriver for OpencodeDriver {
         }
     }
 
+    /// OpenCode writes into the conversation's private folder (relocated
+    /// `XDG_DATA_HOME`), which the daemon deletes.
+    fn private_conversations(&self) -> Option<super::types::PrivateConversations> {
+        cfg!(unix).then_some(super::types::PrivateConversations::Scrubbed)
+    }
+
     fn supports_native_fork(&self) -> bool {
         true
     }
@@ -508,6 +518,75 @@ async fn control_request_updates(
         .await
 }
 
+/// Moves everything a private conversation's OpenCode process stores into
+/// its private folder (see `docs/API.md`, "隐私对话"). OpenCode keeps its
+/// database (sessions, messages), log, truncated tool output and snapshots
+/// in `$XDG_DATA_HOME/opencode`, beside the credentials of `opencode auth`
+/// and MCP OAuth: `XDG_DATA_HOME` points into the private folder, where the
+/// two credential files are linked back. Snapshots (a git copy of the
+/// workspace per step) are turned off rather than kept in memory.
+#[cfg(unix)]
+fn private_opencode_storage(spec: &mut CommandSpec, conversation_id: &str) -> Result<(), AppError> {
+    spec.private = true;
+    crate::private_dirs::private_temp_env(spec, conversation_id)?;
+    let shared = crate::private_dirs::absolute_env_dir("XDG_DATA_HOME")
+        .unwrap_or_else(|| {
+            crate::private_dirs::user_home()
+                .join(".local")
+                .join("share")
+        })
+        .join("opencode");
+    let data = crate::private_dirs::private_xdg_home(
+        spec,
+        conversation_id,
+        "XDG_DATA_HOME",
+        "data",
+        "opencode",
+    )?;
+    for name in ["auth.json", "mcp-auth.json"] {
+        crate::private_dirs::link_shared(&data, name, &shared.join(name))?;
+    }
+    let content = private_config_content(spec.env.get("OPENCODE_CONFIG_CONTENT"))?;
+    spec.env
+        .insert("OPENCODE_CONFIG_CONTENT".to_owned(), content);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn private_opencode_storage(
+    _spec: &mut CommandSpec,
+    _conversation_id: &str,
+) -> Result<(), AppError> {
+    Err(AppError::Unsupported(
+        "OpenCode private conversations need Linux or macOS".to_owned(),
+    ))
+}
+
+/// `OPENCODE_CONFIG_CONTENT` for a private conversation: the forwarded
+/// value (a JSON object) with snapshots turned off.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn private_config_content(current: Option<&String>) -> Result<String, AppError> {
+    let mut config = match current
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => serde_json::from_str::<Value>(text).map_err(|_| {
+            AppError::InvalidRequest(
+                "OPENCODE_CONFIG_CONTENT must be a JSON object for a private conversation"
+                    .to_owned(),
+            )
+        })?,
+        None => json!({}),
+    };
+    let Some(object) = config.as_object_mut() else {
+        return Err(AppError::InvalidRequest(
+            "OPENCODE_CONFIG_CONTENT must be a JSON object for a private conversation".to_owned(),
+        ));
+    };
+    object.insert("snapshot".to_owned(), Value::Bool(false));
+    Ok(config.to_string())
+}
+
 fn opencode_environment(allowlist: &[String]) -> BTreeMap<String, String> {
     allowlisted_environment(
         &[("NO_COLOR", "1"), ("OPENCODE_DISABLE_AUTOUPDATE", "1")],
@@ -559,6 +638,11 @@ mod tests {
     #[cfg(unix)]
     impl Fixture {
         async fn new() -> Self {
+            Self::with_privacy(false).await
+        }
+
+        /// `ephemeral`: a private conversation.
+        async fn with_privacy(ephemeral: bool) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let root =
                 std::env::temp_dir().join(format!("todex-opencode-wire-{}", uuid::Uuid::new_v4()));
@@ -574,21 +658,26 @@ mod tests {
             let driver = std::sync::Arc::new(OpencodeDriver {
                 binary: binary.to_string_lossy().to_string(),
                 env_allowlist: vec![],
-                sessions: ResidentSessions::new(&PROFILE, "OpenCode"),
+                // A private conversation's session must outlive this.
+                sessions: if ephemeral {
+                    ResidentSessions::new(&PROFILE, "OpenCode")
+                        .with_idle_timeout(Duration::from_millis(50))
+                } else {
+                    ResidentSessions::new(&PROFILE, "OpenCode")
+                },
                 discovery: DiscoveryCache::new(),
             });
             let store = crate::conversation::ConversationStore::new(root.join("data"))
                 .await
                 .unwrap();
-            let manifest = store
-                .create(crate::conversation::ConversationManifest::new(
-                    ProviderKind::Opencode,
-                    root.clone(),
-                    None,
-                    None,
-                ))
-                .await
-                .unwrap();
+            let mut manifest = crate::conversation::ConversationManifest::new(
+                ProviderKind::Opencode,
+                root.clone(),
+                None,
+                None,
+            );
+            manifest.ephemeral = ephemeral;
+            let manifest = store.create(manifest).await.unwrap();
             Self {
                 root,
                 driver,
@@ -926,6 +1015,71 @@ mod tests {
             0
         );
         fixture.finish().await;
+    }
+
+    /// A private conversation never reattaches: a new process starts a new
+    /// session, reports the lost context, and its OpenCode data lives in the
+    /// conversation's private folder.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_private_conversation_restarts_without_resume() {
+        let fixture = Fixture::with_privacy(true).await;
+        let id = fixture.manifest.id.clone();
+        for turn in ["turn-first", "turn-kept", "turn-after-restart"] {
+            match turn {
+                // Past the idle keepalive: the pinned process stays.
+                "turn-kept" => tokio::time::sleep(Duration::from_millis(300)).await,
+                "turn-after-restart" => fixture.driver.shutdown_session(&id).await,
+                _ => {}
+            }
+            let (_cancel, task) = fixture.start(turn, "normal").await;
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.stop_reason, "end_turn");
+        }
+        let count = |method: &str| {
+            fixture
+                .requests()
+                .iter()
+                .filter(|request| request["method"] == method)
+                .count()
+        };
+        assert_eq!(count("initialize"), 2);
+        assert_eq!(count("session/new"), 2);
+        assert_eq!(count("session/resume"), 0);
+        assert_eq!(count("session/load"), 0);
+        let events = fixture.store.complete_history(&id).await.unwrap();
+        let lost: Vec<_> = events
+            .iter()
+            .filter(|event| event.payload["providerMethod"] == "context_lost")
+            .collect();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].payload["turnId"], "turn-after-restart");
+        assert!(!fixture.store.provider_state(&id).await.unwrap().recoverable);
+        let folder = crate::private_dirs::root().conversation_path(&id);
+        assert!(folder.join("xdg/data/opencode").is_dir());
+        assert!(folder.join("tmp").is_dir());
+        crate::private_dirs::root().remove_conversation(&id);
+        fixture.finish().await;
+    }
+
+    #[test]
+    fn private_config_content_turns_snapshots_off_and_keeps_the_rest() {
+        let merged =
+            private_config_content(Some(&r#"{"model":"a/b","snapshot":true}"#.to_owned())).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&merged).unwrap(),
+            json!({"model": "a/b", "snapshot": false})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&private_config_content(None).unwrap()).unwrap(),
+            json!({"snapshot": false})
+        );
+        assert!(private_config_content(Some(&"[1]".to_owned())).is_err());
+        assert!(private_config_content(Some(&"{oops".to_owned())).is_err());
     }
 
     #[cfg(unix)]

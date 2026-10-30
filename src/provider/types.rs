@@ -86,7 +86,6 @@ pub enum PrivateConversations {
     Native,
     /// The CLI writes into the conversation's private folder, which the
     /// daemon deletes.
-    #[allow(dead_code)]
     Scrubbed,
 }
 

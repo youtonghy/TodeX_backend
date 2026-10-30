@@ -895,12 +895,14 @@ async fn run_acp_turn_steps(
     .await?;
     let mut state = context.provider_state;
     state.native_session_id = Some(native_session_id.clone());
-    // A session is recoverable when a later process can reattach to it.
-    state.recoverable = initialize.agent_capabilities.load_session
-        || (quirks(provider).prefer_resume
-            && initialize_value
-                .pointer("/agentCapabilities/sessionCapabilities/resume")
-                .is_some());
+    // A session is recoverable when a later process can reattach to it;
+    // a private conversation's never is.
+    state.recoverable = !context.manifest.ephemeral
+        && (initialize.agent_capabilities.load_session
+            || (quirks(provider).prefer_resume
+                && initialize_value
+                    .pointer("/agentCapabilities/sessionCapabilities/resume")
+                    .is_some()));
     state.last_error = None;
     sink.save_provider_state(state).await?;
 
@@ -1616,7 +1618,18 @@ async fn prepare_acp_session(
             .transpose()?;
         (id.clone(), options, response.get("models").cloned())
     } else {
-        match context.provider_state.native_session_id.clone() {
+        // A private conversation's native session is never stored, so a new
+        // process cannot reattach to the earlier one: it starts a fresh
+        // session, and the user is told the earlier context is gone.
+        let stored_session = if context.manifest.ephemeral {
+            if super::types::private_context_lost(context) {
+                super::types::journal_context_lost(sink, provider).await;
+            }
+            None
+        } else {
+            context.provider_state.native_session_id.clone()
+        };
+        match stored_session {
             Some(session_id) => {
                 // `session/resume` attaches without replaying history; TodeX
                 // keeps its own event log, so agents that prefer it skip

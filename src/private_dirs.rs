@@ -184,18 +184,109 @@ pub(crate) fn private_temp_env(
     spec: &mut crate::provider::process::CommandSpec,
     conversation_id: &str,
 ) -> Result<PathBuf, crate::error::AppError> {
-    let folder = root()
-        .ensure_subdir(conversation_id, "tmp")
-        .map_err(|error| {
-            crate::error::AppError::Io(io::Error::other(format!(
-                "the private conversation folder is unavailable: {error}"
-            )))
-        })?;
+    let folder = private_subdir(conversation_id, "tmp")?;
     let value = folder.to_string_lossy().into_owned();
     for key in ["TMPDIR", "TMP", "TEMP"] {
         spec.env.insert(key.to_owned(), value.clone());
     }
     Ok(folder)
+}
+
+/// `path` (relative, `/`-separated) inside the conversation's folder,
+/// created owner-only level by level.
+pub(crate) fn private_subdir(
+    conversation_id: &str,
+    path: &str,
+) -> Result<PathBuf, crate::error::AppError> {
+    let unavailable = |error: io::Error| {
+        crate::error::AppError::Io(io::Error::other(format!(
+            "the private conversation folder is unavailable: {error}"
+        )))
+    };
+    let mut folder = root()
+        .ensure_conversation_dir(conversation_id)
+        .map_err(unavailable)?;
+    for part in path.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(unavailable(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid private subfolder",
+            )));
+        }
+        folder.push(part);
+        crate::prompt_uploads::ensure_private_dir(&folder).map_err(unavailable)?;
+    }
+    Ok(folder)
+}
+
+/// Points the XDG base directory `variable` (`XDG_DATA_HOME`,
+/// `XDG_STATE_HOME`, `XDG_CACHE_HOME`) of a private conversation's agent
+/// process into its private folder, at `xdg/<name>`, and creates the
+/// `<app>` folder inside it: CLIs that switch to XDG locations only when
+/// `$XDG_*_HOME/<app>` exists (omp) use it then too. Returns that folder.
+/// The process's own children (tool commands) inherit the variable.
+#[cfg(unix)]
+pub(crate) fn private_xdg_home(
+    spec: &mut crate::provider::process::CommandSpec,
+    conversation_id: &str,
+    variable: &str,
+    name: &str,
+    app: &str,
+) -> Result<PathBuf, crate::error::AppError> {
+    let home = private_subdir(conversation_id, &format!("xdg/{name}"))?;
+    spec.env
+        .insert(variable.to_owned(), home.to_string_lossy().into_owned());
+    private_subdir(conversation_id, &format!("xdg/{name}/{app}"))
+}
+
+/// Links `dir/name` to `target`: a store the user's other sessions share
+/// and that holds no conversation content (credentials, model catalogs,
+/// installed plugins), so a private conversation's process, relocated into
+/// its private folder, still finds it. A missing target is skipped.
+/// Removing the private folder removes the link, never the target.
+#[cfg(unix)]
+pub(crate) fn link_shared(
+    dir: &Path,
+    name: &str,
+    target: &Path,
+) -> Result<(), crate::error::AppError> {
+    if std::fs::symlink_metadata(target).is_err() {
+        return Ok(());
+    }
+    let link = dir.join(name);
+    match std::fs::symlink_metadata(&link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if std::fs::read_link(&link).is_ok_and(|current| current == target) {
+                return Ok(());
+            }
+            std::fs::remove_file(&link)?;
+        }
+        // The CLI made its own copy (the target appeared later); keep what
+        // this conversation already wrote there.
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::os::unix::fs::symlink(target, &link)?;
+    Ok(())
+}
+
+/// The user's home directory, as the agent CLIs see it.
+#[cfg(unix)]
+pub(crate) fn user_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The daemon's `$variable` when it is an absolute path (agent CLIs ignore
+/// empty and relative XDG values).
+#[cfg(unix)]
+pub(crate) fn absolute_env_dir(variable: &str) -> Option<PathBuf> {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
 /// Subfolder of a conversation's folder holding its prompt uploads.
@@ -389,6 +480,43 @@ mod tests {
         root.remove_conversation(&id);
         assert!(victim.join("keep.txt").exists());
         assert!(victim.join(&id).exists());
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_links_are_removed_without_their_targets() {
+        let temp =
+            std::env::temp_dir().join(format!("todex-private-test-{}", uuid::Uuid::new_v4()));
+        let shared = temp.join("shared");
+        std::fs::create_dir_all(shared.join("plugins")).unwrap();
+        std::fs::write(shared.join("plugins").join("keep.txt"), "keep").unwrap();
+        std::fs::write(shared.join("auth.json"), "secret").unwrap();
+        let root = root_in(&temp);
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = root.ensure_subdir(&id, "data").unwrap();
+        for name in ["plugins", "auth.json", "missing.db"] {
+            link_shared(&dir, name, &shared.join(name)).unwrap();
+            // Linking again is a no-op.
+            link_shared(&dir, name, &shared.join(name)).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("auth.json")).unwrap(),
+            "secret"
+        );
+        assert!(std::fs::symlink_metadata(dir.join("missing.db")).is_err());
+        // A file the CLI wrote itself is kept.
+        std::fs::write(dir.join("own.db"), "mine").unwrap();
+        std::fs::write(shared.join("own.db"), "shared").unwrap();
+        link_shared(&dir, "own.db", &shared.join("own.db")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("own.db")).unwrap(), "mine");
+        root.remove_conversation(&id);
+        assert!(!root.conversation_path(&id).exists());
+        assert!(shared.join("plugins").join("keep.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(shared.join("auth.json")).unwrap(),
+            "secret"
+        );
         let _ = std::fs::remove_dir_all(temp);
     }
 

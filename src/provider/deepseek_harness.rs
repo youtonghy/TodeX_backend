@@ -143,10 +143,43 @@ impl DeepseekHarnessDriver {
         context: &DriverContext,
         _prompt: &DriverPrompt,
     ) -> Result<ResidentLaunch, AppError> {
+        let mut spec = self.command_spec(&context.manifest.workspace)?;
+        if context.manifest.ephemeral {
+            // Written by `prepare_private` before the session starts.
+            let patch = private_patch_path(&context.manifest.id)?;
+            if !patch.is_file() {
+                return Err(AppError::ProviderUnavailable(
+                    "the private DeepSeek Harness patch is missing".to_owned(),
+                ));
+            }
+            spec.private = true;
+            spec.args.push("--patch".to_owned());
+            spec.args.push(patch.to_string_lossy().into_owned());
+        }
         Ok(ResidentLaunch {
-            spec: self.command_spec(&context.manifest.workspace)?,
+            spec,
             runtime: self.runtime_options(),
         })
+    }
+
+    /// Writes a private conversation's own patch overlay, once: it re-roots
+    /// what dsh stores into the conversation's private folder (see
+    /// [`private_patch`]). The rows' other settings come from the composed
+    /// profile, since a patch replaces a row's config wholesale.
+    async fn prepare_private(&self, context: &DriverContext) -> Result<(), AppError> {
+        if !context.manifest.ephemeral {
+            return Ok(());
+        }
+        let path = private_patch_path(&context.manifest.id)?;
+        if path.is_file() {
+            return Ok(());
+        }
+        write_patch(&self.patch_path)?;
+        let rows = compose_profile(&self.binary, &self.env_allowlist, &self.patch_path).await?;
+        let folder = crate::private_dirs::private_subdir(&context.manifest.id, "dsh-home")?;
+        let patch = private_patch(&rows, &folder)?;
+        crate::secure_fs::write_owner_only_atomic_if_changed(&path, patch.as_bytes())?;
+        Ok(())
     }
 
     pub fn new(config: &AgentConfig, data_dir: &Path) -> Self {
@@ -245,8 +278,17 @@ pub(crate) async fn composed_profile(
 ) -> Result<Vec<crate::dsh_config::ComposedRow>, AppError> {
     let patch = patch_path(data_dir);
     write_patch(&patch)?;
+    compose_profile(&config.dsh_bin, &config.dsh_env_allowlist, &patch).await
+}
+
+/// [`composed_profile`] with TodeX's overlay already written at `patch`.
+async fn compose_profile(
+    binary: &str,
+    allowlist: &[String],
+    patch: &Path,
+) -> Result<Vec<crate::dsh_config::ComposedRow>, AppError> {
     let cwd = patch.parent().expect("patch path has a parent").to_owned();
-    let mut spec = CommandSpec::new(&config.dsh_bin, &cwd);
+    let mut spec = CommandSpec::new(binary, &cwd);
     spec.args = vec![
         "--profile".to_owned(),
         crate::dsh_config::PROFILE.to_owned(),
@@ -254,7 +296,7 @@ pub(crate) async fn composed_profile(
         patch.to_string_lossy().into_owned(),
         "--dump-config".to_owned(),
     ];
-    spec.env = dsh_environment(&config.dsh_env_allowlist);
+    spec.env = dsh_environment(allowlist);
     let output =
         super::process::run_bounded_command(&spec, DUMP_OUTPUT_BYTES, DUMP_TIMEOUT).await?;
     if !output.success {
@@ -270,6 +312,66 @@ pub(crate) async fn composed_profile(
         )));
     }
     crate::dsh_config::parse_dump(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// A private conversation's patch overlay, in its private folder.
+fn private_patch_path(conversation_id: &str) -> Result<PathBuf, AppError> {
+    Ok(crate::private_dirs::private_subdir(conversation_id, "dsh")?.join(PATCH_FILE))
+}
+
+/// The rows a private conversation's patch changes, with the settings it
+/// gives them inside the private `folder`:
+/// - session journals (`session-persistence-jsonl`), the session
+///   projection cache and other storages (`storage-json`), attachments
+///   (`attachment-local`) and spilled tool output (`spill-local`) move into
+///   the folder;
+/// - the bash executor keeps no full-output spill file: those go to the
+///   system temp folder and are never removed. `TMPDIR` cannot point into
+///   the folder instead: dsh's sandbox lets commands write only to `/tmp`
+///   and the workspace, so their temp files would fail.
+fn private_patch(
+    rows: &[crate::dsh_config::ComposedRow],
+    folder: &Path,
+) -> Result<String, AppError> {
+    let path = |name: &str| Value::String(folder.join(name).to_string_lossy().into_owned());
+    let overrides: [(&str, Vec<(&str, Value)>); 5] = [
+        (
+            "session-persistence-jsonl",
+            vec![("root", path("sessions"))],
+        ),
+        ("storage-json", vec![("root", path("storages"))]),
+        ("attachment-local", vec![("dshHome", path(""))]),
+        ("spill-local", vec![("root", path("spill"))]),
+        // A spill file is kept only while the whole output fits this cap,
+        // and spilling starts once the output outgrows the in-memory tail.
+        ("bash-sandbox", vec![("maxSpillBytes", json!(1))]),
+    ];
+    let mut entries = Vec::new();
+    for (id, settings) in overrides {
+        let Some(row) = rows.iter().find(|row| row.id.as_deref() == Some(id)) else {
+            continue;
+        };
+        // Expressions (`!!js`) do not survive the dump; plain numbers and
+        // switches do, and the rest of the row's settings are paths this
+        // patch replaces.
+        let mut config = serde_json::Map::new();
+        if let Some(Value::Object(composed)) = &row.config {
+            for (key, value) in composed {
+                if value.is_number() || value.is_boolean() {
+                    config.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        for (key, value) in settings {
+            config.insert(key.to_owned(), value);
+        }
+        entries.push(json!({ "id": id, "config": config }));
+    }
+    // JSON is YAML; the overlay holds no `!!js` expressions.
+    let body = serde_json::to_string_pretty(&entries)?;
+    Ok(format!(
+        "# Managed by TodeX for one private conversation; deleted with it.\n{body}\n"
+    ))
 }
 
 fn write_patch(path: &Path) -> Result<(), AppError> {
@@ -457,6 +559,12 @@ impl ProviderDriver for DeepseekHarnessDriver {
         self.shutdown_session(conversation_id).await;
     }
 
+    /// dsh runs with a second patch overlay that re-roots its stores into
+    /// the conversation's private folder, which the daemon deletes.
+    fn private_conversations(&self) -> Option<super::types::PrivateConversations> {
+        cfg!(unix).then_some(super::types::PrivateConversations::Scrubbed)
+    }
+
     fn supports_runtime_stop(&self) -> bool {
         true
     }
@@ -518,6 +626,7 @@ impl ProviderDriver for DeepseekHarnessDriver {
         settings: DriverPrompt,
         sink: DriverEventSink,
     ) -> Result<ProviderPrewarm, AppError> {
+        self.prepare_private(&context).await?;
         self.sessions
             .prewarm(context, settings, sink, |context, prompt| {
                 self.resident_launch(context, prompt)
@@ -532,6 +641,7 @@ impl ProviderDriver for DeepseekHarnessDriver {
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
     ) -> Result<DriverTurnResult, AppError> {
+        self.prepare_private(&context).await?;
         self.sessions
             .run_turn(context, prompt, sink, cancel, |context, prompt| {
                 self.resident_launch(context, prompt)
@@ -566,6 +676,41 @@ mod tests {
     const FLASH: &str = r#"["deepseek-official","deepseek-v4-flash"]"#;
     const PRO: &str = r#"["deepseek-official","deepseek-v4-pro"]"#;
     const PLAIN: &str = r#"["gateway","plain-chat"]"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_patch_reroots_stores_and_keeps_plain_settings() {
+        let row = |id: &str, config: Option<Value>| crate::dsh_config::ComposedRow {
+            id: Some(id.to_owned()),
+            name: format!("@deepseek-ai/dsh-{id}"),
+            state: crate::dsh_config::RowState::Enabled,
+            layer: "@deepseek-ai/dsh-base".to_owned(),
+            patched_by: Vec::new(),
+            config,
+        };
+        let rows = [
+            row(
+                "session-persistence-jsonl",
+                // A dropped `!!js` tag leaves the expression as a string.
+                Some(json!({"root": "dshHomePath('sessions')"})),
+            ),
+            row("bash-sandbox", Some(json!({"timeoutMs": 90000}))),
+            row("spill-local", None),
+        ];
+        let folder = Path::new("/private/conv/dsh-home");
+        let text = private_patch(&rows, folder).unwrap();
+        assert!(text.starts_with("# "));
+        let body: Value = serde_json::from_str(text.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(
+            body,
+            json!([
+                {"id": "session-persistence-jsonl",
+                 "config": {"root": "/private/conv/dsh-home/sessions"}},
+                {"id": "spill-local", "config": {"root": "/private/conv/dsh-home/spill"}},
+                {"id": "bash-sandbox", "config": {"timeoutMs": 90000, "maxSpillBytes": 1}},
+            ])
+        );
+    }
 
     #[test]
     fn grouped_model_options_flatten_with_route_family() {

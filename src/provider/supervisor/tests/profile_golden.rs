@@ -105,7 +105,16 @@ fn error_text(error: AppError) -> Value {
 #[tokio::test]
 async fn providers_snapshot_matches_golden() {
     let (root, _workspace, supervisor) = golden_supervisor("todex-golden-providers", None).await;
-    let providers = serde_json::to_value(supervisor.providers_snapshot().await).unwrap();
+    #[cfg_attr(unix, allow(unused_mut))]
+    let mut providers = serde_json::to_value(supervisor.providers_snapshot().await).unwrap();
+    // omp, OpenCode and DeepSeek Harness relocate their storage through XDG
+    // folders and symlinks, so they run private conversations on Unix only.
+    #[cfg(not(unix))]
+    for provider in providers.as_array_mut().unwrap() {
+        if ["omp", "opencode", "deepseek-harness"].contains(&provider["id"].as_str().unwrap()) {
+            provider["capabilities"]["privateConversations"] = json!("scrubbed");
+        }
+    }
     // `/v2/providers` lists every kind once, in `ProviderKind` order.
     let ids: Vec<_> = providers
         .as_array()
