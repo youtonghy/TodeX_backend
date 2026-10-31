@@ -2801,14 +2801,16 @@ async fn read_claude_turn(
         0_u32
     };
     // With `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` Claude reports
-    // `session_state_changed`, and `idle` comes only once its input queue and
-    // background work are drained. That is the authoritative end of the turn:
-    // a subagent's `SubagentHandback` reaches the main session as a queued
-    // `peer` message with no `task_notification`, so `BackgroundTasks` alone
-    // can end the turn on a `result` with a hand-back still queued and kill
-    // the process before the model reads it. `settled` holds the latest
-    // successful `result` until `idle`; a CLI that never reports session
-    // state falls back to `BackgroundTasks`.
+    // `session_state_changed`, and `idle` comes once its input queue is drained
+    // and no background subagent is still working. That is the authoritative
+    // end of the turn. A backgrounded Bash command does not hold `idle` back:
+    // it reports later in an invocation of Claude's own, which becomes a
+    // provider-initiated turn. A subagent's `SubagentHandback` reaches the
+    // main session as a queued `peer` message with no `task_notification`, so
+    // `BackgroundTasks` alone can end the turn on a `result` with a hand-back
+    // still queued and kill the process before the model reads it. `settled`
+    // holds the latest successful `result` until `idle`; a CLI that never
+    // reports session state falls back to `BackgroundTasks`.
     // Claude's own invocation began with a `running` the worker already read.
     let mut session_states = start != TurnStart::Prompt;
     let mut settled: Option<Value> = None;
@@ -3714,8 +3716,9 @@ struct IdleWait {
 }
 
 impl IdleWait {
-    /// After `idle` Claude has drained its input and background work, so
-    /// pending tasks that TodeX still counts do not stretch the wait.
+    /// After `idle` Claude has drained its input, and any background command
+    /// still running reports back in an invocation of Claude's own, so pending
+    /// tasks that TodeX still counts do not stretch the wait.
     fn start(after_idle: bool, background_tasks: &BackgroundTasks) -> Self {
         let grace = if after_idle {
             IDLE_CONFIRM_GRACE

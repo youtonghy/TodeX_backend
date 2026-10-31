@@ -53,8 +53,12 @@ optional and canonical aliases are recomputed when old journals are replayed.
 - Claude Code `result` frames close a model turn, not the process. Claude runs
   with `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`, and the turn ends at the
   `session_state_changed` `idle` frame that follows the last successful
-  `result`. Only then are background tasks and queued subagent hand-backs
-  drained. A CLI without session state events falls back to keeping the turn
+  `result`. Claude sends it once its input queue (queued subagent hand-backs
+  included) is drained and no background subagent is still working; a
+  backgrounded Bash command does not hold it back (verified on 2.1.312:
+  `result`, then `idle` at once, the command finishing 20 s later), so the turn
+  ends while that command runs and its report arrives as a provider-initiated
+  turn. A CLI without session state events falls back to keeping the turn
   open while provider-reported background tasks remain. A zero-iteration result
   means the prompt was consumed unanswered and is resent on the open stream.
   Every successful `result` is kept as the turn's answer even while background
