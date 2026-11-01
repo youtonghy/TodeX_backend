@@ -142,6 +142,7 @@ impl EngineChoice {
 
 /// Longest `TMPDIR` the CLI is given: its command host listens on a Unix
 /// socket inside it, and socket paths are limited to ~104 bytes.
+#[cfg(unix)]
 const MAX_TMPDIR_LEN: usize = 48;
 
 /// The CLI's `TMPDIR` when the inherited one will not do (`None`: keep
