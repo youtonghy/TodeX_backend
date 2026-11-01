@@ -8,6 +8,7 @@
 //! pill and a global shortcut stop the session, and [`policy`] keeps
 //! agents out of credential stores and TodeX itself.
 
+pub(crate) mod agent_desktop_engine;
 mod engine;
 pub(crate) mod host_ui;
 pub(crate) mod keys;
@@ -30,6 +31,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use self::{
+    agent_desktop_engine::{Cli, EngineChoice},
     engine::{Engine, Grants},
     platform::Permissions,
     policy::{PolicyFailure, Target},
@@ -151,8 +153,12 @@ pub(crate) trait ComputerHost: Send + Sync {
 pub(crate) struct Computer(Arc<dyn ComputerHost>);
 
 impl Computer {
-    pub(crate) fn native() -> Self {
-        Self(Arc::new(NativeComputer::default()))
+    /// `choice`: which engine reads trees and performs ref actions.
+    pub(crate) fn native(choice: Arc<EngineChoice>) -> Self {
+        Self(Arc::new(NativeComputer {
+            choice: Some(choice),
+            ..NativeComputer::default()
+        }))
     }
 
     #[cfg(test)]
@@ -180,6 +186,8 @@ struct NativeComputer {
     /// The latest scan of installed apps. Held across the scan, so
     /// concurrent listings share one.
     installed: tokio::sync::Mutex<Option<(Instant, Arc<Vec<Target>>)>>,
+    /// The engine selection; `None` (tests) is the native engine.
+    choice: Option<Arc<EngineChoice>>,
 }
 
 /// Marks the work of a call abandoned when its future is dropped (the
@@ -194,6 +202,14 @@ impl Drop for AbandonOnDrop {
 }
 
 impl NativeComputer {
+    /// The agent-desktop CLI when its engine is selected.
+    fn cli(&self) -> Result<Option<Cli>, ComputerError> {
+        match &self.choice {
+            Some(choice) => choice.cli(),
+            None => Ok(None),
+        }
+    }
+
     async fn with_engine<T: Send + 'static>(
         &self,
         lease: u64,
@@ -347,8 +363,9 @@ impl ComputerHost for NativeComputer {
     }
 
     async fn observe(&self, lease: u64, args: Value) -> Result<Value, ComputerError> {
-        self.with_engine(lease, move |engine, _| {
-            engine.observe(&args, std::process::id())
+        let cli = self.cli()?;
+        self.with_engine(lease, move |engine, cancelled| {
+            engine.observe(&args, std::process::id(), cli.as_ref(), cancelled)
         })
         .await
     }
@@ -360,6 +377,7 @@ impl ComputerHost for NativeComputer {
         allowed_apps: Vec<String>,
         confirmed: bool,
     ) -> Result<Value, ComputerError> {
+        let cli = self.cli()?;
         self.with_engine(lease, move |engine, cancelled| {
             engine.act(
                 &args,
@@ -369,6 +387,7 @@ impl ComputerHost for NativeComputer {
                     cancelled,
                 },
                 std::process::id(),
+                cli.as_ref(),
             )
         })
         .await

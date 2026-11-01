@@ -77,6 +77,8 @@ jpeg-encoder = "0.7"
 # Agent browser: the DevTools socket on Windows, and unpacking Chromium.
 tokio-tungstenite = "0.29"
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# Computer Use: unpacking the optional agent-desktop engine's release.
+tar = { version = "0.4", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 xa11y-macos = "=0.15.2"

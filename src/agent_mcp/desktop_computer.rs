@@ -169,12 +169,22 @@ pub(super) fn validate(name: &str, arguments: Value) -> Result<ComputerCall, Str
                 "wait" if args.ms.is_some_and(|ms| ms > MAX_WAIT_MS) => {
                     return Err(format!("wait is limited to {MAX_WAIT_MS} ms"))
                 }
+                action if ENGINE_ACTIONS.contains(&action) && !has_ref => {
+                    return Err(format!(
+                        "{action} needs ref from the latest computer_observe"
+                    ))
+                }
+                "set_value" | "select" if args.text.is_none() => {
+                    return Err(format!("{} needs text", args.action))
+                }
+                action if ENGINE_ACTIONS.contains(&action) => {}
                 "click" | "double_click" | "right_click" | "hover" | "drag" | "scroll" | "type"
                 | "wait" | "open_app" | "focus_window" => {}
                 other => {
                     return Err(format!(
                     "unknown action {other}; use click, double_click, right_click, hover, drag, \
-                         scroll, type, key, wait, open_app or focus_window"
+                         scroll, type, key, wait, open_app or focus_window (with the agent-desktop \
+                         engine also set_value, select, toggle, expand, collapse or scroll_to)"
                 ))
                 }
             }
@@ -307,44 +317,7 @@ pub(super) fn tools(
         false,
         prepare_observe,
         ),
-        entry(
-        Tool::new(
-            "computer_act",
-            "Act on the computer the TodeX backend runs on. Prefer ref from the latest \
-             computer_observe: the action goes to that element in the background without moving \
-             the user's pointer. x/y are screenshot pixels of the latest observation and move the \
-             pointer (refused while the user is using it; retry shortly). type inserts text (into \
-             ref, or the focused field); where the app ignores inserted text (web editors) it \
-             brings the app forward and types instead (path: keyboard); key sends a chord such as \
-             cmd+c (cmd is ⌘ on macOS and Ctrl elsewhere), enter, shift+tab. The first action in each app and typing into \
-             password fields ask the user; some apps (TodeX, system settings, credential stores, \
-             password managers) can never be controlled. Unavailable in Plan mode; in ask mode the \
-             user approves each call.",
-            schema(json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["click", "double_click", "right_click", "hover", "drag", "scroll", "type", "key", "wait", "open_app", "focus_window"] },
-                    "ref": { "type": "string" },
-                    "x": { "type": "number" },
-                    "y": { "type": "number" },
-                    "toX": { "type": "number" },
-                    "toY": { "type": "number" },
-                    "text": { "type": "string" },
-                    "keys": { "type": "string" },
-                    "app": { "type": "string", "description": "App for open_app (id or name). An `@app:<id>` mention in the user's message names an app on this computer: pass its id here as is." },
-                    "window": { "type": "integer" },
-                    "deltaX": { "type": "number" },
-                    "deltaY": { "type": "number" },
-                    "ms": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            })),
-        )
-        .with_annotations(ToolAnnotations::new().read_only(false).destructive(true).open_world(true)),
-        true,
-        prepare_act,
-        ),
+        entry(act_tool(true), true, prepare_act),
         entry(
         Tool::new(
             "computer_done",
@@ -356,6 +329,87 @@ pub(super) fn tools(
         prepare_done,
         ),
     ]
+}
+
+/// Actions only the agent-desktop engine performs (on a ref).
+pub(super) const ENGINE_ACTIONS: [&str; 6] = [
+    "set_value",
+    "select",
+    "toggle",
+    "expand",
+    "collapse",
+    "scroll_to",
+];
+
+/// `computer_act`; `agent_desktop`: the engine's ref actions are listed.
+pub(super) fn act_tool(agent_desktop: bool) -> Tool {
+    let mut actions = vec![
+        "click",
+        "double_click",
+        "right_click",
+        "hover",
+        "drag",
+        "scroll",
+        "type",
+        "key",
+        "wait",
+        "open_app",
+        "focus_window",
+    ];
+    let mut description = String::from(
+        "Act on the computer the TodeX backend runs on. Prefer ref from the latest \
+         computer_observe: the action goes to that element in the background without moving \
+         the user's pointer. x/y are screenshot pixels of the latest observation and move the \
+         pointer (refused while the user is using it; retry shortly). type inserts text (into \
+         ref, or the focused field); where the app ignores inserted text (web editors) it \
+         brings the app forward and types instead (path: keyboard); key sends a chord such as \
+         cmd+c (cmd is ⌘ on macOS and Ctrl elsewhere), enter, shift+tab. ",
+    );
+    if agent_desktop {
+        actions.extend(ENGINE_ACTIONS);
+        description.push_str(
+            "On a ref: set_value replaces a field's value with text (not password fields; use \
+             type), select picks the option named text in a list or pop-up, toggle flips a \
+             checkbox or switch, expand / collapse open or close a disclosure or tree item, \
+             scroll_to scrolls the element into view. ",
+        );
+    }
+    description.push_str(
+        "The first action in each app and typing into \
+         password fields ask the user; some apps (TodeX, system settings, credential stores, \
+         password managers) can never be controlled. Unavailable in Plan mode; in ask mode the \
+         user approves each call.",
+    );
+    Tool::new(
+        "computer_act",
+        description,
+        schema(json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": actions },
+                "ref": { "type": "string" },
+                "x": { "type": "number" },
+                "y": { "type": "number" },
+                "toX": { "type": "number" },
+                "toY": { "type": "number" },
+                "text": { "type": "string" },
+                "keys": { "type": "string" },
+                "app": { "type": "string", "description": "App for open_app (id or name). An `@app:<id>` mention in the user's message names an app on this computer: pass its id here as is." },
+                "window": { "type": "integer" },
+                "deltaX": { "type": "number" },
+                "deltaY": { "type": "number" },
+                "ms": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        })),
+    )
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            .open_world(true),
+    )
 }
 
 /// The agent-facing text of a `computer_observe` result: TodeX's notes,
@@ -974,6 +1028,27 @@ fn grant_prompt(conversation_title: Option<&str>) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_actions_need_a_ref_and_are_listed_only_for_agent_desktop() {
+        assert!(validate("computer_act", json!({ "action": "toggle", "ref": "e1" })).is_ok());
+        assert!(validate("computer_act", json!({ "action": "toggle" })).is_err());
+        assert!(validate("computer_act", json!({ "action": "select", "ref": "e1" })).is_err());
+        let call = validate(
+            "computer_act",
+            json!({ "action": "set_value", "ref": "e2", "text": "secret" }),
+        )
+        .unwrap();
+        // The value never reaches the summary prompts and the journal show.
+        assert!(!call.summary.contains("secret"));
+        let actions = |agent_desktop: bool| {
+            act_tool(agent_desktop).input_schema["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        assert_eq!(actions(true), actions(false) + ENGINE_ACTIONS.len());
+    }
 
     #[test]
     fn computer_arguments_are_validated() {

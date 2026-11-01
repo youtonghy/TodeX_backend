@@ -33,7 +33,12 @@ impl Harness {
     fn observe(&mut self, window_title: &str) -> Value {
         let listing = self
             .engine
-            .observe(&json!({ "screenshot": false }), std::process::id())
+            .observe(
+                &json!({ "screenshot": false }),
+                std::process::id(),
+                None,
+                &NEVER_CANCELLED,
+            )
             .unwrap();
         self.windows = listing["windows"].clone();
         let id = self
@@ -44,6 +49,8 @@ impl Harness {
             .observe(
                 &json!({ "window": id, "screenshot": self.gpu }),
                 std::process::id(),
+                None,
+                &NEVER_CANCELLED,
             )
             .unwrap();
         self.tree = observed["tree"].as_str().unwrap_or_default().to_owned();
@@ -85,6 +92,7 @@ impl Harness {
                     cancelled: &NEVER_CANCELLED,
                 },
                 std::process::id(),
+                None,
             ) {
                 Ok(result) => return result,
                 Err(ComputerError { code, .. }) if code == "USER_ACTIVE" => {
@@ -146,10 +154,12 @@ fn kde_wayland_end_to_end() {
     // The app starts, AT-SPI publishes it, and its bounds become global.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if let Ok(listing) = harness
-            .engine
-            .observe(&json!({ "screenshot": false }), std::process::id())
-        {
+        if let Ok(listing) = harness.engine.observe(
+            &json!({ "screenshot": false }),
+            std::process::id(),
+            None,
+            &NEVER_CANCELLED,
+        ) {
             harness.windows = listing["windows"].clone();
             if harness.window_id(MAIN_TITLE).is_some() && harness.window_id(SECOND_TITLE).is_some()
             {

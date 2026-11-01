@@ -29,7 +29,10 @@ use tokio::sync::{watch, RwLock};
 
 use crate::{
     agent_browser::{AgentBrowser, CloseReason},
-    computer::{Computer, ComputerError},
+    computer::{
+        agent_desktop_engine::{AgentDesktopEngineStatus, EngineChoice, EngineKind},
+        Computer, ComputerError,
+    },
     error::AppError,
     secure_fs,
 };
@@ -38,6 +41,9 @@ pub(crate) use keyed::KeyedLocks;
 pub(crate) use shots::ShotStore;
 
 const SETTINGS_FILE: &str = "agent-desktop.json";
+/// The Computer Use engine, apart from [`SETTINGS_FILE`] so a daemon that
+/// predates engines still reads its settings after a downgrade.
+const ENGINE_FILE: &str = "computer-engine.json";
 /// A screen lease nobody used for this long may be taken over.
 pub(crate) const SCREEN_IDLE: Duration = Duration::from_secs(120);
 const STATE_DIR: &str = "agent-desktop";
@@ -60,6 +66,14 @@ pub(crate) struct DesktopSettings {
     /// effective while `enabled`.
     #[serde(default)]
     pub computer_enabled: bool,
+}
+
+/// [`ENGINE_FILE`]. Unknown fields are ignored for newer daemons' files.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct EngineSettings {
+    #[serde(default)]
+    engine: EngineKind,
 }
 
 /// What a revoke ended for a conversation.
@@ -176,6 +190,8 @@ struct Inner {
     approved_apps: Mutex<HashMap<String, HashSet<String>>>,
     shots: ShotStore,
     computer: std::sync::RwLock<Computer>,
+    engine_path: PathBuf,
+    engine: Arc<EngineChoice>,
     /// The latest live frame (and its lease), shared by concurrent viewers.
     frame: tokio::sync::Mutex<Option<LiveFrame>>,
 }
@@ -196,6 +212,23 @@ impl AgentDesktop {
             }
             Err(error) => return Err(error.into()),
         };
+        let engine_path = data_dir.join(ENGINE_FILE);
+        let engine_settings = match tokio::fs::read(&engine_path).await {
+            Ok(bytes) => serde_json::from_slice::<EngineSettings>(&bytes).unwrap_or_else(|error| {
+                tracing::warn!(%error, path = %engine_path.display(), "unreadable Computer Use engine setting; using the built-in engine");
+                EngineSettings::default()
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                EngineSettings::default()
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let engine = Arc::new(EngineChoice::new(
+            &data_dir.join(STATE_DIR),
+            EngineKind::Native,
+        ));
+        // Starts the install when agent-desktop is selected but missing.
+        engine.set_kind(engine_settings.engine);
         Ok(Self {
             inner: Arc::new(Inner {
                 settings_path,
@@ -207,7 +240,9 @@ impl AgentDesktop {
                 next_lease: AtomicU64::new(1),
                 approved_apps: Mutex::new(HashMap::new()),
                 shots: ShotStore::new(data_dir.join(STATE_DIR).join("shots")),
-                computer: std::sync::RwLock::new(Computer::native()),
+                computer: std::sync::RwLock::new(Computer::native(engine.clone())),
+                engine_path,
+                engine,
                 frame: tokio::sync::Mutex::new(None),
             }),
         })
@@ -236,6 +271,38 @@ impl AgentDesktop {
             .computer
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = computer;
+    }
+
+    pub(crate) fn computer_engine(&self) -> EngineKind {
+        self.inner.engine.kind()
+    }
+
+    pub(crate) fn agent_desktop_engine(&self) -> AgentDesktopEngineStatus {
+        self.inner.engine.status()
+    }
+
+    /// Persists the Computer Use engine. A change ends the screen session
+    /// (its refs belong to the other engine) without revoking grants;
+    /// returns the conversation whose session ended. Selecting
+    /// agent-desktop starts its download.
+    pub(crate) async fn set_computer_engine(
+        &self,
+        kind: EngineKind,
+    ) -> Result<Option<String>, AppError> {
+        // Serializes with the other switches.
+        let _settings = self.inner.settings.write().await;
+        let bytes = serde_json::to_vec_pretty(&EngineSettings { engine: kind })?;
+        let path = self.inner.engine_path.clone();
+        tokio::task::spawn_blocking(move || secure_fs::write_owner_only_atomic(&path, &bytes))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        let changed = self.inner.engine.kind() != kind;
+        self.inner.engine.set_kind(kind);
+        if !changed {
+            return Ok(None);
+        }
+        let holder = self.screen_holder();
+        Ok(holder.filter(|conversation_id| self.release_screen(conversation_id)))
     }
 
     pub(crate) async fn enabled(&self) -> bool {
@@ -790,6 +857,50 @@ pub(crate) mod tests {
 
         std::fs::write(root.join(SETTINGS_FILE), b"{\"enabled\":1}").unwrap();
         assert!(AgentDesktop::load(&root).await.is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[tokio::test]
+    async fn the_engine_persists_apart_and_a_change_ends_the_screen_session() {
+        let (desktop, root) = desktop().await;
+        assert_eq!(desktop.computer_engine(), EngineKind::Native);
+        let host = Grant {
+            device_id: HOST_DEVICE_ID.into(),
+            device_name: "Host".into(),
+        };
+        desktop.set_computer_grant("a", host.clone());
+        let held = desktop.claim_screen("a").unwrap();
+        drop(held);
+
+        let ended = desktop
+            .set_computer_engine(EngineKind::AgentDesktop)
+            .await
+            .unwrap();
+        assert_eq!(ended.as_deref(), Some("a"));
+        assert_eq!(desktop.screen_holder(), None);
+        // The grant stays: only the session ended.
+        assert_eq!(desktop.computer_grant("a"), Some(host));
+        assert!(!desktop.agent_desktop_engine().available);
+        // Setting the same engine again ends nothing.
+        desktop.claim_screen("a").unwrap();
+        assert_eq!(
+            desktop
+                .set_computer_engine(EngineKind::AgentDesktop)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(desktop.screen_holder().as_deref(), Some("a"));
+
+        let reloaded = AgentDesktop::load(&root).await.unwrap();
+        assert_eq!(reloaded.computer_engine(), EngineKind::AgentDesktop);
+        // The switches file is untouched, so older daemons still read it.
+        assert!(!root.join(SETTINGS_FILE).exists());
+        // An unreadable engine file falls back to the built-in engine.
+        std::fs::write(root.join(ENGINE_FILE), b"{\"engine\":\"warp\"}").unwrap();
+        assert_eq!(
+            AgentDesktop::load(&root).await.unwrap().computer_engine(),
+            EngineKind::Native
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

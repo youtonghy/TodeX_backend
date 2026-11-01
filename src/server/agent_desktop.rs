@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::app_state::AppState;
-use crate::computer::platform::Permission;
+use crate::computer::{agent_desktop_engine::EngineKind, platform::Permission};
 use crate::error::AppError;
 
 use super::v2::require_auth;
@@ -24,6 +24,9 @@ struct SettingsRequest {
     enabled: Option<bool>,
     #[serde(default)]
     computer_enabled: Option<bool>,
+    /// `native` or `agentDesktop`.
+    #[serde(default)]
+    computer_engine: Option<EngineKind>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +116,10 @@ async fn settings_view(state: &AppState) -> Value {
         "executors": [],
         "browser": state.agent_desktop.browser().status(),
         "computer": state.agent_desktop.computer().host().status(),
+        "computerEngine": state.agent_desktop.computer_engine(),
+        "computerEngines": {
+            "agentDesktop": state.agent_desktop.agent_desktop_engine(),
+        },
     })
 }
 
@@ -144,17 +151,27 @@ async fn set_settings(
     Json(request): Json<SettingsRequest>,
 ) -> Result<Json<Value>, AppError> {
     require_auth(&state, &headers)?;
-    if request.enabled.is_none() && request.computer_enabled.is_none() {
+    if request.enabled.is_none()
+        && request.computer_enabled.is_none()
+        && request.computer_engine.is_none()
+    {
         return Err(AppError::InvalidRequest(
-            "set enabled and/or computerEnabled".to_owned(),
+            "set enabled, computerEnabled and/or computerEngine".to_owned(),
         ));
     }
-    let change = state
-        .agent_mcp
-        .update_desktop_settings(request.enabled, request.computer_enabled)
-        .await?;
-    for conversation_id in change.screen_ended {
-        journal_screen_end(&state, &conversation_id, "revoked").await;
+    if let Some(engine) = request.computer_engine {
+        if let Some(conversation_id) = state.agent_desktop.set_computer_engine(engine).await? {
+            journal_screen_end(&state, &conversation_id, "engine").await;
+        }
+    }
+    if request.enabled.is_some() || request.computer_enabled.is_some() {
+        let change = state
+            .agent_mcp
+            .update_desktop_settings(request.enabled, request.computer_enabled)
+            .await?;
+        for conversation_id in change.screen_ended {
+            journal_screen_end(&state, &conversation_id, "revoked").await;
+        }
     }
     Ok(Json(settings_view(&state).await))
 }

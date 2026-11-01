@@ -11189,6 +11189,37 @@ mod tests {
         // Computer Use runs on this host; tests have no host UI to confirm.
         assert!(body["computer"]["host"].is_string());
         assert_eq!(body["computer"]["available"], false);
+        assert_eq!(body["computerEngine"], "native");
+        assert_eq!(
+            body["computerEngines"]["agentDesktop"]["version"],
+            crate::computer::agent_desktop_engine::AGENT_DESKTOP_VERSION
+        );
+        let (status, body) = send(signed_request(
+            &device,
+            "PUT",
+            "/v2/agent-desktop",
+            r#"{"computerEngine":"agentDesktop"}"#,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["computerEngine"], "agentDesktop");
+        assert_eq!(body["computerEnabled"], true);
+        assert_eq!(body["computerEngines"]["agentDesktop"]["available"], false);
+        let (status, _) = send(signed_request(
+            &device,
+            "PUT",
+            "/v2/agent-desktop",
+            r#"{"computerEngine":"warp"}"#,
+        ))
+        .await;
+        assert!(status.is_client_error());
+        send(signed_request(
+            &device,
+            "PUT",
+            "/v2/agent-desktop",
+            r#"{"computerEngine":"native"}"#,
+        ))
+        .await;
 
         let manifest = state
             .conversations

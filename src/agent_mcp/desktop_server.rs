@@ -40,6 +40,7 @@ use crate::{
     agent_browser::{policy, AgentBrowser, BrowserError, CloseReason},
     agent_desktop::{Grant, HOST_DEVICE_ID},
     app_state::AppState,
+    computer::agent_desktop_engine::EngineKind,
     provider::ConversationSupervisor,
 };
 
@@ -588,10 +589,21 @@ impl ServerHandler for DesktopTools {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let computer = self.mcp.desktop().computer_enabled().await;
-        Ok(self
+        let desktop = self.mcp.desktop();
+        let computer = desktop.computer_enabled().await;
+        let mut listed = self
             .registry
-            .list(|name| computer || !name.starts_with("computer_")))
+            .list(|name| computer || !name.starts_with("computer_"));
+        // The agent-desktop engine's ref actions are listed only while it
+        // is selected; calls of them otherwise fail with ENGINE_REQUIRED.
+        if desktop.computer_engine() != EngineKind::AgentDesktop {
+            for tool in &mut listed.tools {
+                if tool.name == "computer_act" {
+                    *tool = desktop_computer::act_tool(false);
+                }
+            }
+        }
+        Ok(listed)
     }
 
     async fn call_tool(

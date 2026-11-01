@@ -20,6 +20,7 @@ use xa11y::{
 };
 
 use super::{
+    agent_desktop_engine::{self as external, Cli, ExternalElement, RefAction},
     keys, platform,
     platform::{Display, Typed},
     policy::{self, ShotMapping, Target},
@@ -29,7 +30,7 @@ use super::{
 const SCREENSHOT_MAX_WIDTH: u32 = 1280;
 const SCREENSHOT_QUALITY: u8 = 70;
 const MAX_WINDOWS: usize = 40;
-const MAX_NODES: usize = 4000;
+pub(super) const MAX_NODES: usize = 4000;
 const MAX_DEPTH: usize = 60;
 const MAX_WAIT_MS: u64 = 10_000;
 /// How long an app just brought forward may take to own the keyboard.
@@ -63,6 +64,10 @@ pub(super) struct Engine {
     observed: Option<Target>,
     /// The screen lease the observation above belongs to.
     lease: u64,
+    /// Elements of the latest observation when agent-desktop read its tree
+    /// (`refs` index these instead of `elements` then).
+    external: Vec<ExternalElement>,
+    external_observed: bool,
 }
 
 /// What `act` may touch, decided by the daemon (never by the agent).
@@ -82,6 +87,8 @@ impl Engine {
         self.windows.clear();
         self.shot = None;
         self.observed = None;
+        self.external.clear();
+        self.external_observed = false;
     }
 
     /// A call of screen lease `lease` starts: another lease's refs and
@@ -130,7 +137,14 @@ impl Engine {
     /// Protected apps (TodeX itself, [`policy::is_blocked`]) stay unseen:
     /// naming one is refused, its tree is never read, its window titles
     /// are withheld and its windows are painted over in screenshots.
-    pub(super) fn observe(&mut self, args: &Value, own_pid: u32) -> Result<Value, ComputerError> {
+    /// `cli`: agent-desktop reads the tree instead (its engine is selected).
+    pub(super) fn observe(
+        &mut self,
+        args: &Value,
+        own_pid: u32,
+        cli: Option<&Cli>,
+        cancelled: &AtomicBool,
+    ) -> Result<Value, ComputerError> {
         let provider = self.provider()?;
         self.reset();
         self.list_windows(&provider);
@@ -173,6 +187,14 @@ impl Engine {
                 ),
                 false,
             )
+        } else if let Some(cli) = cli {
+            let title = window_index.map(|index| self.windows[index].title.clone());
+            let snapshot = cli.snapshot(&app, title.as_deref(), cancelled)?;
+            let formatted = tree::format(&snapshot.root);
+            self.refs = formatted.refs;
+            self.external = snapshot.elements;
+            self.external_observed = true;
+            (formatted.text, formatted.truncated || snapshot.truncated)
         } else {
             let root = match window_index {
                 Some(index) => self.windows[index].element.clone(),
@@ -478,11 +500,14 @@ impl Engine {
 
     // ---- Act --------------------------------------------------------------
 
+    /// `cli`: the agent-desktop engine is selected; refs of an observation
+    /// it read go to it.
     pub(super) fn act(
         &mut self,
         args: &Value,
         grants: Grants<'_>,
         own_pid: u32,
+        cli: Option<&Cli>,
     ) -> Result<Value, ComputerError> {
         let action = args["action"].as_str().unwrap_or_default().to_owned();
         let cancelled = grants.cancelled;
@@ -510,30 +535,68 @@ impl Engine {
         } else {
             Some(self.provider()?)
         };
-        let element = match args["ref"]
+        let named = RefAction::from_action(&action);
+        let reference = args["ref"]
             .as_str()
-            .filter(|reference| !reference.is_empty())
-        {
-            Some(reference) => Some(
-                self.refs
-                    .get(reference)
-                    .and_then(|handle| self.elements.get(*handle))
-                    .cloned()
-                    .ok_or_else(|| {
-                        ComputerError::invalid(format!(
-                            "unknown ref {reference}; refs come from the latest computer_observe"
-                        ))
-                    })?,
-            ),
-            None => None,
+            .filter(|reference| !reference.is_empty());
+        let unknown = |reference: &str| {
+            ComputerError::invalid(format!(
+                "unknown ref {reference}; refs come from the latest computer_observe"
+            ))
         };
+        let (element, external) = match reference {
+            Some(reference) if self.external_observed => (
+                None,
+                Some(
+                    self.refs
+                        .get(reference)
+                        .and_then(|handle| self.external.get(*handle))
+                        .cloned()
+                        .ok_or_else(|| unknown(reference))?,
+                ),
+            ),
+            Some(reference) => (
+                Some(
+                    self.refs
+                        .get(reference)
+                        .and_then(|handle| self.elements.get(*handle))
+                        .cloned()
+                        .ok_or_else(|| unknown(reference))?,
+                ),
+                None,
+            ),
+            None => (None, None),
+        };
+        // Its ref, when agent-desktop gave the element one.
+        let external_ref = external
+            .as_ref()
+            .map(|element| element.reference.clone())
+            .filter(|reference| !reference.is_empty());
+        let external_cli = cli.filter(|_| external_ref.is_some());
+        if named.is_some() {
+            if cli.is_none() {
+                return Err(ComputerError::new(
+                    "ENGINE_REQUIRED",
+                    format!("{action} needs the agent-desktop engine (Settings > Computer Use); use click, type or key instead"),
+                ));
+            }
+            if external_ref.is_none() {
+                return Err(ComputerError::invalid(format!(
+                    "{action} needs a ref of an actionable element from the latest computer_observe"
+                )));
+            }
+        }
         let point = self.map_point(args["x"].as_f64(), args["y"].as_f64())?;
         let to = self.map_point(args["toX"].as_f64(), args["toY"].as_f64())?;
 
         let target = if action == "wait" {
             Target::default()
         } else {
-            let target = self.target(&action, args, element.as_ref(), point, provider.as_ref())?;
+            // A ref agent-desktop read belongs to the app observed.
+            let target = match (&external, &self.observed) {
+                (Some(_), Some(observed)) => observed.clone(),
+                _ => self.target(&action, args, element.as_ref(), point, provider.as_ref())?,
+            };
             if let Some(failure) = policy::check_target(&target, grants.allowed_apps, own_pid) {
                 return Err(ComputerError::from(failure));
             }
@@ -567,12 +630,91 @@ impl Engine {
                     f64::from(bounds.x) + f64::from(bounds.width) / 2.0,
                     f64::from(bounds.y) + f64::from(bounds.height) / 2.0,
                 )
-            });
+            })
+            .or_else(|| external.as_ref().and_then(ExternalElement::center));
+        // agent-desktop performs a ref action in the background; when it
+        // reports nothing was delivered, the pointer may still be tried.
+        let by_cli = |command: RefAction, text: Option<&str>| -> Result<bool, ComputerError> {
+            let (Some(cli), Some(reference)) = (external_cli, external_ref.as_deref()) else {
+                return Ok(false);
+            };
+            if point.is_some() {
+                return Ok(false);
+            }
+            live(cancelled)?;
+            match cli.act(command, reference, text, cancelled) {
+                Ok(()) => Ok(true),
+                Err(error)
+                    if external::not_delivered(&error) && center.is_some() && text.is_none() =>
+                {
+                    tracing::debug!(%error, "agent-desktop did not deliver the action; using the pointer");
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            }
+        };
         let pointer_at = point.or(center);
 
         let _injecting = (!matches!(action.as_str(), "wait" | "open_app" | "focus_window"))
             .then(platform::injecting);
         let path = match action.as_str() {
+            "click" | "right_click"
+                if by_cli(
+                    if action == "click" {
+                        RefAction::Click
+                    } else {
+                        RefAction::RightClick
+                    },
+                    None,
+                )? =>
+            {
+                "background"
+            }
+            "double_click" if by_cli(RefAction::DoubleClick, None)? => "background",
+            _ if named.is_some() => {
+                let element = external.as_ref().expect("named actions need a ref");
+                let text = args["text"].as_str();
+                if named == Some(RefAction::SetValue) && element.secure {
+                    return Err(ComputerError::invalid(
+                        "set_value cannot fill password fields; use type",
+                    ));
+                }
+                if named.is_some_and(RefAction::takes_text) && text.is_none() {
+                    return Err(ComputerError::invalid(format!("{action} needs text")));
+                }
+                let cli = external_cli.expect("named actions need the engine");
+                live(cancelled)?;
+                cli.act(
+                    named.expect("named action"),
+                    external_ref.as_deref().expect("named actions need a ref"),
+                    text,
+                    cancelled,
+                )?;
+                "background"
+            }
+            "type" if external.is_some() => {
+                let element = external.as_ref().expect("external ref");
+                if element.secure && !grants.confirmed {
+                    return Err(sensitive());
+                }
+                // Focus through agent-desktop, then type natively: the text
+                // never reaches a command line.
+                let (Some(cli), Some(reference)) = (external_cli, external_ref.as_deref()) else {
+                    return Err(ComputerError::invalid(
+                        "that element cannot take text; type into a text field's ref",
+                    ));
+                };
+                live(cancelled)?;
+                cli.act(RefAction::Focus, reference, None, cancelled)?;
+                self.type_text(
+                    args["text"].as_str().unwrap_or_default(),
+                    &target,
+                    None,
+                    provider.as_ref(),
+                    &grants,
+                    own_pid,
+                )?
+            }
             "click" | "right_click" => {
                 let background = point.is_none()
                     && element.as_ref().is_some_and(|element| {
@@ -720,6 +862,7 @@ impl Engine {
             .as_ref()
             .and_then(|element| element.pid)
             .map(platform::app_identity)
+            .or_else(|| external.as_ref().and(self.observed.clone()))
             .or_else(|| args["app"].as_str().and_then(platform::running_app))
             .or_else(|| {
                 point
