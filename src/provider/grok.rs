@@ -16,8 +16,8 @@ use super::process::{
     executable_available, redact_sensitive_text, run_bounded_command, CommandSpec, JsonLineProcess,
 };
 use super::profile::{
-    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
-    ProviderProfile, SkillInjection,
+    CatalogProfile, CatalogSource, ConfigHome, McpInjection, ProcessModel, ProviderProfile,
+    SkillInjection,
 };
 use super::resident::{allowlisted_environment, initialize_acp, ResidentLaunch, ResidentSessions};
 use super::rpc::{FailureWording, RpcClient, RpcPeer};
@@ -76,7 +76,6 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     image_input_mode: ImageInputMode::Always,
     mcp_injection: McpInjection::AcpServers,
     skill_injection: SkillInjection::PromptText,
-    file_attachments: FileAttachmentStyle::AtMention,
     profile_required: false,
     recovery_full_scan: false,
     process_model: ProcessModel::Resident {

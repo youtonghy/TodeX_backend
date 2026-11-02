@@ -42,15 +42,6 @@ pub enum SkillInjection {
     PromptText,
 }
 
-/// How attached workspace files are referenced.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FileAttachmentStyle {
-    /// Only as typed prompt content.
-    Native,
-    /// Also as an `Attached file: @path` line in the prompt text.
-    AtMention,
-}
-
 /// Process lifetime of a conversation's native runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessModel {
@@ -167,7 +158,6 @@ pub struct ProviderProfile {
     pub image_input_mode: ImageInputMode,
     pub mcp_injection: McpInjection,
     pub skill_injection: SkillInjection,
-    pub file_attachments: FileAttachmentStyle,
     /// Conversations must name one of the configured profiles
     /// (`providerProfile`), each launching its own executable.
     pub profile_required: bool,

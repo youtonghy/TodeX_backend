@@ -17,8 +17,8 @@ use crate::error::AppError;
 use super::discovery::CatalogCache;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::profile::{
-    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
-    ProviderProfile, SkillInjection, UserConfigFile,
+    CatalogProfile, CatalogSource, ConfigHome, McpInjection, ProcessModel, ProviderProfile,
+    SkillInjection, UserConfigFile,
 };
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
@@ -53,7 +53,6 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     image_input_mode: ImageInputMode::Always,
     mcp_injection: McpInjection::ClaudeArgs,
     skill_injection: SkillInjection::PromptText,
-    file_attachments: FileAttachmentStyle::AtMention,
     profile_required: false,
     recovery_full_scan: false,
     // One resident process per conversation; see `claude/runtime.rs`.

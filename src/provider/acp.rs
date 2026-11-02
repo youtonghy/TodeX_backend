@@ -26,8 +26,7 @@ use crate::error::AppError;
 use super::discovery::DiscoveryCache;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::profile::{
-    CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
-    SkillInjection,
+    CatalogProfile, ConfigHome, McpInjection, ProcessModel, ProviderProfile, SkillInjection,
 };
 use super::resident::{ResidentLaunch, ResidentSessions};
 use super::rpc::{safe_error_text, FailureWording, RpcClient, RpcPeer};
@@ -66,7 +65,6 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     image_input_mode: ImageInputMode::Profile,
     mcp_injection: McpInjection::AcpServers,
     skill_injection: SkillInjection::PromptText,
-    file_attachments: FileAttachmentStyle::AtMention,
     profile_required: true,
     recovery_full_scan: false,
     // Profiles with `resident = false` start a process per turn instead.

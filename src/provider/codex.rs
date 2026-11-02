@@ -13,8 +13,8 @@ use super::process::{
     JsonLineProcess,
 };
 use super::profile::{
-    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
-    ProviderProfile, SkillInjection, UserConfigFile,
+    CatalogProfile, CatalogSource, ConfigHome, McpInjection, ProcessModel, ProviderProfile,
+    SkillInjection, UserConfigFile,
 };
 use super::rpc::{id_matches, safe_error_text, FailureWording, RpcClient, RpcPeer};
 use super::types::{
@@ -53,7 +53,6 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     image_input_mode: ImageInputMode::Model,
     mcp_injection: McpInjection::CodexConfig,
     skill_injection: SkillInjection::Native,
-    file_attachments: FileAttachmentStyle::Native,
     profile_required: false,
     recovery_full_scan: false,
     process_model: ProcessModel::Resident {
@@ -898,11 +897,8 @@ fn codex_prompt_input(prompt: &DriverPrompt) -> Vec<Value> {
                 "type": "image",
                 "url": format!("data:{mime_type};base64,{data}"),
             })),
-            super::types::DriverPromptContent::File { path, name } => input.push(json!({
-                "type": "mention",
-                "name": name,
-                "path": path,
-            })),
+            // The prompt text names the file; `mention` items select apps.
+            super::types::DriverPromptContent::File { .. } => {}
         }
     }
     for skill in &prompt.skills {
@@ -2006,7 +2002,6 @@ mod tests {
                 },
                 DriverPromptContent::File {
                     path: PathBuf::from("/workspace/readme.md"),
-                    name: "readme.md".to_owned(),
                 },
             ],
             skills: vec![DriverSkill {
@@ -2025,8 +2020,8 @@ mod tests {
         let input = codex_prompt_input(&prompt);
         assert_eq!(input[0]["type"], "text");
         assert_eq!(input[1]["type"], "localImage");
-        assert_eq!(input[2]["type"], "mention");
-        assert_eq!(input[3]["type"], "skill");
+        assert_eq!(input[2]["type"], "skill");
+        assert_eq!(input.len(), 3);
     }
     #[test]
     fn sandbox_wire_and_answer_rejection_match_protocol() {

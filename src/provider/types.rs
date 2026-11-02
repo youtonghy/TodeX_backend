@@ -762,7 +762,6 @@ pub enum DriverPromptContent {
     },
     File {
         path: PathBuf,
-        name: String,
     },
 }
 

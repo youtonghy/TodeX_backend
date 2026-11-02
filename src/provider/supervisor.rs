@@ -35,7 +35,7 @@ use super::codex::CodexDriver;
 use super::grok::GrokBuildDriver;
 use super::pi::PiDriver;
 use super::process::same_executable;
-use super::profile::{profile, FileAttachmentStyle, McpInjection, SkillInjection};
+use super::profile::{profile, McpInjection, SkillInjection};
 #[cfg(all(test, unix))]
 use super::types::ProviderDescriptor;
 use super::types::{
@@ -3802,10 +3802,10 @@ async fn prepare_prompt_content_hashed(
                     ));
                 }
                 let relative = path.strip_prefix(&workspace).unwrap_or(&path);
-                if profile(provider).file_attachments == FileAttachmentStyle::AtMention {
-                    text.push(format!("Attached file: @{}", relative.display()));
-                }
-                driver_content.push(DriverPromptContent::File { path, name });
+                // Named in the text for every provider: none hands a typed file
+                // item to the model (Codex `mention` items select apps only).
+                text.push(format!("Attached file: @{}", relative.display()));
+                driver_content.push(DriverPromptContent::File { path });
             }
         }
     }
@@ -4773,7 +4773,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(last.sequence > 1201);
-        assert_eq!(last.payload["content"], "latest question");
+        assert_eq!(
+            last.payload["content"],
+            "latest question\n\nAttached file: @attachment.txt"
+        );
         let events = store.complete_history(&manifest.id).await.unwrap();
         assert!(events.iter().any(|event| event.event_type == "turn.started"
             && event.payload["clientRequestId"] == "retry-2"));
@@ -8759,7 +8762,7 @@ done
             .unwrap();
 
         let (text, content) = prepare_prompt_content(
-            ProviderKind::ClaudeCode,
+            ProviderKind::Codex,
             &workspace,
             None,
             vec![

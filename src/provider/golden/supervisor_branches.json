@@ -13,7 +13,7 @@
   "codex": {
     "recoveryIsSettled": true,
     "promptWithSkills": "do it",
-    "attachedFileText": "",
+    "attachedFileText": "Attached file: @notes.txt",
     "attachedFileItems": 1,
     "profileExplicit": {
       "error": "invalid request: providerProfile is only valid for ACP conversations"

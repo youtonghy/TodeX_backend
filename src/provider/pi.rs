@@ -15,8 +15,8 @@ use crate::error::AppError;
 use super::discovery::CatalogCache;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::profile::{
-    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
-    ProviderProfile, SkillInjection, UserConfigFile,
+    CatalogProfile, CatalogSource, ConfigHome, McpInjection, ProcessModel, ProviderProfile,
+    SkillInjection, UserConfigFile,
 };
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode, LostWork,
@@ -91,7 +91,6 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     image_input_mode: ImageInputMode::Model,
     mcp_injection: McpInjection::PiExtension,
     skill_injection: SkillInjection::PromptText,
-    file_attachments: FileAttachmentStyle::AtMention,
     profile_required: false,
     recovery_full_scan: true,
     process_model: ProcessModel::Resident {
