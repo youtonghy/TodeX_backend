@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, ClientInfo};
+use rmcp::model::{CallToolRequestParams, ClientConfig};
 use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::{
     async_rw::AsyncRwTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -78,7 +78,7 @@ pub async fn call_tool(
 async fn stdio_tools(target: &McpRuntimeTarget) -> Result<Vec<McpToolDescriptor>, AppError> {
     let transport = stdio_transport(target)?;
     let oversized = transport.oversized.clone();
-    let mut client = timeout(INITIALIZE_TIMEOUT, ClientInfo::default().serve(transport))
+    let mut client = timeout(INITIALIZE_TIMEOUT, ClientConfig::default().serve(transport))
         .await
         .map_err(|_| mcp_timeout(target, "initialize"))?
         .map_err(|error| stdio_error(target, "initialize", error, &oversized))?;
@@ -98,7 +98,7 @@ async fn stdio_call(
     let arguments = call_arguments(arguments)?;
     let transport = stdio_transport(target)?;
     let oversized = transport.oversized.clone();
-    let mut client = timeout(INITIALIZE_TIMEOUT, ClientInfo::default().serve(transport))
+    let mut client = timeout(INITIALIZE_TIMEOUT, ClientConfig::default().serve(transport))
         .await
         .map_err(|_| mcp_timeout(target, "initialize"))?
         .map_err(|error| stdio_error(target, "initialize", error, &oversized))?;
@@ -316,7 +316,7 @@ async fn forward_stderr(stderr: impl AsyncRead + Unpin, mut emit: impl FnMut(Str
 
 async fn http_tools(target: &McpRuntimeTarget) -> Result<Vec<McpToolDescriptor>, AppError> {
     let transport = StreamableHttpClientTransport::from_config(http_config(target)?);
-    let mut client = timeout(INITIALIZE_TIMEOUT, ClientInfo::default().serve(transport))
+    let mut client = timeout(INITIALIZE_TIMEOUT, ClientConfig::default().serve(transport))
         .await
         .map_err(|_| mcp_timeout(target, "initialize"))?
         .map_err(|error| mcp_error(target, "initialize", error))?;
@@ -335,7 +335,7 @@ async fn http_call(
 ) -> Result<McpCallResult, AppError> {
     let arguments = call_arguments(arguments)?;
     let transport = StreamableHttpClientTransport::from_config(http_config(target)?);
-    let mut client = timeout(INITIALIZE_TIMEOUT, ClientInfo::default().serve(transport))
+    let mut client = timeout(INITIALIZE_TIMEOUT, ClientConfig::default().serve(transport))
         .await
         .map_err(|_| mcp_timeout(target, "initialize"))?
         .map_err(|error| mcp_error(target, "initialize", error))?;

@@ -1548,7 +1548,7 @@ exit 3
     /// connected through the stdio bridge.
     async fn bridged_client(
         harness: &Harness,
-    ) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo> {
+    ) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig> {
         use rmcp::ServiceExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1571,7 +1571,7 @@ exit 3
                 .unwrap();
         });
         let (read, write) = tokio::io::split(client_side);
-        rmcp::model::ClientInfo::default()
+        rmcp::model::ClientConfig::default()
             .serve((read, write))
             .await
             .unwrap()
@@ -1633,7 +1633,7 @@ exit 3
     }
 
     async fn call(
-        client: &rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
+        client: &rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>,
         name: &'static str,
         arguments: Value,
     ) -> CallToolResult {
@@ -2305,7 +2305,7 @@ exit 3
 
     fn spawn_exec(
         client: &std::sync::Arc<
-            rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
+            rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>,
         >,
         arguments: Value,
     ) -> tokio::task::JoinHandle<CallToolResult> {
@@ -2723,7 +2723,7 @@ exit 3
         let (read, write) = tokio::io::split(client_side);
         let client = tokio::time::timeout(
             Duration::from_secs(10),
-            rmcp::model::ClientInfo::default().serve((read, write)),
+            rmcp::model::ClientConfig::default().serve((read, write)),
         )
         .await
         .expect("initialize must not hang");

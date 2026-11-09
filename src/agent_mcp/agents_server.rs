@@ -961,7 +961,7 @@ mod tests {
         state.agent_calling.update(update).await.unwrap();
     }
 
-    type Client = RunningService<RoleClient, rmcp::model::ClientInfo>;
+    type Client = RunningService<RoleClient, rmcp::model::ClientConfig>;
 
     /// An MCP client of `conversation_id`'s token through the stdio bridge,
     /// against the real router on a loopback port.
@@ -986,7 +986,7 @@ mod tests {
             let _ = super::super::bridge::proxy(&url, &token, bridge_read, bridge_write).await;
         });
         let (read, write) = tokio::io::split(client_side);
-        rmcp::model::ClientInfo::default()
+        rmcp::model::ClientConfig::default()
             .serve((read, write))
             .await
             .unwrap()

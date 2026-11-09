@@ -918,7 +918,7 @@ mod tests {
     };
     use std::net::SocketAddr;
 
-    type Client = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>;
+    type Client = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>;
 
     /// A daemon with desktop tools on, one conversation, and an MCP client
     /// bridged to its `todex_desktop` endpoint.
@@ -982,7 +982,7 @@ mod tests {
             let _ = super::super::bridge::proxy(&url, &token, bridge_read, bridge_write).await;
         });
         let (read, write) = tokio::io::split(client_side);
-        rmcp::model::ClientInfo::default()
+        rmcp::model::ClientConfig::default()
             .serve((read, write))
             .await
             .unwrap()
