@@ -568,13 +568,7 @@ impl Authorizer<'_> {
         match self.state.tool_mode(conversation_id) {
             ToolMode::Unrestricted => Ok(None),
             ToolMode::Auto if !escapes_sandbox => Ok(None),
-            ToolMode::Plan => Err(Denied::new(
-                "PLAN_MODE",
-                format!(
-                    "{tool} changes things and is not available while the conversation is in Plan \
-                     mode. Read-only tools still work; describe the step in your plan instead."
-                ),
-            )),
+            ToolMode::Plan => Err(plan_refusal(tool)),
             ToolMode::Ask | ToolMode::Auto => {
                 let qualified = format!("{server}.{tool}");
                 let always = |state: &AuthorizerState| {
@@ -628,6 +622,64 @@ impl Authorizer<'_> {
             }
         }
     }
+
+    /// The gate for one call the user approves whatever the permission
+    /// mode allows (the SSH "every command" setting): refused in Plan, and
+    /// never remembered, so the same call asks again. Declines back off per
+    /// exact call. Returns the approving device.
+    pub(super) async fn allow_this_call(
+        &self,
+        conversation_id: &str,
+        server: &str,
+        tool: &str,
+        summary: &str,
+        input: Value,
+        cancel: &CancelSignal,
+    ) -> Result<String, Denied> {
+        if self.state.tool_mode(conversation_id) == ToolMode::Plan {
+            return Err(plan_refusal(tool));
+        }
+        let qualified = format!("{server}.{tool}");
+        let key = action_key(&format!("call:{qualified}"), &input);
+        let _serial = self.serialize(conversation_id, &key, cancel).await?;
+        self.ask(
+            conversation_id,
+            Prompt {
+                key,
+                answerer: Answerer::AnyDevice,
+                // The kind provider tool approvals use.
+                kind: "tool",
+                title: format!("Allow {tool}: {summary}?"),
+                message: String::new(),
+                details: json!({
+                    "tool_name": format!("mcp__{server}__{tool}"),
+                    "server": server,
+                    "tool": tool,
+                    "summary": summary,
+                    "input": input,
+                }),
+                options: json!([
+                    { "id": "allow_once", "kind": "allow_once", "name": "Allow once" },
+                    { "id": "reject_once", "kind": "reject_once", "name": "Reject" }
+                ]),
+                once: true,
+            },
+            cancel,
+        )
+        .await
+        .map(|approval| approval.device_id)
+        .map_err(|denied| denied.or_declined(format!("the user rejected {tool}")))
+    }
+}
+
+fn plan_refusal(tool: &str) -> Denied {
+    Denied::new(
+        "PLAN_MODE",
+        format!(
+            "{tool} changes things and is not available while the conversation is in Plan \
+             mode. Read-only tools still work; describe the step in your plan instead."
+        ),
+    )
 }
 
 #[cfg(test)]

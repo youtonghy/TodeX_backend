@@ -1,8 +1,11 @@
 //! The `todex_ssh` MCP server: `ssh_list_hosts` and `ssh_exec`.
 //!
-//! Hosts must have agent access; commands run without approval through the
-//! same OpenSSH wrapper config as everything else (`BatchMode`, strict host
-//! keys), so agents only reach hosts the user already trusts.
+//! Hosts must have agent access; commands run through the same OpenSSH
+//! wrapper config as everything else (`BatchMode`, strict host keys), so
+//! agents only reach hosts the user already trusts. The SSH approval setting
+//! (`/v2/ssh/agent-approval`, on by default) asks the user before the first
+//! connection to each host of a conversation, or before every command,
+//! whatever the permission mode; otherwise the permission mode decides.
 
 use std::{
     net::SocketAddr,
@@ -33,9 +36,9 @@ use tokio::sync::{mpsc, Semaphore};
 use uuid::Uuid;
 
 use super::{
-    authorizer::ToolMode,
+    authorizer::{Answerer, CancelSignal, Prompt, ToolMode},
     registry::{
-        self, parse, schema, tool_error, BoxFuture, Caller, Invocation, Prepared, ToolEntry,
+        self, parse, schema, tool_error, BoxFuture, Caller, Gate, Invocation, Prepared, ToolEntry,
         ToolHost, ToolRegistry,
     },
     AgentMcp, SSH_ROUTE as ROUTE, SSH_SERVER as SERVER_NAME,
@@ -81,6 +84,8 @@ const ERROR_DETAIL_LIMIT: usize = 4096;
 const SUMMARY_COMMAND_CHARS: usize = 200;
 /// Standard input shown in an approval prompt.
 const APPROVAL_STDIN_PREVIEW_BYTES: usize = 4096;
+/// `permission.requested` kind of the per-host connection approval.
+const HOST_GRANT_KIND: &str = "ssh_host";
 
 pub(crate) fn routes(state: &AppState) -> Router<AppState> {
     let tools = SshTools {
@@ -256,7 +261,7 @@ fn redact_stdin_preview(text: &str) -> String {
     privacy_filter::redact(text, &PREVIEW).text
 }
 
-/// Why `ssh_exec` is refused before asking: in ask mode the user approves
+/// Why `ssh_exec` is refused before asking: when the user approves
 /// the whole call, and the prompt and journal keep only
 /// [`EVENT_COMMAND_LIMIT`] bytes of the command and
 /// [`APPROVAL_STDIN_PREVIEW_BYTES`] of standard input, so a longer one could
@@ -315,8 +320,10 @@ fn registry_of_tools() -> ToolRegistry<SshTools, SshCall> {
                 "Run a shell command on an allowed SSH host (non-interactive, no TTY, no password prompts). \
                  Returns stdout, stderr and the exit code; a non-zero exit code is a normal result. \
                  stdout and stderr are each capped at 256 KiB (truncated=true when cut). Unavailable \
-                 in Plan mode; in ask mode the user approves each call and command and stdin are each limited \
-                 to 4096 bytes (upload a longer script to the host as a file first, then run it). \
+                 in Plan mode. Depending on the user's settings, the user approves the first connection to \
+                 each host or every call; when every call is approved (also in ask mode), command and stdin \
+                 are each limited to 4096 bytes (upload a longer script to the host as a file first, then \
+                 run it). A declined approval is final for now: do not retry it right away. \
                  The user's privacy filter may replace keys, passwords, tokens, proxy credentials, \
                  card and ID numbers (and other values the user chose) in the output with \
                  [REDACTED:<kind>] placeholders (redacted=true). The host `Local`, when \
@@ -363,6 +370,49 @@ impl ToolHost for SshTools {
     fn conversations(&self) -> &ConversationSupervisor {
         &self.conversations
     }
+
+    async fn approve(
+        &self,
+        _tool: &str,
+        prepared: &Prepared<SshCall>,
+        caller: &Caller,
+        cancel: &CancelSignal,
+    ) -> Result<Gate, String> {
+        let SshCall::Exec(request) = &prepared.call else {
+            return Ok(Gate::PermissionMode);
+        };
+        let conversation_id = &caller.conversation_id;
+        // Plan mode refuses through the permission mode, without asking.
+        if self.mcp.inner.authorizer.tool_mode(conversation_id) == ToolMode::Plan {
+            return Ok(Gate::PermissionMode);
+        }
+        let approval = self.mcp.ssh().agent_approval().await;
+        if !approval.enabled {
+            return Ok(Gate::PermissionMode);
+        }
+        // Nothing to approve for a host the agent cannot use.
+        if let Some(message) = self.unavailable(&request.host).await {
+            return Err(message);
+        }
+        let authorizer = self.mcp.authorizer(&self.conversations);
+        if approval.per_command() {
+            return authorizer
+                .allow_this_call(
+                    conversation_id,
+                    SERVER_NAME,
+                    "ssh_exec",
+                    &prepared.summary,
+                    prepared.input.clone(),
+                    cancel,
+                )
+                .await
+                .map(Gate::Approved)
+                .map_err(|denied| denied.to_string());
+        }
+        self.grant_host(conversation_id, &request.host, cancel)
+            .await
+            .map(|()| Gate::PermissionMode)
+    }
 }
 
 impl ServerHandler for SshTools {
@@ -397,7 +447,8 @@ impl ServerHandler for SshTools {
                 .and_then(|arguments| arguments.get("host"))
                 .and_then(Value::as_str)
                 .is_some_and(crate::ssh::is_agent_local_alias);
-            if mode == ToolMode::Ask || (mode == ToolMode::Auto && local) {
+            let per_command = self.mcp.ssh().agent_approval().await.per_command();
+            if per_command || mode == ToolMode::Ask || (mode == ToolMode::Auto && local) {
                 if let Some(message) = ask_mode_exec_refusal(request.arguments.as_ref()) {
                     return Ok(tool_error(message).into());
                 }
@@ -432,6 +483,87 @@ impl ServerHandler for SshTools {
 }
 
 impl SshTools {
+    /// Why agents cannot use `host`, if they cannot.
+    async fn unavailable(&self, host: &str) -> Option<String> {
+        if is_agent_local_alias(host) {
+            return (!self.mcp.ssh().agent_local().await.enabled).then(|| {
+                format!(
+                    "{AGENT_LOCAL_HOST} is not available to agents. The user can allow agents to \
+                     run commands on the TodeX machine in TodeX SSH settings."
+                )
+            });
+        }
+        match self.mcp.ssh().is_agent_host(host).await {
+            Ok(true) => None,
+            Ok(false) => Some(format!(
+                "SSH host {host} is not available to agents. Use a host from ssh_list_hosts; \
+                 the user can grant access per host in TodeX SSH settings."
+            )),
+            Err(error) => Some(format!("cannot list SSH hosts: {error}")),
+        }
+    }
+
+    /// The user's approval to connect to `host` in this conversation,
+    /// asked once (any paired device) and kept until the conversation ends
+    /// or the daemon restarts. A decline is not kept: the next call asks
+    /// again once the decline backoff has passed.
+    async fn grant_host(
+        &self,
+        conversation_id: &str,
+        host: &str,
+        cancel: &CancelSignal,
+    ) -> Result<(), String> {
+        let local = is_agent_local_alias(host);
+        let alias = if local { AGENT_LOCAL_HOST } else { host };
+        let key = format!("ssh-host:{alias}");
+        let state = &self.mcp.inner.authorizer;
+        if state.always_allows(conversation_id, &key) {
+            return Ok(());
+        }
+        let authorizer = self.mcp.authorizer(&self.conversations);
+        let _asking = authorizer
+            .serialize(conversation_id, &key, cancel)
+            .await
+            .map_err(|denied| denied.to_string())?;
+        if state.always_allows(conversation_id, &key) {
+            return Ok(());
+        }
+        let title = if local {
+            "Allow the agent to run commands on the TodeX machine?".to_owned()
+        } else {
+            format!("Allow the agent to connect to {alias}?")
+        };
+        authorizer
+            .ask(
+                conversation_id,
+                Prompt {
+                    key: key.clone(),
+                    answerer: Answerer::AnyDevice,
+                    kind: HOST_GRANT_KIND,
+                    message: title.clone(),
+                    title,
+                    details: json!({ "host": alias, "local": local }),
+                    options: json!([
+                        { "id": "allow", "kind": "allow_always", "name": "Allow for this conversation" },
+                        { "id": "reject", "kind": "reject_once", "name": "Deny" }
+                    ]),
+                    once: false,
+                },
+                cancel,
+            )
+            .await
+            .map_err(|denied| {
+                denied
+                    .or_declined(format!(
+                        "the user declined connecting to {alias}; do not retry it now, \
+                         continue without it or ask the user in the chat."
+                    ))
+                    .to_string()
+            })?;
+        state.allow_always(conversation_id, &key);
+        Ok(())
+    }
+
     async fn list_hosts(&self) -> CallToolResult {
         let local = self.mcp.ssh().agent_local().await.enabled.then(|| {
             json!({
@@ -460,30 +592,17 @@ impl SshTools {
         let caller = &invocation.caller;
         let context = invocation.context;
         // The local host runs in the conversation's workspace.
+        if let Some(message) = self.unavailable(&request.host).await {
+            return tool_error(message);
+        }
         let local_workspace = if is_agent_local_alias(&request.host) {
-            if !self.mcp.ssh().agent_local().await.enabled {
-                return tool_error(format!(
-                    "{AGENT_LOCAL_HOST} is not available to agents. The user can allow agents to \
-                     run commands on the TodeX machine in TodeX SSH settings."
-                ));
-            }
             request.host = AGENT_LOCAL_HOST.to_owned();
             match self.conversations.get(&caller.conversation_id).await {
                 Ok(manifest) => Some(manifest.workspace),
                 Err(error) => return tool_error(format!("cannot read the conversation: {error}")),
             }
         } else {
-            match self.mcp.ssh().is_agent_host(&request.host).await {
-                Ok(true) => None,
-                Ok(false) => {
-                    return tool_error(format!(
-                        "SSH host {} is not available to agents. Use a host from ssh_list_hosts; \
-                         the user can grant access per host in TodeX SSH settings.",
-                        request.host
-                    ))
-                }
-                Err(error) => return tool_error(format!("cannot list SSH hosts: {error}")),
-            }
+            None
         };
         let local_directory = local_workspace.map(|workspace| match &request.cwd {
             // An absolute `cwd` replaces the workspace.
@@ -1168,6 +1287,7 @@ mod tests {
     use crate::config::Config;
     use crate::conversation::ProviderKind;
     use crate::privacy_filter::AgentOutputFilter;
+    use crate::provider::{PermissionDecision, PermissionOutcome};
     use axum::body::Body;
     use rmcp::model::CacheScope;
     use std::os::unix::fs::PermissionsExt;
@@ -1304,6 +1424,16 @@ exit 3
         for alias in ["web", "bad1", "slow1", "big1"] {
             state.ssh.set_agent_access(alias, true).await.unwrap();
         }
+        // The SSH approval setting is on by default; tests for it turn it
+        // back on, the rest exercise the permission modes alone.
+        state
+            .ssh
+            .set_agent_approval(crate::ssh::AgentApproval {
+                enabled: false,
+                scope: crate::ssh::AgentApprovalScope::Host,
+            })
+            .await
+            .unwrap();
         let manifest = state
             .conversations
             .create_for_tests(
@@ -2125,6 +2255,234 @@ exit 3
         assert_eq!(ran.is_error, Some(false), "{ran:?}");
         let Ok(client) = std::sync::Arc::try_unwrap(client) else {
             panic!("the call task still holds the client");
+        };
+        client.cancel().await.unwrap();
+    }
+
+    /// The `permission.requested` payloads so far.
+    async fn permission_requests(harness: &Harness) -> Vec<Value> {
+        harness
+            .state
+            .conversations
+            .history_for_tests(&harness.conversation_id)
+            .await
+            .iter()
+            .filter(|event| event.event_type == "permission.requested")
+            .map(|event| event.payload.clone())
+            .collect()
+    }
+
+    /// Waits for the `count`th prompt of the conversation.
+    async fn nth_permission_request(harness: &Harness, count: usize) -> Value {
+        for _ in 0..250 {
+            let requests = permission_requests(harness).await;
+            if requests.len() >= count {
+                return requests[count - 1].clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("no permission request #{count}");
+    }
+
+    async fn answer(harness: &Harness, request: &Value, option: &str, outcome: PermissionOutcome) {
+        harness
+            .state
+            .conversations
+            .resolve_permission_owned(
+                "local",
+                "dev_phone",
+                &harness.conversation_id,
+                request["permissionId"].as_str().unwrap(),
+                PermissionDecision {
+                    outcome,
+                    option_id: Some(option.to_owned()),
+                    data: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    fn spawn_exec(
+        client: &std::sync::Arc<
+            rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
+        >,
+        arguments: Value,
+    ) -> tokio::task::JoinHandle<CallToolResult> {
+        let client = client.clone();
+        tokio::spawn(async move { call(&client, "ssh_exec", arguments).await })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_host_approval_asks_once_per_host_even_in_full_access() {
+        let harness = harness().await;
+        let client = std::sync::Arc::new(bridged_client(&harness).await);
+        harness
+            .state
+            .ssh
+            .set_agent_approval(crate::ssh::AgentApproval::default())
+            .await
+            .unwrap();
+
+        // A host agents cannot use is refused without asking.
+        let refused = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "off", "command": "ls" }),
+        )
+        .await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(permission_requests(&harness).await.is_empty());
+
+        let first = spawn_exec(&client, json!({ "host": "web", "command": "ls" }));
+        let grant = nth_permission_request(&harness, 1).await;
+        assert_eq!(grant["kind"], HOST_GRANT_KIND);
+        assert_eq!(grant["details"], json!({ "host": "web", "local": false }));
+        let options = grant["options"].as_array().unwrap();
+        assert!(options
+            .iter()
+            .any(|option| option["kind"] == "allow_always"));
+        // Nothing connects before the user answers.
+        let log = std::fs::read_to_string(harness.root.join("ssh.log")).unwrap_or_default();
+        assert!(!log.lines().any(|line| line.contains("-- web ")), "{log}");
+        answer(&harness, &grant, "allow", PermissionOutcome::AllowAlways).await;
+        let ran = first.await.unwrap();
+        assert_eq!(ran.is_error, Some(false), "{ran:?}");
+
+        // The same host in the same conversation runs without asking again.
+        let again = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "web", "command": "pwd" }),
+        )
+        .await;
+        assert_eq!(again.is_error, Some(false), "{again:?}");
+        assert_eq!(permission_requests(&harness).await.len(), 1);
+
+        // Every host is approved on its own; a decline is not remembered
+        // as a grant.
+        let other = spawn_exec(&client, json!({ "host": "big1", "command": "ls" }));
+        let grant = nth_permission_request(&harness, 2).await;
+        assert_eq!(grant["details"]["host"], "big1");
+        answer(&harness, &grant, "reject", PermissionOutcome::RejectOnce).await;
+        let declined = other.await.unwrap();
+        assert_eq!(declined.is_error, Some(true));
+        let text = serde_json::to_string(&declined.content).unwrap();
+        assert!(text.contains("declined connecting to big1"), "{text}");
+        assert!(!harness
+            .state
+            .agent_mcp
+            .authorizer_state()
+            .always_allows(&harness.conversation_id, "ssh-host:big1"));
+
+        // Off: the permission mode alone decides again.
+        harness
+            .state
+            .ssh
+            .set_agent_approval(crate::ssh::AgentApproval {
+                enabled: false,
+                scope: crate::ssh::AgentApprovalScope::Host,
+            })
+            .await
+            .unwrap();
+        let free = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "big1", "command": "ls" }),
+        )
+        .await;
+        assert_eq!(free.is_error, Some(false), "{free:?}");
+        assert_eq!(permission_requests(&harness).await.len(), 2);
+
+        let Ok(client) = std::sync::Arc::try_unwrap(client) else {
+            panic!("a call task still holds the client");
+        };
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_command_approval_asks_every_call_without_an_always_option() {
+        let harness = harness().await;
+        let client = std::sync::Arc::new(bridged_client(&harness).await);
+        harness
+            .state
+            .ssh
+            .set_agent_approval(crate::ssh::AgentApproval {
+                enabled: true,
+                scope: crate::ssh::AgentApprovalScope::Command,
+            })
+            .await
+            .unwrap();
+
+        // What the user approves must be shown whole, even in full access.
+        let long = format!("echo {}", "x".repeat(EVENT_COMMAND_LIMIT));
+        let refused = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "web", "command": long }),
+        )
+        .await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(permission_requests(&harness).await.is_empty());
+
+        for count in 1..=2 {
+            let pending = spawn_exec(&client, json!({ "host": "web", "command": "ls" }));
+            let asked = nth_permission_request(&harness, count).await;
+            assert_eq!(asked["kind"], "tool");
+            assert_eq!(asked["details"]["tool_name"], "mcp__todex_ssh__ssh_exec");
+            assert_eq!(asked["details"]["input"]["command"], "ls");
+            let options = asked["options"].as_array().unwrap();
+            assert!(!options
+                .iter()
+                .any(|option| option["kind"] == "allow_always"));
+            answer(&harness, &asked, "allow_once", PermissionOutcome::AllowOnce).await;
+            let ran = pending.await.unwrap();
+            assert_eq!(ran.is_error, Some(false), "{ran:?}");
+        }
+        // One prompt per call, not the setting's plus ask mode's.
+        harness
+            .state
+            .agent_mcp
+            .record_turn_mode(&harness.conversation_id, "ask", "implement");
+        let pending = spawn_exec(&client, json!({ "host": "web", "command": "id" }));
+        let asked = nth_permission_request(&harness, 3).await;
+        answer(&harness, &asked, "allow_once", PermissionOutcome::AllowOnce).await;
+        let ran = pending.await.unwrap();
+        assert_eq!(ran.is_error, Some(false), "{ran:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(permission_requests(&harness).await.len(), 3);
+        let history = harness
+            .state
+            .conversations
+            .history_for_tests(&harness.conversation_id)
+            .await;
+        let started: Vec<_> = history
+            .iter()
+            .filter(|event| event.event_type == "ssh.exec.started")
+            .collect();
+        assert_eq!(started.len(), 3);
+        assert!(started
+            .iter()
+            .all(|event| event.payload["approvedBy"] == "dev_phone"));
+
+        // Plan mode still refuses without asking.
+        harness
+            .state
+            .agent_mcp
+            .record_turn_mode(&harness.conversation_id, "ask", "plan");
+        let refused = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "web", "command": "ls" }),
+        )
+        .await;
+        assert_eq!(refused.is_error, Some(true));
+        let text = serde_json::to_string(&refused.content).unwrap();
+        assert!(text.contains("PLAN_MODE"), "{text}");
+        assert_eq!(permission_requests(&harness).await.len(), 3);
+
+        let Ok(client) = std::sync::Arc::try_unwrap(client) else {
+            panic!("a call task still holds the client");
         };
         client.cancel().await.unwrap();
     }

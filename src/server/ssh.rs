@@ -19,7 +19,7 @@ use crate::ssh::forward::ForwardInput;
 use crate::ssh::ip_pool::{AssignmentInput, AssignmentUpdate, PoolConfigInput};
 use crate::ssh::keys::{KeyGenerateRequest, KeyImportRequest};
 use crate::ssh::login::LoginAnswer;
-use crate::ssh::{AgentLocal, ConnectionSettings, FtpSiteInput, ManagedHost};
+use crate::ssh::{AgentApproval, AgentLocal, ConnectionSettings, FtpSiteInput, ManagedHost};
 
 use super::v2::require_auth;
 
@@ -88,6 +88,10 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/v2/ssh/agent-local",
             get(get_agent_local).put(set_agent_local),
+        )
+        .route(
+            "/v2/ssh/agent-approval",
+            get(get_agent_approval).put(set_agent_approval),
         )
         .route("/v2/ssh/keys", get(list_keys))
         .route(
@@ -517,6 +521,29 @@ async fn set_agent_local(
         )
     })?;
     Ok(Json(state.ssh.set_agent_local(settings).await?))
+}
+
+async fn get_agent_approval(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AgentApproval>, AppError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(state.ssh.agent_approval().await))
+}
+
+async fn set_agent_approval(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<AgentApproval>, AppError> {
+    require_auth(&state, &headers)?;
+    let settings: AgentApproval = serde_json::from_slice(&body).map_err(|_| {
+        AppError::InvalidRequest(
+            "invalid agent SSH approval: expected { enabled: boolean, scope: \"host\" | \"command\" }"
+                .to_owned(),
+        )
+    })?;
+    Ok(Json(state.ssh.set_agent_approval(settings).await?))
 }
 
 async fn list_keys(

@@ -149,6 +149,14 @@ pub(super) struct Prepared<C> {
     pub escapes_sandbox: bool,
 }
 
+/// What a server's own approval ([`ToolHost::approve`]) leaves to do.
+pub(super) enum Gate {
+    /// The permission mode decides, as for any tool.
+    PermissionMode,
+    /// Approved by this device; the permission mode's prompt is skipped.
+    Approved(String),
+}
+
 /// Everything a handler gets besides its call.
 pub(super) struct Invocation<'a> {
     pub caller: Caller,
@@ -185,6 +193,19 @@ pub(super) trait ToolHost: Sized + Send + Sync + 'static {
     /// Refuses calls while the tool's feature is off.
     fn precheck(&self, _tool: &str) -> impl Future<Output = Result<(), String>> + Send {
         async { Ok(()) }
+    }
+
+    /// Approval the server asks for a side-effect call before the
+    /// permission mode's own (the SSH approval setting); an `Err` is the
+    /// refusal the agent sees. Must leave Plan mode to the permission mode.
+    fn approve<'a>(
+        &'a self,
+        _tool: &'a str,
+        _prepared: &'a Prepared<Self::Call>,
+        _caller: &'a Caller,
+        _cancel: &'a CancelSignal,
+    ) -> impl Future<Output = Result<Gate, String>> + Send + 'a {
+        async { Ok(Gate::PermissionMode) }
     }
 }
 
@@ -252,7 +273,17 @@ impl<S: ToolHost<Call = C>, C: Send + 'static> ToolRegistry<S, C> {
             return Ok(tool_error(message).into());
         }
         let cancel = CancelSignal::from_context(context);
-        let approved_by = if entry.side_effect {
+        let gate = if entry.side_effect {
+            match host.approve(name, &prepared, &caller, &cancel).await {
+                Ok(gate) => gate,
+                Err(message) => return Ok(tool_error(message).into()),
+            }
+        } else {
+            Gate::PermissionMode
+        };
+        let approved_by = if let Gate::Approved(device) = gate {
+            Some(device)
+        } else if entry.side_effect {
             let authorizer = host.mcp().authorizer(host.conversations());
             match authorizer
                 .allow_side_effect(

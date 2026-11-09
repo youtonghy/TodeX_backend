@@ -131,6 +131,8 @@ struct SshStore {
     agent_output_filter: AgentOutputFilter,
     /// The [`AGENT_LOCAL_HOST`] pseudo-host for agents; off by default.
     agent_local: AgentLocal,
+    /// The user's approval of agent connections; on (per host) by default.
+    agent_approval: AgentApproval,
 }
 
 /// The alias agents use to run commands on the daemon's own machine; real
@@ -164,6 +166,59 @@ impl AgentLocal {
     }
 }
 
+/// How often the user approves an agent's `ssh_exec`, on top of what the
+/// conversation's permission mode asks.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AgentApprovalScope {
+    /// Once per host and conversation, before the first connection.
+    #[default]
+    Host,
+    /// Every command, with no "always" option.
+    Command,
+}
+
+/// `/v2/ssh/agent-approval`: whether agents need the user's approval to
+/// connect, whatever the permission mode (Plan still refuses).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentApproval {
+    pub enabled: bool,
+    pub scope: AgentApprovalScope,
+}
+
+impl Default for AgentApproval {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scope: AgentApprovalScope::Host,
+        }
+    }
+}
+
+impl AgentApproval {
+    /// Approval of every command, when on.
+    pub(crate) fn per_command(self) -> bool {
+        self.enabled && self.scope == AgentApprovalScope::Command
+    }
+
+    /// Unreadable parts keep their default: approval stays on unless the
+    /// store says `enabled: false`.
+    fn from_stored(value: serde_json::Value) -> Self {
+        let default = Self::default();
+        Self {
+            enabled: value
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(default.enabled),
+            scope: value
+                .get("scope")
+                .and_then(|scope| serde_json::from_value(scope.clone()).ok())
+                .unwrap_or(default.scope),
+        }
+    }
+}
+
 /// `store.json`. Older daemons ignore unknown top-level fields but reject
 /// unknown fields in host records, so everything newer than v2.3.0 that
 /// belongs to a host is kept beside the records, keyed by alias.
@@ -191,6 +246,8 @@ struct PersistedStore {
     agent_output_filter: Option<serde_json::Value>,
     #[serde(default)]
     agent_local: Option<serde_json::Value>,
+    #[serde(default)]
+    agent_approval: Option<serde_json::Value>,
 }
 
 /// The written form of [`SshStore`], read back as [`PersistedStore`].
@@ -209,6 +266,7 @@ struct PersistedStoreRef<'a> {
     ip_pool: Option<&'a StoredIpPool>,
     agent_output_filter: &'a AgentOutputFilter,
     agent_local: &'a AgentLocal,
+    agent_approval: &'a AgentApproval,
 }
 
 impl SshStore {
@@ -266,6 +324,10 @@ impl SshStore {
                 .agent_local
                 .map(AgentLocal::from_stored)
                 .unwrap_or_default(),
+            agent_approval: persisted
+                .agent_approval
+                .map(AgentApproval::from_stored)
+                .unwrap_or_default(),
         })
     }
 
@@ -291,6 +353,7 @@ impl SshStore {
             ip_pool: (!self.ip_pool.is_default()).then_some(&self.ip_pool),
             agent_output_filter: &self.agent_output_filter,
             agent_local: &self.agent_local,
+            agent_approval: &self.agent_approval,
         };
         Ok(serde_json::to_vec_pretty(&persisted)?)
     }
@@ -1260,6 +1323,27 @@ impl SshService {
         Ok(store.agent_local)
     }
 
+    pub async fn agent_approval(&self) -> AgentApproval {
+        self.inner.store.read().await.agent_approval
+    }
+
+    /// Applies to the next `ssh_exec`; hosts approved before stay approved
+    /// for their conversations.
+    pub async fn set_agent_approval(
+        &self,
+        settings: AgentApproval,
+    ) -> Result<AgentApproval, AppError> {
+        let mut store = self.inner.store.write().await;
+        if store.agent_approval != settings {
+            let next = SshStore {
+                agent_approval: settings,
+                ..store.clone()
+            };
+            self.save(&mut store, next).await?;
+        }
+        Ok(store.agent_approval)
+    }
+
     /// Whether a granted host is usable by agents: one named like
     /// [`AGENT_LOCAL_HOST`] is not while the local host is on.
     async fn agent_visible(&self, view: &SshHostView) -> bool {
@@ -2117,6 +2201,47 @@ exit 0
         assert_eq!(
             AgentLocal::from_stored(serde_json::json!("garbage")),
             AgentLocal { enabled: false }
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_approval_is_on_per_host_by_default_and_persists() {
+        let fixture = fixture("").await;
+        assert_eq!(
+            fixture.service.agent_approval().await,
+            AgentApproval {
+                enabled: true,
+                scope: AgentApprovalScope::Host
+            }
+        );
+        let per_command = AgentApproval {
+            enabled: true,
+            scope: AgentApprovalScope::Command,
+        };
+        fixture
+            .service
+            .set_agent_approval(per_command)
+            .await
+            .unwrap();
+        let reloaded = SshService::with_home(
+            &fixture.root.join("data"),
+            "ssh".into(),
+            Some(fixture.root.join("home")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reloaded.agent_approval().await, per_command);
+        // Unreadable parts fall back to the default, never to "off".
+        assert_eq!(
+            AgentApproval::from_stored(serde_json::json!("garbage")),
+            AgentApproval::default()
+        );
+        assert_eq!(
+            AgentApproval::from_stored(serde_json::json!({ "enabled": false, "scope": "bogus" })),
+            AgentApproval {
+                enabled: false,
+                scope: AgentApprovalScope::Host
+            }
         );
     }
 
