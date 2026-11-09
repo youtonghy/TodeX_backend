@@ -195,6 +195,7 @@ fn detach_with_config(command: &mut Command, config: &Config) -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+        close_inherited_fds_on_exec(command);
     }
     #[cfg(windows)]
     {
@@ -205,6 +206,45 @@ fn detach_with_config(command: &mut Command, config: &Config) -> Result<()> {
         command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
     }
     Ok(())
+}
+
+/// Keeps descriptors the launcher leaked out of the daemon. The daemon runs
+/// for days, and a parent that is not careful with close-on-exec (Electron's
+/// Chromium leaves its `--remote-debugging-port` socket inheritable, so a
+/// `daemon restart` from the desktop app passed it on) would otherwise have
+/// that socket held open by the daemon and every process it spawns. The
+/// descriptors are marked close-on-exec rather than closed so that the
+/// standard library's exec-failure pipe keeps working.
+#[cfg(unix)]
+fn close_inherited_fds_on_exec(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the hook runs between fork and exec and only makes
+    // async-signal-safe calls (close_range, sysconf, fcntl).
+    unsafe {
+        command.pre_exec(|| {
+            #[cfg(target_os = "linux")]
+            if libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) == 0
+            {
+                return Ok(());
+            }
+            // No close_range (macOS, or Linux before 5.11): every possible
+            // descriptor; unused ones just fail with EBADF.
+            let limit = match libc::sysconf(libc::_SC_OPEN_MAX) {
+                limit if limit > 3 => limit.min(65_536) as libc::c_int,
+                _ => 1024,
+            };
+            for fd in 3..limit {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            Ok(())
+        });
+    }
 }
 
 /// `daemon status --format json`.
@@ -1317,6 +1357,34 @@ mod tests {
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use chrono::Utc;
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_does_not_inherit_descriptors_its_launcher_leaked() {
+        use std::os::fd::AsRawFd;
+
+        // An inheritable descriptor at a number nothing else uses, like the
+        // socket Chromium leaves open in the desktop app.
+        let file = fs::File::open("/dev/null").unwrap();
+        let leaked = (900..1000)
+            // SAFETY: F_GETFD only reads the flags of a possibly unused fd.
+            .find(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } == -1)
+            .unwrap();
+        // SAFETY: `leaked` is unused; dup2 never sets close-on-exec.
+        assert_eq!(unsafe { libc::dup2(file.as_raw_fd(), leaked) }, leaked);
+        let check = format!("[ -e /dev/fd/{leaked} ] && echo open || echo closed");
+        let child_sees = |command: &mut Command| {
+            let output = command.arg("-c").arg(&check).output().unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+
+        assert_eq!(child_sees(&mut Command::new("/bin/sh")), "open");
+        let mut command = Command::new("/bin/sh");
+        super::close_inherited_fds_on_exec(&mut command);
+        assert_eq!(child_sees(&mut command), "closed");
+        // SAFETY: `leaked` is the dup made above.
+        unsafe { libc::close(leaked) };
+    }
 
     #[test]
     fn status_report_json_has_every_field_whether_or_not_running() {
