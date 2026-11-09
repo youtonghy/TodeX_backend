@@ -1076,15 +1076,19 @@ async fn dispatch(
             )
             .await?;
             // An SSH terminal only reaches a host from the inventory, or the
-            // daemon's own machine as `Local`; it is not tied to a workspace,
-            // so workspace roots do not apply. Local shells keep that check.
+            // daemon's own machine as `Local` (its login shell, started
+            // directly); neither is tied to a workspace, so workspace roots
+            // do not apply. Workspace shells keep that check.
+            let local_host = payload
+                .ssh
+                .as_ref()
+                .is_some_and(|target| crate::ssh::is_agent_local_alias(&target.host));
             let (cwd, command, askpass_secret) = match payload.ssh.as_mut() {
-                Some(target) if crate::ssh::is_agent_local_alias(&target.host) => {
-                    // Ignored, as behind a jump host: the user signs in at
-                    // the prompt. Zeroized as it drops.
+                Some(target) if local_host => {
+                    // Nothing signs in. Zeroized as it drops.
                     drop(target.password.take().map(Zeroizing::new));
-                    let command = state.ssh.local_terminal_command().await?;
-                    (command.cwd.display().to_string(), Some(command), None)
+                    let cwd = state.ssh.local_terminal_dir();
+                    (cwd.display().to_string(), None, None)
                 }
                 Some(target) => {
                     state.ssh.require_host(&target.host).await?;
@@ -1120,11 +1124,13 @@ async fn dispatch(
                         .then_some(payload.workspace_id)
                         .flatten(),
                     cwd,
-                    shell: payload.shell,
+                    // `Local` is the user's login shell, whatever was asked.
+                    shell: if local_host { None } else { payload.shell },
                     rows: payload.rows,
                     cols: payload.cols,
                     command,
                     shell_integration: payload.shell_integration,
+                    login_host: local_host.then(|| crate::ssh::AGENT_LOCAL_HOST.to_owned()),
                 })
                 .await?;
             // A failed start dropped the password file above; a running ssh

@@ -141,12 +141,9 @@ pub(crate) fn is_agent_local_alias(alias: &str) -> bool {
     alias.eq_ignore_ascii_case(AGENT_LOCAL_HOST)
 }
 
-/// Whether the terminal's [`AGENT_LOCAL_HOST`] exists: `ssh localhost`
-/// needs an sshd on the daemon's machine, so only Unix systems offer it.
-pub(crate) const LOCAL_TERMINAL_SUPPORTED: bool = cfg!(unix);
-
-/// Where the terminal's [`AGENT_LOCAL_HOST`] connects.
-const LOCAL_TERMINAL_TARGET: &str = "localhost";
+/// Whether the terminal's [`AGENT_LOCAL_HOST`] exists. It is the daemon
+/// user's login shell started directly (no ssh), so every platform has it.
+pub(crate) const LOCAL_TERMINAL_SUPPORTED: bool = true;
 
 /// `/v2/ssh/agent-local`: whether agents get the [`AGENT_LOCAL_HOST`].
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -719,19 +716,13 @@ impl SshService {
         Ok((command, secret))
     }
 
-    /// `ssh -tt localhost` for the terminal's [`AGENT_LOCAL_HOST`]: a login
-    /// session on the daemon's own machine as the daemon's user, through
-    /// its sshd. It needs no host in the inventory and takes no password;
-    /// the user signs in at the prompt when keys do not.
-    pub(crate) async fn local_terminal_command(&self) -> Result<TerminalCommand, AppError> {
-        if !LOCAL_TERMINAL_SUPPORTED {
-            return Err(AppError::InvalidRequest(format!(
-                "the {AGENT_LOCAL_HOST} terminal needs a Linux or macOS backend"
-            )));
-        }
-        let (mut command, _) = self.terminal_command(LOCAL_TERMINAL_TARGET, None).await?;
-        command.ssh_host = AGENT_LOCAL_HOST.to_owned();
-        Ok(command)
+    /// Where the terminal's [`AGENT_LOCAL_HOST`] starts: the daemon user's
+    /// home, as an ssh login would, else the SSH data directory.
+    pub(crate) fn local_terminal_dir(&self) -> PathBuf {
+        self.inner
+            .home
+            .clone()
+            .unwrap_or_else(|| self.inner.dir.clone())
     }
 
     /// Environment that lets one ssh child answer a password prompt with
@@ -2213,21 +2204,6 @@ exit 0
             .collect()
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn local_terminal_connects_to_localhost_without_inventory() {
-        let fixture = fixture("Host good\n").await;
-        let command = fixture.service.local_terminal_command().await.unwrap();
-        assert_eq!(command.ssh_host, AGENT_LOCAL_HOST);
-        let args: Vec<String> = command
-            .args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert!(args.ends_with(&["-tt".into(), "--".into(), LOCAL_TERMINAL_TARGET.into()]));
-        assert!(!command.env.iter().any(|(key, _)| key == askpass::FILE_ENV));
-    }
-
     #[tokio::test]
     async fn terminal_password_goes_to_askpass_only() {
         let fixture = fixture("Host good\n").await;
@@ -2467,6 +2443,7 @@ exit 0
             cols: None,
             command: Some(command),
             shell_integration: false,
+            login_host: None,
         };
         assert!(!format!("{options:?}").contains("hunter2"));
         let target = crate::server::protocol::TerminalSshTarget {

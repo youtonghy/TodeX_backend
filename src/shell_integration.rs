@@ -93,15 +93,19 @@ pub fn clean_environment(command: &mut CommandBuilder) {
     command.env("TERM_PROGRAM_VERSION", crate::version::APP_VERSION);
 }
 
-/// Sets `command` (a plain interactive `shell`) up to load the integration
-/// from `dir`. Returns false, leaving it untouched, for other shells.
-pub fn apply(command: &mut CommandBuilder, shell: &str, dir: &Path) -> bool {
-    let name = Path::new(shell)
+/// The program name of `shell` (`/bin/bash`, `-bash` → `bash`).
+pub fn shell_name(shell: &str) -> &str {
+    Path::new(shell)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default()
-        .trim_start_matches('-');
-    match name {
+        .trim_start_matches('-')
+}
+
+/// Sets `command` (a plain interactive `shell`) up to load the integration
+/// from `dir`. Returns false, leaving it untouched, for other shells.
+pub fn apply(command: &mut CommandBuilder, shell: &str, dir: &Path) -> bool {
+    match shell_name(shell) {
         "bash" => {
             command.arg("--rcfile");
             command.arg(dir.join("bash/todex.bash"));

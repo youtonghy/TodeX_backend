@@ -184,6 +184,9 @@ pub struct TerminalStartOptions {
     /// Load the bash/zsh/fish integration (prompt marks, working directory)
     /// into a local shell; ignored for commands and other shells.
     pub shell_integration: bool,
+    /// Starts the shell as a login shell (Unix) and reports the terminal as
+    /// this SSH host: the daemon's own machine as `Local`.
+    pub login_host: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -346,9 +349,19 @@ impl LocalTerminalManager {
             }
         } else {
             crate::shell_integration::clean_environment(&mut command);
+            let mut integrated = false;
             if options.shell_integration {
                 if let Some(dir) = self.shell_integration_dir().await {
-                    crate::shell_integration::apply(&mut command, &shell, &dir);
+                    integrated = crate::shell_integration::apply(&mut command, &shell, &dir);
+                }
+            }
+            if options.login_host.is_some() && cfg!(unix) {
+                if integrated && crate::shell_integration::shell_name(&shell) == "bash" {
+                    // A login bash would skip `--rcfile`; the integration
+                    // reads the login files itself instead.
+                    command.env("TODEX_BASH_LOGIN", "1");
+                } else {
+                    command.arg("-l");
                 }
             }
         }
@@ -386,7 +399,8 @@ impl LocalTerminalManager {
             ssh_host: options
                 .command
                 .as_ref()
-                .map(|command| command.ssh_host.clone()),
+                .map(|command| command.ssh_host.clone())
+                .or_else(|| options.login_host.clone()),
             pid,
             started_at: chrono::Utc::now().timestamp_millis(),
             input_tx,
@@ -1104,6 +1118,7 @@ mod tests {
                 cols: Some(97),
                 command: None,
                 shell_integration: false,
+                login_host: None,
             })
             .await
             .unwrap();
@@ -1180,6 +1195,7 @@ mod tests {
                     ssh_host: "web".to_string(),
                 }),
                 shell_integration: false,
+                login_host: None,
             })
             .await
             .unwrap();
@@ -1233,6 +1249,7 @@ mod tests {
                     ssh_host: "web".to_string(),
                 }),
                 shell_integration: false,
+                login_host: None,
             })
             .await
             .unwrap();
@@ -1288,6 +1305,7 @@ mod tests {
                 cols: Some(80),
                 command: None,
                 shell_integration: false,
+                login_host: None,
             })
             .await
             .unwrap();
@@ -1396,6 +1414,7 @@ mod tests {
                 cols: Some(80),
                 command: None,
                 shell_integration: false,
+                login_host: None,
             })
             .await
             .unwrap();
@@ -1531,85 +1550,109 @@ mod tests {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
             }
-            let events = EventBus::new(256);
-            let mut rx = events.subscribe();
-            let manager =
-                LocalTerminalManager::new(events).with_shell_integration_root(root.clone());
-            let terminal_id = format!("term-integration-{shell}");
-            manager
-                .start(TerminalStartOptions {
-                    request_id: "start".to_string(),
-                    terminal_id: Some(terminal_id.clone()),
-                    tenant_id: "local".to_string(),
-                    workspace_id: None,
-                    cwd: root.display().to_string(),
-                    shell: Some(path.display().to_string()),
-                    rows: Some(24),
-                    cols: Some(80),
-                    command: None,
-                    shell_integration: true,
+            // Login files print a marker, so the test sees which ran.
+            fs::create_dir_all(home.join(".config/fish")).unwrap();
+            for file in [".bash_profile", ".zprofile"] {
+                fs::write(home.join(file), "echo todex-login-files\n").unwrap();
+            }
+            fs::write(
+                home.join(".config/fish/config.fish"),
+                "status is-login; and echo todex-login-files\n",
+            )
+            .unwrap();
+            for login in [false, true] {
+                let events = EventBus::new(256);
+                let mut rx = events.subscribe();
+                let manager =
+                    LocalTerminalManager::new(events).with_shell_integration_root(root.clone());
+                let terminal_id = format!("term-integration-{shell}-{login}");
+                manager
+                    .start(TerminalStartOptions {
+                        request_id: "start".to_string(),
+                        terminal_id: Some(terminal_id.clone()),
+                        tenant_id: "local".to_string(),
+                        workspace_id: None,
+                        cwd: root.display().to_string(),
+                        shell: Some(path.display().to_string()),
+                        rows: Some(24),
+                        cols: Some(80),
+                        command: None,
+                        shell_integration: true,
+                        login_host: login.then(|| "Local".to_string()),
+                    })
+                    .await
+                    .unwrap();
+                let mut output = String::new();
+                let mut started_host = None;
+                let mut sent = false;
+                let mut answered = 0;
+                let done = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let event = rx.recv().await.unwrap();
+                        if event.event_type == "terminal.started" {
+                            started_host = event.payload["ssh"]["host"].as_str().map(str::to_owned);
+                        }
+                        if event.event_type != "terminal.output" {
+                            continue;
+                        }
+                        output.push_str(&payload_text(&event.payload, "data"));
+                        // fish 4 waits for the terminal to answer its device
+                        // attribute and cursor queries before it reads input.
+                        let queries =
+                            output.matches("\x1b[0c").count() + output.matches("\x1b[6n").count();
+                        while answered < queries {
+                            answered += 1;
+                            manager
+                                .input(TerminalInputOptions {
+                                    request_id: "reply".to_string(),
+                                    terminal_id: terminal_id.clone(),
+                                    tenant_id: "local".to_string(),
+                                    data: "\x1b[1;1R\x1b[?62;22c".to_string(),
+                                })
+                                .await
+                                .unwrap();
+                        }
+                        if !sent && output.contains("\x1b]133;A") {
+                            sent = true;
+                            manager
+                                .input(TerminalInputOptions {
+                                    request_id: "input".to_string(),
+                                    terminal_id: terminal_id.clone(),
+                                    tenant_id: "local".to_string(),
+                                    data: "false\r".to_string(),
+                                })
+                                .await
+                                .unwrap();
+                        }
+                        if output.contains("\x1b]133;D;1") {
+                            break;
+                        }
+                    }
                 })
-                .await
-                .unwrap();
-            let mut output = String::new();
-            let mut sent = false;
-            let mut answered = 0;
-            let done = tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let event = rx.recv().await.unwrap();
-                    if event.event_type != "terminal.output" {
-                        continue;
-                    }
-                    output.push_str(&payload_text(&event.payload, "data"));
-                    // fish 4 waits for the terminal to answer its device
-                    // attribute and cursor queries before it reads input.
-                    let queries =
-                        output.matches("\x1b[0c").count() + output.matches("\x1b[6n").count();
-                    while answered < queries {
-                        answered += 1;
-                        manager
-                            .input(TerminalInputOptions {
-                                request_id: "reply".to_string(),
-                                terminal_id: terminal_id.clone(),
-                                tenant_id: "local".to_string(),
-                                data: "\x1b[1;1R\x1b[?62;22c".to_string(),
-                            })
-                            .await
-                            .unwrap();
-                    }
-                    if !sent && output.contains("\x1b]133;A") {
-                        sent = true;
-                        manager
-                            .input(TerminalInputOptions {
-                                request_id: "input".to_string(),
-                                terminal_id: terminal_id.clone(),
-                                tenant_id: "local".to_string(),
-                                data: "false\r".to_string(),
-                            })
-                            .await
-                            .unwrap();
-                    }
-                    if output.contains("\x1b]133;D;1") {
-                        break;
-                    }
-                }
-            })
-            .await;
-            manager
-                .stop(TerminalStopOptions {
-                    request_id: "stop".to_string(),
-                    terminal_id,
-                    tenant_id: "local".to_string(),
-                    force: true,
-                })
-                .await
-                .unwrap();
-            assert!(
-                done.is_ok(),
-                "{shell}: no command-finished mark in {output:?}"
-            );
-            assert!(output.contains("\x1b]133;C"), "{shell}: {output:?}");
-            assert!(output.contains("\x1b]7;"), "{shell}: {output:?}");
+                .await;
+                manager
+                    .stop(TerminalStopOptions {
+                        request_id: "stop".to_string(),
+                        terminal_id,
+                        tenant_id: "local".to_string(),
+                        force: true,
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    done.is_ok(),
+                    "{shell}: no command-finished mark in {output:?}"
+                );
+                assert!(output.contains("\x1b]133;C"), "{shell}: {output:?}");
+                assert!(output.contains("\x1b]7;"), "{shell}: {output:?}");
+                // The `Local` host is a login shell: it read the login files.
+                assert_eq!(
+                    output.contains("todex-login-files"),
+                    login,
+                    "{shell} login={login}: {output:?}"
+                );
+                assert_eq!(started_host.as_deref(), login.then_some("Local"));
+            }
         }
         let _ = fs::remove_dir_all(root);
     }
@@ -1639,6 +1682,7 @@ mod tests {
                     ssh_host: "local".to_string(),
                 }),
                 shell_integration: false,
+                login_host: None,
             })
             .await
             .unwrap();

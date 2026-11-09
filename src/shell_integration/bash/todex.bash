@@ -4,7 +4,23 @@
 # OSC 133 A (prompt), C (command starts), D;<status> (command finished),
 # OSC 7 (working directory) and OSC 2 (title).
 
-if [ -r "$HOME/.bashrc" ]; then
+# For the `Local` host the daemon asks for a login shell with
+# TODEX_BASH_LOGIN=1 (a login bash would not read this file), so the files a
+# login bash reads stand in for ~/.bashrc, in bash's order; ~/.bash_profile
+# usually loads ~/.bashrc itself.
+if [ "${TODEX_BASH_LOGIN:-}" = 1 ]; then
+    unset TODEX_BASH_LOGIN
+    if [ -r /etc/profile ]; then
+        . /etc/profile
+    fi
+    if [ -r "$HOME/.bash_profile" ]; then
+        . "$HOME/.bash_profile"
+    elif [ -r "$HOME/.bash_login" ]; then
+        . "$HOME/.bash_login"
+    elif [ -r "$HOME/.profile" ]; then
+        . "$HOME/.profile"
+    fi
+elif [ -r "$HOME/.bashrc" ]; then
     . "$HOME/.bashrc"
 fi
 
