@@ -654,6 +654,14 @@ impl ProviderDriver for ClaudeDriver {
         self.sessions.stop(conversation_id).await;
     }
 
+    fn supports_background_task_stop(&self) -> bool {
+        true
+    }
+
+    async fn stop_background_tasks(&self, conversation_id: &str) -> Result<Vec<String>, AppError> {
+        self.sessions.stop_tasks(conversation_id).await
+    }
+
     async fn shutdown(&self) {
         self.sessions.stop_all().await;
     }

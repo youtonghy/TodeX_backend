@@ -201,6 +201,9 @@ pub struct ProviderCapabilitySnapshot {
     pub backend_queue_control: bool,
     /// The queue can be held until a set time (`conversation.schedule`).
     pub scheduled_conversations: bool,
+    /// Background tasks a session runs between turns can be stopped
+    /// (`conversation.backgroundTasks.stop`).
+    pub background_task_stop: bool,
     /// Private (RAM-only) conversations (`ephemeral: true` on create);
     /// omitted when unsupported.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,6 +283,7 @@ impl ProviderSnapshot {
                 backend_queue: true,
                 backend_queue_control: true,
                 scheduled_conversations: true,
+                background_task_stop: driver.supports_background_task_stop(),
                 private_conversations: driver.private_conversations(),
                 resident_runtime: driver.supports_runtime_stop().then_some(
                     ResidentRuntimeCapabilities {
@@ -1464,6 +1468,20 @@ pub trait ProviderDriver: Send + Sync {
 
     fn supports_runtime_stop(&self) -> bool {
         false
+    }
+
+    /// Whether [`Self::stop_background_tasks`] can stop the background
+    /// tasks a session runs between turns.
+    fn supports_background_task_stop(&self) -> bool {
+        false
+    }
+
+    /// Stops the background tasks the conversation's session runs while no
+    /// turn does; returns the ids of those stopped.
+    async fn stop_background_tasks(&self, _conversation_id: &str) -> Result<Vec<String>, AppError> {
+        Err(AppError::Unsupported(
+            "This provider cannot stop background tasks.".to_owned(),
+        ))
     }
 
     /// Whether the resident runtime exchanges extension messages and UI

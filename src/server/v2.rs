@@ -114,6 +114,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.interrupt"
             | "conversation.stop"
             | "conversation.runtime.stop"
+            | "conversation.backgroundTasks.stop"
             | "conversation.warm"
             | "conversation.permission.respond"
             | "mcp.list"
@@ -157,7 +158,11 @@ const MAX_BROWSER_WATCHES: usize = 8;
 fn is_v2_background_command(command_type: &str) -> bool {
     matches!(
         command_type,
-        "mcp.refresh" | "mcp.call" | "conversation.control" | "conversation.warm"
+        "mcp.refresh"
+            | "mcp.call"
+            | "conversation.control"
+            | "conversation.warm"
+            | "conversation.backgroundTasks.stop"
     )
 }
 
@@ -432,6 +437,10 @@ fn authenticated_routes() -> Router<AppState> {
         .route(
             "/v2/conversations/{conversation_id}/runtime/stop",
             post(stop_provider_runtime),
+        )
+        .route(
+            "/v2/conversations/{conversation_id}/background-tasks/stop",
+            post(stop_background_tasks),
         )
         .route(
             "/v2/conversations/{conversation_id}/warm",
@@ -2399,6 +2408,20 @@ async fn stop_provider_runtime(
     ))
 }
 
+async fn stop_background_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(conversation_id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    Ok(Json(
+        state
+            .conversations
+            .stop_background_tasks_owned(&auth.tenant_id, &conversation_id)
+            .await?,
+    ))
+}
+
 async fn warm_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4201,6 +4224,20 @@ async fn dispatch_mcp_command_response(
         dispatch_provider_control(state, owner_id, &command).await
     } else if command.command_type == "conversation.warm" {
         dispatch_warm(state, owner_id, &command).await
+    } else if command.command_type == "conversation.backgroundTasks.stop" {
+        // Off the conversation's lane, like a cancel: it must not wait
+        // behind a prompt that is starting the provider.
+        match Deserialize::deserialize(&command.payload) {
+            Ok(WsConversationRequest {
+                conversation_id, ..
+            }) => {
+                state
+                    .conversations
+                    .stop_background_tasks_owned(owner_id, &conversation_id)
+                    .await
+            }
+            Err(error) => Err(error.into()),
+        }
     } else {
         dispatch_mcp_command(state, owner_id, &command).await
     };
@@ -5887,6 +5924,10 @@ mod tests {
                 "POST",
                 format!("/v2/conversations/{}/runtime/stop", foreign.id),
             ),
+            (
+                "POST",
+                format!("/v2/conversations/{}/background-tasks/stop", foreign.id),
+            ),
         ] {
             let denied = app
                 .clone()
@@ -5917,6 +5958,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stopped.status(), StatusCode::OK);
+        // Only providers that can stop background tasks take the request.
+        let unsupported = app
+            .clone()
+            .oneshot(signed_request(
+                &device,
+                "POST",
+                &format!("/v2/conversations/{}/background-tasks/stop", created.id),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unsupported.status(), StatusCode::NOT_IMPLEMENTED);
 
         let replay = app
             .oneshot(signed_request(

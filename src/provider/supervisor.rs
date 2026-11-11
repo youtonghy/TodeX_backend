@@ -2073,6 +2073,36 @@ impl ConversationSupervisor {
             .await
     }
 
+    /// Stops the background tasks a conversation's session runs while it
+    /// waits between turns (`conversation.backgroundTasks.stop`), and
+    /// journals them as ended so clients stop waiting on them. Refused
+    /// while a turn runs: its Stop (`conversation.cancel`) comes first, so a
+    /// late request never stops work the user did not see waiting.
+    pub async fn stop_background_tasks_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+    ) -> Result<Value, AppError> {
+        let manifest = self.writable_owned(owner_id, conversation_id).await?;
+        let driver = self.registry.driver(manifest.provider)?;
+        if !driver.supports_background_task_stop() {
+            return Err(AppError::Unsupported(
+                "This provider cannot stop background tasks.".to_owned(),
+            ));
+        }
+        if self.active.contains_key(&manifest.id) {
+            return Err(AppError::Conflict(
+                "A turn is running; stop the turn first".to_owned(),
+            ));
+        }
+        let stopped = driver.stop_background_tasks(&manifest.id).await?;
+        if !stopped.is_empty() {
+            self.journal_lost_work(&manifest.id, manifest.provider, &stopped, "user_stopped")
+                .await;
+        }
+        Ok(json!({ "conversationId": manifest.id, "stoppedTaskIds": stopped }))
+    }
+
     /// Starts the conversation's provider process ahead of its next prompt,
     /// prepared with the settings of its last request (`conversation.warm`).
     /// Best effort: `Ok(Some(reason))` when it was skipped, `Ok(None)` when

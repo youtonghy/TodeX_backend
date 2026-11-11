@@ -49,6 +49,9 @@ const MAX_BACKGROUND_HOLD: Duration = Duration::from_secs(6 * 3600);
 /// How long a stopping worker waits for the loss of its background work to
 /// be journalled.
 const REPORT_LOST_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long Claude may take to answer the `stop_task` requests of a user
+/// stop.
+const STOP_TASKS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Everything a turn needs to start Claude.
 #[derive(Clone)]
@@ -84,6 +87,9 @@ pub(in crate::provider) struct Warm {
 enum Request {
     Turn(Turn),
     Warm(Warm, oneshot::Sender<Result<(), AppError>>),
+    /// Stop the session's running background tasks between turns; answers
+    /// with the ids Claude stopped.
+    StopTasks(oneshot::Sender<Result<Vec<String>, AppError>>),
 }
 
 enum Reply {
@@ -297,7 +303,7 @@ impl Sessions {
                     run = turn.run;
                     worker.shutdown.borrow().retry()
                 }
-                Err(mpsc::error::SendError(Request::Warm(..))) => {
+                Err(mpsc::error::SendError(Request::Warm(..) | Request::StopTasks(..))) => {
                     unreachable!("a turn was sent")
                 }
             };
@@ -415,6 +421,31 @@ impl Sessions {
         }
         response.await.map_err(|_| unavailable())??;
         Ok(ProviderPrewarm::Warmed)
+    }
+
+    /// Asks Claude to stop the conversation's running background tasks.
+    /// Runs between turns: a request sent during a turn waits for it to
+    /// end. A conversation without a running process has none to stop.
+    pub async fn stop_tasks(&self, id: &str) -> Result<Vec<String>, AppError> {
+        let worker = {
+            let mut table = self.table.lock().await;
+            table.prune();
+            table
+                .workers
+                .get(id)
+                .filter(|worker| !worker.stopping())
+                .cloned()
+        };
+        let Some(worker) = worker else {
+            return Ok(Vec::new());
+        };
+        let (reply, response) = oneshot::channel();
+        worker
+            .turns
+            .send(Request::StopTasks(reply))
+            .await
+            .map_err(|_| unavailable())?;
+        response.await.map_err(|_| unavailable())?
     }
 
     /// Stops the conversation's process, if any, and waits for it to exit.
@@ -729,36 +760,43 @@ async fn worker(
     let mut awaiting: Option<(String, Instant, Vec<String>)> = None;
     // Why the loop ended, should background work go with the process.
     let mut reason = "stopped";
+    // What a user stop of background tasks read past while it waited for
+    // Claude's answers, handled like any frame between turns.
+    let mut carried: Option<Ended> = None;
     loop {
         // Biased: a requested stop wins, then a waiting turn; the deadlines
         // only fire when nothing else is ready.
-        let next = tokio::select! {
-            biased;
-            _ = shutdown.changed() => {
-                reason = shutdown.borrow().lost_reason();
-                Next::Stop
-            }
-            turn = turns.recv() => match turn { Some(turn) => Next::Request(turn), None => Next::Stop },
-            between = async {
-                match (live.as_mut(), &awaiting) {
-                    (Some(live), None) => between_turns(live).await,
-                    _ => std::future::pending().await,
+        let next = if let Some(ended) = carried.take() {
+            Next::Between(ended)
+        } else {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    reason = shutdown.borrow().lost_reason();
+                    Next::Stop
                 }
-            } => Next::Between(between),
-            _ = async {
-                match &awaiting {
-                    Some((_, deadline, _)) => tokio::time::sleep_until(*deadline).await,
-                    None => tokio::time::sleep_until(idle_at).await,
+                turn = turns.recv() => match turn { Some(turn) => Next::Request(turn), None => Next::Stop },
+                between = async {
+                    match (live.as_mut(), &awaiting) {
+                        (Some(live), None) => between_turns(live).await,
+                        _ => std::future::pending().await,
+                    }
+                } => Next::Between(between),
+                _ = async {
+                    match &awaiting {
+                        Some((_, deadline, _)) => tokio::time::sleep_until(*deadline).await,
+                        None => tokio::time::sleep_until(idle_at).await,
+                    }
+                } => {
+                    if awaiting.is_some() {
+                        tracing::warn!("no turn took over Claude Code's own work; restarting its process");
+                        reason = "not_adopted";
+                    } else {
+                        // Work still held at the idle deadline outlived its cap.
+                        reason = "expired";
+                    }
+                    Next::Stop
                 }
-            } => {
-                if awaiting.is_some() {
-                    tracing::warn!("no turn took over Claude Code's own work; restarting its process");
-                    reason = "not_adopted";
-                } else {
-                    // Work still held at the idle deadline outlived its cap.
-                    reason = "expired";
-                }
-                Next::Stop
             }
         };
         let turn = match next {
@@ -796,6 +834,36 @@ async fn worker(
             pending,
         } = match turn {
             Request::Turn(turn) => turn,
+            Request::StopTasks(reply) => {
+                let live = match (live.as_mut(), &awaiting) {
+                    (Some(live), None) => live,
+                    (None, _) => {
+                        let _ = reply.send(Ok(Vec::new()));
+                        continue;
+                    }
+                    // Claude already started reporting on its work; its
+                    // frames belong to the turn about to take it over.
+                    (Some(_), Some(_)) => {
+                        let _ = reply.send(Err(AppError::Conflict(
+                            "Claude Code is already reporting on its background work; stop that turn instead"
+                                .to_owned(),
+                        )));
+                        continue;
+                    }
+                };
+                let (result, ended) = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        let _ = reply.send(Err(AppError::TurnCancelled));
+                        reason = shutdown.borrow().lost_reason();
+                        break;
+                    }
+                    outcome = stop_tasks(live) => outcome,
+                };
+                let _ = reply.send(result);
+                carried = Some(ended);
+                continue;
+            }
             Request::Warm(warm, reply) => {
                 if live.is_some() {
                     let _ = reply.send(Ok(()));
@@ -1033,8 +1101,8 @@ async fn worker(
                     retry,
                 });
             }
-            // Dropping its reply tells the prewarm the worker stopped.
-            Request::Warm(..) => {}
+            // Dropping its reply tells the caller the worker stopped.
+            Request::Warm(..) | Request::StopTasks(..) => {}
         }
     }
     let _ = stopped.send(true);
@@ -1043,11 +1111,15 @@ async fn worker(
 /// Reads one frame while no turn runs. Background task frames update the
 /// session's work; of them only subagent lifecycle reaches the journal.
 async fn between_turns(live: &mut Live) -> Ended {
-    let process = &mut live.process;
-    let message = match process.read().await {
+    let message = match live.process.read().await {
         Ok(Some(message)) => message,
         Ok(None) | Err(_) => return Ended::Retire,
     };
+    handle_between_turns(live, message).await
+}
+
+async fn handle_between_turns(live: &mut Live, message: Value) -> Ended {
+    let process = &mut live.process;
     match message.get("type").and_then(Value::as_str) {
         Some("control_request") => {
             // No turn owns a permission dialog now.
@@ -1094,6 +1166,85 @@ async fn between_turns(live: &mut Live) -> Ended {
         }
         _ => Ended::Reusable,
     }
+}
+
+/// Sends `stop_task` for every running background task and waits, bounded
+/// by [`STOP_TASKS_TIMEOUT`], for Claude's answers. Frames read meanwhile
+/// are handled as between turns; one that ends the wait early (the process
+/// retires or Claude starts work) is returned for the worker to act on.
+/// Succeeds with the ids Claude stopped, unless it stopped none of them.
+async fn stop_tasks(live: &mut Live) -> (Result<Vec<String>, AppError>, Ended) {
+    let task_ids = live.work.running_task_ids();
+    // request id -> task id
+    let mut waiting = HashMap::new();
+    for task_id in task_ids {
+        let request_id = format!("todex-stop-task-{}", uuid::Uuid::new_v4());
+        let request = json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": { "subtype": "stop_task", "task_id": task_id },
+        });
+        if live.process.send(&request).await.is_err() {
+            return (Err(unavailable()), Ended::Retire);
+        }
+        waiting.insert(request_id, task_id);
+    }
+    let mut stopped = Vec::new();
+    let mut refused = None;
+    let deadline = Instant::now() + STOP_TASKS_TIMEOUT;
+    let mut ended = Ended::Reusable;
+    while !waiting.is_empty() {
+        let message = match tokio::time::timeout_at(deadline, live.process.read()).await {
+            Err(_) => break,
+            Ok(Ok(Some(message))) => message,
+            Ok(Ok(None) | Err(_)) => {
+                ended = Ended::Retire;
+                break;
+            }
+        };
+        let answered = (message.get("type").and_then(Value::as_str) == Some("control_response"))
+            .then(|| {
+                message
+                    .pointer("/response/request_id")
+                    .and_then(Value::as_str)
+            })
+            .flatten()
+            .and_then(|id| waiting.remove(id));
+        if let Some(task_id) = answered {
+            if message.pointer("/response/subtype").and_then(Value::as_str) == Some("success") {
+                stopped.push(task_id);
+            } else {
+                let error = message
+                    .pointer("/response/error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("refused");
+                tracing::warn!(%task_id, %error, "Claude Code did not stop a background task");
+                refused.get_or_insert_with(|| error.to_owned());
+            }
+            continue;
+        }
+        ended = handle_between_turns(live, message).await;
+        if !matches!(ended, Ended::Reusable) {
+            break;
+        }
+    }
+    if !waiting.is_empty() {
+        tracing::warn!(
+            unanswered = waiting.len(),
+            "Claude Code did not answer every stop_task request"
+        );
+    }
+    let result = if !stopped.is_empty() || (refused.is_none() && waiting.is_empty()) {
+        Ok(stopped)
+    } else {
+        Err(AppError::ProviderUnavailable(match refused {
+            Some(error) => format!("Claude Code could not stop its background tasks: {error}"),
+            None => {
+                "Claude Code did not answer the request to stop its background tasks".to_owned()
+            }
+        }))
+    };
+    (result, ended)
 }
 
 /// The result of a provider-initiated turn whose work was already gone.
@@ -1301,6 +1452,17 @@ while IFS= read -r line; do
         printf '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}\n'
         printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1}\n'
         printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+      fi
+      continue ;;
+    *'"subtype":"stop_task"'*)
+      rid=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      task=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"task_id":"\([^"]*\)".*/\1/p')
+      if [ -f "$dir/refuse-stop" ]; then
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"No task found"}}\n' "$rid"
+      else
+        printf '{"type":"system","subtype":"task_notification","task_id":"%s","status":"stopped","task_type":"local_bash"}\n' "$task"
+        printf '{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n'
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$rid"
       fi
       continue ;;
     *'"type":"control_response"'*) continue ;;
@@ -2074,6 +2236,57 @@ done
                 .is_ok_and(|table| table.workers.values().all(Worker::stopping))
         })
         .await;
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn stopping_background_tasks_asks_claude_and_releases_the_hold() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (handle, _offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        let stopped = sessions.stop_tasks(&manifest.id).await.unwrap();
+        assert_eq!(stopped, vec!["bg-1".to_owned()]);
+        assert!(fixture
+            .wire()
+            .contains(r#""request":{"subtype":"stop_task","task_id":"bg-1"}"#));
+        // The session no longer counts as holding background work.
+        wait_until(|| {
+            sessions.table.try_lock().is_ok_and(|table| {
+                table.workers.values().all(|worker| {
+                    !worker
+                        .activity
+                        .lock()
+                        .expect("Claude worker activity lock")
+                        .background
+                })
+            })
+        })
+        .await;
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_refused_background_stop_is_an_error_and_keeps_the_process() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        std::fs::write(fixture.root.join("refuse-stop"), "").unwrap();
+        let (handle, _offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        let error = sessions.stop_tasks(&manifest.id).await.unwrap_err();
+        assert!(error.to_string().contains("No task found"), "{error}");
+        assert!(sessions.holds(&manifest.id).await);
+        // A conversation without a process has nothing to stop.
+        let idle = fixture.conversation().await;
+        assert!(sessions.stop_tasks(&idle.id).await.unwrap().is_empty());
         sessions.stop_all().await;
         cleanup(&fixture.root);
     }

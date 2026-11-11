@@ -272,6 +272,15 @@ impl SessionWork {
             || !self.wakeups.is_empty()
     }
 
+    /// Background tasks still running, the main session's and those
+    /// subagents left behind: what a user stop targets.
+    pub(super) fn running_task_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.live.keys().cloned().collect();
+        ids.extend(self.subagent_live.iter().cloned());
+        ids.sort();
+        ids
+    }
+
     /// Background tasks that are running or whose follow-up has not started:
     /// lost if the process stops now.
     pub(super) fn task_ids(&self) -> Vec<String> {
