@@ -92,7 +92,19 @@ pub struct ClaudeDriver {
     binary: String,
     catalogs: Catalogs,
     sessions: runtime::Sessions,
+    /// Gateway `/v1/models` catalogs (`ANTHROPIC_BASE_URL` set).
     models: CatalogCache<Vec<super::types::ProviderModelDescriptor>>,
+    /// Session-less `initialize` probes: one CLI start serves both the
+    /// command and the model catalog of a workspace.
+    probes: CatalogCache<ClaudeProbe>,
+}
+
+/// What a session-less `initialize` reports.
+#[derive(Clone)]
+struct ClaudeProbe {
+    commands: Vec<ProviderCommandDescriptor>,
+    /// Empty when the CLI reports no usable model list.
+    models: Vec<super::types::ProviderModelDescriptor>,
 }
 
 /// Claude Code accepts both family aliases (`opus`) and concrete model ids
@@ -263,6 +275,14 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         None,
     ),
     (
+        "claude-fable-5-2",
+        "Fable 5.2",
+        "fable",
+        CLAUDE_EFFORTS_ULTRACODE,
+        Some("high"),
+        Some(1_000_000),
+    ),
+    (
         "claude-fable-5-1",
         "Fable 5.1",
         "fable",
@@ -277,6 +297,14 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         CLAUDE_EFFORTS_ULTRACODE,
         Some("high"),
         Some(1_000_000),
+    ),
+    (
+        "claude-haiku-5-5",
+        "Haiku 5.5",
+        "haiku",
+        CLAUDE_EFFORTS_ULTRACODE,
+        None,
+        Some(200_000),
     ),
     (
         "claude-haiku-4-5-20251001",
@@ -301,15 +329,17 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
 const CLAUDE_FAMILY_ALIASES: &[(&str, &str)] = &[
     ("opus", "Opus 5.5"),
     ("sonnet", "Sonnet 5.5"),
-    ("fable", "Fable 5.1"),
-    ("haiku", "Haiku 4.5"),
+    ("fable", "Fable 5.2"),
+    ("haiku", "Haiku 5.5"),
 ];
 
+/// Built-in catalog: the fallback when the CLI's own list (see
+/// [`claude_cli_models`]) cannot be read, and the provider snapshot.
 fn claude_model_aliases() -> Vec<super::types::ProviderModelDescriptor> {
     let mut models = vec![claude_model(
         "default",
         "default",
-        "Opus 5",
+        "Opus 5.5",
         None,
         CLAUDE_EFFORTS_ULTRACODE,
         None,
@@ -317,19 +347,12 @@ fn claude_model_aliases() -> Vec<super::types::ProviderModelDescriptor> {
     )];
     models[0].is_default = true;
     for (alias, resolves_to) in CLAUDE_FAMILY_ALIASES {
-        // Haiku tops out below xhigh; its alias keeps effort selection but not
-        // the tiers the family cannot run.
-        let alias_efforts = if *alias == "haiku" {
-            CLAUDE_EFFORTS_MAX
-        } else {
-            CLAUDE_EFFORTS_ULTRACODE
-        };
         models.push(claude_model(
             alias,
             alias,
             resolves_to,
             Some(alias),
-            alias_efforts,
+            CLAUDE_EFFORTS_ULTRACODE,
             None,
             None,
         ));
@@ -370,6 +393,187 @@ fn claude_model_family(id: &str) -> Option<String> {
         .into_iter()
         .find(|family| lower.contains(family))
         .map(str::to_owned)
+}
+
+/// The model list Claude Code reports in its `initialize` response (the one
+/// its own `/model` menu shows), shaped like the built-in catalog: `default`
+/// first, then per family its alias as "latest" followed by pinned versions.
+/// An alias whose resolved version is not listed gets that version added, so
+/// the family always shows what "latest" runs. Effort rungs come from the CLI,
+/// plus `ultracode` wherever `xhigh` is available. Empty when the response has
+/// no usable list, so callers fall back to [`claude_model_aliases`].
+fn claude_cli_models(initialize_response: &Value) -> Vec<super::types::ProviderModelDescriptor> {
+    struct Entry<'a> {
+        id: &'a str,
+        resolved: &'a str,
+        display_name: &'a str,
+        efforts: Vec<String>,
+    }
+    let entries = initialize_response
+        .pointer("/response/response/models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let id = item.get("value").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let efforts = if item.get("supportsEffort").and_then(Value::as_bool) == Some(false) {
+                Vec::new()
+            } else {
+                let mut efforts = item
+                    .get("supportedEffortLevels")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if efforts.iter().any(|effort| effort == "xhigh")
+                    && !efforts.iter().any(|effort| effort == "ultracode")
+                {
+                    efforts.push("ultracode".to_owned());
+                }
+                efforts
+            };
+            Some(Entry {
+                id,
+                resolved: item
+                    .get("resolvedModel")
+                    .and_then(Value::as_str)
+                    .filter(|resolved| !resolved.trim().is_empty())
+                    .unwrap_or(id),
+                display_name: item
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id),
+                efforts,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let builtin = |id: &str| CLAUDE_MODELS.iter().find(|spec| spec.0 == id);
+    // Display name of a concrete model id: its own row, else an alias that
+    // resolves to it, else the built-in catalog, else the id itself.
+    let name_of = |resolved: &str| -> String {
+        entries
+            .iter()
+            .find(|entry| entry.id == resolved)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| entry.resolved == resolved && entry.id != "default")
+            })
+            .map(|entry| entry.display_name.to_owned())
+            .or_else(|| builtin(resolved).map(|spec| spec.1.to_owned()))
+            .unwrap_or_else(|| resolved.to_owned())
+    };
+    let pinned = |id: &str, name: &str, family: &str, efforts: &[String]| {
+        let spec = builtin(id);
+        super::types::ProviderModelDescriptor {
+            id: id.to_owned(),
+            display_name: name.to_owned(),
+            description: String::new(),
+            is_default: false,
+            supported_reasoning_efforts: efforts.to_vec(),
+            default_reasoning_effort: spec.and_then(|spec| spec.4).map(str::to_owned),
+            context_window: spec.and_then(|spec| spec.5),
+            image_input: Some(true),
+            family: Some(family.to_owned()),
+        }
+    };
+
+    let mut ungrouped = Vec::new();
+    // (family, alias row, pinned rows) in the CLI's family order.
+    let mut families: Vec<(
+        String,
+        Option<super::types::ProviderModelDescriptor>,
+        Vec<_>,
+    )> = Vec::new();
+    for entry in &entries {
+        let family = claude_model_family(entry.id);
+        if entry.id == "default" || family.is_none() {
+            let model = super::types::ProviderModelDescriptor {
+                id: entry.id.to_owned(),
+                display_name: if entry.id == "default" {
+                    "default".to_owned()
+                } else {
+                    entry.display_name.to_owned()
+                },
+                description: if entry.resolved == entry.id {
+                    String::new()
+                } else {
+                    name_of(entry.resolved)
+                },
+                is_default: entry.id == "default",
+                supported_reasoning_efforts: entry.efforts.clone(),
+                default_reasoning_effort: None,
+                context_window: None,
+                image_input: Some(true),
+                family: None,
+            };
+            if model.is_default {
+                ungrouped.insert(0, model);
+            } else {
+                ungrouped.push(model);
+            }
+            continue;
+        }
+        let family = family.expect("checked above");
+        let slot = match families.iter().position(|(name, ..)| *name == family) {
+            Some(index) => index,
+            None => {
+                families.push((family.clone(), None, Vec::new()));
+                families.len() - 1
+            }
+        };
+        if entry.id == family {
+            families[slot].1 = Some(super::types::ProviderModelDescriptor {
+                id: entry.id.to_owned(),
+                display_name: entry.id.to_owned(),
+                description: name_of(entry.resolved),
+                is_default: false,
+                supported_reasoning_efforts: entry.efforts.clone(),
+                default_reasoning_effort: None,
+                context_window: None,
+                image_input: Some(true),
+                family: Some(family.clone()),
+            });
+            if entry.resolved != entry.id && !entries.iter().any(|other| other.id == entry.resolved)
+            {
+                let version = pinned(
+                    entry.resolved,
+                    &name_of(entry.resolved),
+                    &family,
+                    &entry.efforts,
+                );
+                families[slot].2.push(version);
+            }
+        } else {
+            families[slot].2.push(pinned(
+                entry.id,
+                entry.display_name,
+                &family,
+                &entry.efforts,
+            ));
+        }
+    }
+    // The CLI lists pinned versions in no particular order: ids the built-in
+    // catalog does not know yet (newer) first, then its newest-first order.
+    let rank = |id: &str| {
+        CLAUDE_MODELS
+            .iter()
+            .position(|spec| spec.0 == id)
+            .map_or(0, |index| index + 1)
+    };
+    let mut models = ungrouped;
+    for (_, alias, mut versions) in families {
+        versions.sort_by_key(|model| rank(&model.id));
+        models.extend(alias);
+        models.extend(versions);
+    }
+    models
 }
 
 /// Upper bound for the gateway `/v1/models` request; discovery falls back to
@@ -428,8 +632,79 @@ impl ClaudeDriver {
                     .expect("Claude declares a session limit"),
             ),
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
+            probes: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }
     }
+
+    /// The workspace's cached `initialize` probe. An expired probe is served
+    /// at once while a background one refreshes it, and a caller that stops
+    /// waiting does not cancel the probe.
+    async fn probe(&self, workspace: &Path) -> Result<ClaudeProbe, AppError> {
+        let binary = self.binary.clone();
+        let probe_workspace = workspace.to_path_buf();
+        self.probes
+            .fetch_or_stale(&self.binary, workspace, async move {
+                probe_claude(&binary, &probe_workspace).await
+            })
+            .await
+    }
+
+    /// The CLI's own model list, or the built-in catalog when the probe
+    /// fails, runs too long or reports no models.
+    async fn cli_models(&self, workspace: &Path) -> Vec<super::types::ProviderModelDescriptor> {
+        match tokio::time::timeout(CLAUDE_CLI_MODELS_TIMEOUT, self.probe(workspace)).await {
+            Ok(Ok(probe)) if !probe.models.is_empty() => return probe.models,
+            Ok(Ok(_)) => {
+                tracing::warn!("Claude Code reported no model list; using the built-in catalog")
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("Claude Code model probe failed; using the built-in catalog");
+                tracing::debug!(%error, "Claude Code model probe error");
+            }
+            Err(_) => {
+                tracing::warn!("Claude Code model probe timed out; using the built-in catalog")
+            }
+        }
+        claude_model_aliases()
+    }
+}
+
+/// Below [`ClaudeDriver::discovery_timeout`] so a slow probe still answers
+/// with the built-in catalog instead of a discovery timeout.
+const CLAUDE_CLI_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Starts a session-less Claude Code in `workspace` and reads its
+/// `initialize` response: the slash-command catalog (builtins, workspace
+/// commands, plugin commands and skills) and the model list, without ever
+/// reaching a model call.
+async fn probe_claude(binary: &str, workspace: &Path) -> Result<ClaudeProbe, AppError> {
+    let mut spec = CommandSpec::new(binary, workspace);
+    spec.args = vec![
+        "-p".to_owned(),
+        "--input-format".to_owned(),
+        "stream-json".to_owned(),
+        "--output-format".to_owned(),
+        "stream-json".to_owned(),
+        "--verbose".to_owned(),
+        "--no-session-persistence".to_owned(),
+        "--permission-prompts".to_owned(),
+        "host".to_owned(),
+        "--permission-prompt-tool".to_owned(),
+        "stdio".to_owned(),
+        "--permission-mode".to_owned(),
+        "default".to_owned(),
+    ];
+    let mut process = JsonLineProcess::spawn(&spec).await?;
+    // The sender must outlive initialize: `cancel.changed()` resolves as
+    // soon as every sender drops and would masquerade as a cancellation.
+    let (_cancel, mut receiver) = watch::channel(false);
+    let initialized = initialize_claude(&mut process, &mut receiver, None).await;
+    process.terminate().await;
+    let (response, _) = initialized?;
+    Ok(ClaudeProbe {
+        commands: claude_command_catalog(&response),
+        models: claude_cli_models(&response),
+    })
 }
 
 #[async_trait]
@@ -459,10 +734,13 @@ impl ProviderDriver for ClaudeDriver {
         &self,
         workspace: &Path,
     ) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
+        // Without a gateway the CLI's own list is authoritative: it follows
+        // CLI upgrades and the account's entitlements without TodeX handling
+        // any credential.
+        let Some(base) = claude_discovery_env("ANTHROPIC_BASE_URL") else {
+            return Ok(self.cli_models(workspace).await);
+        };
         let fetch = async {
-            let Some(base) = claude_discovery_env("ANTHROPIC_BASE_URL") else {
-                return Ok(claude_model_aliases());
-            };
             let Some(url) = claude_discovery_url(&base) else {
                 return Ok(claude_model_aliases());
             };
@@ -547,32 +825,7 @@ impl ProviderDriver for ClaudeDriver {
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        // The initialize control response carries the slash-command catalog,
-        // so a session-less probe gets builtins, workspace commands, plugin
-        // commands and skills without ever reaching a model call.
-        let mut spec = CommandSpec::new(&self.binary, workspace);
-        spec.args = vec![
-            "-p".to_owned(),
-            "--input-format".to_owned(),
-            "stream-json".to_owned(),
-            "--output-format".to_owned(),
-            "stream-json".to_owned(),
-            "--verbose".to_owned(),
-            "--no-session-persistence".to_owned(),
-            "--permission-prompts".to_owned(),
-            "host".to_owned(),
-            "--permission-prompt-tool".to_owned(),
-            "stdio".to_owned(),
-            "--permission-mode".to_owned(),
-            "default".to_owned(),
-        ];
-        let mut process = JsonLineProcess::spawn(&spec).await?;
-        // The sender must outlive initialize: `cancel.changed()` resolves as
-        // soon as every sender drops and would masquerade as a cancellation.
-        let (_cancel, mut receiver) = watch::channel(false);
-        let commands = initialize_claude(&mut process, &mut receiver, None).await;
-        process.terminate().await;
-        commands.map(|(commands, _)| commands)
+        Ok(self.probe(workspace).await?.commands)
     }
 
     fn supports_native_fork(&self) -> bool {
@@ -862,11 +1115,11 @@ async fn initialize_session(
     expected_mode: Option<&str>,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<permission_mode::ModeReport, AppError> {
-    let (commands, report) = initialize_claude(process, cancel, expected_mode).await?;
+    let (response, report) = initialize_claude(process, cancel, expected_mode).await?;
     catalogs.lock().await.insert(
         context.manifest.id.clone(),
         ProviderSessionCommands {
-            commands,
+            commands: claude_command_catalog(&response),
             runtime_id,
         },
     );
@@ -1063,7 +1316,7 @@ mod tests {
     }
 
     use super::{
-        claude_command_catalog, claude_discovery_url, claude_frame_limit_reset,
+        claude_cli_models, claude_command_catalog, claude_discovery_url, claude_frame_limit_reset,
         claude_model_aliases, claude_model_family, claude_permission_details,
         claude_question_details, claude_question_response, claude_quota_event, claude_result_error,
         claude_transcript_loadable, claude_user_content, handle_stream_event, usage_limit_reset,
@@ -1612,11 +1865,15 @@ mod tests {
             opus_46.supported_reasoning_efforts,
             ["low", "medium", "high", "max"]
         );
-        let haiku = models.iter().find(|model| model.id == "haiku").unwrap();
-        assert!(!haiku
-            .supported_reasoning_efforts
+        // Haiku 4.5 predates the effort option; the Haiku 5.5 alias has it.
+        let haiku_45 = models
             .iter()
-            .any(|effort| effort == "ultracode" || effort == "xhigh"));
+            .find(|model| model.id == "claude-haiku-4-5-20251001")
+            .unwrap();
+        assert!(haiku_45.supported_reasoning_efforts.is_empty());
+        let fable = models.iter().find(|model| model.id == "fable").unwrap();
+        assert_eq!(fable.description, "Fable 5.2");
+        assert!(models.iter().any(|model| model.id == "claude-fable-5-2"));
         let opus_55 = models
             .iter()
             .find(|model| model.id == "claude-opus-5-5")
@@ -1994,6 +2251,174 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn initialize_models_follow_the_cli_catalog() {
+        let efforts = json!(["low", "medium", "high", "xhigh", "max"]);
+        // Shape and order as Claude Code 2.1.322 reports them.
+        let response = json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "todex-initialize", "response": {
+                "models": [
+                    { "value": "default", "resolvedModel": "claude-opus-5-5",
+                      "displayName": "Default (recommended)", "supportsEffort": true,
+                      "supportedEffortLevels": efforts },
+                    { "value": "opus", "resolvedModel": "claude-opus-5-5", "displayName": "Opus 5.5",
+                      "supportsEffort": true, "supportedEffortLevels": efforts },
+                    { "value": "fable", "resolvedModel": "claude-fable-5-2", "displayName": "Fable 5.2",
+                      "supportsEffort": true, "supportedEffortLevels": efforts },
+                    { "value": "claude-fable-5-1", "resolvedModel": "claude-fable-5-1",
+                      "displayName": "Fable 5.1", "supportsEffort": true,
+                      "supportedEffortLevels": efforts },
+                    { "value": "claude-haiku-4-5-20251001", "displayName": "Haiku 4.5" },
+                    { "value": "claude-opus-4-6", "displayName": "Opus 4.6", "supportsEffort": true,
+                      "supportedEffortLevels": ["low", "medium", "high", "max"] },
+                    { "value": "claude-opus-5", "displayName": "Opus 5", "supportsEffort": true,
+                      "supportedEffortLevels": efforts },
+                    { "value": "haiku", "resolvedModel": "claude-haiku-4-5-20251001",
+                      "displayName": "Haiku 4.5" },
+                    { "value": "" },
+                ],
+            } },
+        });
+
+        let models = claude_cli_models(&response);
+        let ids = models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "default",
+                "opus",
+                "claude-opus-5-5",
+                "claude-opus-5",
+                "claude-opus-4-6",
+                "fable",
+                "claude-fable-5-2",
+                "claude-fable-5-1",
+                "haiku",
+                "claude-haiku-4-5-20251001",
+            ]
+        );
+
+        let default = &models[0];
+        assert!(default.is_default);
+        assert_eq!(default.display_name, "default");
+        assert_eq!(default.description, "Opus 5.5");
+        assert_eq!(default.family, None);
+
+        let fable = models.iter().find(|model| model.id == "fable").unwrap();
+        assert_eq!(fable.family.as_deref(), Some("fable"));
+        assert_eq!(fable.description, "Fable 5.2");
+        assert_eq!(
+            fable.supported_reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max", "ultracode"]
+        );
+
+        // The version "latest" runs is listed even though the CLI only names
+        // it through the alias; known ids keep the built-in metadata.
+        let fable_52 = models
+            .iter()
+            .find(|model| model.id == "claude-fable-5-2")
+            .unwrap();
+        assert_eq!(fable_52.display_name, "Fable 5.2");
+        assert_eq!(fable_52.family.as_deref(), Some("fable"));
+        assert_eq!(fable_52.context_window, Some(1_000_000));
+        assert_eq!(fable_52.default_reasoning_effort.as_deref(), Some("high"));
+
+        let opus_46 = models
+            .iter()
+            .find(|model| model.id == "claude-opus-4-6")
+            .unwrap();
+        assert_eq!(
+            opus_46.supported_reasoning_efforts,
+            ["low", "medium", "high", "max"]
+        );
+        let haiku_45 = models
+            .iter()
+            .find(|model| model.id == "claude-haiku-4-5-20251001")
+            .unwrap();
+        assert!(haiku_45.supported_reasoning_efforts.is_empty());
+
+        assert!(claude_cli_models(&json!({ "response": { "response": {} } })).is_empty());
+    }
+
+    /// A driver whose binary is `script`, written to a fresh directory that
+    /// also collects its `launches.log`.
+    #[cfg(unix)]
+    fn driver_with_fake_claude(script: &str) -> (super::ClaudeDriver, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "todex-claude-probe-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("claude");
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ttl = Some(std::time::Duration::from_secs(60));
+        let driver = super::ClaudeDriver {
+            binary: binary.to_string_lossy().into_owned(),
+            catalogs: Default::default(),
+            sessions: super::runtime::Sessions::new(std::time::Duration::from_secs(30), 1),
+            models: super::CatalogCache::new(ttl),
+            probes: super::CatalogCache::new(ttl),
+        };
+        (driver, root)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_initialize_probe_serves_commands_and_models() {
+        use crate::provider::types::ProviderDriver;
+        let (driver, root) = driver_with_fake_claude(
+            r#"#!/bin/sh
+printf 'launch\n' >> "$(dirname "$0")/launches.log"
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"initialize"'*)
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{"commands":[{"name":"review","description":"Review"}],"models":[{"value":"default","resolvedModel":"claude-fable-9","displayName":"Default"},{"value":"fable","resolvedModel":"claude-fable-9","displayName":"Fable 9","supportsEffort":true,"supportedEffortLevels":["low","high"]}]}}}\n' ;;
+  esac
+done
+"#,
+        );
+        let models = driver.cli_models(&root).await;
+        let ids = models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["default", "fable", "claude-fable-9"]);
+        assert_eq!(models[0].description, "Fable 9");
+        assert_eq!(models[1].supported_reasoning_efforts, ["low", "high"]);
+        let commands = driver.discover_commands(&root).await.unwrap();
+        assert_eq!(commands[0].name, "review");
+        let launches = std::fs::read_to_string(root.join("launches.log")).unwrap();
+        assert_eq!(launches.lines().count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_or_empty_probe_falls_back_to_the_built_in_catalog() {
+        for script in [
+            "#!/bin/sh\nexit 1\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do printf '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"todex-initialize\",\"response\":{\"commands\":[]}}}\\n'; done\n",
+        ] {
+            let (driver, root) = driver_with_fake_claude(script);
+            let models = driver.cli_models(&root).await;
+            assert_eq!(
+                models.iter().map(|model| &model.id).collect::<Vec<_>>(),
+                claude_model_aliases()
+                    .iter()
+                    .map(|model| &model.id)
+                    .collect::<Vec<_>>(),
+                "{script}"
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -2436,6 +2861,8 @@ fn claude_result_error(message: &Value) -> Option<String> {
 // Protocol reference: anthropics/claude-agent-sdk-python, _internal/query.py.
 // Use the same initialize exchange as the official Agent SDK before sending
 // a user turn. A rejected/unsupported control channel must fail before tools run.
+// Returns the raw `initialize` control response; callers read the command
+// catalog and model list from it.
 //
 // `expected_mode` is the requested `--permission-mode`: when the response
 // reports another one in place of bypass or auto, a `get_settings` probe
@@ -2444,7 +2871,7 @@ async fn initialize_claude(
     process: &mut JsonLineProcess,
     cancel: &mut watch::Receiver<bool>,
     expected_mode: Option<&str>,
-) -> Result<(Vec<ProviderCommandDescriptor>, permission_mode::ModeReport), AppError> {
+) -> Result<(Value, permission_mode::ModeReport), AppError> {
     process
         .send(&json!({
             "type": "control_request",
@@ -2491,7 +2918,7 @@ async fn initialize_claude(
                             .map(str::to_owned),
                         settings: None,
                     };
-                    Ok((claude_command_catalog(&message), report))
+                    Ok((message, report))
                 } else {
                     Err(AppError::ProviderUnavailable(format!(
                         "Claude Code initialization rejected: {}",
@@ -2504,7 +2931,7 @@ async fn initialize_claude(
             }
         }
     };
-    let (commands, mut report) = tokio::select! {
+    let (response, mut report) = tokio::select! {
         result = tokio::time::timeout(super::process::control_timeout()?, initialize) => {
             result.map_err(|_| AppError::ProviderUnavailable("Claude Code initialization timed out".to_owned()))??
         }
@@ -2527,7 +2954,7 @@ async fn initialize_claude(
             .unwrap_or_default(),
         );
     }
-    Ok((commands, report))
+    Ok((response, report))
 }
 
 /// How long start-up waits on the `get_settings` probe.
