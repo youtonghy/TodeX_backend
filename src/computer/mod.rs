@@ -94,6 +94,10 @@ pub(crate) struct ComputerStatus {
     pub host: String,
     pub platform: &'static str,
     pub permissions: Permissions,
+    /// The permission the person at the host is being guided to grant
+    /// right now (macOS: the drag-in panel is on screen).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_request: Option<platform::Permission>,
 }
 
 /// An app on this host that agents can name, for the composer's `@app:`
@@ -337,6 +341,7 @@ impl ComputerHost for NativeComputer {
             host: host_name(),
             platform: std::env::consts::OS,
             permissions,
+            permission_request: host_ui::permission_guide(),
         }
     }
 

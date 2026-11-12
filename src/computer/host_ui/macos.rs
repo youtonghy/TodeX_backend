@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dispatch2::run_on_main;
@@ -19,16 +19,23 @@ use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
 use objc2::{
-    define_class, msg_send, rc::Retained, runtime::AnyObject, sel, MainThreadMarker, MainThreadOnly,
+    define_class, msg_send,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+    sel, AnyThread, MainThreadMarker, MainThreadOnly,
 };
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
-    NSPanel, NSScreen, NSTextField, NSWindowCollectionBehavior, NSWindowSharingType,
-    NSWindowStyleMask,
+    NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession, NSDraggingSource,
+    NSEvent, NSFont, NSImageScaling, NSImageView, NSPanel, NSScreen, NSTextField,
+    NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask, NSWorkspace,
 };
-use objc2_foundation::{NSLocale, NSObject, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSArray, NSLocale, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+};
 
 use super::Strings;
+use crate::computer::platform::{self, Permission};
 
 const SHORTCUT_LABEL: &str = "⌘⇧⎋";
 
@@ -63,6 +70,15 @@ struct Ui {
     answer_target: Retained<AnswerTarget>,
     /// The confirmation on screen, if any.
     confirming: Option<Retained<NSAlert>>,
+    guide_target: Retained<GuideTarget>,
+    /// The permission guide on screen, if any.
+    guide: Option<Guide>,
+}
+
+/// The panel that offers `todex-agentd` to drag into System Settings.
+struct Guide {
+    panel: Retained<NSPanel>,
+    purpose: Retained<NSTextField>,
 }
 
 struct Pill {
@@ -168,6 +184,8 @@ pub(super) fn run_with_main_loop(body: impl FnOnce() + Send + 'static) -> ! {
                     stop_target: StopTarget::new(mtm),
                     answer_target: AnswerTarget::new(mtm),
                     confirming: None,
+                    guide_target: GuideTarget::new(mtm),
+                    guide: None,
                 });
             });
             super::mark_available();
@@ -415,4 +433,330 @@ pub(super) fn confirm(
         run_on_main(|_| close_confirmation());
     }
     Some(answer.unwrap_or(false))
+}
+
+const GUIDE_WIDTH: f64 = 440.0;
+const GUIDE_HEIGHT: f64 = 76.0;
+const GUIDE_ICON: f64 = 48.0;
+/// How often the guide follows System Settings and rereads the grants.
+const GUIDE_TICK: Duration = Duration::from_millis(300);
+/// A guide nobody acted on goes away.
+const GUIDE_TIMEOUT: Duration = Duration::from_secs(300);
+/// The guide on screen; a newer guide or closing it moves this on, which
+/// ends the older guide's thread.
+static GUIDE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements and GuideTarget
+    // does not implement Drop.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TodexComputerGuideTarget"]
+    struct GuideTarget;
+
+    impl GuideTarget {
+        #[unsafe(method(closeGuide:))]
+        fn close_guide(&self, _sender: Option<&AnyObject>) {
+            GUIDE_GENERATION.fetch_add(1, Ordering::SeqCst);
+            super::set_permission_guide(None);
+            UI.with(|ui| {
+                if let Some(guide) = ui.borrow_mut().as_mut().and_then(|ui| ui.guide.take()) {
+                    guide.panel.orderOut(None);
+                }
+            });
+        }
+    }
+);
+
+impl GuideTarget {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        // SAFETY: plain NSObject init.
+        unsafe { msg_send![Self::alloc(mtm), init] }
+    }
+}
+
+define_class!(
+    // SAFETY: NSImageView allows subclassing, the overrides keep its
+    // contracts (a drag instead of the default mouse tracking), and
+    // DragIcon does not implement Drop.
+    #[unsafe(super(NSImageView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TodexComputerDragIcon"]
+    struct DragIcon;
+
+    impl DragIcon {
+        // The panel never becomes key: the first click must start the drag.
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            self.drag_executable(event);
+        }
+    }
+
+    unsafe impl NSObjectProtocol for DragIcon {}
+
+    unsafe impl NSDraggingSource for DragIcon {
+        #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
+        fn source_operation(
+            &self,
+            _session: &NSDraggingSession,
+            _context: NSDraggingContext,
+        ) -> NSDragOperation {
+            NSDragOperation::Copy
+        }
+    }
+);
+
+impl DragIcon {
+    /// Starts dragging this executable's file, which the privacy lists of
+    /// System Settings take like a file picked with their "+" button.
+    fn drag_executable(&self, event: &NSEvent) {
+        let Some(path) = executable_path() else {
+            return;
+        };
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path));
+        let item = NSDraggingItem::initWithPasteboardWriter(
+            NSDraggingItem::alloc(),
+            ProtocolObject::from_ref(&*url),
+        );
+        let image = self.image();
+        // SAFETY: an NSImage is a valid dragging-frame content.
+        unsafe {
+            item.setDraggingFrame_contents(
+                self.bounds(),
+                image
+                    .as_deref()
+                    .map(|image| -> &AnyObject { image.as_ref() }),
+            );
+        }
+        let items = NSArray::from_retained_slice(&[item]);
+        self.beginDraggingSessionWithItems_event_source(
+            &items,
+            event,
+            ProtocolObject::from_ref(self),
+        );
+    }
+}
+
+/// The file TCC knows this daemon by.
+fn executable_path() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    exe.to_str().map(str::to_owned)
+}
+
+fn guide_purpose(permission: Permission) -> &'static str {
+    match (permission, super::chinese()) {
+        (Permission::Screen, true) => "授予“屏幕录制”，Agent 才能看到屏幕内容",
+        (Permission::Accessibility, true) => "授予“辅助功能”，Agent 才能点击和输入",
+        (Permission::Screen, false) => "Screen Recording lets agents see the screen",
+        (Permission::Accessibility, false) => "Accessibility lets agents click and type",
+    }
+}
+
+fn build_guide(ui: &Ui, mtm: MainThreadMarker) -> Guide {
+    let chinese = super::chinese();
+    let frame = NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(GUIDE_WIDTH, GUIDE_HEIGHT),
+    );
+    let panel = overlay_panel(mtm, frame);
+    panel.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.1, 0.94)));
+    let inset = (GUIDE_HEIGHT - GUIDE_ICON) / 2.0;
+    let icon: Retained<DragIcon> = {
+        let frame = NSRect::new(
+            NSPoint::new(inset, inset),
+            NSSize::new(GUIDE_ICON, GUIDE_ICON),
+        );
+        // SAFETY: NSView's designated initialiser.
+        unsafe { msg_send![DragIcon::alloc(mtm), initWithFrame: frame] }
+    };
+    if let Some(path) = executable_path() {
+        let image = NSWorkspace::sharedWorkspace().iconForFile(&NSString::from_str(&path));
+        icon.setImage(Some(&image));
+    }
+    icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+    let text_x = inset * 2.0 + GUIDE_ICON;
+    let text_width = GUIDE_WIDTH - text_x - 88.0;
+    let title = NSTextField::labelWithString(
+        &NSString::from_str(if chinese {
+            "把 todex-agentd 拖到上方的列表中"
+        } else {
+            "Drag todex-agentd into the list above"
+        }),
+        mtm,
+    );
+    title.setTextColor(Some(&NSColor::whiteColor()));
+    title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+    title.setFrame(NSRect::new(
+        NSPoint::new(text_x, 40.0),
+        NSSize::new(text_width, 18.0),
+    ));
+    let purpose = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+    purpose.setTextColor(Some(&NSColor::colorWithWhite_alpha(1.0, 0.7)));
+    purpose.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    purpose.setFrame(NSRect::new(
+        NSPoint::new(text_x, 18.0),
+        NSSize::new(text_width, 16.0),
+    ));
+    // SAFETY: the target outlives the button (kept in `Ui`).
+    let close = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str(if chinese { "关闭" } else { "Close" }),
+            Some(&ui.guide_target),
+            Some(sel!(closeGuide:)),
+            mtm,
+        )
+    };
+    close.setFrame(NSRect::new(
+        NSPoint::new(GUIDE_WIDTH - 80.0, (GUIDE_HEIGHT - 28.0) / 2.0),
+        NSSize::new(68.0, 28.0),
+    ));
+    if let Some(content) = panel.contentView() {
+        content.addSubview(&icon);
+        content.addSubview(&title);
+        content.addSubview(&purpose);
+        content.addSubview(&close);
+    }
+    Guide { panel, purpose }
+}
+
+/// Main thread: puts the guide under System Settings' window (inside its
+/// bottom edge when there is no room below), or in the middle of the main
+/// screen while that window is not up.
+fn place_guide(guide: &Guide, settings: Option<(f64, f64, f64, f64)>, mtm: MainThreadMarker) {
+    let origin = match settings {
+        Some((x, y, width, height)) => {
+            let bottom = primary_height(mtm) - (y + height);
+            let centre = NSPoint::new(x + width / 2.0, bottom + height / 2.0);
+            let floor = NSScreen::screens(mtm)
+                .iter()
+                .find(|screen| {
+                    let frame = screen.frame();
+                    centre.x >= frame.origin.x
+                        && centre.x < frame.origin.x + frame.size.width
+                        && centre.y >= frame.origin.y
+                        && centre.y < frame.origin.y + frame.size.height
+                })
+                .map_or(0.0, |screen| screen.visibleFrame().origin.y);
+            let below = bottom - 8.0 - GUIDE_HEIGHT;
+            NSPoint::new(
+                x + (width - GUIDE_WIDTH) / 2.0,
+                if below >= floor { below } else { bottom + 16.0 },
+            )
+        }
+        None => {
+            let Some(screen) = NSScreen::mainScreen(mtm) else {
+                return;
+            };
+            let visible = screen.visibleFrame();
+            NSPoint::new(
+                visible.origin.x + (visible.size.width - GUIDE_WIDTH) / 2.0,
+                visible.origin.y + (visible.size.height - GUIDE_HEIGHT) / 2.0,
+            )
+        }
+    };
+    let current = guide.panel.frame().origin;
+    if (current.x - origin.x).abs() > 0.5 || (current.y - origin.y).abs() > 0.5 {
+        guide.panel.setFrameOrigin(origin);
+    }
+}
+
+/// Shows the guide for `permission` if `generation` is still the current
+/// one.
+fn present_guide(generation: u64, permission: Permission) {
+    let settings = platform::settings_window().flatten();
+    with_ui(move |ui, mtm| {
+        if GUIDE_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        if ui.guide.is_none() {
+            ui.guide = Some(build_guide(ui, mtm));
+        }
+        if let Some(guide) = &ui.guide {
+            guide
+                .purpose
+                .setStringValue(&NSString::from_str(guide_purpose(permission)));
+            place_guide(guide, settings, mtm);
+            guide.panel.orderFrontRegardless();
+        }
+        super::set_permission_guide(Some(permission));
+    });
+}
+
+/// Takes the guide off screen if `generation` is still the current one.
+fn dismiss_guide(generation: u64) {
+    with_ui(move |ui, _| {
+        if GUIDE_GENERATION
+            .compare_exchange(
+                generation,
+                generation + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+        super::set_permission_guide(None);
+        if let Some(guide) = ui.guide.take() {
+            guide.panel.orderOut(None);
+        }
+    });
+}
+
+pub(super) fn show_permission_guide(mut missing: Vec<Permission>) {
+    let Some(first) = missing.first().copied() else {
+        return;
+    };
+    let generation = GUIDE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    present_guide(generation, first);
+    let spawned = std::thread::Builder::new()
+        .name("todex-permission-guide".to_owned())
+        .spawn(move || {
+            let opened = Instant::now();
+            // System Settings takes a moment to start; only its quitting
+            // after it was seen ends the guide.
+            let mut settings_seen = false;
+            loop {
+                std::thread::sleep(GUIDE_TICK);
+                if GUIDE_GENERATION.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                let granted = platform::permissions();
+                let before = missing.len();
+                missing.retain(|permission| !permission.granted(granted));
+                let settings = platform::settings_window();
+                settings_seen |= settings.is_some();
+                let Some(current) = missing.first().copied() else {
+                    return dismiss_guide(generation);
+                };
+                if opened.elapsed() > GUIDE_TIMEOUT || (settings_seen && settings.is_none()) {
+                    return dismiss_guide(generation);
+                }
+                if missing.len() != before {
+                    // The one being asked for was granted: on to the next.
+                    platform::open_privacy_pane(current);
+                    present_guide(generation, current);
+                    continue;
+                }
+                let settings = settings.flatten();
+                with_ui(move |ui, mtm| {
+                    if GUIDE_GENERATION.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    if let Some(guide) = &ui.guide {
+                        place_guide(guide, settings, mtm);
+                    }
+                });
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("todex-agentd: could not follow the permission guide: {error}");
+        dismiss_guide(generation);
+    }
 }

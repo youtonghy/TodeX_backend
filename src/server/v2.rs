@@ -11442,6 +11442,7 @@ mod tests {
                 host: "test-host".into(),
                 platform: "macos",
                 permissions: crate::computer::platform::Permissions::default(),
+                permission_request: None,
             }
         }
 

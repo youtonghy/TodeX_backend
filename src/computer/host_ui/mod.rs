@@ -27,13 +27,15 @@ use other as native;
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         OnceLock,
     },
     time::Duration,
 };
 
 use tokio::sync::broadcast;
+
+use super::platform::Permission;
 
 /// The global shortcut that stops a session on this OS, as shown to
 /// people; `None` where the only stop control is the pill's or the status
@@ -104,6 +106,41 @@ pub(crate) fn show_status(summary: &str) {
 pub(crate) fn hide_status() {
     if available() {
         native::hide_status();
+    }
+}
+
+/// The permission the on-screen guide is asking for: 0 when there is none.
+static PERMISSION_GUIDE: AtomicU8 = AtomicU8::new(0);
+
+/// The permission the person at this computer is being guided to grant
+/// right now, if a guide is on screen.
+pub(crate) fn permission_guide() -> Option<Permission> {
+    match PERMISSION_GUIDE.load(Ordering::SeqCst) {
+        1 => Some(Permission::Screen),
+        2 => Some(Permission::Accessibility),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_permission_guide(permission: Option<Permission>) {
+    let value = match permission {
+        None => 0,
+        Some(Permission::Screen) => 1,
+        Some(Permission::Accessibility) => 2,
+    };
+    PERMISSION_GUIDE.store(value, Ordering::SeqCst);
+}
+
+/// Shows the floating panel that offers `todex-agentd` to drag into
+/// System Settings, for each of `missing` in turn (the caller has opened
+/// the first one's list). Replaces a guide already on screen; closes by
+/// itself once everything is granted, System Settings quits, or nobody
+/// acted for a few minutes.
+#[cfg(target_os = "macos")]
+pub(crate) fn show_permission_guide(missing: Vec<Permission>) {
+    if available() {
+        native::show_permission_guide(missing);
     }
 }
 

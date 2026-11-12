@@ -197,40 +197,71 @@ pub(crate) fn permissions() -> Permissions {
     }
 }
 
-/// Shows the system prompt for each requested permission that is missing.
-/// macOS asks once per identity: after an answer, or a dismissed prompt,
-/// the request calls do nothing, so a permission still missing afterwards
-/// also opens its pane in System Settings.
+/// Asks the person at this Mac for each requested permission that is
+/// missing: System Settings opens on the permission's list and a floating
+/// panel offers `todex-agentd` to drag into it (the guide moves on to the
+/// next permission by itself). Without a host UI nobody can be shown the
+/// panel, so the system prompts are used instead; macOS shows those once
+/// per identity, hence the pane as well.
 pub(crate) fn request_permissions(which: Option<Permission>) -> Permissions {
     let current = permissions();
+    let missing: Vec<Permission> = [Permission::Screen, Permission::Accessibility]
+        .into_iter()
+        .filter(|permission| permission.requested(which) && !permission.granted(current))
+        .collect();
+    let Some(first) = missing.first().copied() else {
+        return current;
+    };
+    if crate::computer::host_ui::available() {
+        open_privacy_pane(first);
+        crate::computer::host_ui::show_permission_guide(missing);
+        return current;
+    }
     // SAFETY: the options dictionary lives across the call.
     unsafe {
-        if Permission::Accessibility.requested(which) && !current.accessibility {
+        if missing.contains(&Permission::Accessibility) {
             let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
             let options = CFDictionary::from_CFType_pairs(&[(key, CFBoolean::true_value())]);
             AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef());
         }
-        if Permission::Screen.requested(which) && !current.screen {
+        if missing.contains(&Permission::Screen) {
             CGRequestScreenCaptureAccess();
         }
     }
     let after = permissions();
-    if Permission::Accessibility.requested(which) && !after.accessibility {
-        open_privacy_pane("Privacy_Accessibility");
-    }
-    if Permission::Screen.requested(which) && !after.screen {
-        open_privacy_pane("Privacy_ScreenCapture");
+    for permission in missing {
+        if !permission.granted(after) {
+            open_privacy_pane(permission);
+        }
     }
     after
 }
 
-fn open_privacy_pane(anchor: &str) {
+/// Opens System Settings on the list that grants `permission`.
+pub(crate) fn open_privacy_pane(permission: Permission) {
+    let anchor = match permission {
+        Permission::Screen => "Privacy_ScreenCapture",
+        Permission::Accessibility => "Privacy_Accessibility",
+    };
     let url = format!("x-apple.systempreferences:com.apple.preference.security?{anchor}");
     match Command::new("open").arg(url).status() {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!("todex-agentd: open System Settings ({anchor}) failed: {status}"),
         Err(error) => eprintln!("todex-agentd: could not open System Settings ({anchor}): {error}"),
     }
+}
+
+/// System Settings, as the permission guide needs it: `None` when it is
+/// not running, otherwise its front window's frame in global top-left
+/// points (`None` while it has no window on screen).
+pub(crate) fn settings_window() -> Option<Option<(f64, f64, f64, f64)>> {
+    let pid = running_app("com.apple.systempreferences")?.pid;
+    Some(on_screen_windows().and_then(|windows| {
+        windows
+            .into_iter()
+            .find(|window| window.pid == pid && window.layer == 0)
+            .map(|window| (window.x, window.y, window.width, window.height))
+    }))
 }
 
 /// Seconds since the user last touched the mouse or keyboard. Events this

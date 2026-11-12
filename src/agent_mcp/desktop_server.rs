@@ -1346,6 +1346,7 @@ mod tests {
                     screen: true,
                     accessibility: true,
                 },
+                permission_request: None,
             }
         }
 

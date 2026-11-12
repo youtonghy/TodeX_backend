@@ -101,7 +101,7 @@ impl Permissions {
 
 /// One of the [`Permissions`], for asking the person at the host for it
 /// alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Permission {
     Screen,
@@ -113,6 +113,15 @@ impl Permission {
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub(crate) fn requested(self, which: Option<Permission>) -> bool {
         which.is_none_or(|which| which == self)
+    }
+
+    /// Whether `permissions` already has `self`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn granted(self, permissions: Permissions) -> bool {
+        match self {
+            Permission::Screen => permissions.screen,
+            Permission::Accessibility => permissions.accessibility,
+        }
     }
 }
 
