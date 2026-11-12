@@ -445,6 +445,12 @@ const GUIDE_TIMEOUT: Duration = Duration::from_secs(300);
 /// The guide on screen; a newer guide or closing it moves this on, which
 /// ends the older guide's thread.
 static GUIDE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The guide generation whose icon was last dropped somewhere that took
+/// it; 0 when none was since the guide last read it.
+static GUIDE_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// How long a drop may go without the grant showing before the guide
+/// explains what is still missing.
+const GUIDE_DROP_GRACE: Duration = Duration::from_secs(3);
 
 define_class!(
     // SAFETY: NSObject has no subclassing requirements and GuideTarget
@@ -508,6 +514,13 @@ define_class!(
         ) -> NSDragOperation {
             NSDragOperation::Copy
         }
+
+        #[unsafe(method(draggingSession:endedAtPoint:operation:))]
+        fn ended(&self, _session: &NSDraggingSession, _point: NSPoint, operation: NSDragOperation) {
+            if operation != NSDragOperation::None {
+                GUIDE_DROPPED.store(GUIDE_GENERATION.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+        }
     }
 );
 
@@ -556,6 +569,34 @@ fn guide_purpose(permission: Permission) -> &'static str {
         (Permission::Screen, false) => "Screen Recording lets agents see the screen",
         (Permission::Accessibility, false) => "Accessibility lets agents click and type",
     }
+}
+
+/// What the guide says when a drop went through but the grant still does
+/// not show: macOS applies Screen Recording to a running process only once
+/// it restarts, and an Accessibility entry may have landed switched off.
+fn guide_after_drop(permission: Permission) -> &'static str {
+    match (permission, super::chinese()) {
+        (Permission::Screen, true) => "已添加？屏幕录制需重启 TodeX 后端后生效",
+        (Permission::Accessibility, true) => "已添加？请确认列表中 todex-agentd 的开关已打开",
+        (Permission::Screen, false) => {
+            "Added? Restart the TodeX backend for Screen Recording to apply"
+        }
+        (Permission::Accessibility, false) => {
+            "Added? Make sure todex-agentd is switched on in the list"
+        }
+    }
+}
+
+/// Replaces the guide's second line if `generation` is still on screen.
+fn set_guide_text(generation: u64, text: &'static str) {
+    with_ui(move |ui, _| {
+        if GUIDE_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        if let Some(guide) = &ui.guide {
+            guide.purpose.setStringValue(&NSString::from_str(text));
+        }
+    });
 }
 
 fn build_guide(ui: &Ui, mtm: MainThreadMarker) -> Guide {
@@ -722,6 +763,10 @@ pub(super) fn show_permission_guide(mut missing: Vec<Permission>) {
             // System Settings takes a moment to start; only its quitting
             // after it was seen ends the guide.
             let mut settings_seen = false;
+            // When the icon was dropped for the permission asked for now,
+            // and whether the guide already said what is still missing.
+            let mut dropped_at: Option<Instant> = None;
+            let mut explained = false;
             loop {
                 std::thread::sleep(GUIDE_TICK);
                 if GUIDE_GENERATION.load(Ordering::SeqCst) != generation {
@@ -740,9 +785,22 @@ pub(super) fn show_permission_guide(mut missing: Vec<Permission>) {
                 }
                 if missing.len() != before {
                     // The one being asked for was granted: on to the next.
+                    dropped_at = None;
+                    explained = false;
+                    GUIDE_DROPPED.store(0, Ordering::SeqCst);
                     platform::open_privacy_pane(current);
                     present_guide(generation, current);
                     continue;
+                }
+                if GUIDE_DROPPED
+                    .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    dropped_at = Some(Instant::now());
+                }
+                if !explained && dropped_at.is_some_and(|at| at.elapsed() >= GUIDE_DROP_GRACE) {
+                    explained = true;
+                    set_guide_text(generation, guide_after_drop(current));
                 }
                 let settings = settings.flatten();
                 with_ui(move |ui, mtm| {
