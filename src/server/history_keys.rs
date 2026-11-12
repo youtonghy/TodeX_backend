@@ -383,6 +383,79 @@ async fn fulfill(
     Ok(json!({ "added": added }))
 }
 
+/// History for the devices a group chain added (docs/mesh-v1.md "History"):
+/// each device's key becomes a recipient and, when it is new, a grant opens
+/// for it, which the group's devices fulfill without asking. The group's
+/// recovery key is set when this node has none. Failures are logged; they
+/// never undo the chain. Devices the chain removed are revoked and blocked
+/// by the registry's reconciliation, published here too.
+pub(super) async fn adopt_group_members(
+    state: &AppState,
+    devices: &[crate::mesh::roster::Member],
+    recovery: Option<&crate::mesh::roster::Recovery>,
+) {
+    let registry = state.history_keys.recipients();
+    for member in devices {
+        let Some(history_key) = &member.history_key else {
+            continue;
+        };
+        let registered = RecipientPublicKey::from_base64url(history_key)
+            .and_then(|key| registry.register_device(&member.id, &key));
+        let applied = match registered {
+            Ok(applied) => applied,
+            Err(error) => {
+                tracing::warn!(device_id = %member.id, error = %error, "group member history key was not registered");
+                continue;
+            }
+        };
+        let Some(written) = applied.written else {
+            continue;
+        };
+        let update = Updated::new("recipient.registered")
+            .rid(&applied.value)
+            .device(&member.id);
+        publish(state, Some(written), update).await;
+        match registry.request_grant(&member.id) {
+            Ok(applied) => {
+                let update = Updated::new("grant.requested")
+                    .grant(&applied.value.grant_id)
+                    .rid(&applied.value.rid)
+                    .device(&member.id);
+                publish(state, applied.written, update).await;
+            }
+            Err(error) => {
+                tracing::warn!(device_id = %member.id, error = %error, "group member history grant was not opened");
+            }
+        }
+    }
+    if let Some(recovery) = recovery {
+        let has_recovery = registry
+            .snapshot()
+            .map(|snapshot| {
+                snapshot.recipients.iter().any(|record| {
+                    record.kind == RecipientKind::Recovery && record.revoked_at.is_none()
+                })
+            })
+            .unwrap_or(true);
+        if !has_recovery {
+            match RecipientPublicKey::from_base64url(&recovery.history_key)
+                .and_then(|key| registry.set_recovery(&key))
+            {
+                Ok(applied) => {
+                    let update = Updated::new("recovery.set").rid(&applied.value);
+                    publish(state, applied.written, update).await;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "group recovery key was not set");
+                }
+            }
+        }
+    }
+    if let Err(error) = publish_external_changes(state).await {
+        tracing::warn!(error = %error, "history registry was not reconciled with the group");
+    }
+}
+
 /// Announces device blocks the registry noticed outside `history.*`
 /// commands: the TUI revoking devices through `devices.json` from its own
 /// process, or the daemon blocking devices that vanished from it. Called

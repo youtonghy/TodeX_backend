@@ -870,6 +870,16 @@ curl -N -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
 
 transcript、HKDF 标签与验证码格式见 [transport-v2.md](transport-v2.md#device-pairing-v3-commit-then-reveal) 与 [设备验证](device-verification.md)。
 
+### 设备组（mesh v1）
+
+规范见 [mesh-v1.md](mesh-v1.md)。设备组让一组后端与客户端设备互相信任：设备加入一次即可访问组内所有后端并读取历史，加入申请由组内任一已加入的设备批准，不在后端批准。点对点配对保持不变。
+
+- 加入沿用配对 v3：`POST /v2/device-pairing/create` 的请求体多一个 `mesh` 对象（`deviceJoin` 或 `nodeJoin`），`reveal` 可带 `joinCodeProof`，凭据多出 `groupId`（节点加入另有 `nodeId`、`nodePublicKey`、`joinProof`）。带 `mesh` 的申请不出现在 TUI 与 `pair list` 中，也不写 `devices.json`。
+- WebSocket 命令：`mesh.node.get`、`mesh.state.get`、`mesh.state.push`、`mesh.join.list`、`mesh.join.approve`、`mesh.join.reject`；事件 `mesh.updated`（`reason` 为 `join.requested`、`join.decided`、`roster.updated`、`node-info.updated`、`group.left`）。
+- 组内设备经设备认证照常签名请求；后端按 `devices.json`、所在设备组的成员、节点加入时的临时准入依次查找设备。被移出组的设备下一个请求即被拒绝，已开的 WebSocket 在 5 秒内以 `4401` 关闭，其历史接收方被吊销并封禁。
+- 组名单新增设备时，后端登记其历史公钥并为其开一个授权（`grant.requested`）；组内其他设备自动完成授权，不再弹窗。
+- 状态保存在 `$DATA_DIR/mesh/`（`node-key.json`、`groups/<groupId>.json`、`join-code.json`，均 0600）。命令行：`todex-agentd mesh join-code [--new]`、`todex-agentd mesh status`；未加入任何组的后端启动时在日志中打印加入码。
+
 ### 健康检查
 
 ```http
@@ -906,6 +916,7 @@ GET /v2/version
 | `historyEncryption` | number | 后端支持的历史加密版本（当前 `1`），见「历史加密密钥」 |
 | `terminalReplay` | number | 终端输出序号与 `terminal.attach` / `terminal.clear` 的协议版本（当前 `1`），见「终端」；旧后端没有该字段 |
 | `terminalSnapshot` | number | `terminal.attach` 无法衔接时发送屏幕快照（当前 `1`），见「终端」；旧后端没有该字段 |
+| `mesh` | number | 设备组协议版本（当前 `1`），见「设备组」；`enable_auth = false` 或旧后端没有该字段，客户端据此隐藏设备组功能 |
 
 ## 本机 IPC 与本地管理 API
 
@@ -924,6 +935,7 @@ IPC 上是普通 HTTP/1.1（含 WebSocket 升级），客户端发送 `Host: loc
 | `POST /v2/local-admin/pairing-requests/{requestId}/decision` | body `{approved, verificationCode}`。验证码须与该申请一致（不区分大小写，连字符可省），否则 409 `code_mismatch`；申请不存在、已过期或已决定 404 `not_found`。成功 `{ok: true}` |
 | `GET /v2/local-admin/devices` | `[{deviceId, name, publicKey, pairedAt, lastSeenAt\|null}]` |
 | `DELETE /v2/local-admin/devices/{deviceId}` | 吊销设备（同 `devices revoke`），`{ok: true}`；不存在 404 `not_found` |
+| `POST /v2/local-admin/mesh/join-code` | 新建并返回设备组加入码 `{code, createdAt, expiresAt}`（毫秒），替换已有的码；桌面端据此把本机后端加入设备组。未开启设备认证时 501 |
 | `POST /v2/local-admin/reset` | body `{target: "devices"\|"encryption"}`：吊销全部设备，或重新生成传输密钥（同 TUI 重置）。`{ok: true, restartRequired: true}` |
 
 ## Workspace 缓存同步

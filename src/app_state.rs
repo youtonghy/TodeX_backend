@@ -21,6 +21,7 @@ use crate::{
     history_keys::HistoryKeys,
     kanban_store::KanbanTaskStore,
     local_terminal::LocalTerminalManager,
+    mesh::MeshStore,
     provider::{CliManager, ConversationSupervisor},
     quota_store::QuotaStore,
     remote_fs::RemoteSessions,
@@ -47,6 +48,8 @@ pub struct AppState {
     pub pairing_keys: PairingKeyStore,
     pub(crate) device_auth: DeviceAuthenticator,
     pub(crate) device_pairing: DevicePairingRegistry,
+    /// Device groups (docs/mesh-v1.md); `None` without device auth.
+    pub(crate) mesh: Option<MeshStore>,
     /// History encryption recipients, keyrings and DEKs; see
     /// [`crate::history_keys`].
     pub(crate) history_keys: HistoryKeys,
@@ -146,7 +149,17 @@ impl AppState {
         ssh.set_reserved_listeners(reserved_listeners(&config));
         let agent_desktop = AgentDesktop::load(&config.data_dir).await?;
         let agent_mcp = AgentMcp::new(&config.data_dir, ssh.clone(), agent_desktop.clone()).await?;
-        let devices = DeviceRegistry::load(&config.data_dir)?;
+        // Groups authorize their devices through the device registry, so
+        // device auth, socket rechecks and history revocation follow them.
+        let mesh = if config.security.enable_auth {
+            Some(MeshStore::load(&config.data_dir)?)
+        } else {
+            None
+        };
+        let mut devices = DeviceRegistry::load(&config.data_dir)?;
+        if let Some(mesh) = &mesh {
+            devices = devices.with_mesh(mesh.clone());
+        }
         crate::config::warn_retired_history_encryption(&config.data_dir);
         let history_keys = HistoryKeys::load(
             &config.data_dir,
@@ -199,13 +212,16 @@ impl AppState {
         let device_auth = DeviceAuthenticator::new(devices.clone());
         // Pairing reads the same key store and configured protocol as the
         // handshake, so the key it delivers is the one the transport uses.
-        let device_pairing = DevicePairingRegistry::new(
+        let mut device_pairing = DevicePairingRegistry::new(
             &config.data_dir,
             config.security.enable_auth,
             devices,
             pairing_keys.clone(),
             config.pairing_encryption,
         )?;
+        if let Some(mesh) = &mesh {
+            device_pairing = device_pairing.with_mesh(mesh.clone());
+        }
         let websocket_connections = Arc::new(AtomicUsize::new(0));
         let audit_log = crate::event::AuditLog::default();
 
@@ -224,6 +240,7 @@ impl AppState {
             pairing_keys,
             device_auth,
             device_pairing,
+            mesh,
             history_keys,
             api_keys,
             agent_calling,

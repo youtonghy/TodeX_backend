@@ -52,6 +52,7 @@ pub(crate) fn routes(state: AppState, info: LocalAdminInfo) -> Router {
         .route("/v2/local-admin/devices", get(devices))
         .route("/v2/local-admin/devices/{device_id}", delete(revoke_device))
         .route("/v2/local-admin/reset", post(reset))
+        .route("/v2/local-admin/mesh/join-code", post(mesh_join_code))
         .with_state(LocalAdmin {
             state,
             info: Arc::new(info),
@@ -476,6 +477,15 @@ struct DeviceBody {
     public_key: String,
     paired_at: u64,
     last_seen_at: Option<u64>,
+}
+
+/// A fresh join code, so the desktop can add its own backend to a group
+/// (docs/mesh-v1.md "A node joins").
+async fn mesh_join_code(State(admin): State<LocalAdmin>) -> AdminResult<crate::mesh::JoinCode> {
+    let Some(mesh) = &admin.state.mesh else {
+        return Err(AppError::Unsupported("device groups need device auth".to_owned()).into());
+    };
+    Ok(Json(mesh.join_code(true)?))
 }
 
 async fn devices(State(admin): State<LocalAdmin>) -> AdminResult<Vec<DeviceBody>> {

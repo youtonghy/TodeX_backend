@@ -133,6 +133,12 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "history.keys.list"
             | "history.keys.wraps"
             | "history.device.restore"
+            | "mesh.node.get"
+            | "mesh.state.get"
+            | "mesh.state.push"
+            | "mesh.join.list"
+            | "mesh.join.approve"
+            | "mesh.join.reject"
     )
 }
 
@@ -555,6 +561,7 @@ pub(super) async fn version(
         history_encryption: HISTORY_ENCRYPTION_VERSION,
         terminal_replay: crate::local_terminal::TERMINAL_REPLAY_VERSION,
         terminal_snapshot: crate::local_terminal::TERMINAL_SNAPSHOT_VERSION,
+        mesh: state.mesh.as_ref().map(|_| super::mesh::MESH_VERSION),
     })
 }
 
@@ -4209,6 +4216,9 @@ async fn dispatch_lane_command(
         command_type if history_keys::is_history_command(command_type) => {
             history_keys::dispatch(state, owner_id, device_id, command_type, &command.payload).await
         }
+        command_type if super::mesh::is_mesh_command(command_type) => {
+            super::mesh::dispatch(state, command_type, &command.payload).await
+        }
         other => Err(AppError::Unsupported(format!(
             "v2 websocket command {other}"
         ))),
@@ -4456,6 +4466,9 @@ pub(super) struct VersionResponse {
     /// Attach sends a screen snapshot when it cannot continue from `since`.
     #[serde(rename = "terminalSnapshot")]
     terminal_snapshot: u8,
+    /// Device groups (docs/mesh-v1.md); absent without device auth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mesh: Option<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -11605,6 +11618,172 @@ mod tests {
     #[tokio::test]
     async fn v2_history_key_commands_cover_registration_grants_and_revocation() {
         Box::pin(history_key_commands_scenario()).await;
+    }
+
+    #[tokio::test]
+    async fn v2_mesh_commands_join_groups_and_follow_their_devices() {
+        Box::pin(mesh_commands_scenario()).await;
+    }
+
+    async fn mesh_commands_scenario() {
+        use crate::mesh::roster::test_support::{append, device_member, genesis, node_member};
+        use crate::mesh::roster::{
+            parse_signing_public_key, verify_chain, NodeInfoBody, SignedDoc, NODE_INFO_DOMAIN,
+            NODE_INFO_TYPE,
+        };
+
+        let root = make_temp_workspace("v2-mesh");
+        let (state, _) = Box::pin(keyless_auth_test_state(&root, 0)).await;
+        let (outgoing, _events) = mpsc::channel(16);
+        let mut subscriptions = WsSubscriptions::declared();
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        let mut announcements = state.events.subscribe();
+        macro_rules! run {
+            ($type:expr, $payload:expr $(,)?) => {{
+                assert!(is_v2_native_command($type));
+                history_command(
+                    &state,
+                    &outgoing,
+                    &mut subscriptions,
+                    &event_scope,
+                    "dev_caller",
+                    $type,
+                    $payload,
+                )
+                .await
+            }};
+        }
+        let node = run!("mesh.node.get", json!({})).unwrap();
+        let node_id = node["nodeId"].as_str().unwrap().to_owned();
+        assert!(node["groups"].as_array().unwrap().is_empty());
+        assert_eq!(node["nodeInfo"]["body"].is_string(), true);
+        let node_key = parse_signing_public_key(node["nodePublicKey"].as_str().unwrap()).unwrap();
+
+        let creator = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let chain = genesis(&creator, 1);
+        let creator_member = verify_chain(&chain).unwrap().head().members[0].clone();
+        // A chain that does not list this node does not join it.
+        assert_eq!(
+            run!("mesh.state.push", json!({ "chain": chain }))
+                .unwrap_err()
+                .code(),
+            "NOT_FOUND"
+        );
+        let other_node = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let base = vec![
+            creator_member.clone(),
+            node_member(&node_key, &creator_member.id),
+            node_member(&other_node.verifying_key(), &creator_member.id),
+        ];
+        let joined = append(&chain, &creator, base.clone());
+        let other_info_body = NodeInfoBody {
+            doc_type: NODE_INFO_TYPE.to_owned(),
+            v: 1,
+            node_id: base[2].id.clone(),
+            public_key: base[2].public_key.clone(),
+            seq: 5,
+            name: "other".to_owned(),
+            transport_protocol: "x25519".to_owned(),
+            transport_public_key: "AAAA".to_owned(),
+            urls: vec!["http://10.0.0.9:7345".to_owned()],
+            signed_at: 5,
+        };
+        let other_info = SignedDoc::sign(
+            NODE_INFO_DOMAIN,
+            &serde_json::to_vec(&other_info_body).unwrap(),
+            &other_node,
+        );
+        let pushed = run!(
+            "mesh.state.push",
+            json!({ "chain": joined, "nodeInfos": [other_info] })
+        )
+        .unwrap();
+        assert_eq!(pushed["changed"], true);
+        assert_eq!(pushed["version"], 2);
+        let group_id = pushed["groupId"].as_str().unwrap().to_owned();
+        let mut reasons = Vec::new();
+        while let Ok(event) = announcements.try_recv() {
+            reasons.push((event.event_type.clone(), event.payload["reason"].clone()));
+        }
+        assert!(reasons.contains(&(
+            crate::server::mesh::UPDATED_EVENT.to_owned(),
+            json!("roster.updated")
+        )));
+        assert!(reasons.contains(&(
+            crate::server::mesh::UPDATED_EVENT.to_owned(),
+            json!("node-info.updated")
+        )));
+        assert!(reasons.contains(&(
+            super::history_keys::UPDATED_EVENT.to_owned(),
+            json!("grant.requested")
+        )));
+
+        // The creator authenticates and has a history recipient and a grant.
+        assert!(state.device_auth.is_registered(&creator_member.id));
+        let snapshot = state.history_keys.recipients().snapshot().unwrap();
+        assert!(snapshot.recipients.iter().any(|record| {
+            record.device_id.as_deref() == Some(creator_member.id.as_str())
+                && record.revoked_at.is_none()
+        }));
+        assert_eq!(
+            snapshot
+                .grants
+                .iter()
+                .filter(|grant| grant.device_id == creator_member.id)
+                .count(),
+            1
+        );
+        let listed = run!("mesh.state.get", json!({ "groupId": group_id })).unwrap();
+        assert_eq!(listed["nodeId"], node_id.as_str());
+        assert_eq!(listed["groups"][0]["chain"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            listed["groups"][0]["nodeInfos"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            run!("mesh.join.list", json!({})).unwrap()["requests"],
+            json!([])
+        );
+
+        // A second device joins and is removed again: it loses access and
+        // its history recipient.
+        let second = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
+        let second_member = device_member(&second, 2, &creator_member.id);
+        let with_second = append(
+            &joined,
+            &creator,
+            [base.clone(), vec![second_member.clone()]].concat(),
+        );
+        run!("mesh.state.push", json!({ "chain": with_second })).unwrap();
+        assert!(state.device_auth.is_registered(&second_member.id));
+        let without_second = append(&with_second, &creator, base.clone());
+        run!("mesh.state.push", json!({ "chain": without_second })).unwrap();
+        assert!(!state.device_auth.is_registered(&second_member.id));
+        let snapshot = state.history_keys.recipients().snapshot().unwrap();
+        assert!(snapshot
+            .revoked_devices
+            .iter()
+            .any(|entry| entry.device_id == second_member.id));
+        // An older chain loses to the stored one.
+        assert_eq!(
+            run!("mesh.state.push", json!({ "chain": joined })).unwrap()["changed"],
+            false
+        );
+
+        // A chain without this node takes it out of the group.
+        let left = append(
+            &without_second,
+            &creator,
+            vec![creator_member.clone(), base[2].clone()],
+        );
+        run!("mesh.state.push", json!({ "chain": left })).unwrap();
+        assert!(!state.device_auth.is_registered(&creator_member.id));
+        assert!(run!("mesh.node.get", json!({})).unwrap()["groups"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     /// One dispatch per call frame: in debug builds every inlined

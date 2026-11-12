@@ -74,6 +74,27 @@ pub enum DevicesCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum MeshCommand {
+    #[command(about = "Print the code that lets a device add this node to its group")]
+    JoinCode {
+        /// Replace the current code with a new one.
+        #[arg(long)]
+        new: bool,
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    #[command(about = "Show this node's id and the device groups it is in")]
+    Status {
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ProvidersCommand {
     #[command(about = "Install Agent CLIs with the same installers as the app")]
     Install {
@@ -383,6 +404,70 @@ pub fn devices(command: DevicesCommand) -> CommandResult {
                     format!("no paired device has id {device_id}; see `todex-agentd devices list`"),
                 ))
             }
+        }
+    }
+}
+
+/// `mesh join-code` and `mesh status` (docs/mesh-v1.md). They read and
+/// write the same `mesh/` files as the daemon, as its user.
+pub fn mesh(command: MeshCommand) -> CommandResult {
+    match command {
+        MeshCommand::JoinCode {
+            new,
+            format,
+            data_dir,
+        } => {
+            let config = load_config(data_dir)?;
+            ensure_control_owner(&config.data_dir, "mesh join-code")?;
+            let store = crate::mesh::MeshStore::load(&config.data_dir)?;
+            let code = store.join_code(new)?;
+            match format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&code).map_err(AppError::from)?
+                ),
+                OutputFormat::Text => {
+                    println!("Join code: {}", code.code);
+                    println!(
+                        "Valid until {} for one join.",
+                        format_ms(Some(code.expires_at))
+                    );
+                    println!("Enter it on a device of the group under Settings → Backend groups → Add backend.");
+                }
+            }
+            Ok(())
+        }
+        MeshCommand::Status { format, data_dir } => {
+            let config = load_config(data_dir)?;
+            ensure_control_owner(&config.data_dir, "mesh status")?;
+            let store = crate::mesh::MeshStore::load(&config.data_dir)?;
+            let groups = store.summaries()?;
+            match format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "nodeId": store.node_id(),
+                        "groups": groups,
+                    }))
+                    .map_err(AppError::from)?
+                ),
+                OutputFormat::Text => {
+                    println!("Node id: {}", store.node_id());
+                    if groups.is_empty() {
+                        println!("Not in a device group. Create a join code with `todex-agentd mesh join-code`.");
+                    }
+                    for group in &groups {
+                        println!(
+                            "{}  {:?}  version {}",
+                            group.group_id, group.name, group.version
+                        );
+                        for member in &group.members {
+                            println!("  {:<6} {}  {:?}", member.kind, member.id, member.name);
+                        }
+                    }
+                }
+            }
+            Ok(())
         }
     }
 }

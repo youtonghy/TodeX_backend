@@ -33,6 +33,7 @@ mod kanban_store;
 mod listen_addrs;
 mod local_terminal;
 mod mcp;
+mod mesh;
 mod native_history;
 mod pi_agent_templates;
 mod pi_mcp;
@@ -107,6 +108,11 @@ enum Command {
     Devices {
         #[command(subcommand)]
         command: admin_cli::DevicesCommand,
+    },
+    #[command(about = "Show this node's device groups or its join code")]
+    Mesh {
+        #[command(subcommand)]
+        command: admin_cli::MeshCommand,
     },
     #[command(about = "Install Agent CLIs")]
     Providers {
@@ -324,6 +330,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Pair { command } => exit_on_failure(admin_cli::pair(command)),
         Command::Devices { command } => exit_on_failure(admin_cli::devices(command)),
+        Command::Mesh { command } => exit_on_failure(admin_cli::mesh(command)),
         Command::Providers { command } => exit_on_failure(admin_cli::providers(command).await),
         Command::DaemonRun(args) => {
             init_serve_logging();

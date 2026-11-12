@@ -123,10 +123,16 @@ async fn reveal(
     ),
     AppError,
 > {
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(state.device_pairing.reveal(request)?),
-    ))
+    let request_id = request.request_id.clone();
+    let response = state.device_pairing.reveal(request)?;
+    if let Some(group_id) = state.device_pairing.mesh_join_group(&request_id) {
+        super::mesh::announce(
+            &state,
+            super::mesh::Announcement::new("join.requested", &group_id).request(&request_id),
+        )
+        .await;
+    }
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(response)))
 }
 async fn poll(
     State(state): State<AppState>,

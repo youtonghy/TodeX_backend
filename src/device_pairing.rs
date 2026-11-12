@@ -25,6 +25,7 @@
 use crate::config::PairingEncryption;
 use crate::devices::DeviceRegistry;
 use crate::error::AppError;
+use crate::mesh::{roster, MeshStore};
 use crate::transport_crypto::PairingKeyStore;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chacha20poly1305::{
@@ -92,6 +93,96 @@ pub(crate) struct CreateDevicePairingRequest {
     pub device_name: String,
     /// Long-term Ed25519 device identity key registered on approval.
     pub device_public_key: String,
+    /// Joining a device group instead of pairing with this backend
+    /// (docs/mesh-v1.md "Joining a group"); parsed by [`MeshPairing::parse`].
+    #[serde(default)]
+    pub mesh: Option<serde_json::Value>,
+}
+
+/// The `mesh` object of a create request.
+#[derive(Clone)]
+enum MeshPairing {
+    /// A device joins `group_id`; a device of the group decides.
+    DeviceJoin {
+        group_id: String,
+        history_key: String,
+    },
+    /// The caller adds this node to `group_id`, proving the join code.
+    NodeJoin { group_id: String },
+}
+
+impl MeshPairing {
+    fn parse(value: &serde_json::Value, device_public: &[u8; 32]) -> Result<Self> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            kind: String,
+            group_id: String,
+            #[serde(default)]
+            history_key: Option<String>,
+            #[serde(default)]
+            history_key_signature: Option<String>,
+        }
+        let raw: Raw = serde_json::from_value(value.clone())
+            .map_err(|_| invalid("malformed mesh pairing request"))?;
+        if !raw.group_id.starts_with("grp_") || raw.group_id.len() > 64 {
+            return Err(invalid("invalid groupId"));
+        }
+        match raw.kind.as_str() {
+            "deviceJoin" => {
+                let history_key = raw
+                    .history_key
+                    .ok_or_else(|| invalid("missing historyKey"))?;
+                let bytes = roster::parse_history_key(&history_key)?;
+                let signature = raw
+                    .history_key_signature
+                    .as_deref()
+                    .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+                    .and_then(|value| ed25519_dalek::Signature::from_slice(&value).ok())
+                    .ok_or_else(|| invalid("invalid historyKeySignature"))?;
+                let key = ed25519_dalek::VerifyingKey::from_bytes(device_public)
+                    .map_err(|_| invalid("invalid device public key"))?;
+                key.verify_strict(
+                    &roster::history_key_binding(&raw.group_id, &bytes),
+                    &signature,
+                )
+                .map_err(|_| invalid("historyKeySignature does not verify"))?;
+                Ok(Self::DeviceJoin {
+                    group_id: raw.group_id,
+                    history_key,
+                })
+            }
+            "nodeJoin" => Ok(Self::NodeJoin {
+                group_id: raw.group_id,
+            }),
+            _ => Err(invalid("unknown mesh pairing kind")),
+        }
+    }
+
+    fn group_id(&self) -> &str {
+        match self {
+            Self::DeviceJoin { group_id, .. } | Self::NodeJoin { group_id } => group_id,
+        }
+    }
+}
+
+/// A revealed, undecided device join, as `mesh.join.list` shows it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MeshJoinRequest {
+    pub request_id: String,
+    pub group_id: String,
+    pub verification_code: String,
+    pub device_name: String,
+    pub device_id: String,
+    pub device_public_key: String,
+    pub history_key: String,
+    pub peer_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub via_proxy: bool,
+    pub expires_at: u64,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +193,9 @@ pub(crate) struct RevealDevicePairingRequest {
     pub client_public_key: String,
     /// 32 random bytes committed together with the key.
     pub client_nonce: String,
+    /// A node join's proof of the join code (docs/mesh-v1.md).
+    #[serde(default)]
+    pub join_code_proof: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +216,12 @@ pub(crate) struct CreateDevicePairingResponse {
     /// Static public key the v2 handshake uses right now for that protocol,
     /// base64url without padding; empty for `none`.
     pub transport_public_key: String,
+    /// A node join: the node's id and Ed25519 key, authenticated later by
+    /// the credential's `joinProof`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_public_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -347,6 +447,7 @@ impl PairingMaterial {
         &self,
         device_id: &str,
         transport: &TransportBinding,
+        mesh: Option<CredentialMesh>,
         nonce: &[u8; 24],
     ) -> Result<String> {
         #[derive(Serialize)]
@@ -355,24 +456,40 @@ impl PairingMaterial {
             device_id: &'a str,
             transport_protocol: PairingEncryption,
             transport_public_key: String,
+            #[serde(flatten, skip_serializing_if = "Option::is_none")]
+            mesh: Option<CredentialMesh>,
         }
-        let plaintext = serde_json::to_vec(&Credential {
+        let plaintext = Zeroizing::new(serde_json::to_vec(&Credential {
             device_id,
             transport_protocol: transport.protocol,
             transport_public_key: URL_SAFE_NO_PAD.encode(&transport.public_key),
-        })?;
+            mesh,
+        })?);
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.wrap_key));
         let encrypted = cipher
             .encrypt(
                 XNonce::from_slice(nonce),
                 Payload {
-                    msg: &plaintext,
+                    msg: plaintext.as_slice(),
                     aad: &self.transcript,
                 },
             )
             .map_err(|_| invalid("unable to encrypt pairing response"))?;
         Ok(URL_SAFE_NO_PAD.encode(encrypted))
     }
+}
+
+/// The credential fields a group join adds.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialMesh {
+    group_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    join_proof: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -446,6 +563,10 @@ struct PendingRequest {
     reveals: RateWindow<()>,
     /// Poll and cancel calls (4 per second).
     proofs: RateWindow<()>,
+    /// A group join instead of a pairing; see [`MeshPairing`].
+    mesh: Option<MeshPairing>,
+    /// A node join's code key, kept from `reveal` for the server proof.
+    join_code_key: Option<Zeroizing<[u8; 32]>>,
 }
 struct RegistryState {
     directory: PathBuf,
@@ -473,6 +594,8 @@ pub(crate) struct DevicePairingRegistry {
     /// exactly the key the transport uses.
     transport_keys: PairingKeyStore,
     transport_protocol: PairingEncryption,
+    /// This node's groups; `None` disables group joins.
+    mesh: Option<MeshStore>,
 }
 impl DevicePairingRegistry {
     pub(crate) fn new(
@@ -509,6 +632,7 @@ impl DevicePairingRegistry {
             devices,
             transport_keys,
             transport_protocol,
+            mesh: None,
             inner: Arc::new(Mutex::new(RegistryState {
                 directory,
                 requests: HashMap::new(),
@@ -516,6 +640,12 @@ impl DevicePairingRegistry {
                 lookups: RateWindow::new(Duration::from_secs(1)),
             })),
         })
+    }
+
+    /// Accepts group joins (docs/mesh-v1.md) for `mesh`'s groups.
+    pub(crate) fn with_mesh(mut self, mesh: MeshStore) -> Self {
+        self.mesh = Some(mesh);
+        self
     }
 
     #[cfg(test)]
@@ -570,6 +700,36 @@ impl DevicePairingRegistry {
         {
             return Err(invalid("device public key is a weak Ed25519 key"));
         }
+        let mesh = match &request.mesh {
+            None => None,
+            Some(value) => {
+                let Some(store) = &self.mesh else {
+                    return Err(AppError::Unsupported("device groups".to_owned()));
+                };
+                let parsed = MeshPairing::parse(value, &device_public)?;
+                match &parsed {
+                    MeshPairing::DeviceJoin { group_id, .. } if !store.has_group(group_id) => {
+                        return Err(AppError::NotFound(format!(
+                            "this node is not in group {group_id}"
+                        )));
+                    }
+                    MeshPairing::NodeJoin { .. } if !store.has_join_code()? => {
+                        return Err(AppError::Conflict(
+                            "this node has no join code; create one with `todex-agentd mesh join-code`"
+                                .to_owned(),
+                        ));
+                    }
+                    _ => {}
+                }
+                Some(parsed)
+            }
+        };
+        let node_identity = match (&mesh, &self.mesh) {
+            (Some(MeshPairing::NodeJoin { .. }), Some(store)) => {
+                Some((store.node_id().to_owned(), store.node_public_key()))
+            }
+            _ => None,
+        };
         let transport = self.transport_binding()?;
         let source = match peer {
             PairingPeer::Ip(address) => SourceKey::Ip(source_key(address)),
@@ -643,6 +803,8 @@ impl DevicePairingRegistry {
                 status: RequestStatus::Pending,
                 reveals: RateWindow::new(Duration::from_secs(60)),
                 proofs: RateWindow::new(Duration::from_secs(1)),
+                mesh,
+                join_code_key: None,
             },
         );
         Ok(CreateDevicePairingResponse {
@@ -652,6 +814,8 @@ impl DevicePairingRegistry {
             poll_interval_ms: 1000,
             transport_protocol: transport.protocol,
             transport_public_key: URL_SAFE_NO_PAD.encode(&transport.public_key),
+            node_id: node_identity.as_ref().map(|(id, _)| id.clone()),
+            node_public_key: node_identity.map(|(_, key)| key),
         })
     }
 
@@ -724,6 +888,35 @@ impl DevicePairingRegistry {
                 return Err(error);
             }
         };
+        if let Some(mesh) = &pending.mesh {
+            // A group join never reaches the local approver: a device of the
+            // group decides a device join, the join code a node join.
+            if let MeshPairing::NodeJoin { .. } = mesh {
+                let proof = request
+                    .join_code_proof
+                    .as_deref()
+                    .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+                    .unwrap_or_default();
+                let transcript_hash: [u8; 32] = Sha256::digest(&material.transcript).into();
+                let checked = self
+                    .mesh
+                    .as_ref()
+                    .ok_or(AppError::Unauthenticated)
+                    .and_then(|store| store.check_join_proof(&transcript_hash, &proof));
+                match checked {
+                    Ok(key) => {
+                        pending.join_code_key = Some(key);
+                        pending.status = RequestStatus::Approved;
+                    }
+                    Err(error) => {
+                        state.requests.remove(&request.request_id);
+                        return Err(error);
+                    }
+                }
+            }
+            pending.stage = Stage::Revealed(material);
+            return Ok(RevealDevicePairingResponse { status: "pending" });
+        }
         let summary = DevicePairingRequestSummary {
             request_id: request.request_id.clone(),
             verification_code: material.verification_code.clone(),
@@ -794,18 +987,58 @@ impl DevicePairingRegistry {
         if self.transport_binding()? != pending.transport {
             return Ok(poll_state("expired", pending.expires_at));
         }
-        // Approval commits the long-term device key to the registry before the
-        // id is delivered; a registration failure must not leak a device id
-        // that cannot authenticate.
-        let record = self
-            .devices
-            .register(&pending.device_name, &pending.device_public_key)?;
-        let mut nonce = [0; 24];
-        OsRng.fill_bytes(&mut nonce);
         let Some(material) = pending.material() else {
             return Err(AppError::Unauthenticated);
         };
-        let ciphertext = material.wrap(&record.device_id, &pending.transport, &nonce)?;
+        let (device_id, mesh) = match &pending.mesh {
+            // Approval commits the long-term device key to the registry before
+            // the id is delivered; a registration failure must not leak a
+            // device id that cannot authenticate.
+            None => (
+                self.devices
+                    .register(&pending.device_name, &pending.device_public_key)?
+                    .device_id,
+                None,
+            ),
+            // The approving device already listed it in the group's roster.
+            Some(MeshPairing::DeviceJoin { group_id, .. }) => (
+                crate::devices::device_id_for(&pending.device_public_key),
+                Some(CredentialMesh {
+                    group_id: group_id.clone(),
+                    node_id: None,
+                    node_public_key: None,
+                    join_proof: None,
+                }),
+            ),
+            Some(MeshPairing::NodeJoin { group_id }) => {
+                let (Some(store), Some(code_key)) = (&self.mesh, &pending.join_code_key) else {
+                    return Err(AppError::Unauthenticated);
+                };
+                let node_public: [u8; 32] = URL_SAFE_NO_PAD
+                    .decode(store.node_public_key())
+                    .ok()
+                    .and_then(|key| key.try_into().ok())
+                    .ok_or_else(|| invalid("node key is unavailable"))?;
+                let transcript_hash: [u8; 32] = Sha256::digest(&material.transcript).into();
+                let device_id = store.admit(&pending.device_public_key)?;
+                (
+                    device_id,
+                    Some(CredentialMesh {
+                        group_id: group_id.clone(),
+                        node_id: Some(store.node_id().to_owned()),
+                        node_public_key: Some(store.node_public_key()),
+                        join_proof: Some(crate::mesh::node_join_server_proof(
+                            code_key,
+                            &transcript_hash,
+                            &node_public,
+                        )),
+                    }),
+                )
+            }
+        };
+        let mut nonce = [0; 24];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = material.wrap(&device_id, &pending.transport, mesh, &nonce)?;
         Ok(DevicePairingPollResponse {
             status: "approved",
             expires_at: pending.expires_at,
@@ -838,6 +1071,109 @@ impl DevicePairingRegistry {
         remove_local_files(&state.directory, &request.request_id);
         Ok(())
     }
+}
+
+impl DevicePairingRegistry {
+    /// Revealed, undecided device joins for `group_ids`.
+    pub(crate) fn mesh_join_requests(&self, group_ids: &[String]) -> Result<Vec<MeshJoinRequest>> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid("pairing registry is unavailable"))?;
+        state.prune()?;
+        let mut requests: Vec<MeshJoinRequest> = state
+            .requests
+            .iter()
+            .filter(|(_, request)| request.status == RequestStatus::Pending)
+            .filter_map(|(id, request)| mesh_join_view(id, request))
+            .filter(|view| group_ids.contains(&view.group_id))
+            .collect();
+        requests.sort_by_key(|view| view.expires_at);
+        Ok(requests)
+    }
+
+    /// The revealed, undecided device join `request_id`.
+    pub(crate) fn mesh_join_request(&self, request_id: &str) -> Result<MeshJoinRequest> {
+        validate_id(request_id)?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid("pairing registry is unavailable"))?;
+        state.prune()?;
+        let request = state
+            .requests
+            .get(request_id)
+            .ok_or_else(|| AppError::NotFound("join request no longer exists".to_owned()))?;
+        if request.status != RequestStatus::Pending {
+            return Err(AppError::Conflict(
+                "join request was already decided".to_owned(),
+            ));
+        }
+        mesh_join_view(request_id, request)
+            .ok_or_else(|| AppError::NotFound("join request no longer exists".to_owned()))
+    }
+
+    /// Records a device's decision on a device join; the first one wins.
+    pub(crate) fn decide_mesh_join(&self, request_id: &str, approved: bool) -> Result<()> {
+        validate_id(request_id)?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid("pairing registry is unavailable"))?;
+        state.prune()?;
+        let request = state
+            .requests
+            .get_mut(request_id)
+            .filter(|request| matches!(request.mesh, Some(MeshPairing::DeviceJoin { .. })))
+            .ok_or_else(|| AppError::NotFound("join request no longer exists".to_owned()))?;
+        if request.status != RequestStatus::Pending {
+            return Err(AppError::Conflict(
+                "join request was already decided".to_owned(),
+            ));
+        }
+        request.status = if approved {
+            RequestStatus::Approved
+        } else {
+            RequestStatus::Rejected
+        };
+        Ok(())
+    }
+
+    /// The group of a device join, once revealed (to announce it).
+    pub(crate) fn mesh_join_group(&self, request_id: &str) -> Option<String> {
+        let state = self.inner.lock().ok()?;
+        let request = state.requests.get(request_id)?;
+        match (&request.mesh, &request.stage) {
+            (Some(mesh @ MeshPairing::DeviceJoin { .. }), Stage::Revealed(_)) => {
+                Some(mesh.group_id().to_owned())
+            }
+            _ => None,
+        }
+    }
+}
+
+fn mesh_join_view(id: &str, request: &PendingRequest) -> Option<MeshJoinRequest> {
+    let Some(MeshPairing::DeviceJoin {
+        group_id,
+        history_key,
+    }) = &request.mesh
+    else {
+        return None;
+    };
+    let material = request.material()?;
+    Some(MeshJoinRequest {
+        request_id: id.to_owned(),
+        group_id: group_id.clone(),
+        verification_code: material.verification_code.clone(),
+        device_name: request.device_name.clone(),
+        device_id: crate::devices::device_id_for(&request.device_public_key),
+        device_public_key: URL_SAFE_NO_PAD.encode(request.device_public_key),
+        history_key: history_key.clone(),
+        peer_address: request.peer.display(),
+        origin: request.arrival.origin.clone(),
+        via_proxy: request.arrival.via_proxy,
+        expires_at: request.expires_at,
+    })
 }
 
 impl PendingRequest {
@@ -1349,6 +1685,7 @@ mod tests {
             device_name_binding: Some(json!(1)),
             device_name: DEVICE_NAME.to_owned(),
             device_public_key: URL_SAFE_NO_PAD.encode(device_key()),
+            mesh: None,
         }
     }
     fn reveal_request(
@@ -1360,6 +1697,7 @@ mod tests {
             request_id: id.to_owned(),
             client_public_key: URL_SAFE_NO_PAD.encode(client_public),
             client_nonce: URL_SAFE_NO_PAD.encode(nonce),
+            join_code_proof: None,
         }
     }
     /// Commit only; the request is invisible to the local approver.
@@ -1558,7 +1896,9 @@ mod tests {
         let credential = &vector["credential"];
         let nonce: [u8; 24] = fixture_bytes(&credential["nonce"]).try_into().unwrap();
         assert_eq!(URL_SAFE_NO_PAD.encode(nonce), credential["nonceBase64Url"]);
-        let wrapped = material.wrap("dev_vector", &transport, &nonce).unwrap();
+        let wrapped = material
+            .wrap("dev_vector", &transport, None, &nonce)
+            .unwrap();
         assert_eq!(wrapped, credential["ciphertextBase64Url"]);
         assert_eq!(
             URL_SAFE_NO_PAD.decode(&wrapped).unwrap(),
@@ -2325,6 +2665,7 @@ mod tests {
                     device_name_binding: None,
                     device_name: String::new(),
                     device_public_key: String::new(),
+                    mesh: None,
                 }
             ),
             Err(AppError::Conflict(_))
@@ -2441,5 +2782,232 @@ mod tests {
             control_owner_mismatch(&fixture.root.join("missing"), euid.wrapping_add(1)),
             None
         );
+    }
+
+    mod mesh_joins {
+        use super::*;
+        use crate::mesh::roster::test_support::{append, device_member, genesis, node_member};
+        use crate::mesh::roster::{history_key_binding, parse_signing_public_key, verify_chain};
+        use ed25519_dalek::Signer;
+
+        const DEVICE_SEED: u8 = 21;
+
+        /// A registry whose node is in a group created by device 1.
+        fn grouped(fixture: &Fixture) -> (DevicePairingRegistry, MeshStore, String) {
+            let mesh = MeshStore::load(&fixture.root).unwrap();
+            let creator = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+            let chain = genesis(&creator, 1);
+            let members = verify_chain(&chain).unwrap().head().members.clone();
+            let node = parse_signing_public_key(&mesh.node_public_key()).unwrap();
+            let chain = append(
+                &chain,
+                &creator,
+                [members.clone(), vec![node_member(&node, &members[0].id)]].concat(),
+            );
+            let group_id = mesh.accept_chain(&chain).unwrap().group_id;
+            let registry = fixture.registry().with_mesh(mesh.clone());
+            (registry, mesh, group_id)
+        }
+
+        fn device_join(group_id: &str, signed_group: &str) -> serde_json::Value {
+            let signing = ed25519_dalek::SigningKey::from_bytes(&[DEVICE_SEED; 32]);
+            let member = device_member(&signing, DEVICE_SEED, "x");
+            let history_key = member.history_key.unwrap();
+            let bytes = URL_SAFE_NO_PAD.decode(&history_key).unwrap();
+            let signature = signing.sign(&history_key_binding(signed_group, &bytes));
+            json!({
+                "kind": "deviceJoin",
+                "groupId": group_id,
+                "historyKey": history_key,
+                "historyKeySignature": URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            })
+        }
+
+        fn create_with(
+            registry: &DevicePairingRegistry,
+            mesh: serde_json::Value,
+        ) -> Result<CreateDevicePairingResponse> {
+            registry.create(
+                peer(),
+                CreateDevicePairingRequest {
+                    mesh: Some(mesh),
+                    ..create_request(Some(commitment(&client_public(), &CLIENT_NONCE)))
+                },
+            )
+        }
+
+        fn material_for(response: &CreateDevicePairingResponse) -> PairingMaterial {
+            let server_public = decode_32(&response.server_public_key).unwrap();
+            let shared = StaticSecret::from([7; 32])
+                .diffie_hellman(&PublicKey::from(server_public))
+                .to_bytes();
+            PairingMaterial::derive(
+                &response.request_id,
+                &client_public(),
+                &server_public,
+                &device_key(),
+                &CLIENT_NONCE,
+                &response_binding(response),
+                DEVICE_NAME,
+                &shared,
+            )
+            .unwrap()
+        }
+
+        fn open(material: &PairingMaterial, polled: &DevicePairingPollResponse) -> Value {
+            let cipher = XChaCha20Poly1305::new(Key::from_slice(&material.wrap_key));
+            let plaintext = cipher
+                .decrypt(
+                    XNonce::from_slice(
+                        &URL_SAFE_NO_PAD
+                            .decode(polled.nonce.as_ref().unwrap())
+                            .unwrap(),
+                    ),
+                    Payload {
+                        msg: &URL_SAFE_NO_PAD
+                            .decode(polled.ciphertext.as_ref().unwrap())
+                            .unwrap(),
+                        aad: &material.transcript,
+                    },
+                )
+                .unwrap();
+            serde_json::from_slice(&plaintext).unwrap()
+        }
+
+        #[test]
+        fn a_device_join_waits_for_a_group_device_and_never_registers_locally() {
+            let fixture = Fixture::new();
+            let (registry, _mesh, group_id) = grouped(&fixture);
+            // The history key must be bound to this group.
+            assert!(matches!(
+                create_with(&registry, device_join(&group_id, "grp_other")),
+                Err(AppError::InvalidRequest(_))
+            ));
+            assert!(matches!(
+                create_with(&registry, device_join("grp_unknown", "grp_unknown")),
+                Err(AppError::NotFound(_))
+            ));
+            let response = create_with(&registry, device_join(&group_id, &group_id)).unwrap();
+            assert!(response.node_id.is_none());
+            assert!(registry.mesh_join_group(&response.request_id).is_none());
+            registry
+                .reveal(reveal_request(
+                    &response.request_id,
+                    client_public(),
+                    CLIENT_NONCE,
+                ))
+                .unwrap();
+            let material = material_for(&response);
+            // Devices of the group see it with its code; the local approver does not.
+            let listed = registry
+                .mesh_join_requests(std::slice::from_ref(&group_id))
+                .unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].verification_code, material.verification_code);
+            assert!(read_undecided_requests(&fixture.root).unwrap().is_empty());
+            assert_eq!(
+                registry.mesh_join_group(&response.request_id),
+                Some(group_id.clone())
+            );
+            let polled = registry
+                .poll(proof(&response.request_id, &material.poll_proof))
+                .unwrap();
+            assert_eq!(polled.status, "pending");
+            registry
+                .decide_mesh_join(&response.request_id, true)
+                .unwrap();
+            assert!(matches!(
+                registry.decide_mesh_join(&response.request_id, false),
+                Err(AppError::Conflict(_))
+            ));
+            let polled = registry
+                .poll(proof(&response.request_id, &material.poll_proof))
+                .unwrap();
+            assert_eq!(polled.status, "approved");
+            let credential = open(&material, &polled);
+            assert_eq!(credential["groupId"], group_id.as_str());
+            assert_eq!(
+                credential["deviceId"],
+                crate::devices::device_id_for(&device_key()).as_str()
+            );
+            assert!(credential.get("joinProof").is_none());
+            assert!(DeviceRegistry::load(&fixture.root)
+                .unwrap()
+                .get(credential["deviceId"].as_str().unwrap())
+                .unwrap()
+                .is_none());
+        }
+
+        #[test]
+        fn a_node_join_needs_the_code_and_proves_it_back() {
+            let fixture = Fixture::new();
+            let mesh = MeshStore::load(&fixture.root).unwrap();
+            let registry = fixture.registry().with_mesh(mesh.clone());
+            let node_join = json!({ "kind": "nodeJoin", "groupId": "grp_new" });
+            // No code, no node join.
+            assert!(matches!(
+                create_with(&registry, node_join.clone()),
+                Err(AppError::Conflict(_))
+            ));
+            let code = mesh.join_code(false).unwrap();
+            let code_key = crate::mesh::join_code_key(&code.code);
+            let client_proof = |material: &PairingMaterial| {
+                let hash: [u8; 32] = Sha256::digest(&material.transcript).into();
+                let mut mac =
+                    <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(code_key.as_ref()).unwrap();
+                hmac::Mac::update(&mut mac, b"todex.mesh.v1/node-join/client\0");
+                hmac::Mac::update(&mut mac, &hash);
+                URL_SAFE_NO_PAD.encode(hmac::Mac::finalize(mac).into_bytes())
+            };
+            // A wrong proof drops the request.
+            let response = create_with(&registry, node_join.clone()).unwrap();
+            assert_eq!(response.node_id.as_deref(), Some(mesh.node_id()));
+            let wrong = RevealDevicePairingRequest {
+                join_code_proof: Some(URL_SAFE_NO_PAD.encode([0u8; 32])),
+                ..reveal_request(&response.request_id, client_public(), CLIENT_NONCE)
+            };
+            assert!(matches!(
+                registry.reveal(wrong),
+                Err(AppError::Unauthenticated)
+            ));
+            let material = material_for(&response);
+            assert_eq!(
+                registry
+                    .poll(proof(&response.request_id, &material.poll_proof))
+                    .unwrap()
+                    .status,
+                "expired"
+            );
+            // The right proof approves at once.
+            let response = create_with(&registry, node_join).unwrap();
+            let material = material_for(&response);
+            registry
+                .reveal(RevealDevicePairingRequest {
+                    join_code_proof: Some(client_proof(&material)),
+                    ..reveal_request(&response.request_id, client_public(), CLIENT_NONCE)
+                })
+                .unwrap();
+            assert!(!mesh.has_join_code().unwrap());
+            let polled = registry
+                .poll(proof(&response.request_id, &material.poll_proof))
+                .unwrap();
+            assert_eq!(polled.status, "approved");
+            let credential = open(&material, &polled);
+            let hash: [u8; 32] = Sha256::digest(&material.transcript).into();
+            let node_public: [u8; 32] = URL_SAFE_NO_PAD
+                .decode(mesh.node_public_key())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            assert_eq!(
+                credential["joinProof"].as_str().unwrap(),
+                crate::mesh::node_join_server_proof(&code_key, &hash, &node_public)
+            );
+            assert_eq!(credential["nodePublicKey"], mesh.node_public_key().as_str());
+            // The device may now authenticate until it lists the node.
+            assert!(mesh
+                .device_record(credential["deviceId"].as_str().unwrap())
+                .is_some());
+        }
     }
 }

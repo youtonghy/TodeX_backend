@@ -472,6 +472,7 @@ impl ManagedServer {
                 ipc_path,
             })
         });
+        log_mesh_join_code(&state);
         let migration_task = Some(state.spawn_legacy_conversation_migration());
         let maintenance_task = Some(state.spawn_journal_maintenance());
         let legacy_scan_task = state.spawn_legacy_history_scan();
@@ -710,6 +711,31 @@ pub fn bind_addr(config: &Config) -> Result<SocketAddr> {
 /// (`localhost`, `127.0.0.0/8` and `::1` count as loopback).
 fn plaintext_listener_needs_warning(enable_tls: bool, host: &str) -> bool {
     !enable_tls && !listen_addrs::is_loopback_host(host)
+}
+
+/// A node in no device group prints its join code at startup, so a
+/// container's log or the TUI shows what to enter on a device of the group
+/// (docs/mesh-v1.md "A node joins").
+fn log_mesh_join_code(state: &AppState) {
+    let Some(mesh) = &state.mesh else {
+        return;
+    };
+    match mesh.group_ids() {
+        Ok(groups) if groups.is_empty() => {}
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(error = %error, "device groups are unavailable");
+            return;
+        }
+    }
+    match mesh.join_code(false) {
+        Ok(code) => tracing::info!(
+            node_id = %mesh.node_id(),
+            "device group join code: {} (add this backend from a device of the group; `todex-agentd mesh join-code --new` replaces it)",
+            code.code
+        ),
+        Err(error) => tracing::warn!(error = %error, "no device group join code was created"),
+    }
 }
 
 #[cfg(test)]

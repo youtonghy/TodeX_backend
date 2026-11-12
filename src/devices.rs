@@ -92,6 +92,10 @@ struct Inner {
 #[derive(Clone)]
 pub(crate) struct DeviceRegistry {
     inner: Arc<Mutex<Inner>>,
+    /// Device members of this node's groups (docs/mesh-v1.md
+    /// "Authorization"), consulted after `devices.json`. The daemon sets it;
+    /// the TUI and the CLI only see `devices.json`.
+    mesh: Option<crate::mesh::MeshStore>,
 }
 
 impl DeviceRegistry {
@@ -114,7 +118,14 @@ impl DeviceRegistry {
                 #[cfg(test)]
                 flush_attempts: 0,
             })),
+            mesh: None,
         })
+    }
+
+    /// Also authenticates the device members of `mesh`'s groups.
+    pub(crate) fn with_mesh(mut self, mesh: crate::mesh::MeshStore) -> Self {
+        self.mesh = Some(mesh);
+        self
     }
 
     pub(crate) fn register(&self, name: &str, public_key: &[u8; 32]) -> Result<DeviceRecord> {
@@ -143,9 +154,16 @@ impl DeviceRegistry {
     /// Returns the current record for `device_id`, reloading the file when the
     /// TUI (or another writer) changed it since the last read.
     pub(crate) fn get(&self, device_id: &str) -> Result<Option<DeviceRecord>> {
-        let mut inner = self.lock()?;
-        inner.reload_if_changed()?;
-        Ok(inner.devices.get(device_id).cloned())
+        let paired = {
+            let mut inner = self.lock()?;
+            inner.reload_if_changed()?;
+            inner.devices.get(device_id).cloned()
+        };
+        Ok(paired.or_else(|| {
+            self.mesh
+                .as_ref()
+                .and_then(|mesh| mesh.device_record(device_id))
+        }))
     }
 
     /// Record request activity. The timestamp is kept in memory and flushed at

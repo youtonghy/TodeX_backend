@@ -13,6 +13,7 @@ mod git;
 mod history_cleanup;
 mod history_keys;
 mod local_admin;
+mod mesh;
 mod native_history;
 mod omp_plugins;
 mod pi_agent_templates;
