@@ -130,6 +130,46 @@ pub(crate) struct Member {
     pub history_key: Option<String>,
     pub added_at: u64,
     pub added_by: String,
+    /// Nodes: addresses a user pinned (docs/mesh-v1.md "Addresses").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+    /// Nodes: whether this node relays for the group (`allowed` when
+    /// absent); see "Relay".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayRole>,
+    /// Nodes: `false` when no member may reach this node through a relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_target: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum RelayRole {
+    Preferred,
+    Allowed,
+    Denied,
+}
+
+impl Member {
+    /// This node relays for its group.
+    pub(crate) fn relays(&self) -> bool {
+        self.kind == MemberKind::Node && self.relay != Some(RelayRole::Denied)
+    }
+
+    /// Members may reach this node through a relay.
+    pub(crate) fn reachable_by_relay(&self) -> bool {
+        self.kind == MemberKind::Node && self.relay_target != Some(false)
+    }
+}
+
+/// Longest pinned address list of a node.
+pub(crate) const MAX_PINNED_ADDRESSES: usize = 16;
+
+/// An `http(s)://host[:port][/path]` address of at most 512 bytes.
+pub(crate) fn valid_address(value: &str) -> bool {
+    value.len() <= 512
+        && (value.starts_with("http://") || value.starts_with("https://"))
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +258,21 @@ impl RosterBody {
             }
             crate::device_pairing::validate_device_name(&member.name)
                 .map_err(|_| invalid("invalid member name"))?;
+            if member.kind == MemberKind::Device
+                && (!member.addresses.is_empty()
+                    || member.relay.is_some()
+                    || member.relay_target.is_some())
+            {
+                return Err(invalid("only nodes carry addresses and relay settings"));
+            }
+            if member.addresses.len() > MAX_PINNED_ADDRESSES
+                || !member
+                    .addresses
+                    .iter()
+                    .all(|address| valid_address(address))
+            {
+                return Err(invalid("invalid pinned node address"));
+            }
         }
         if self.devices().next().is_none() {
             return Err(invalid("roster must list at least one device"));
@@ -383,6 +438,9 @@ pub(crate) mod test_support {
             history_key: Some(history_key(byte)),
             added_at: 1,
             added_by: added_by.to_owned(),
+            addresses: Vec::new(),
+            relay: None,
+            relay_target: None,
         }
     }
 
@@ -395,6 +453,9 @@ pub(crate) mod test_support {
             history_key: None,
             added_at: 1,
             added_by: added_by.to_owned(),
+            addresses: Vec::new(),
+            relay: None,
+            relay_target: None,
         }
     }
 
@@ -488,6 +549,33 @@ mod tests {
             assert_eq!(ids, expected);
         }
         assert_eq!(chain.head().signer, RECOVERY_SIGNER);
+        let node = chain
+            .head()
+            .members
+            .iter()
+            .find(|member| member.kind == MemberKind::Node)
+            .unwrap();
+        assert_eq!(
+            node.addresses,
+            vec!["https://nas.example.net:7345".to_owned()]
+        );
+        assert_eq!(node.relay, Some(RelayRole::Preferred));
+        assert!(node.relays() && !node.reachable_by_relay());
+        let ticket = &fixture["relayTicket"];
+        let parts: Vec<&str> = ticket["ticket"].as_str().unwrap().splitn(3, '.').collect();
+        let device = parse_signing_public_key(ticket["devicePublicKey"].as_str().unwrap()).unwrap();
+        let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap()).unwrap();
+        device
+            .verify_strict(
+                &crate::server::mesh_relay_ticket_message(
+                    ticket["deviceId"].as_str().unwrap(),
+                    ticket["relayNodeId"].as_str().unwrap(),
+                    ticket["targetNodeId"].as_str().unwrap(),
+                    ticket["expiresAt"].as_u64().unwrap(),
+                ),
+                &signature,
+            )
+            .unwrap();
         for (name, invalid) in fixture["invalidChains"].as_object().unwrap() {
             let docs: Vec<SignedDoc> = serde_json::from_value(invalid.clone()).unwrap();
             assert!(verify_chain(&docs).is_err(), "{name}");

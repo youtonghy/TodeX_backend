@@ -20,6 +20,8 @@ fn is_direct_route(path: &str, query: Option<&str>) -> bool {
         path,
         "/health" | "/v2/transport-policy" | "/v2/version" | SEALED_PATH
     ) || path.starts_with("/v2/device-pairing/")
+        // Carries only the target node's direct routes; see mesh_relay.
+        || path.starts_with(super::mesh_relay::RELAY_PREFIX)
         || (path == "/v2/ws" && query_value(query, "tv").as_deref() == Some("2"))
 }
 

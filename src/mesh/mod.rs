@@ -83,7 +83,20 @@ struct Admission {
     expires: Instant,
 }
 
+/// A group device's connections to this node (`mesh.presence.get`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DevicePresence {
+    pub device_id: String,
+    pub connections: u32,
+    /// When its first open connection started.
+    pub connected_at: u64,
+}
+
 struct Inner {
+    /// Open connections of group devices; `last_seen` when they closed.
+    presence: BTreeMap<String, DevicePresence>,
+    last_seen: BTreeMap<String, u64>,
     groups: BTreeMap<String, Group>,
     admissions: Vec<Admission>,
     join_code_failures: u32,
@@ -178,6 +191,8 @@ impl MeshStore {
             node_key: Arc::new(node_key),
             node_id,
             inner: Arc::new(Mutex::new(Inner {
+                presence: BTreeMap::new(),
+                last_seen: BTreeMap::new(),
                 groups,
                 admissions: Vec::new(),
                 join_code_failures: 0,
@@ -526,6 +541,138 @@ impl MeshStore {
         inner.join_code_failures = 0;
         remove_if_exists(&path)?;
         Ok(key)
+    }
+
+    /// A connection of `device_id` opened; `false` when it is not a group
+    /// device (nothing is tracked then).
+    pub(crate) fn presence_open(&self, device_id: &str) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        let member = inner.groups.values().any(|group| {
+            group
+                .chain
+                .head()
+                .member(device_id)
+                .is_some_and(|member| member.kind == MemberKind::Device)
+        });
+        if !member {
+            return false;
+        }
+        let entry = inner
+            .presence
+            .entry(device_id.to_owned())
+            .or_insert_with(|| DevicePresence {
+                device_id: device_id.to_owned(),
+                connections: 0,
+                connected_at: unix_ms(),
+            });
+        entry.connections += 1;
+        true
+    }
+
+    /// A connection [`Self::presence_open`] tracked closed.
+    pub(crate) fn presence_close(&self, device_id: &str) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let gone = match inner.presence.get_mut(device_id) {
+            Some(entry) => {
+                entry.connections = entry.connections.saturating_sub(1);
+                entry.connections == 0
+            }
+            None => false,
+        };
+        if gone {
+            inner.presence.remove(device_id);
+            inner.last_seen.insert(device_id.to_owned(), unix_ms());
+        }
+    }
+
+    /// Connected devices of `group_id` and when the others were last seen
+    /// here (since this daemon started).
+    pub(crate) fn presence(
+        &self,
+        group_id: &str,
+    ) -> Result<(Vec<DevicePresence>, BTreeMap<String, u64>)> {
+        let inner = self.lock()?;
+        let Some(group) = inner.groups.get(group_id) else {
+            return Err(AppError::NotFound(format!(
+                "this node is not in group {group_id}"
+            )));
+        };
+        let devices: Vec<String> = group
+            .chain
+            .head()
+            .devices()
+            .map(|member| member.id.clone())
+            .collect();
+        Ok((
+            devices
+                .iter()
+                .filter_map(|id| inner.presence.get(id).cloned())
+                .collect(),
+            devices
+                .iter()
+                .filter_map(|id| inner.last_seen.get(id).map(|at| (id.clone(), *at)))
+                .collect(),
+        ))
+    }
+
+    /// Groups that list `device_id` as a device.
+    pub(crate) fn groups_of_device(&self, device_id: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .map(|inner| {
+                inner
+                    .groups
+                    .iter()
+                    .filter(|(_, group)| group.chain.head().member(device_id).is_some())
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Who may relay to `target` through this node (docs/mesh-v1.md
+    /// "Relay"): a group lists this node (not `denied`), `target` as another
+    /// node reachable by relay, and `device_id` as a device. Returns the
+    /// device's key and the target's addresses (pinned first, then announced).
+    pub(crate) fn relay_route(
+        &self,
+        device_id: &str,
+        target: &str,
+    ) -> Result<(String, Vec<String>)> {
+        let inner = self.lock()?;
+        for group in inner.groups.values() {
+            let head = group.chain.head();
+            let (Some(this), Some(node), Some(device)) = (
+                head.member(&self.node_id),
+                head.member(target),
+                head.member(device_id),
+            ) else {
+                continue;
+            };
+            if target == self.node_id
+                || !this.relays()
+                || !node.reachable_by_relay()
+                || device.kind != MemberKind::Device
+            {
+                continue;
+            }
+            let mut urls = node.addresses.clone();
+            if let Some((doc, _)) = group.node_infos.get(target) {
+                if let Ok(info) = verify_node_info(doc, &node.public_key) {
+                    urls.extend(info.urls);
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            urls.retain(|url| seen.insert(url.clone()));
+            return Ok((device.public_key.clone(), urls));
+        }
+        Err(AppError::Unauthorized(
+            "this node does not relay to that node for this device".to_owned(),
+        ))
     }
 
     /// Name, version and members of every group, for status output.
@@ -890,6 +1037,53 @@ mod tests {
         assert_ne!(moved, first);
         let body = verify_node_info(&moved, &store.node_public_key()).unwrap();
         assert_eq!(body.urls, vec!["http://10.0.0.3:7345".to_owned()]);
+    }
+
+    #[test]
+    fn relays_follow_the_roster_settings_and_presence_counts_connections() {
+        let (_root, store) = store();
+        let creator = device_key(1);
+        let chain = genesis(&creator, 1);
+        let me = verify_chain(&chain).unwrap().head().members[0].clone();
+        let this = node_member(&node_key(&store), &me.id);
+        let mut target = node_member(&device_key(9).verifying_key(), &me.id);
+        target.addresses = vec!["http://10.0.0.9:7345".to_owned()];
+        let joined = append(
+            &chain,
+            &creator,
+            vec![me.clone(), this.clone(), target.clone()],
+        );
+        store.accept_chain(&joined).unwrap();
+        let (key, urls) = store.relay_route(&me.id, &target.id).unwrap();
+        assert_eq!(key, me.public_key);
+        assert_eq!(urls, vec!["http://10.0.0.9:7345".to_owned()]);
+        // Not to itself, not for strangers.
+        assert!(store.relay_route(&me.id, &this.id).is_err());
+        assert!(store.relay_route("dev_stranger", &target.id).is_err());
+        // A target that refuses relays, then a relay that is denied.
+        let closed = Member {
+            relay_target: Some(false),
+            ..target.clone()
+        };
+        let joined = append(&joined, &creator, vec![me.clone(), this.clone(), closed]);
+        store.accept_chain(&joined).unwrap();
+        assert!(store.relay_route(&me.id, &target.id).is_err());
+        let denied = Member {
+            relay: Some(roster::RelayRole::Denied),
+            ..this.clone()
+        };
+        let joined = append(&joined, &creator, vec![me.clone(), denied, target.clone()]);
+        store.accept_chain(&joined).unwrap();
+        assert!(store.relay_route(&me.id, &target.id).is_err());
+
+        let group_id = verify_chain(&joined).unwrap().group_id;
+        assert!(!store.presence_open("dev_stranger"));
+        assert!(store.presence_open(&me.id) && store.presence_open(&me.id));
+        assert_eq!(store.presence(&group_id).unwrap().0[0].connections, 2);
+        store.presence_close(&me.id);
+        store.presence_close(&me.id);
+        let (connected, last_seen) = store.presence(&group_id).unwrap();
+        assert!(connected.is_empty() && last_seen.contains_key(&me.id));
     }
 
     #[test]

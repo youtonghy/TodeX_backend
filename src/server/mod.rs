@@ -13,7 +13,8 @@ mod git;
 mod history_cleanup;
 mod history_keys;
 mod local_admin;
-mod mesh;
+pub(crate) mod mesh;
+mod mesh_relay;
 mod native_history;
 mod omp_plugins;
 mod pi_agent_templates;
@@ -35,6 +36,7 @@ mod ws;
 pub(crate) use api::api_router;
 pub(crate) use history_keys::spawn_history_watch;
 pub(crate) use local_admin::LocalAdminInfo;
+pub(crate) use mesh_relay::ticket_message as mesh_relay_ticket_message;
 
 use std::time::Duration;
 
@@ -54,6 +56,8 @@ pub fn router(state: AppState) -> Router {
     let api: Router = Router::new()
         .merge(routes::routes(&state))
         .merge(device_pairing::routes())
+        // Ticket-authorized and end-to-end encrypted for the target node.
+        .merge(mesh_relay::routes())
         // Loopback + per-conversation token; deliberately outside device auth.
         .merge(crate::agent_mcp::routes(&state))
         .with_state(state.clone());

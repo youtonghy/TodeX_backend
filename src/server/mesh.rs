@@ -17,6 +17,7 @@ pub(super) fn is_mesh_command(command_type: &str) -> bool {
     matches!(
         command_type,
         "mesh.node.get"
+            | "mesh.presence.get"
             | "mesh.state.get"
             | "mesh.state.push"
             | "mesh.join.list"
@@ -34,6 +35,12 @@ struct Empty {}
 struct StateGet {
     #[serde(default)]
     group_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PresenceGet {
+    group_id: String,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +129,11 @@ pub(super) async fn dispatch(
                 "nodeInfo": node_info(state, mesh)?,
                 "groups": mesh.group_ids()?,
             }))
+        }
+        "mesh.presence.get" => {
+            let request = parse::<PresenceGet>(payload)?;
+            let (connected, last_seen) = mesh.presence(&request.group_id)?;
+            Ok(json!({ "nodeId": mesh.node_id(), "connected": connected, "lastSeen": last_seen }))
         }
         "mesh.state.get" => {
             let request = parse::<StateGet>(payload)?;
@@ -223,6 +235,117 @@ pub(super) async fn dispatch(
     }
 }
 
+/// Tracks one `/v2/ws` connection of a group device for `mesh.presence.get`
+/// and announces its arrival and departure (`presence`).
+pub(super) struct PresenceGuard {
+    state: AppState,
+    device_id: String,
+}
+
+impl PresenceGuard {
+    pub(super) async fn open(state: &AppState, device_id: &str) -> Option<Self> {
+        let mesh = state.mesh.as_ref()?;
+        if !mesh.presence_open(device_id) {
+            return None;
+        }
+        for group_id in mesh.groups_of_device(device_id) {
+            announce(state, Announcement::new("presence", &group_id)).await;
+        }
+        Some(Self {
+            state: state.clone(),
+            device_id: device_id.to_owned(),
+        })
+    }
+}
+
+impl Drop for PresenceGuard {
+    fn drop(&mut self) {
+        let Some(mesh) = self.state.mesh.clone() else {
+            return;
+        };
+        mesh.presence_close(&self.device_id);
+        let state = self.state.clone();
+        let groups = mesh.groups_of_device(&self.device_id);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                for group_id in groups {
+                    announce(&state, Announcement::new("presence", &group_id)).await;
+                }
+            });
+        }
+    }
+}
+
+/// How often a node re-reads its own addresses and transport key.
+const NODE_INFO_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+/// UDP port of the LAN beacon (docs/mesh-v1.md "LAN beacon").
+pub(crate) const BEACON_PORT: u16 = 21047;
+
+/// Re-signs this node's info when its addresses or transport key change
+/// (a new network, a TUI key reset) and announces `node-info.updated`, so
+/// connected devices carry the new addresses to the rest of the group. A
+/// node in a group also sends the LAN beacon on every round.
+pub(crate) fn spawn_node_watch(state: AppState) -> Option<tokio::task::JoinHandle<()>> {
+    let mesh = state.mesh.clone()?;
+    let beacon = beacon_enabled(&state);
+    Some(tokio::spawn(async move {
+        let mut last: Option<SignedDoc> = None;
+        let mut interval = tokio::time::interval(NODE_INFO_POLL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let groups = mesh.group_ids().unwrap_or_default();
+            match node_info(&state, &mesh) {
+                Ok(doc) => {
+                    if last.as_ref().is_some_and(|previous| *previous != doc) {
+                        for group_id in &groups {
+                            announce(&state, Announcement::new("node-info.updated", group_id))
+                                .await;
+                        }
+                    }
+                    last = Some(doc);
+                }
+                Err(error) => tracing::warn!(error = %error, "node info is unavailable"),
+            }
+            if beacon && !groups.is_empty() {
+                send_beacon(mesh.node_id(), state.config.port).await;
+            }
+        }
+    }))
+}
+
+/// The beacon needs a listener other devices can reach; `TODEX_AGENTD_MESH_BEACON=false` turns it off.
+fn beacon_enabled(state: &AppState) -> bool {
+    let disabled = std::env::var("TODEX_AGENTD_MESH_BEACON").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    });
+    !disabled
+        && state.config.network_enabled
+        && !crate::listen_addrs::is_loopback_host(&state.config.host)
+}
+
+/// `{"t":"todex-mesh-beacon","v":1,"nodeId","port"}` to the IPv4 broadcast
+/// address. It carries no group id or key: a device that knows the node id
+/// still verifies the node through the pinned transport key.
+async fn send_beacon(node_id: &str, port: u16) {
+    let payload =
+        json!({ "t": "todex-mesh-beacon", "v": 1, "nodeId": node_id, "port": port }).to_string();
+    let result = async {
+        let socket = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await?;
+        socket.set_broadcast(true)?;
+        socket
+            .send_to(payload.as_bytes(), ("255.255.255.255", BEACON_PORT))
+            .await
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::debug!(error = %error, "mesh beacon was not sent");
+    }
+}
+
 /// Stores a pushed chain, then applies what it changed: history for added
 /// devices and the announcements.
 async fn accept_chain(
@@ -258,7 +381,7 @@ async fn accept_chain(
 
 /// This node's signed info: transport key as the handshake uses it now, and
 /// the addresses clients can reach it at.
-fn node_info(state: &AppState, mesh: &MeshStore) -> Result<SignedDoc, AppError> {
+pub(crate) fn node_info(state: &AppState, mesh: &MeshStore) -> Result<SignedDoc, AppError> {
     let config = &state.config;
     let keys = state.pairing_keys.current()?;
     let protocol = config.pairing_encryption;

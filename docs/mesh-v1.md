@@ -1,7 +1,9 @@
 # TodeX device groups (mesh v1)
 
-Status: normative for phase 1 (identity, groups, joining, approval on the
-clients, history in one step). Implemented by `TodeX_backend` (`src/mesh/`,
+Status: normative. Phase 1: identity, groups, joining, approval on the
+clients, history in one step. Phase 2: addresses, presence and getting back
+into the group after a network change. Phase 3: relaying through group
+nodes. Implemented by `TodeX_backend` (`src/mesh/`,
 `src/server/mesh.rs`), `TodeX_protocol` (`src/mesh.ts`, the pairing
 extensions in `src/devicePairing.ts`) and the desktop and web clients. All
 implementations pass `TodeX_protocol/tests/fixtures/mesh-v1.json`
@@ -15,9 +17,10 @@ device already in the group, never on a backend. Point-to-point pairing
 ([device-verification.md](device-verification.md)) is unchanged and keeps
 working next to groups.
 
-Later phases (address tables and re-joining after network changes, relaying
-through members) build on the records defined here and are not part of this
-version.
+There is no central server: a device gets back into its group with the
+addresses it saved. When none answers it shows the group as disconnected;
+the user retries or pins a new address. A group with at least one node that
+others can reach (a public address, a port forward) recovers on its own.
 
 ## Encoding and primitives
 
@@ -78,7 +81,10 @@ Bodies are at most 256 KiB. Unknown fields are ignored.
     {"id": "dev_…", "kind": "device", "name": "MacBook", "publicKey": "<b64u>",
      "historyKey": "<b64u X-Wing>", "addedAt": 1767225600000, "addedBy": "dev_…"},
     {"id": "node_…", "kind": "node", "name": "nas", "publicKey": "<b64u>",
-     "addedAt": 1767225600000, "addedBy": "dev_…"}
+     "addedAt": 1767225600000, "addedBy": "dev_…",
+     "addresses": ["https://nas.example.net:7345"],   // optional, pinned by a user
+     "relay": "preferred",                             // optional: preferred | allowed | denied
+     "relayTarget": false}                             // optional, default true
   ]
 }
 ```
@@ -99,6 +105,8 @@ valid when:
 3. Every document lists 1–256 members with unique ids, at least one device.
    Each id matches its kind and public key (prefix and derivation above).
    Device members carry a 1216-byte `historyKey`; node members carry none.
+   Only nodes carry `addresses` (at most 16 `http(s)://` URLs, 512 bytes
+   each), `relay` and `relayTarget`.
    Names follow the device-name rules of pairing v3 (1–80 scalars, no
    control or bidi formatting characters, no surrounding whitespace).
 4. The chain has at most 4096 documents.
@@ -283,6 +291,7 @@ All require an authenticated device. Mesh needs device auth: with
 | Command | Request | Response |
 |---|---|---|
 | `mesh.node.get` | `{}` | `{nodeId, nodePublicKey, nodeInfo, groups: [groupId…]}` |
+| `mesh.presence.get` | `{groupId}` | `{nodeId, connected[], lastSeen}` |
 | `mesh.state.get` | `{groupId?}` | `{nodeId, nodeInfo, groups: [{groupId, chain, nodeInfos: [SignedDoc…]}]}` |
 | `mesh.state.push` | `{chain, nodeInfos?}` | `{groupId, version, head, changed}` |
 | `mesh.join.list` | `{}` | `{requests: [{requestId, groupId, verificationCode, deviceName, deviceId, devicePublicKey, historyKey, peerAddress, origin?, viaProxy?, expiresAt}]}` |
@@ -299,7 +308,68 @@ group for a caller the node does not trust).
 Broadcast to every `/v2/ws` connection after a change was stored:
 `{reason, groupId, requestId?, version?}` with `reason` one of
 `join.requested`, `join.decided`, `roster.updated`, `node-info.updated`,
-`group.left`. Clients re-read with `mesh.state.get` / `mesh.join.list`.
+`group.left`, `presence`. Clients re-read with `mesh.state.get` / `mesh.join.list`.
+
+## Addresses and getting back into the group (phase 2)
+
+A device keeps, per node of its group, the addresses that worked (last
+success first) and tries, in order: those, the node's pinned `addresses`,
+the addresses its LAN beacon showed, then the `urls` of its node info. It
+moves to the next address after about 15 s without a connection. Every
+connect reads the node's group state, so a device that was offline catches
+up with the roster and the other nodes' infos, and hands them to nodes that
+are behind.
+
+- A node re-reads its addresses and transport key every 30 s; when its
+  signed info changes it announces `node-info.updated` to its connected
+  devices, which carry the new info to the other nodes.
+- `mesh.presence.get {groupId}` → `{nodeId, connected: [{deviceId,
+  connections, connectedAt}], lastSeen: {deviceId: ms}}`: the group's devices
+  connected to this node, and when the others last left (since the node
+  started). Arrivals and departures are announced as `presence`.
+- Pinned addresses live in the roster, so every member learns them; a user
+  adds one when all known addresses fail (a new public IP, a new port
+  forward).
+
+### LAN beacon
+
+A node in a group whose listener is reachable from other machines (not a
+loopback bind, network on) broadcasts every 30 s to UDP
+`255.255.255.255:21047`:
+`{"t":"todex-mesh-beacon","v":1,"nodeId":"node_…","port":7345}`. It carries
+no group id and no key; a device that knows the node id tries
+`http://<sender address>:<port>` and still verifies the node through the
+pinned transport key. `TODEX_AGENTD_MESH_BEACON=false` turns it off. The
+desktop listens; browsers cannot.
+
+## Relay (phase 3)
+
+A device that reaches none of a node T's addresses may reach T through
+another node R of the group. R serves
+`/v2/mesh/relay/{T}/{ticket}/{path}` and forwards `path` to T byte for
+byte: only `health`, `v2/version`, `v2/transport-policy`, `v2/sealed` and
+the `v2/ws` upgrade (others answer `404`). The device uses
+`<R's address>/v2/mesh/relay/{T}/{ticket}` as T's address and keeps T's
+pinned transport key, so REST stays sealed and the socket encrypted for T
+and signed by the device: R sees both ids, timing and sizes, never content.
+A session keyed for any other node fails at T (`4400`).
+
+- **Ticket:** `deviceId.expiresAt.b64u(sig)`, the device's Ed25519
+  signature over `"todex.mesh.v1/relay-ticket\0" || deviceId || "\0" ||
+  relayNodeId || "\0" || targetNodeId || "\0" || expiresAt` (decimal
+  milliseconds). R accepts it until `expiresAt`, at most 7 days ahead;
+  devices issue 24-hour tickets and renew them. A ticket only lets its
+  holder use R's bandwidth towards T; T still authenticates the device.
+- **Authorization at R:** a group lists R (not `relay: "denied"`), T as
+  another node without `relayTarget: false`, and the ticket's device. R
+  dials T's pinned addresses, then its node info `urls`, preferring the one
+  that answered `/health` in the last minute. At most 64 relayed requests
+  and sockets at once (`503 TRANSPORT_BUSY`).
+- **Device rules:** a device relays only when direct addresses failed and
+  its own relay setting is on; it prefers `relay: "preferred"` nodes, never
+  uses `denied` ones, and never relays to a `relayTarget: false` node. It
+  shows the connection as relayed and checks the direct addresses every
+  minute (`/health`), switching back as soon as one answers.
 
 ## Version
 

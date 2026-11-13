@@ -134,6 +134,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "history.keys.wraps"
             | "history.device.restore"
             | "mesh.node.get"
+            | "mesh.presence.get"
             | "mesh.state.get"
             | "mesh.state.push"
             | "mesh.join.list"
@@ -2886,6 +2887,12 @@ async fn handle_socket(
         transport_version,
     } = codec;
     let encryption_protocol = protocol.map(|protocol| protocol.as_str());
+    // Group devices' connections are visible to the group (`presence`).
+    let _presence = if authenticated {
+        super::mesh::PresenceGuard::open(&state, &auth.principal_id).await
+    } else {
+        None
+    };
     let active_connections = state.increment_websocket_connections();
     state
         .events
@@ -11658,7 +11665,7 @@ mod tests {
         let node = run!("mesh.node.get", json!({})).unwrap();
         let node_id = node["nodeId"].as_str().unwrap().to_owned();
         assert!(node["groups"].as_array().unwrap().is_empty());
-        assert_eq!(node["nodeInfo"]["body"].is_string(), true);
+        assert!(node["nodeInfo"]["body"].is_string());
         let node_key = parse_signing_public_key(node["nodePublicKey"].as_str().unwrap()).unwrap();
 
         let creator = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
