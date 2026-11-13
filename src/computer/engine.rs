@@ -166,7 +166,14 @@ impl Engine {
             (None, Some(identifier)) => platform::running_app(identifier).ok_or_else(|| {
                 ComputerError::invalid(format!("{identifier} is not running; use open_app"))
             })?,
-            (None, None) => frontmost(&provider)?,
+            (None, None) => frontmost(&provider).or_else(|error| {
+                // The accessibility API names no front app while apps
+                // switch; the window server still knows it.
+                platform::frontmost_pid()
+                    .map(platform::app_identity)
+                    .filter(|app| app.pid != 0)
+                    .ok_or(error)
+            })?,
         };
         let protected = policy::is_protected(&app, own_pid);
         if protected && (target_window.is_some() || args["app"].is_string()) {
@@ -174,11 +181,17 @@ impl Engine {
         }
         self.observed = Some(app.clone());
         // The front app is protected: show the display without its tree.
+        // Its window on the current screen, else its first one.
         let window_index = target_window.or_else(|| {
+            let mine = |window: &&WindowEntry| !protected && window.app.pid == app.pid;
             self.windows
                 .iter()
-                .position(|window| !protected && window.app.pid == app.pid)
+                .position(|window| mine(&window) && window_on_screen(window))
+                .or_else(|| self.windows.iter().position(|window| mine(&window)))
         });
+        // Said to the agent above the tree: why it is not agent-desktop's,
+        // or why the screenshot is missing.
+        let mut notes: Vec<String> = Vec::new();
         let (tree_text, truncated) = if protected {
             (
                 format!(
@@ -187,27 +200,75 @@ impl Engine {
                 ),
                 false,
             )
-        } else if let Some(cli) = cli {
-            let title = window_index.map(|index| self.windows[index].title.clone());
-            let snapshot = cli.snapshot(&app, title.as_deref(), cancelled)?;
-            let formatted = tree::format(&snapshot.root);
-            self.refs = formatted.refs;
-            self.external = snapshot.elements;
-            self.external_observed = true;
-            (formatted.text, formatted.truncated || snapshot.truncated)
         } else {
-            let root = match window_index {
-                Some(index) => self.windows[index].element.clone(),
-                None => provider
-                    .app_by_pid(app.pid)
-                    .map_err(ComputerError::platform)?,
+            let external = match cli {
+                Some(cli) => {
+                    let title = window_index.map(|index| self.windows[index].title.clone());
+                    match cli.snapshot(&app, title.as_deref(), cancelled) {
+                        Ok(snapshot) => Some(snapshot),
+                        Err(error) if error.code == "CANCELLED" => return Err(error),
+                        // A window agent-desktop cannot read yet (a
+                        // Chromium app builds its tree on first contact)
+                        // or does not list: the built-in reader may.
+                        Err(error) => {
+                            notes.push(format!(
+                                "agent-desktop could not read this window ({}: {}); this tree comes from the built-in engine, so set_value, select, toggle, expand, collapse and scroll_to are unavailable until an observation succeeds with agent-desktop.",
+                                error.code, error.message
+                            ));
+                            None
+                        }
+                    }
+                }
+                None => None,
             };
-            let offset = window_index.map_or((0, 0), |index| self.windows[index].offset);
-            let mut budget = MAX_NODES;
-            let node = self.read_tree(&provider, root, 0, offset, &mut budget);
-            let formatted = tree::format(&node);
-            self.refs = formatted.refs;
-            (formatted.text, formatted.truncated || budget == 0)
+            match external {
+                Some(snapshot) => {
+                    let formatted = tree::format(&snapshot.root);
+                    self.refs = formatted.refs;
+                    self.external = snapshot.elements;
+                    self.external_observed = true;
+                    (formatted.text, formatted.truncated || snapshot.truncated)
+                }
+                None => {
+                    let root = match window_index {
+                        Some(index) => Ok(self.windows[index].element.clone()),
+                        None => provider.app_by_pid(app.pid),
+                    };
+                    match root {
+                        Ok(root) => {
+                            let offset =
+                                window_index.map_or((0, 0), |index| self.windows[index].offset);
+                            let mut budget = MAX_NODES;
+                            let node = self.read_tree(&provider, root, 0, offset, &mut budget);
+                            let formatted = tree::format(&node);
+                            self.refs = formatted.refs;
+                            (formatted.text, formatted.truncated || budget == 0)
+                        }
+                        // The screenshot still shows it: act by coordinates.
+                        Err(error) => (
+                            format!(
+                                "({}'s accessibility tree could not be read: {error}. Use the screenshot and x/y coordinates.)",
+                                label(&app)
+                            ),
+                            false,
+                        ),
+                    }
+                }
+            }
+        };
+        // A window in another Space (a full-screen app there) or minimized:
+        // the screen shows something else, and input would land there.
+        let off_screen = window_index.is_some_and(|index| !window_on_screen(&self.windows[index]));
+        if off_screen {
+            notes.push(format!(
+                "This window of {} is not on the current screen (another desktop Space, a full-screen app there, or minimized), so it has no screenshot and pointer input would not reach it. Bring it forward with computer_act focus_window (or open_app), then observe again.",
+                label(&app)
+            ));
+        }
+        let tree_text = if notes.is_empty() {
+            tree_text
+        } else {
+            format!("{}\n\n{tree_text}", notes.join("\n"))
         };
 
         let displays = platform::displays();
@@ -237,7 +298,9 @@ impl Engine {
                 "height": bounds.map(|b| b.height).unwrap_or(0),
             });
         }
-        if args["screenshot"].as_bool() != Some(false) {
+        let wants_screenshot = args["screenshot"].as_bool() != Some(false)
+            && (args["display"].is_u64() || !off_screen);
+        if wants_screenshot {
             let rect = match args["display"].as_u64() {
                 Some(index) => display_rect(
                     displays
@@ -1198,6 +1261,22 @@ fn sensitive() -> ComputerError {
 /// AT-SPI reports password fields by role.
 fn is_secure_role(element: &ElementData) -> bool {
     element.raw.get("atspi_role").and_then(Value::as_str) == Some("password text")
+}
+
+/// Whether `window` shows on the current screen (see
+/// [`platform::on_current_space`]); one without bounds is assumed to.
+fn window_on_screen(window: &WindowEntry) -> bool {
+    window.element.bounds.is_none_or(|bounds| {
+        platform::on_current_space(
+            window.app.pid,
+            (
+                f64::from(bounds.x),
+                f64::from(bounds.y),
+                f64::from(bounds.width),
+                f64::from(bounds.height),
+            ),
+        )
+    })
 }
 
 fn frontmost(provider: &Arc<dyn Provider>) -> Result<Target, ComputerError> {

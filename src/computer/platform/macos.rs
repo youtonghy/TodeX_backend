@@ -264,6 +264,35 @@ pub(crate) fn settings_window() -> Option<Option<(f64, f64, f64, f64)>> {
     }))
 }
 
+/// The front app's process id, for when the accessibility API cannot say
+/// (it answers nothing while apps switch).
+pub(crate) fn frontmost_pid() -> Option<u32> {
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .and_then(|app| u32::try_from(app.processIdentifier()).ok())
+        .filter(|pid| *pid != 0)
+}
+
+/// Whether `pid`'s window with these global bounds is visible on the
+/// current desktop. Windows in another Space (a full-screen app there
+/// included) and minimized ones are not; when the window server does not
+/// answer, the window is assumed to be.
+pub(crate) fn on_current_space(pid: u32, bounds: (f64, f64, f64, f64)) -> bool {
+    let Some(windows) = on_screen_windows() else {
+        return true;
+    };
+    let (x, y, width, height) = bounds;
+    let near = |a: f64, b: f64| (a - b).abs() <= 2.0;
+    windows.iter().any(|window| {
+        window.pid == pid
+            && window.layer == 0
+            && near(window.x, x)
+            && near(window.y, y)
+            && near(window.width, width)
+            && near(window.height, height)
+    })
+}
+
 /// Seconds since the user last touched the mouse or keyboard. Events this
 /// process posts are not hardware input and do not count.
 pub(crate) fn idle_seconds() -> f64 {

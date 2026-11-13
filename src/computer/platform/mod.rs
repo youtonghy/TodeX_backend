@@ -51,6 +51,21 @@ pub(crate) fn window_offsets(windows: &[xa11y::ElementData]) -> Vec<(i32, i32)> 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn globalize(_element: &mut xa11y::ElementData, _offset: (i32, i32)) {}
 
+/// The front app's process id, for when the accessibility API cannot say
+/// (it answers nothing while apps switch); macOS only.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn frontmost_pid() -> Option<u32> {
+    None
+}
+
+/// Whether `pid`'s window with these global bounds is visible on the
+/// current desktop (not in another Space, full screen elsewhere, or
+/// minimized); only macOS can tell, elsewhere it is assumed to be.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn on_current_space(_pid: u32, _bounds: (f64, f64, f64, f64)) -> bool {
+    true
+}
+
 /// A Computer Use session started.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn begin_session() {}
