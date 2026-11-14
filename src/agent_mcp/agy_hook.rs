@@ -118,6 +118,7 @@ enum ToolClass {
 fn classify(name: &str, args: &Value) -> ToolClass {
     match name {
         "view_file"
+        | "read_file"
         | "list_dir"
         | "grep_search"
         | "find_by_name"
@@ -129,9 +130,12 @@ fn classify(name: &str, args: &Value) -> ToolClass {
         "ask_question"
         | "ask_permission"
         | "ask_custom_permission"
+        | "exit_plan_mode"
         | "finish"
         | "wait"
         | "wait_5_seconds"
+        | "schedule"
+        | "swarm"
         | "define_subagent"
         | "invoke_subagent"
         | "manage_subagents"
@@ -139,8 +143,10 @@ fn classify(name: &str, args: &Value) -> ToolClass {
         | "manage_inbox"
         | "generate_image" => ToolClass::Internal,
         "write_to_file"
+        | "write_file"
         | "replace_file_content"
         | "multi_replace_file_content"
+        | "edit_file"
         | "sed_file"
         | "notebook_edit" => ToolClass::Edit,
         "run_command" | "send_command_input" | "manage_task" | "notebook_execution" => {
@@ -256,21 +262,43 @@ async fn decide(
 
 /// Read tools that take filesystem paths. In ask mode they are allowed
 /// without a prompt only inside [`read_roots`].
-const PATH_READ_TOOLS: &[&str] = &["view_file", "list_dir", "grep_search", "find_by_name"];
+const PATH_READ_TOOLS: &[&str] = &[
+    "view_file",
+    "read_file",
+    "list_dir",
+    "grep_search",
+    "find_by_name",
+];
 
 /// Where reads need no prompt: the conversation's workspace, the images
 /// TodeX staged for it (`attachments`), the prompt uploads, agy's bundled docs
-/// (`~/.gemini/antigravity-cli/builtin`), and this conversation's artifact
-/// directory when it lies under agy's `brain` directory.
+/// (`~/.gemini/antigravity-cli/builtin`), installed skills directories, and
+/// this conversation's artifact directory when it lies under agy's `brain`
+/// directory.
 fn read_roots(workspace: &Path, attachments: PathBuf, payload: &Value) -> Vec<PathBuf> {
+    let gemini = crate::provider::antigravity::integration_dir();
+    read_roots_under(workspace, attachments, payload, gemini.parent())
+}
+
+fn read_roots_under(
+    workspace: &Path,
+    attachments: PathBuf,
+    payload: &Value,
+    gemini: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut roots = vec![
         workspace.to_path_buf(),
         attachments,
         crate::prompt_uploads::upload_root(),
     ];
-    if let Some(gemini) = crate::provider::antigravity::integration_dir().parent() {
+    if let Some(gemini) = gemini {
         let cli = gemini.join("antigravity-cli");
         roots.push(cli.join("builtin"));
+        roots.push(gemini.join("skills"));
+        roots.push(gemini.join("config/plugins"));
+        if let Some(home) = gemini.parent() {
+            roots.push(home.join(".agents/skills"));
+        }
         if let Some(artifacts) = payload
             .get("artifactDirectoryPath")
             .and_then(Value::as_str)
@@ -464,6 +492,10 @@ fn summary(name: &str, args: &Value) -> String {
         "CommandLine",
         "TargetFile",
         "AbsolutePath",
+        "Path",
+        "DirectoryPath",
+        "SearchPath",
+        "SearchDirectory",
         "Url",
         "url",
         "Query",
@@ -612,8 +644,17 @@ mod tests {
     #[test]
     fn tools_are_classified_by_what_they_can_do() {
         assert_eq!(classify("view_file", &Value::Null), ToolClass::Read);
+        assert_eq!(classify("read_file", &Value::Null), ToolClass::Read);
         assert_eq!(classify("ask_question", &Value::Null), ToolClass::Internal);
+        assert_eq!(
+            classify("exit_plan_mode", &Value::Null),
+            ToolClass::Internal
+        );
+        assert_eq!(classify("schedule", &Value::Null), ToolClass::Internal);
+        assert_eq!(classify("swarm", &Value::Null), ToolClass::Internal);
         assert_eq!(classify("write_to_file", &Value::Null), ToolClass::Edit);
+        assert_eq!(classify("write_file", &Value::Null), ToolClass::Edit);
+        assert_eq!(classify("edit_file", &Value::Null), ToolClass::Edit);
         assert_eq!(classify("run_command", &Value::Null), ToolClass::Command);
         assert_eq!(
             classify("browser_click_element", &Value::Null),
@@ -728,9 +769,63 @@ mod tests {
             summary("run_command", &json!({ "CommandLine": "npm test" })),
             "npm test"
         );
+        assert_eq!(
+            summary("read_file", &json!({ "Path": "/workspace/src/lib.rs" })),
+            "/workspace/src/lib.rs"
+        );
         assert_eq!(summary("finish", &Value::Null), "finish");
         let long = "x".repeat(SUMMARY_CHARS + 10);
         assert!(summary("run_command", &json!({ "CommandLine": long })).ends_with('…'));
+    }
+
+    #[test]
+    fn skill_directories_are_readable_without_prompt() {
+        let root = std::env::temp_dir().join(format!("todex-agy-roots-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let attachments = root.join("attachments");
+        let home = root.join("home");
+        let gemini = home.join(".gemini");
+        let builtin = gemini.join("antigravity-cli/builtin");
+        let gemini_skills = gemini.join("skills/shadcn");
+        let plugin_skills = gemini.join("config/plugins/shadcn-plugin/skills/shadcn");
+        let agent_skills = home.join(".agents/skills/animate");
+        let outside = root.join("outside");
+        for dir in [
+            &workspace,
+            &attachments,
+            &builtin,
+            &gemini_skills,
+            &plugin_skills,
+            &agent_skills,
+            &outside,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for file in [
+            gemini_skills.join("SKILL.md"),
+            plugin_skills.join("SKILL.md"),
+            agent_skills.join("SKILL.md"),
+            outside.join("secret.txt"),
+        ] {
+            std::fs::write(&file, "x").unwrap();
+        }
+
+        let roots = read_roots_under(&workspace, attachments, &Value::Null, Some(&gemini));
+        for allowed in [
+            gemini_skills.join("SKILL.md"),
+            plugin_skills.join("SKILL.md"),
+            agent_skills.join("SKILL.md"),
+        ] {
+            assert!(
+                paths_inside(&roots, &read_paths(&json!({ "Path": allowed }))),
+                "{allowed:?} should be inside read_roots"
+            );
+        }
+        assert!(!paths_inside(
+            &roots,
+            &read_paths(&json!({ "Path": outside.join("secret.txt") }))
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     mod route {
@@ -1015,6 +1110,7 @@ mod tests {
                     "view_file",
                     json!({ "AbsolutePath": format!("{workspace}/a.txt") }),
                 ),
+                ("read_file", json!({ "Path": format!("{workspace}/a.txt") })),
                 ("list_dir", json!({ "DirectoryPath": workspace.clone() })),
                 (
                     "grep_search",
@@ -1025,6 +1121,9 @@ mod tests {
                     json!({ "SearchDirectory": "src/new", "Pattern": "*" }),
                 ),
                 ("command_status", json!({ "CommandId": "1" })),
+                ("exit_plan_mode", json!({ "plan": "ok" })),
+                ("schedule", json!({ "Prompt": "check" })),
+                ("swarm", json!({ "action": "status" })),
             ] {
                 assert_eq!(
                     harness.decide(tool, args.clone()).await["decision"],
@@ -1037,25 +1136,88 @@ mod tests {
             // and reads without a recognizable path, ask like an edit.
             #[cfg_attr(not(unix), allow(unused_mut))]
             let mut outside_reads = vec![
-                json!({ "AbsolutePath": outside.join("secret.txt").display().to_string() }),
-                json!({ "AbsolutePath": format!("{workspace}/../../outside/secret.txt") }),
-                json!({ "AbsolutePath": format!("{workspace}/new/../../../outside/x") }),
-                json!({ "toolAction": "Reading file" }),
+                (
+                    "view_file",
+                    json!({ "AbsolutePath": outside.join("secret.txt").display().to_string() }),
+                ),
+                (
+                    "read_file",
+                    json!({ "Path": outside.join("secret.txt").display().to_string() }),
+                ),
+                (
+                    "view_file",
+                    json!({ "AbsolutePath": format!("{workspace}/../../outside/secret.txt") }),
+                ),
+                (
+                    "view_file",
+                    json!({ "AbsolutePath": format!("{workspace}/new/../../../outside/x") }),
+                ),
+                ("view_file", json!({ "toolAction": "Reading file" })),
             ];
             #[cfg(unix)]
-            outside_reads.push(json!({ "AbsolutePath": format!("{workspace}/link/secret.txt") }));
-            for args in outside_reads {
+            outside_reads.push((
+                "view_file",
+                json!({ "AbsolutePath": format!("{workspace}/link/secret.txt") }),
+            ));
+            for (tool, args) in outside_reads {
                 let call = {
                     let harness = harness.clone();
                     let args = args.clone();
-                    tokio::spawn(async move { harness.decide("view_file", args).await })
+                    tokio::spawn(async move { harness.decide(tool, args).await })
                 };
                 let prompt = harness.pending_permission().await;
-                assert_eq!(prompt["details"]["tool_name"], "view_file", "{args}");
+                assert_eq!(prompt["details"]["tool_name"], tool, "{args}");
                 harness
                     .answer(&prompt, PermissionOutcome::RejectOnce, "reject_once")
                     .await;
                 assert_eq!(call.await.unwrap()["decision"], "deny", "{args}");
+            }
+
+            // write_file / edit_file ask in `ask`, deny in `plan`, defer in `native_auto`, allow in `full-access`.
+            let edit_args = json!({ "Path": format!("{workspace}/a.txt") });
+            for edit_tool in ["write_file", "edit_file"] {
+                harness
+                    .state
+                    .agent_mcp
+                    .record_turn_mode(id, "ask", "implement");
+                let call = {
+                    let harness = harness.clone();
+                    let edit_args = edit_args.clone();
+                    tokio::spawn(async move { harness.decide(edit_tool, edit_args).await })
+                };
+                let prompt = harness.pending_permission().await;
+                assert_eq!(prompt["details"]["tool_name"], edit_tool);
+                harness
+                    .answer(&prompt, PermissionOutcome::RejectOnce, "reject_once")
+                    .await;
+                assert_eq!(call.await.unwrap()["decision"], "deny");
+
+                harness.state.agent_mcp.record_turn_mode(id, "ask", "plan");
+                assert_eq!(
+                    harness.decide(edit_tool, edit_args.clone()).await["decision"],
+                    "deny"
+                );
+
+                harness
+                    .state
+                    .agent_mcp
+                    .record_turn_mode(id, "auto", "implement");
+                assert_eq!(
+                    harness
+                        .post_as(Some(&harness.token), true, edit_tool, edit_args.clone())
+                        .await
+                        .1["decision"],
+                    "defer"
+                );
+
+                harness
+                    .state
+                    .agent_mcp
+                    .record_turn_mode(id, "full-access", "implement");
+                assert_eq!(
+                    harness.decide(edit_tool, edit_args.clone()).await["decision"],
+                    "allow"
+                );
             }
 
             // Full access reads anywhere without asking.

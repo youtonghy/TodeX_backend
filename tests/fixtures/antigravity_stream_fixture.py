@@ -39,6 +39,30 @@ def marked(name):
 
 
 if "--mode" in args and args[args.index("--mode") + 1] == "auto":
+    if "-p=/config" in args:
+        if marked("auto-unavailable") or marked("auto-preauth-warning"):
+            sys.stderr.write(
+                "warning: --mode auto is not available for this account; "
+                "continuing in the default mode.\n"
+            )
+            sys.stderr.flush()
+        agent_mode = (
+            "auto"
+            if marked("auto-preauth-warning") and not marked("auto-unavailable")
+            else "default"
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "SUCCESS",
+                    "command": {
+                        "name": "config",
+                        "data": {"config": {"agentMode": agent_mode}},
+                    },
+                }
+            )
+        )
+        sys.exit(0)
     probe = "-p=/help" in args
     if probe:
         with open(os.path.join(here, "probe-cwd.log"), "a") as log:
@@ -52,7 +76,11 @@ if "--mode" in args and args[args.index("--mode") + 1] == "auto":
         if marked("auto-probe-fails"):
             sys.stderr.write("error: probe crashed\n")
             sys.exit(1)
-    if marked("auto-unavailable") or (not probe and marked("auto-revoked")):
+    if (
+        marked("auto-unavailable")
+        or marked("auto-preauth-warning")
+        or (not probe and marked("auto-revoked"))
+    ):
         sys.stderr.write("warning: --mode auto is not available for this account; "
                          "continuing in the default mode.\n")
         if not probe and marked("stderr-noise"):

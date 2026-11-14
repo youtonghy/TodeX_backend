@@ -135,11 +135,15 @@ const AUTO_PROBE_FAILURE_TTL: Duration = Duration::from_secs(2 * 60);
 struct AutoProbe {
     expires: std::time::Instant,
     available: bool,
+    /// `agy` 1.5.9+ warns `--mode auto is not available` pre-auth before
+    /// silent auth runs even when `/config` confirms Auto is enabled.
+    pre_auth_warning: bool,
 }
 
 impl AutoProbe {
-    fn fresh(self) -> Option<bool> {
-        (std::time::Instant::now() < self.expires).then_some(self.available)
+    fn fresh(self) -> Option<(bool, bool)> {
+        (std::time::Instant::now() < self.expires)
+            .then_some((self.available, self.pre_auth_warning))
     }
 }
 
@@ -171,56 +175,122 @@ impl AntigravityDriver {
         }
     }
 
-    /// The cached answer, without waiting for a probe in progress.
-    fn cached_auto_mode(&self) -> Option<bool> {
+    /// The cached `(available, pre_auth_warning)` answer, without waiting for
+    /// a probe in progress.
+    fn cached_auto_mode(&self) -> Option<(bool, bool)> {
         let cached = self.auto_mode.try_lock().ok()?;
         cached.and_then(AutoProbe::fresh)
     }
 
-    /// Whether the signed-in account offers `--mode auto`, probing when the
-    /// cached answer expired. A failed probe counts as unavailable, so the
-    /// turn falls back to `ask`, and is retried after
+    /// Whether the signed-in account offers `--mode auto` (and whether `agy`
+    /// emits a pre-auth unavailability warning on stderr even when Auto is
+    /// active), probing when the cached answer expired. A failed probe counts
+    /// as unavailable, so the turn falls back to `ask`, and is retried after
     /// [`AUTO_PROBE_FAILURE_TTL`]. The probe runs outside any workspace: the
     /// answer is per account.
-    async fn auto_available(&self) -> bool {
+    async fn auto_mode_status(&self) -> (bool, bool) {
         let mut cached = self.auto_mode.lock().await;
-        if let Some(available) = cached.and_then(AutoProbe::fresh) {
-            return available;
+        if let Some(status) = cached.and_then(AutoProbe::fresh) {
+            return status;
         }
+        self.ensure_agy_settings_allow_auto().await;
         let spec = self.command_spec(&std::env::temp_dir(), &["--mode", "auto", "-p=/help"]);
-        let (available, ttl) =
-            match run_bounded_command(&spec, MAX_COMMAND_OUTPUT_BYTES, AUTO_PROBE_TIMEOUT).await {
-                Ok(output) if output.success => (
-                    !String::from_utf8_lossy(&output.stderr).contains(AUTO_UNAVAILABLE),
-                    AUTO_PROBE_TTL,
-                ),
-                Ok(output) => {
-                    tracing::warn!(
-                        stderr = stderr_excerpt(&output.stderr).unwrap_or_default(),
-                        "agy Auto mode probe failed; running auto turns as ask"
-                    );
-                    (false, AUTO_PROBE_FAILURE_TTL)
+        let (available, pre_auth_warning, ttl) = match run_bounded_command(
+            &spec,
+            MAX_COMMAND_OUTPUT_BYTES,
+            AUTO_PROBE_TIMEOUT,
+        )
+        .await
+        {
+            Ok(output) if output.success => {
+                if !String::from_utf8_lossy(&output.stderr).contains(AUTO_UNAVAILABLE) {
+                    (true, false, AUTO_PROBE_TTL)
+                } else {
+                    match self.config_reports_auto_mode().await {
+                        Ok(true) => (true, true, AUTO_PROBE_TTL),
+                        Ok(false) => (false, false, AUTO_PROBE_TTL),
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "agy Auto /config confirmation failed; running auto turns as ask"
+                            );
+                            (false, false, AUTO_PROBE_FAILURE_TTL)
+                        }
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "agy Auto mode probe failed; running auto turns as ask");
-                    (false, AUTO_PROBE_FAILURE_TTL)
-                }
-            };
+            }
+            Ok(output) => {
+                tracing::warn!(
+                    stderr = stderr_excerpt(&output.stderr).unwrap_or_default(),
+                    "agy Auto mode probe failed; running auto turns as ask"
+                );
+                (false, false, AUTO_PROBE_FAILURE_TTL)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "agy Auto mode probe failed; running auto turns as ask");
+                (false, false, AUTO_PROBE_FAILURE_TTL)
+            }
+        };
         *cached = Some(AutoProbe {
             expires: std::time::Instant::now() + ttl,
             available,
+            pre_auth_warning,
         });
-        available
+        (available, pre_auth_warning)
     }
 
-    /// Whether an auto turn runs agy's own Auto. `None`: the turn was
-    /// cancelled while waiting for the probe.
-    async fn native_auto(&self, cancel: &mut watch::Receiver<bool>) -> Option<bool> {
-        if let Some(available) = self.cached_auto_mode() {
-            return Some(available);
+    /// Confirms post-auth Auto mode via `-p=/config` when `--mode auto -p=/help`
+    /// warns pre-auth on `agy` 1.5.9+.
+    async fn config_reports_auto_mode(&self) -> Result<bool, AppError> {
+        let spec = self.command_spec(
+            &std::env::temp_dir(),
+            &["--mode", "auto", "--output-format", "json", "-p=/config"],
+        );
+        let output =
+            run_bounded_command(&spec, MAX_COMMAND_OUTPUT_BYTES, AUTO_PROBE_TIMEOUT).await?;
+        if !output.success {
+            return Err(AppError::ProviderUnavailable(format!(
+                "agy -p=/config failed: {}",
+                stderr_excerpt(&output.stderr).unwrap_or_default()
+            )));
+        }
+        let json: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+            AppError::ProviderUnavailable(format!("agy -p=/config returned invalid JSON: {error}"))
+        })?;
+        Ok(json
+            .pointer("/command/data/config/agentMode")
+            .and_then(Value::as_str)
+            == Some("auto"))
+    }
+
+    /// Ensures `<gemini>/antigravity-cli/settings.json` does not pin
+    /// `agentMode` to a non-`"auto"` value that would override post-auth
+    /// `initAgentMode` on `agy` 1.5.9+.
+    async fn ensure_agy_settings_allow_auto(&self) {
+        let Some(gemini) = self.integration_dir.parent() else {
+            return;
+        };
+        let settings = gemini.join("antigravity-cli").join("settings.json");
+        let result = tokio::task::spawn_blocking(move || ensure_settings_allow_auto(&settings))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) | Err(error) => {
+                tracing::warn!(%error, "could not update agy settings for auto mode");
+            }
+        }
+    }
+
+    /// Whether an auto turn runs agy's own Auto and whether agy prints the
+    /// pre-auth warning unconditionally. `None`: the turn was cancelled while
+    /// waiting for the probe.
+    async fn native_auto(&self, cancel: &mut watch::Receiver<bool>) -> Option<(bool, bool)> {
+        if let Some(status) = self.cached_auto_mode() {
+            return Some(status);
         }
         tokio::select! {
-            available = self.auto_available() => Some(available),
+            status = self.auto_mode_status() => Some(status),
             _ = cancel.changed() => None,
         }
     }
@@ -359,9 +429,9 @@ impl ProviderDriver for AntigravityDriver {
             spec.env.extend(global.env.iter().cloned());
         }
         let auto = controls.work_mode != "plan" && controls.permission_mode == "auto";
-        let native_auto = if auto {
+        let (native_auto, pre_auth_warning) = if auto {
             match self.native_auto(&mut cancel).await {
-                Some(answer) => answer,
+                Some(status) => status,
                 None => {
                     return Ok(DriverTurnResult {
                         native_session_id: context.provider_state.native_session_id.clone(),
@@ -371,7 +441,7 @@ impl ProviderDriver for AntigravityDriver {
                 }
             }
         } else {
-            false
+            (false, false)
         };
         if auto && !native_auto {
             // The supervisor recorded `auto` for TodeX's own MCP tools; the
@@ -398,6 +468,7 @@ impl ProviderDriver for AntigravityDriver {
         if controls.work_mode == "plan" {
             spec.args.extend(["--mode".to_owned(), "plan".to_owned()]);
         } else if native_auto {
+            self.ensure_agy_settings_allow_auto().await;
             spec.args.extend(["--mode".to_owned(), "auto".to_owned()]);
             spec.env
                 .insert(AGY_NATIVE_AUTO_ENV.to_owned(), "1".to_owned());
@@ -441,7 +512,10 @@ impl ProviderDriver for AntigravityDriver {
 
         // agy only warns on stderr when Auto is unavailable after all; it is
         // watched as it streams, so later output cannot push it out of view.
-        let auto_watch = native_auto.then(|| StderrWatch::new(AUTO_UNAVAILABLE));
+        // agy 1.5.9+ prints that warning unconditionally pre-auth even when
+        // Auto is enabled (`pre_auth_warning`), so skip the watch there.
+        let auto_watch =
+            (native_auto && !pre_auth_warning).then(|| StderrWatch::new(AUTO_UNAVAILABLE));
         let mut process = JsonLineProcess::spawn_watching(&spec, auto_watch.clone()).await?;
         let result = run_agy_turn(
             &mut process,
@@ -765,6 +839,46 @@ async fn install_integration(dir: &Path, daemon: &Path) -> Result<(), AppError> 
     })
     .await
     .map_err(|error| AppError::Anyhow(error.into()))?
+}
+
+fn ensure_settings_allow_auto(path: &Path) -> Result<(), AppError> {
+    let rewrite = || -> Result<(), AppError> {
+        let Some(current) =
+            crate::agent_providers::files::read_json5(path, "Antigravity CLI settings")?
+        else {
+            return Ok(());
+        };
+        if !current.is_object() {
+            return Err(AppError::InvalidRequest(format!(
+                "Antigravity CLI settings root must be a JSON object: {}",
+                path.display()
+            )));
+        }
+        let Some(mode) = current.get("agentMode") else {
+            return Ok(());
+        };
+        if mode.as_str() == Some("auto") {
+            return Ok(());
+        }
+        crate::agent_providers::files::modify_json5_file(
+            path,
+            "Antigravity CLI settings",
+            |document| {
+                let object = document.as_object_mut().ok_or_else(|| {
+                    AppError::InvalidRequest(format!(
+                        "Antigravity CLI settings root must be a JSON object: {}",
+                        path.display()
+                    ))
+                })?;
+                object.insert("agentMode".to_owned(), Value::String("auto".to_owned()));
+                Ok(())
+            },
+        )
+    };
+    match rewrite() {
+        Err(AppError::Conflict(_)) => rewrite(),
+        other => other,
+    }
 }
 
 /// One emitted conversation event.
@@ -1621,6 +1735,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
                     .filter(|argv| argv.first().map(String::as_str) != Some("models"))
                     .filter(|argv| !argv.contains(&"-p=/help".to_owned()))
+                    .filter(|argv| !argv.contains(&"-p=/config".to_owned()))
                     .collect()
             }
 
@@ -1824,6 +1939,38 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             assert_eq!(launch[mode + 1], "auto");
             assert_eq!(fixture.last_auto_hint(), "1");
             assert_eq!(fixture.tool_mode(), Some(ToolMode::Auto));
+        }
+
+        #[tokio::test]
+        async fn auto_with_preauth_warning_still_runs_native_auto_when_config_confirms_auto() {
+            let fixture = Fixture::new().await;
+            fixture.mark("auto-preauth-warning");
+            let settings = fixture.root.join("antigravity-cli/settings.json");
+            std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+            std::fs::write(&settings, r#"{"agentMode":"default","theme":"dark"}"#).unwrap();
+
+            fixture
+                .run("turn-1", "hello", Some("auto"), None)
+                .await
+                .unwrap();
+            let launch = &fixture.launches()[0];
+            assert!(!launch.contains(&"--dangerously-skip-permissions".to_owned()));
+            let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
+            assert_eq!(launch[mode + 1], "auto");
+            assert_eq!(fixture.last_auto_hint(), "1");
+            assert_eq!(fixture.auto_unavailable_events().await, 0);
+            let updated: Value =
+                serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+            assert_eq!(updated["agentMode"], "auto");
+            assert_eq!(updated["theme"], "dark");
+
+            // A second turn reuses the cached status and still emits no false unavailable event.
+            fixture
+                .run("turn-2", "again", Some("auto"), None)
+                .await
+                .unwrap();
+            assert_eq!(fixture.auto_probes(), 1);
+            assert_eq!(fixture.auto_unavailable_events().await, 0);
         }
 
         #[tokio::test]
