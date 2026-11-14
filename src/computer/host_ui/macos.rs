@@ -636,9 +636,11 @@ fn executable_path() -> Option<String> {
 
 fn guide_purpose(permission: Permission) -> &'static str {
     match (permission, super::chinese()) {
-        (Permission::Screen, true) => "授予“屏幕录制”，Agent 才能看到屏幕内容",
+        // macOS applies a new Screen Recording grant to a running process
+        // only once it restarts.
+        (Permission::Screen, true) => "授予“屏幕录制”后，需重启 TodeX 后端才会生效",
         (Permission::Accessibility, true) => "授予“辅助功能”，Agent 才能点击和输入",
-        (Permission::Screen, false) => "Screen Recording lets agents see the screen",
+        (Permission::Screen, false) => "Screen Recording applies once the TodeX backend restarts",
         (Permission::Accessibility, false) => "Accessibility lets agents click and type",
     }
 }

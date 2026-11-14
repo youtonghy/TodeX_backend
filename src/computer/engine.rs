@@ -256,12 +256,16 @@ impl Engine {
                 }
             }
         };
-        // A window in another Space (a full-screen app there) or minimized:
-        // the screen shows something else, and input would land there.
-        let off_screen = window_index.is_some_and(|index| !window_on_screen(&self.windows[index]));
+        // A window in another Space (a full-screen app there) or minimized,
+        // or a named app with no window at all here: the screen shows
+        // something else, and input would land there.
+        let off_screen = match window_index {
+            Some(index) => !window_on_screen(&self.windows[index]),
+            None => args["app"].is_string() && !protected,
+        };
         if off_screen {
             notes.push(format!(
-                "This window of {} is not on the current screen (another desktop Space, a full-screen app there, or minimized), so it has no screenshot and pointer input would not reach it. Bring it forward with computer_act focus_window (or open_app), then observe again.",
+                "{} has no window on the current screen (it is in another desktop Space, a full-screen app there, minimized, or has no window open), so there is no screenshot and pointer input would not reach it. Bring it forward with computer_act focus_window (or open_app), then observe again.",
                 label(&app)
             ));
         }
