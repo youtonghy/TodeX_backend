@@ -616,6 +616,8 @@ Skill 与 MCP 列表另带 `editable`（列出的条目能否在此编辑、删�
 
 Skill 条目位于 Skill 根目录下的隐藏目录中（如 Codex 自带的 `skills/.system/*`）时带 `builtIn: true`，表示该 Skill 由 CLI 自行安装和管理；其他条目不返回该字段。配置同步等批量复制会跳过这类 Skill。
 
+Skill 根目录第一层的符号链接，只要指向一个直接含普通文件 `SKILL.md` 的目录，也会作为 Skill 列出（与 Claude Code 一致，例如 `~/.claude/skills/plan-gate -> ~/.codex/skills/plan-gate`），条目带 `linked: true`，其他条目不返回该字段。只跟随这一层：指向文件、不存在的路径或没有 `SKILL.md` 的目录的链接被忽略，链接目标内部的符号链接照旧不跟随。`linked` 条目的来源、优先级按链接所在的根目录计算；可以读取正文与 bundle（链接目标目录中的普通文件），但不能经本接口编辑、替换或删除，`PUT`、`PUT …/bundle`、`DELETE` 返回 `400 INVALID_REQUEST`，链接与目标都不改动。缓存同时检查链接、链接目标目录与目标 `SKILL.md`，链接目标中的修改在下一次请求即可见。
+
 - `POST /v2/catalog/skills` 请求体 `{ source, name, content }`：在该来源的 Skill 根目录下新建 `<name>/SKILL.md`。`name` 为 1–100 个字母、数字、`.`、`_`、`-`，不能以 `.` 开头；目录已存在返回 `409`。`content` 必须带可解析的 YAML front matter，且不超过 256 KiB。返回新 Skill 的 descriptor。
 - `PUT /v2/catalog/skills/{resourceId}` 请求体 `{ content }`：校验同上后原子覆盖该 `SKILL.md`（沿用原权限），`resourceId` 不变；格式无效的 Skill 也可借此修复。返回更新后的 descriptor。
 - `DELETE /v2/catalog/skills/{resourceId}`：删除该 Skill 所在目录（含其中脚本等附属文件）；`SKILL.md` 直接位于 Skill 根目录时只删除该文件。返回 `{ resourceId, name, path }`，`path` 为被删除的目录或文件。

@@ -192,6 +192,11 @@ pub struct SkillDescriptor {
     /// skill root, such as Codex's `skills/.system`); absent when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub built_in: bool,
+    /// Installed as a symbolic link at the top of its skill root (pointing at
+    /// another tool's copy, as Claude Code allows): listed and readable, but
+    /// never written through here; absent when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub linked: bool,
     #[serde(skip)]
     pub(crate) path: PathBuf,
     #[serde(skip)]
@@ -847,9 +852,10 @@ impl CatalogService {
             ));
         }
         let root_level = self.is_root_level_skill(provider, &workspace, &descriptor);
+        let linked = descriptor.linked;
         let path = descriptor.path.clone();
         let (files, skipped) =
-            tokio::task::spawn_blocking(move || read_skill_bundle(&path, root_level))
+            tokio::task::spawn_blocking(move || read_skill_bundle(&path, root_level, linked))
                 .await
                 .map_err(|error| AppError::Anyhow(error.into()))??;
         Ok(SkillBundle {
@@ -1010,8 +1016,16 @@ impl CatalogService {
                 crate::provider::profile::profile(provider).display_name
             )));
         }
-        self.skill_descriptor(provider, workspace, resource_id)
-            .await
+        let descriptor = self
+            .skill_descriptor(provider, workspace, resource_id)
+            .await?;
+        if descriptor.linked {
+            return Err(AppError::InvalidRequest(format!(
+                "{} is installed as a symbolic link; change it where the link points",
+                descriptor.name
+            )));
+        }
+        Ok(descriptor)
     }
 
     async fn mcp_descriptor(
@@ -1253,8 +1267,11 @@ fn scan_skills(
             &mut visited_entries,
             validator,
         )?;
+        let linked = collect_linked_skills(&root.path, &mut visited_entries, validator)?;
+        files.extend(linked.iter().cloned());
         files.sort();
         for path in files {
+            let linked = linked.contains(&path);
             if !seen_paths.insert(path.clone()) {
                 continue;
             }
@@ -1286,6 +1303,7 @@ fn scan_skills(
                     valid: true,
                     error: None,
                     built_in,
+                    linked,
                     path,
                     priority: root.priority,
                 }),
@@ -1300,6 +1318,7 @@ fn scan_skills(
                     valid: false,
                     error: Some(error.to_string().chars().take(500).collect()),
                     built_in,
+                    linked,
                     path,
                     priority: root.priority,
                 }),
@@ -1315,6 +1334,55 @@ fn scan_skills(
             .then_with(|| left.resource_id.cmp(&right.resource_id))
     });
     Ok(skills)
+}
+
+/// Skills installed as symbolic links directly in `root`: each top-level
+/// link that points at a directory holding a regular `SKILL.md` (Claude Code
+/// follows these). Only this one level is followed; nothing inside the
+/// target is (see [`collect_named_files`]). Records the link, the target
+/// directory and its `SKILL.md` in `validator`, so a change behind the link
+/// is seen on the next request.
+fn collect_linked_skills(
+    root: &Path,
+    visited_entries: &mut usize,
+    validator: &mut Validator,
+) -> Result<HashSet<PathBuf>, AppError> {
+    let mut linked = HashSet::new();
+    let is_directory = std::fs::symlink_metadata(root)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_directory {
+        return Ok(linked);
+    }
+    for entry in std::fs::read_dir(root)? {
+        if linked.len() >= MAX_SCAN_ENTRIES || *visited_entries >= MAX_SCAN_VISITED_ENTRIES {
+            break;
+        }
+        let entry = entry?;
+        *visited_entries = visited_entries.saturating_add(1);
+        if !entry.file_type()?.is_symlink() {
+            continue;
+        }
+        let link = entry.path();
+        validator.push((link.clone(), Stamp::read(&link)));
+        // `link/.` resolves the link: its stamp changes when SKILL.md is
+        // added to or removed from the target.
+        let target = link.join(".");
+        let target_stamp = std::fs::metadata(&link)
+            .ok()
+            .map(|metadata| Stamp::of(&metadata));
+        validator.push((target, target_stamp));
+        if !target_stamp.is_some_and(|stamp| stamp.directory) {
+            continue;
+        }
+        let skill_file = link.join("SKILL.md");
+        let stamp = Stamp::read(&skill_file);
+        validator.push((skill_file.clone(), stamp));
+        if stamp.is_some_and(|stamp| !stamp.directory && !stamp.symlink) {
+            linked.insert(skill_file);
+        }
+    }
+    Ok(linked)
 }
 
 fn collect_named_files(
@@ -1627,6 +1695,7 @@ fn parse_grok_skills(inspect: &Value, workspace: &Path) -> Vec<SkillDescriptor> 
                     "Grok reported a skill path that is not a readable regular file".to_owned()
                 }),
                 built_in: false,
+                linked: false,
                 path,
                 priority: 100,
             })
@@ -2325,6 +2394,7 @@ fn bundle_too_large(detail: String) -> AppError {
 fn read_skill_bundle(
     skill_file: &Path,
     root_level: bool,
+    linked: bool,
 ) -> Result<(Vec<SkillBundleFile>, Vec<String>), AppError> {
     let mut reader = BundleReader::default();
     if root_level {
@@ -2337,8 +2407,14 @@ fn read_skill_bundle(
         reader.read_file(skill_file, "SKILL.md".to_owned())?;
     } else {
         let directory = skill_file.parent().expect("skill file has a parent");
-        let metadata = std::fs::symlink_metadata(directory)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        // A linked skill's directory is the link itself (top level only);
+        // links inside it are still skipped by the walk.
+        let metadata = if linked {
+            std::fs::metadata(directory)?
+        } else {
+            std::fs::symlink_metadata(directory)?
+        };
+        if (!linked && metadata.file_type().is_symlink()) || !metadata.is_dir() {
             return Err(AppError::InvalidRequest(format!(
                 "{} is not a regular directory",
                 directory.display()
@@ -3841,6 +3917,142 @@ mod tests {
     }
     // Checks file modes and symlinks, which are Unix-only.
     #[cfg(unix)]
+    #[tokio::test]
+    async fn skills_linked_at_the_top_of_a_root_are_listed_but_read_only() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("todex-catalog-linked");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        // Another tool's copy, linked from both user roots (as cc-switch and
+        // `npx skills` install them).
+        let shared = root.join("codex/skills/plan-gate");
+        fs::create_dir_all(&shared).unwrap();
+        let skill_md = "---\nname: plan-gate\ndescription: Plans first\n---\nBody\n";
+        fs::write(shared.join("SKILL.md"), skill_md).unwrap();
+        fs::write(shared.join("TEMPLATE.md"), "template").unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("SKILL.md"), "---\nname: deep\n---\n").unwrap();
+        symlink(&outside, shared.join("inner")).unwrap();
+        let claude = home.join(".claude/skills");
+        let agents = home.join(".agents/skills");
+        fs::create_dir_all(claude.join("real")).unwrap();
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(claude.join("real/SKILL.md"), "---\nname: real\n---\n").unwrap();
+        symlink(&shared, claude.join("plan-gate")).unwrap();
+        symlink(&shared, agents.join("plan-gate")).unwrap();
+        // Not skills: a target without SKILL.md, a file, a broken link.
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        symlink(&empty, claude.join("empty-link")).unwrap();
+        symlink(shared.join("SKILL.md"), claude.join("file-link")).unwrap();
+        symlink(root.join("missing"), claude.join("broken-link")).unwrap();
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home.clone()));
+        let provider = ProviderKind::ClaudeCode;
+
+        let skills = service
+            .skills(provider, workspace.clone())
+            .await
+            .unwrap()
+            .skills;
+        let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(names, ["plan-gate", "plan-gate", "real"], "{names:?}");
+        let linked: Vec<&SkillDescriptor> = skills
+            .iter()
+            .filter(|skill| skill.name == "plan-gate")
+            .collect();
+        assert!(linked.iter().all(|skill| skill.linked && skill.valid));
+        // The provider's own root wins, as for real directories.
+        let active = linked.iter().find(|skill| skill.active).unwrap();
+        assert_eq!(active.source, "provider-user");
+        assert!(
+            !skills
+                .iter()
+                .find(|skill| skill.name == "real")
+                .unwrap()
+                .linked
+        );
+        let json = serde_json::to_value(active).unwrap();
+        assert_eq!(json["linked"], true);
+        assert!(serde_json::to_value(skills.last().unwrap())
+            .unwrap()
+            .get("linked")
+            .is_none());
+
+        // Readable: SKILL.md and the bundle (links inside are still skipped).
+        let resource = service
+            .skill_resource(provider, workspace.clone(), &active.resource_id)
+            .await
+            .unwrap();
+        assert_eq!(resource.content, skill_md);
+        let bundle = service
+            .skill_bundle(provider, workspace.clone(), &active.resource_id)
+            .await
+            .unwrap();
+        let paths: Vec<&str> = bundle.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["SKILL.md", "TEMPLATE.md"]);
+        assert_eq!(bundle.skipped, ["inner"]);
+
+        // Never written through: edits, bundle replacement and deletion fail
+        // and leave the link and its target alone.
+        let refused = |result: Result<(), AppError>| {
+            assert!(
+                matches!(result, Err(AppError::InvalidRequest(_))),
+                "{result:?}"
+            );
+        };
+        refused(
+            service
+                .update_skill(
+                    provider,
+                    workspace.clone(),
+                    &active.resource_id,
+                    "---\nname: x\n---\n".to_owned(),
+                )
+                .await
+                .map(drop),
+        );
+        refused(
+            service
+                .replace_skill_bundle(provider, workspace.clone(), &active.resource_id, Vec::new())
+                .await
+                .map(drop),
+        );
+        refused(
+            service
+                .delete_skill(provider, workspace.clone(), &active.resource_id)
+                .await
+                .map(drop),
+        );
+        assert_eq!(
+            fs::read_to_string(shared.join("SKILL.md")).unwrap(),
+            skill_md
+        );
+        assert!(fs::symlink_metadata(claude.join("plan-gate"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // A change behind a link shows on the next request.
+        fs::write(
+            shared.join("SKILL.md"),
+            "---\nname: plan-gate\ndescription: Changed and longer\n---\n",
+        )
+        .unwrap();
+        fs::write(empty.join("SKILL.md"), "---\nname: late\n---\n").unwrap();
+        let skills = service.skills(provider, workspace).await.unwrap().skills;
+        assert!(skills
+            .iter()
+            .any(|skill| skill.name == "plan-gate" && skill.description == "Changed and longer"));
+        assert!(skills
+            .iter()
+            .any(|skill| skill.name == "late" && skill.linked));
+    }
+
     #[tokio::test]
     async fn skill_bundles_round_trip_and_replace_the_whole_directory() {
         use std::os::unix::fs::PermissionsExt;
