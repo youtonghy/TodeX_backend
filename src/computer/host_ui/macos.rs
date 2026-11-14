@@ -99,6 +99,30 @@ const ALLOW_TAG: isize = 1;
 const DENY_TAG: isize = 2;
 
 define_class!(
+    // SAFETY: NSView allows subclassing, drawRect: is the documented
+    // override point, and RedFill does not implement Drop.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TodexComputerRedFill"]
+    /// The red rounded ground of the pill's Stop button.
+    struct RedFill;
+
+    impl RedFill {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            NSColor::systemRedColor().setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(), 7.0, 7.0).fill();
+        }
+
+        // Clicks go to the button above it, never here.
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> {
+            None
+        }
+    }
+);
+
+define_class!(
     // SAFETY: NSObject has no subclassing requirements and StopTarget does
     // not implement Drop.
     #[unsafe(super(NSObject))]
@@ -307,12 +331,22 @@ pub(super) fn show_status(strings: &Strings, summary: &str) {
                     mtm,
                 )
             };
-            button.setFrame(NSRect::new(
+            // Red so it reads as the way out at a glance. Drawn by hand: a
+            // system button's tint fades in a panel that never becomes key.
+            let stop_frame = NSRect::new(
                 NSPoint::new(PILL_WIDTH - 104.0, 6.0),
                 NSSize::new(96.0, 28.0),
-            ));
+            );
+            // SAFETY: NSView's designated initialiser.
+            let stop_background: Retained<RedFill> =
+                unsafe { msg_send![RedFill::alloc(mtm), initWithFrame: stop_frame] };
+            button.setBordered(false);
+            button.setContentTintColor(Some(&NSColor::whiteColor()));
+            button.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+            button.setFrame(stop_frame);
             if let Some(content) = panel.contentView() {
                 content.addSubview(&label);
+                content.addSubview(&stop_background);
                 content.addSubview(&button);
             }
             ui.pill = Some(Pill { panel, label });
