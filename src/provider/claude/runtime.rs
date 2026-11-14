@@ -585,6 +585,38 @@ impl LaunchKey {
     }
 }
 
+impl Live {
+    /// An approved plan switched the process to the execute settings mid-turn
+    /// (see [`super::plan_handoff`]): the next implement prompt with those
+    /// settings runs on it rather than restarting it. A switch Claude did not
+    /// take leaves the key alone, so that prompt restarts the process with
+    /// the right flags; an effort it did not take still differs, likewise.
+    fn hand_off(&mut self, outcome: &super::plan_handoff::HandoffOutcome) {
+        if !outcome.applied_now() {
+            return;
+        }
+        let after_plan = &outcome.after_plan;
+        self.key.model = Some(after_plan.model.clone());
+        self.key.permission_mode = Some(outcome.native_mode.clone());
+        if outcome.effort_applied {
+            self.key.effort = after_plan.reasoning_effort.clone();
+        }
+        // Work Claude starts on its own from now on runs on these settings.
+        if let Some((_, settings)) = &mut self.provider_work {
+            settings.model = Some(after_plan.model.clone());
+            if outcome.effort_applied {
+                settings.reasoning_effort = after_plan.reasoning_effort.clone();
+            }
+            settings.permission_mode = Some(after_plan.permission_mode.clone());
+            settings.work_mode = Some("implement".to_owned());
+            settings.permission_profile = None;
+            settings.sandbox_mode = None;
+            settings.approval_policy = None;
+            settings.after_plan = None;
+        }
+    }
+}
+
 struct Live {
     process: JsonLineProcess,
     key: LaunchKey,
@@ -1017,7 +1049,8 @@ async fn worker(
                     sink.clone().for_runtime(started.runtime_id.clone()),
                     prompt.turn_id.clone(),
                 ));
-                super::run_claude_turn(
+                let mut handoff = None;
+                let outcome = super::run_claude_turn(
                     &mut started.process,
                     &mut started.usage,
                     &mut started.mode,
@@ -1030,9 +1063,13 @@ async fn worker(
                     &mut started.work,
                     &mut started.subagents,
                     start,
+                    &mut handoff,
                 )
-                .await
-                .map(Some)
+                .await;
+                if let Some(handoff) = handoff {
+                    started.hand_off(&handoff);
+                }
+                outcome.map(Some)
             } => Some(outcome),
             // The caller gave up on the turn (its task was aborted): nothing
             // will read the result, so stop the process mid-turn.
@@ -1371,6 +1408,7 @@ async fn run_once(
             &mut SessionWork::default(),
             &mut super::ClaudeSubagents::default(),
             TurnStart::Prompt,
+            &mut None,
         )
         .await
     }
@@ -1399,9 +1437,10 @@ mod tests {
     /// turn with a frame while no turn runs, `background` leaves a background
     /// task that finishes once a `finish-bg` file appears, after which Claude
     /// starts an invocation of its own (as Claude Code 2.1.299 does);
-    /// `subagent-resume` leaves a background agent waiting on a command of
-    /// its own, which restarts the agent between turns once `finish-bg`
-    /// appears (as Claude Code 2.1.310 does). A
+    /// `exit-plan` asks to leave Plan mode and answers the settings switches
+    /// TodeX sends before its approval; `subagent-resume` leaves a background
+    /// agent waiting on a command of its own, which restarts the agent
+    /// between turns once `finish-bg` appears (as Claude Code 2.1.310 does). A
     /// `reported-mode` file sets initialize's `current_permission_mode` and
     /// an `init-mode` file each turn's `init` frame mode; with an
     /// `early-request` file a permission request precedes the initialize
@@ -1541,6 +1580,19 @@ while IFS= read -r line; do
       ) &
       ;;
   esac
+  case "$line" in
+    *exit-plan*)
+      printf '{"type":"control_request","request_id":"plan-1","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"p"}}}\n'
+      while IFS= read -r reply; do
+        printf '%s\n' "$reply" >> "$dir/wire.jsonl"
+        case "$reply" in
+          *'"type":"control_response"'*) break ;;
+          *'"subtype":"set_model"'*|*'"subtype":"set_permission_mode"'*|*'"subtype":"apply_flag_settings"'*)
+            rid=$(printf '%s' "$reply" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+            printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$rid" ;;
+        esac
+      done ;;
+  esac
   printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}}\n'
   printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"ok"}\n'
   printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
@@ -1624,14 +1676,35 @@ done
             cancel: watch::Receiver<bool>,
             handles: TurnHandles,
         ) -> Result<DriverTurnResult, AppError> {
-            let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
+            let mut prompt = prompt(text);
+            prompt.model = model.map(str::to_owned);
+            self.run_prompt(
+                sessions,
+                manifest,
+                prompt,
+                cancel,
+                handles,
+                PermissionBroker::default(),
+            )
+            .await
+        }
+
+        async fn run_prompt(
+            &self,
+            sessions: &Sessions,
+            manifest: &ConversationManifest,
+            prompt: DriverPrompt,
+            cancel: watch::Receiver<bool>,
+            handles: TurnHandles,
+            permissions: PermissionBroker,
+        ) -> Result<DriverTurnResult, AppError> {
             let sink = DriverEventSink::new(
                 self.store.clone(),
                 ConversationEventHub::default(),
-                PermissionBroker::default(),
+                permissions,
                 manifest.id.clone(),
             )
-            .with_turn_id(turn_id.clone());
+            .with_turn_id(prompt.turn_id.clone());
             let provider_state = self
                 .store
                 .provider_state(&manifest.id)
@@ -1644,19 +1717,7 @@ done
                     agent_mcp: None,
                     handles,
                 },
-                prompt: DriverPrompt {
-                    turn_id,
-                    text: text.to_owned(),
-                    content: vec![],
-                    skills: vec![],
-                    model: model.map(str::to_owned),
-                    reasoning_effort: None,
-                    permission_mode: None,
-                    work_mode: None,
-                    permission_profile: None,
-                    sandbox_mode: None,
-                    approval_policy: None,
-                },
+                prompt,
                 sink,
                 cancel,
             };
@@ -1699,6 +1760,24 @@ done
         /// Sessions that had two processes at once.
         fn overlaps(&self) -> String {
             std::fs::read_to_string(self.root.join("overlap.log")).unwrap_or_default()
+        }
+    }
+
+    /// A prompt with the provider defaults.
+    fn prompt(text: &str) -> DriverPrompt {
+        DriverPrompt {
+            turn_id: format!("turn-{}", uuid::Uuid::new_v4()),
+            text: text.to_owned(),
+            content: vec![],
+            skills: vec![],
+            model: None,
+            reasoning_effort: None,
+            permission_mode: None,
+            work_mode: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+            after_plan: None,
         }
     }
 
@@ -1777,6 +1856,7 @@ done
                     permission_profile: None,
                     sandbox_mode: None,
                     approval_policy: None,
+                    after_plan: None,
                 },
             };
             tokio::time::timeout(
@@ -1893,6 +1973,95 @@ done
         assert_eq!(fixture.launches().len(), 1);
         sessions.stop_all().await;
         cleanup(&fixture.root);
+    }
+
+    /// Approves every permission request.
+    struct AllowAll;
+
+    #[async_trait::async_trait]
+    impl crate::provider::types::PermissionPolicy for AllowAll {
+        async fn decide(
+            &self,
+            _conversation_id: &str,
+            _options: &Value,
+            _device_bound: bool,
+        ) -> Option<(crate::provider::types::PermissionDecision, String)> {
+            Some((
+                crate::provider::types::PermissionDecision {
+                    outcome: crate::provider::types::PermissionOutcome::AllowOnce,
+                    option_id: Some("allow_once".to_owned()),
+                    data: None,
+                },
+                "test".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approved_plan_keeps_the_process_for_the_execute_settings() {
+        for handed_off in [true, false] {
+            let fixture = Fixture::new().await;
+            let sessions = sessions(16);
+            let manifest = fixture.conversation().await;
+            let permissions = PermissionBroker::default();
+            permissions.set_policy(Arc::new(AllowAll));
+            let mut plan = prompt(if handed_off { "exit-plan" } else { "plan only" });
+            plan.model = Some("claude-fable-5-2".to_owned());
+            plan.reasoning_effort = Some("high".to_owned());
+            plan.permission_mode = Some("ask".to_owned());
+            plan.work_mode = Some("plan".to_owned());
+            plan.after_plan = Some(crate::provider::types::AfterPlan {
+                model: "claude-opus-5-5".to_owned(),
+                reasoning_effort: Some("medium".to_owned()),
+                permission_mode: "auto".to_owned(),
+            });
+            let (_cancel, cancel) = watch::channel(false);
+            fixture
+                .run_prompt(
+                    &sessions,
+                    &manifest,
+                    plan,
+                    cancel,
+                    TurnHandles::default(),
+                    permissions.clone(),
+                )
+                .await
+                .unwrap();
+            let mut execute = prompt("go");
+            execute.model = Some("claude-opus-5-5".to_owned());
+            execute.reasoning_effort = Some("medium".to_owned());
+            execute.permission_mode = Some("auto".to_owned());
+            execute.work_mode = Some("implement".to_owned());
+            let (_cancel, cancel) = watch::channel(false);
+            fixture
+                .run_prompt(
+                    &sessions,
+                    &manifest,
+                    execute,
+                    cancel,
+                    TurnHandles::default(),
+                    permissions,
+                )
+                .await
+                .unwrap();
+            let launches = fixture.launches();
+            let wire = fixture.wire();
+            if handed_off {
+                assert!(wire.contains(r#""subtype":"set_model""#), "{wire}");
+                assert!(
+                    wire.contains(r#""subtype":"apply_flag_settings""#),
+                    "{wire}"
+                );
+                assert_eq!(launches.len(), 1, "{launches:?}");
+            } else {
+                assert!(!wire.contains(r#""subtype":"set_model""#), "{wire}");
+                assert_eq!(launches.len(), 2, "{launches:?}");
+                assert!(launches[1].contains("--model claude-opus-5-5"));
+                assert!(launches[1].contains("--permission-mode auto"));
+            }
+            sessions.stop_all().await;
+            cleanup(&fixture.root);
+        }
     }
 
     #[tokio::test]

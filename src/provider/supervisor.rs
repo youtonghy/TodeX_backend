@@ -274,6 +274,9 @@ pub struct ConversationPrompt {
     pub permission_profile: Option<String>,
     pub sandbox_mode: Option<String>,
     pub approval_policy: Option<String>,
+    /// Plan-mode Claude prompts: what to switch to once the plan is approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_plan: Option<super::types::AfterPlan>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -2252,6 +2255,7 @@ impl ConversationSupervisor {
             permission_profile: field("permissionProfile"),
             sandbox_mode: field("sandboxMode"),
             approval_policy: field("approvalPolicy"),
+            after_plan: None,
         };
         if super::types::resolve_execution_config(
             manifest.provider,
@@ -2442,6 +2446,7 @@ impl ConversationSupervisor {
                 permission_profile: None,
                 sandbox_mode: None,
                 approval_policy: None,
+                after_plan: None,
             },
         )
         .await
@@ -2491,6 +2496,7 @@ impl ConversationSupervisor {
             permission_profile,
             sandbox_mode,
             approval_policy,
+            after_plan,
         } = prompt;
         if client_request_id
             .as_ref()
@@ -2567,6 +2573,7 @@ impl ConversationSupervisor {
                             && request_snapshot.permission_profile.is_none()
                             && request_snapshot.sandbox_mode.is_none()
                             && request_snapshot.approval_policy.is_none()
+                            && request_snapshot.after_plan.is_none()
                     } else if let Some(saved) = self.store.last_request(conversation_id).await? {
                         let plain = saved_request(&request_snapshot, None)?;
                         let sealed = saved_request(&request_snapshot, fingerprint_key.as_deref())?;
@@ -2629,6 +2636,13 @@ impl ConversationSupervisor {
             sandbox_mode.as_deref(),
             approval_policy.as_deref(),
         )?;
+        if let Some(after_plan) = &after_plan {
+            super::types::validate_after_plan(
+                manifest.provider,
+                after_plan,
+                &effective_permissions,
+            )?;
+        }
         let driver = self.registry.driver(manifest.provider)?;
         let descriptor = driver.descriptor();
         if !descriptor.available {
@@ -2754,6 +2768,7 @@ impl ConversationSupervisor {
                 permission_profile,
                 sandbox_mode,
                 approval_policy,
+                after_plan,
             },
             cancel: cancel_rx,
             adopt: None,
@@ -4256,6 +4271,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
         let read_only = |label: &str, error: AppError| {
             assert_eq!(error.code(), "HISTORY_READ_ONLY", "{label}: {error}");
@@ -4396,6 +4412,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
         // Below the default threshold a turn leaves the active file alone.
         supervisor
@@ -4450,6 +4467,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
         let mut turns = Vec::new();
         for text in ["first", "second"] {
@@ -4548,6 +4566,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
         let turn = supervisor
             .prompt_owned("local", &manifest.id, request.clone())
@@ -4770,6 +4789,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: Some("read-only".to_owned()),
             approval_policy: Some("on-request".to_owned()),
+            after_plan: None,
         };
         supervisor
             .prompt_owned("local", &manifest.id, request.clone())
@@ -5690,6 +5710,7 @@ mod tests {
                     permission_profile: None,
                     sandbox_mode: None,
                     approval_policy: None,
+                    after_plan: None,
                 },
             )
             .await
@@ -5864,6 +5885,7 @@ mod tests {
                     permission_profile: None,
                     sandbox_mode: None,
                     approval_policy: None,
+                    after_plan: None,
                 },
             )
             .await
@@ -6614,6 +6636,7 @@ mod tests {
                     permission_profile: None,
                     sandbox_mode: None,
                     approval_policy: None,
+                    after_plan: None,
                 },
             )
             .await
@@ -6623,6 +6646,225 @@ mod tests {
         let stdin = fs::read_to_string(root.join("stdin.log")).unwrap_or_default();
         fs::remove_dir_all(root).unwrap();
         (history, stdin)
+    }
+
+    fn plan_prompt(work_mode: Option<&str>) -> ConversationPrompt {
+        ConversationPrompt {
+            client_request_id: None,
+            text: "make a plan".to_owned(),
+            model: Some("claude-fable-5-2".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
+            skills: Vec::new(),
+            content: Vec::new(),
+            permission_mode: Some("ask".to_owned()),
+            work_mode: work_mode.map(str::to_owned),
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+            after_plan: Some(super::super::types::AfterPlan {
+                model: "claude-opus-5-5".to_owned(),
+                reasoning_effort: Some("medium".to_owned()),
+                permission_mode: "auto".to_owned(),
+            }),
+        }
+    }
+
+    /// Runs a Plan-mode Claude turn with `afterPlan` against the
+    /// `plan-handoff` fixture (`behavior` is its marker), answers the
+    /// ExitPlanMode approval with `outcome`, and returns the history and the
+    /// lines Claude read.
+    async fn plan_handoff_turn(
+        label: &str,
+        behavior: &str,
+        outcome: PermissionOutcome,
+    ) -> (Vec<ConversationEvent>, Vec<String>) {
+        let (root, store, supervisor, workspace) = control_fixture(label).await;
+        fs::write(root.join("plan-handoff"), behavior).unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        supervisor
+            .prompt_owned("local", &manifest.id, plan_prompt(Some("plan")))
+            .await
+            .unwrap();
+        let request = wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "permission.requested"
+        })
+        .await;
+        let option = match outcome {
+            PermissionOutcome::AllowOnce => "allow_once",
+            _ => "reject_once",
+        };
+        supervisor
+            .resolve_permission(
+                &manifest.id,
+                request.payload["permissionId"].as_str().unwrap(),
+                PermissionDecision {
+                    outcome,
+                    option_id: Some(option.to_owned()),
+                    data: None,
+                },
+            )
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let stdin = fs::read_to_string(root.join("stdin.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        fs::remove_dir_all(root).unwrap();
+        (history, stdin)
+    }
+
+    fn line_with(lines: &[String], needle: &str) -> usize {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} not in {lines:#?}"))
+    }
+
+    #[tokio::test]
+    async fn an_approved_plan_switches_claude_to_the_execute_settings_before_the_approval() {
+        let (history, stdin) = plan_handoff_turn(
+            "todex-claude-plan-handoff",
+            "ok",
+            PermissionOutcome::AllowOnce,
+        )
+        .await;
+        let model = line_with(&stdin, r#""subtype":"set_model","#);
+        let mode = line_with(&stdin, r#""subtype":"set_permission_mode","#);
+        let effort = line_with(&stdin, r#""subtype":"apply_flag_settings","#);
+        let allow = line_with(&stdin, r#""behavior":"allow""#);
+        assert!(
+            model < mode && mode < effort && effort < allow,
+            "{stdin:#?}"
+        );
+        assert!(stdin[model].contains(r#""model":"claude-opus-5-5""#));
+        assert!(stdin[mode].contains(r#""mode":"auto""#));
+        assert!(stdin[effort].contains(r#""settings":{"effortLevel":"medium"}"#));
+        let events = provider_events(&history, "plan_handoff");
+        assert_eq!(events.len(), 1, "{history:?}");
+        assert_eq!(
+            events[0].payload["metadata"],
+            json!({
+                "workMode": "implement",
+                "model": "claude-opus-5-5",
+                "reasoningEffort": "medium",
+                "permissionMode": "auto",
+                "applied": "now",
+                "reason": "Plan approved; Claude Code continues this turn with the execute model and permission mode.",
+            })
+        );
+        assert!(events[0].payload["turnId"].is_string());
+        // Claude reporting `auto` after the switch is what was asked for.
+        assert!(provider_events(&history, "auto_mode_unavailable").is_empty());
+        assert!(
+            history
+                .iter()
+                .any(|event| event.event_type == "turn.completed"),
+            "{history:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_plan_switches_nothing() {
+        let (history, stdin) = plan_handoff_turn(
+            "todex-claude-plan-rejected",
+            "ok",
+            PermissionOutcome::RejectOnce,
+        )
+        .await;
+        assert!(
+            !stdin.iter().any(|line| line.contains("todex-handoff")),
+            "{stdin:#?}"
+        );
+        line_with(&stdin, r#""behavior":"deny""#);
+        assert!(provider_events(&history, "plan_handoff").is_empty());
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "turn.completed"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_switch_still_approves_the_plan_and_applies_next_turn() {
+        let (history, stdin) = plan_handoff_turn(
+            "todex-claude-plan-refused",
+            "fail-model",
+            PermissionOutcome::AllowOnce,
+        )
+        .await;
+        let model = line_with(&stdin, r#""subtype":"set_model","#);
+        let allow = line_with(&stdin, r#""behavior":"allow""#);
+        assert!(model < allow, "{stdin:#?}");
+        let events = provider_events(&history, "plan_handoff");
+        assert_eq!(events.len(), 1, "{history:?}");
+        let metadata = &events[0].payload["metadata"];
+        assert_eq!(metadata["applied"], "next_turn");
+        assert_eq!(metadata["permissionMode"], "auto");
+        assert!(
+            metadata["reason"]
+                .as_str()
+                .unwrap()
+                .contains("model not available"),
+            "{metadata}"
+        );
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "turn.completed"));
+    }
+
+    #[tokio::test]
+    async fn after_plan_needs_a_claude_prompt_in_plan_mode() {
+        let (root, _store, supervisor, workspace) =
+            control_fixture("todex-after-plan-validation").await;
+        let claude = supervisor
+            .create(ProviderKind::ClaudeCode, workspace.clone(), None, None)
+            .await
+            .unwrap();
+        let reject = |result: Result<String, AppError>, needle: &str| match result {
+            Err(AppError::InvalidRequest(message)) => {
+                assert!(message.contains(needle), "{message}")
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        };
+        reject(
+            supervisor
+                .prompt_owned("local", &claude.id, plan_prompt(None))
+                .await,
+            "workMode plan",
+        );
+        let mut empty_model = plan_prompt(Some("plan"));
+        empty_model.after_plan.as_mut().unwrap().model = " ".to_owned();
+        reject(
+            supervisor
+                .prompt_owned("local", &claude.id, empty_model)
+                .await,
+            "afterPlan.model",
+        );
+        let mut bad_mode = plan_prompt(Some("plan"));
+        bad_mode.after_plan.as_mut().unwrap().permission_mode = "bypassPermissions".to_owned();
+        reject(
+            supervisor.prompt_owned("local", &claude.id, bad_mode).await,
+            "afterPlan.permissionMode",
+        );
+        let codex = supervisor
+            .create(ProviderKind::Codex, workspace, None, None)
+            .await
+            .unwrap();
+        let mut codex_prompt = plan_prompt(Some("plan"));
+        codex_prompt.model = None;
+        codex_prompt.reasoning_effort = None;
+        reject(
+            supervisor
+                .prompt_owned("local", &codex.id, codex_prompt)
+                .await,
+            "claude-code",
+        );
+        assert!(!supervisor.has_active_turns());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn provider_events<'a>(
@@ -8530,6 +8772,52 @@ elif [ -f "$(dirname "$0")/peer-handback" ]; then
       printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
     ) &
   done
+elif [ -f "$(dirname "$0")/plan-handoff" ]; then
+  # A Plan-mode turn whose plan the user approves: Claude asks for
+  # ExitPlanMode and answers the switches TodeX sends before the approval.
+  # The marker holds `ok`, or `fail-model` to refuse set_model.
+  behavior=$(cat "$(dirname "$0")/plan-handoff")
+  rid_of() {
+    printf '%s' "$1" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'
+  }
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$(dirname "$0")/stdin.log"
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{"current_permission_mode":"plan"}}}\n'
+        continue
+        ;;
+    esac
+    printf '{"type":"system","subtype":"init","permissionMode":"plan","model":"claude-plan-fixture"}\n'
+    printf '{"type":"control_request","request_id":"perm-plan","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"do it"}}}\n'
+    while IFS= read -r reply; do
+      printf '%s\n' "$reply" >> "$(dirname "$0")/stdin.log"
+      rid=$(rid_of "$reply")
+      case "$reply" in
+        *'"type":"control_response"'*) break ;;
+        *'"subtype":"set_model"'*)
+          if [ "$behavior" = fail-model ]; then
+            printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"model not available"}}\n' "$rid"
+          else
+            printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"model":"claude-opus-5-5"}}}\n' "$rid"
+          fi
+          ;;
+        *'"subtype":"set_permission_mode"'*)
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"mode":"auto"}}}\n' "$rid"
+          printf '{"type":"system","subtype":"status","permissionMode":"auto"}\n'
+          ;;
+        *'"subtype":"apply_flag_settings"'*)
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s"}}\n' "$rid"
+          ;;
+      esac
+    done
+    case "$reply" in
+      *'"behavior":"allow"'*) text="implemented" ;;
+      *) text="still planning" ;;
+    esac
+    printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"%s"}}}\n' "$text"
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"%s"}\n' "$text"
+  done
 elif [ -f "$(dirname "$0")/mode-settings" ]; then
   # Claude replacing a requested permission mode. The marker holds the mode
   # initialize reports, the init frame's mode, a mid-turn status frame's
@@ -8957,6 +9245,7 @@ done
                         name: Some("missing".to_owned()),
                     }],
                     content: Vec::new(),
+                    after_plan: None,
                 },
             )
             .await

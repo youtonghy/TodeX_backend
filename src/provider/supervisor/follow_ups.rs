@@ -342,6 +342,17 @@ impl ConversationSupervisor {
                 super::MAX_PROMPT_BYTES
             )));
         }
+        if let Some(after_plan) = &prompt.after_plan {
+            let effective = super::super::types::resolve_execution_config(
+                manifest.provider,
+                prompt.permission_mode.as_deref(),
+                prompt.work_mode.as_deref(),
+                prompt.permission_profile.as_deref(),
+                prompt.sandbox_mode.as_deref(),
+                prompt.approval_policy.as_deref(),
+            )?;
+            super::super::types::validate_after_plan(manifest.provider, after_plan, &effective)?;
+        }
         prepare_prompt_content(
             manifest.provider,
             &manifest.workspace,
@@ -1006,6 +1017,7 @@ fn continuation_prompt(failed: Option<ConversationPrompt>, item_id: &str) -> Con
         permission_profile: None,
         sandbox_mode: None,
         approval_policy: None,
+        after_plan: None,
     });
     prompt.client_request_id = Some(item_id.to_owned());
     RATE_LIMIT_CONTINUE_TEXT.clone_into(&mut prompt.text);

@@ -1285,6 +1285,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
         let images = stage_images(&data_dir, "conv-1", &prompt).await.unwrap();
         let staged = attachments_dir(&data_dir, "conv-1").join("turn1-1.jpg");
@@ -1579,6 +1580,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     permission_profile: None,
                     sandbox_mode: None,
                     approval_policy: None,
+                    after_plan: None,
                 };
                 let sink = DriverEventSink::new(
                     self.store.clone(),

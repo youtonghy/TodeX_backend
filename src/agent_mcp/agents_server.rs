@@ -1540,6 +1540,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
         state
             .conversations
@@ -1708,6 +1709,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
         state
             .conversations

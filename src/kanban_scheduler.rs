@@ -245,6 +245,7 @@ async fn execute(
         permission_profile: None,
         sandbox_mode: None,
         approval_policy: None,
+        after_plan: None,
     };
     let outcome = state
         .conversations

@@ -488,6 +488,67 @@ impl TurnModeHandle {
         self.agent_mcp
             .record_turn_mode(&self.conversation_id, "ask", work_mode);
     }
+
+    /// The turn switched modes mid-way (an approved plan handed off to
+    /// execution): TodeX's own tools follow the new mode from now on.
+    pub fn switch_to(&self, permission_mode: &str, work_mode: &str) {
+        self.agent_mcp
+            .record_turn_mode(&self.conversation_id, permission_mode, work_mode);
+    }
+}
+
+/// What a Plan-mode prompt switches to once the user approves the plan
+/// (Claude's `ExitPlanMode`): the execute model, effort and TodeX permission
+/// mode, applied to the running process within the same turn.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AfterPlan {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    pub permission_mode: String,
+}
+
+/// Checks a prompt's `afterPlan` against its provider and effective work
+/// mode: only a Claude Code prompt in Plan mode hands off.
+pub fn validate_after_plan(
+    provider: ProviderKind,
+    after_plan: &AfterPlan,
+    effective: &EffectivePermissionConfig,
+) -> Result<(), AppError> {
+    if provider != ProviderKind::ClaudeCode {
+        return Err(AppError::InvalidRequest(format!(
+            "afterPlan is only supported for claude-code, not {}",
+            provider.as_str()
+        )));
+    }
+    if effective.work_mode != "plan" {
+        return Err(AppError::InvalidRequest(
+            "afterPlan requires workMode plan".to_owned(),
+        ));
+    }
+    if after_plan.model.trim().is_empty() {
+        return Err(AppError::InvalidRequest(
+            "afterPlan.model must not be empty".to_owned(),
+        ));
+    }
+    if after_plan
+        .reasoning_effort
+        .as_deref()
+        .is_some_and(|effort| effort.trim().is_empty())
+    {
+        return Err(AppError::InvalidRequest(
+            "afterPlan.reasoningEffort must not be empty".to_owned(),
+        ));
+    }
+    let modes = super::profile::profile(provider).permission_config.modes;
+    if !modes.contains(&after_plan.permission_mode.as_str()) {
+        return Err(AppError::InvalidRequest(format!(
+            "afterPlan.permissionMode must be one of {}",
+            modes.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -503,6 +564,9 @@ pub struct DriverPrompt {
     pub permission_profile: Option<String>,
     pub sandbox_mode: Option<String>,
     pub approval_policy: Option<String>,
+    /// Plan-mode prompts only: the settings to switch to once the plan is
+    /// approved (see [`AfterPlan`]).
+    pub after_plan: Option<AfterPlan>,
 }
 
 /// Validated controls actually supported by the selected provider.

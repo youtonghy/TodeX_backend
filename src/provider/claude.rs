@@ -79,6 +79,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 };
 
 mod permission_mode;
+mod plan_handoff;
 mod runtime;
 mod session_rules;
 mod session_work;
@@ -2212,6 +2213,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
 
         assert_eq!(claude_user_content(&prompt), json!("hello"));
@@ -2235,6 +2237,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
 
         assert_eq!(
@@ -3107,6 +3110,7 @@ async fn run_claude_turn(
     work: &mut session_work::SessionWork,
     subagents: &mut ClaudeSubagents,
     start: TurnStart,
+    handoff: &mut Option<plan_handoff::HandoffOutcome>,
 ) -> Result<DriverTurnResult, AppError> {
     let outcome = read_claude_turn(
         process,
@@ -3121,6 +3125,7 @@ async fn run_claude_turn(
         work,
         subagents,
         start,
+        handoff,
     )
     .await;
     let unparsed = sink.unparsed_line_count();
@@ -3156,10 +3161,11 @@ async fn read_claude_turn(
     work: &mut session_work::SessionWork,
     subagents: &mut ClaudeSubagents,
     start: TurnStart,
+    handoff_outcome: &mut Option<plan_handoff::HandoffOutcome>,
 ) -> Result<DriverTurnResult, AppError> {
     work.begin_turn();
     let adopt = start == TurnStart::Adopt;
-    let execution = super::types::resolve_execution_config(
+    let mut execution = super::types::resolve_execution_config(
         context.manifest.provider,
         prompt.permission_mode.as_deref(),
         prompt.work_mode.as_deref(),
@@ -3167,7 +3173,15 @@ async fn read_claude_turn(
         prompt.sandbox_mode.as_deref(),
         prompt.approval_policy.as_deref(),
     )?;
-    let expected_mode = execution.provider_mode.clone();
+    let mut expected_mode = execution.provider_mode.clone();
+    // Answers to control requests TodeX sends mid-turn, and the handoff to
+    // execution an approved plan triggers (see [`plan_handoff`]).
+    let replies = plan_handoff::ControlReplies::default();
+    let handoff = plan_handoff::PlanHandoff::new(
+        prompt.after_plan.as_ref(),
+        &execution.work_mode,
+        replies.clone(),
+    );
     // Start-up already showed Claude refusing full access: fail before the
     // prompt reaches the model.
     if let Some(reported) = mode.reported.as_deref() {
@@ -3264,7 +3278,7 @@ async fn read_claude_turn(
     // so `process` stays single-owner. When the turn ends the cancel channel
     // closes, which resolves any prompt still waiting, and the closed
     // response channel drops the answer.
-    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<Value>();
+    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<plan_handoff::TurnMessage>();
     let open_requests = OpenRequests::default();
     // Whether this turn already reported Claude replacing `auto`.
     let mut auto_fallback = AutoFallback::Active;
@@ -3278,8 +3292,52 @@ async fn read_claude_turn(
             response = response_rx.recv() => {
                 // `response_tx` lives in this scope, so recv() cannot observe
                 // the channel closing while the loop runs.
-                if let Some(response) = response {
-                    process.send(&response).await?;
+                match response {
+                    Some(plan_handoff::TurnMessage::Send(response)) => {
+                        process.send(&response).await?;
+                    }
+                    // Applied before the approval queued behind it is sent.
+                    Some(plan_handoff::TurnMessage::HandedOff(outcome)) => {
+                        if let Some(reported) = outcome.mode_applied.as_deref() {
+                            execution.work_mode = "implement".to_owned();
+                            execution.permission_mode = outcome.after_plan.permission_mode.clone();
+                            execution.provider_mode = Some(outcome.native_mode.clone());
+                            expected_mode = execution.provider_mode.clone();
+                            mode.reported = Some(reported.to_owned());
+                        }
+                        // Claude leaves Plan mode either way: TodeX's own
+                        // tools ask unless the requested mode took.
+                        if let Some(handle) = &context.handles.mode {
+                            handle.switch_to(
+                                if outcome.mode_applied.is_some() {
+                                    &outcome.after_plan.permission_mode
+                                } else {
+                                    "ask"
+                                },
+                                "implement",
+                            );
+                        }
+                        sink.emit("provider.event", outcome.event()).await?;
+                        // Claude may already run another mode than the
+                        // requested `auto`.
+                        if let Some(reported) = outcome.mode_applied.as_deref() {
+                            if auto_mode_fell_back(expected_mode.as_deref(), reported) {
+                                auto_fallback
+                                    .report(
+                                        process,
+                                        sink,
+                                        mode,
+                                        &context.handles,
+                                        &execution.work_mode,
+                                        init_model.as_deref(),
+                                        reported,
+                                    )
+                                    .await?;
+                            }
+                        }
+                        *handoff_outcome = Some(outcome);
+                    }
+                    None => {}
                 }
                 continue;
             }
@@ -3524,6 +3582,7 @@ async fn read_claude_turn(
                     cancel,
                     &open_requests,
                     &context.manifest.workspace,
+                    handoff.as_ref(),
                 );
             }
             // Claude withdrew a request it is no longer waiting on (an
@@ -3692,6 +3751,10 @@ async fn read_claude_turn(
                 .await?;
             }
             Some("control_response") => {
+                // A switch an approved plan is waiting on.
+                if replies.deliver(&message) {
+                    continue;
+                }
                 if let Some(sources) = permission_mode::settings_probe_answer(&message) {
                     mode.settings = Some(sources);
                     auto_fallback.probe_answered(sink, mode).await?;
@@ -5040,12 +5103,13 @@ impl OpenRequests {
 /// Claude withdraws ([`OpenRequests`]) is resolved the same way and never
 /// answered.
 fn spawn_control_request(
-    responses: &mpsc::UnboundedSender<Value>,
+    responses: &mpsc::UnboundedSender<plan_handoff::TurnMessage>,
     message: Value,
     sink: &DriverEventSink,
     cancel: &watch::Receiver<bool>,
     open_requests: &OpenRequests,
     cwd: &Path,
+    handoff: Option<&plan_handoff::PlanHandoff>,
 ) {
     let request_id = message
         .get("request_id")
@@ -5058,6 +5122,7 @@ fn spawn_control_request(
     let mut turn_cancel = cancel.clone();
     let open_requests = open_requests.clone();
     let cwd = cwd.to_path_buf();
+    let handoff = handoff.cloned();
     // Opened before the read loop goes on, so a withdrawal right behind the
     // request finds it.
     let opened = request_id
@@ -5073,7 +5138,15 @@ fn spawn_control_request(
         let outcome = async {
             match request.get("subtype").and_then(Value::as_str) {
                 Some("can_use_tool") => {
-                    tool_permission_response(&request_id, &request, &sink, &mut cancel, &cwd).await
+                    tool_permission_response(
+                        &request_id,
+                        &request,
+                        &sink,
+                        &mut cancel,
+                        &cwd,
+                        handoff.as_ref().map(|handoff| (handoff, &responses)),
+                    )
+                    .await
                 }
                 _ => Err(AppError::Unsupported(
                     "control request is not supported by TodeX".to_owned(),
@@ -5110,7 +5183,9 @@ fn spawn_control_request(
             }),
         };
         if responses
-            .send(json!({ "type": "control_response", "response": response }))
+            .send(plan_handoff::TurnMessage::Send(
+                json!({ "type": "control_response", "response": response }),
+            ))
             .is_err()
         {
             tracing::debug!(
@@ -5124,13 +5199,19 @@ fn spawn_control_request(
 /// Waits for the user's decision and builds the `can_use_tool` response body.
 /// Errors mean the prompt itself failed (cancelled, expired, or journal
 /// write), not that the user denied the tool. `cwd` is Claude's working
-/// directory, which relative file paths in the request refer to.
+/// directory, which relative file paths in the request refer to. An approved
+/// `ExitPlanMode` in a turn with `handoff` switches Claude to the execute
+/// settings before the approval goes out (see [`plan_handoff`]).
 async fn tool_permission_response(
     request_id: &str,
     request: &Value,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
     cwd: &Path,
+    handoff: Option<(
+        &plan_handoff::PlanHandoff,
+        &mpsc::UnboundedSender<plan_handoff::TurnMessage>,
+    )>,
 ) -> Result<Value, AppError> {
     let tool_name = request
         .get("tool_name")
@@ -5167,6 +5248,17 @@ async fn tool_permission_response(
             cancel,
         )
         .await?;
+    let approved = matches!(
+        decision.outcome,
+        PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways
+    );
+    if let Some((handoff, outgoing)) = handoff {
+        if approved && tool_name == plan_handoff::EXIT_PLAN_MODE_TOOL && handoff.claim() {
+            let outcome = handoff.apply(outgoing).await;
+            // Queued ahead of the approval, so the turn switches first.
+            let _ = outgoing.send(plan_handoff::TurnMessage::HandedOff(outcome));
+        }
+    }
     Ok(claude_tool_response(request, rule, &decision))
 }
 

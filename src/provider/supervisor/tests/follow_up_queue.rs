@@ -151,6 +151,7 @@ fn queued_prompt(text: &str) -> ConversationPrompt {
         permission_profile: None,
         sandbox_mode: None,
         approval_policy: None,
+        after_plan: None,
     }
 }
 

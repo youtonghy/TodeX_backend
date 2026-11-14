@@ -135,6 +135,7 @@ impl Harness {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         }
     }
 

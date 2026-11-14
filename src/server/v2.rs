@@ -26,7 +26,7 @@ use crate::conversation::{
 use crate::device_auth;
 use crate::error::AppError;
 use crate::provider::{
-    read_current_version, run_install, run_upgrade, CancelOutcome, CliOperationAction,
+    read_current_version, run_install, run_upgrade, AfterPlan, CancelOutcome, CliOperationAction,
     CliUpgradeOperation, CliVersionsResponse, ConversationPrompt, ConversationSupervisor,
     FollowUpAddOutcome, ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef,
 };
@@ -2695,6 +2695,7 @@ async fn prompt_conversation(
                 approval_policy: request.approval_policy,
                 skills: prompt_skills(request.skills),
                 content: request.content,
+                after_plan: request.after_plan,
             },
         )
         .await?;
@@ -3997,6 +3998,7 @@ async fn dispatch_lane_command(
                         approval_policy: request.approval_policy,
                         skills: prompt_skills(request.skills),
                         content: request.content,
+                        after_plan: request.after_plan,
                     },
                 )
                 .await?;
@@ -4026,6 +4028,7 @@ async fn dispatch_lane_command(
                         approval_policy: request.approval_policy,
                         skills: prompt_skills(request.skills),
                         content: request.content,
+                        after_plan: request.after_plan,
                     },
                     request.front,
                     request.paused,
@@ -4774,6 +4777,9 @@ struct PromptRequest {
     sandbox_mode: Option<String>,
     #[serde(default)]
     approval_policy: Option<String>,
+    /// Plan-mode Claude prompts: the settings to switch to once the plan is approved.
+    #[serde(default)]
+    after_plan: Option<AfterPlan>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4901,6 +4907,9 @@ struct WsConversationRequest {
     sandbox_mode: Option<String>,
     #[serde(default)]
     approval_policy: Option<String>,
+    /// Plan-mode Claude prompts: the settings to switch to once the plan is approved.
+    #[serde(default)]
+    after_plan: Option<AfterPlan>,
     /// Follow-up queue item id (`conversation.queue.*`); defaults to the command id.
     #[serde(default)]
     item_id: Option<String>,

@@ -2016,6 +2016,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
         let input = codex_prompt_input(&prompt);
         assert_eq!(input[0]["type"], "text");
@@ -2185,6 +2186,7 @@ done
                         permission_profile: None,
                         sandbox_mode: sandbox.map(str::to_owned),
                         approval_policy: sandbox.map(|_| "never".to_owned()),
+                        after_plan: None,
                     },
                     sink.clone(),
                     cancel_rx.clone(),

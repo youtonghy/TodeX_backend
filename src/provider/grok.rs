@@ -580,6 +580,7 @@ mod tests {
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
+            after_plan: None,
         };
         let spec = grok_command_spec("grok", &[], Path::new("/tmp"), Some(&prompt)).unwrap();
         assert_eq!(
@@ -720,6 +721,7 @@ mod tests {
                 permission_profile: None,
                 sandbox_mode: None,
                 approval_policy: None,
+                after_plan: None,
             };
             let sink = DriverEventSink::new(
                 self.store.clone(),
@@ -772,6 +774,7 @@ mod tests {
                 permission_profile: None,
                 sandbox_mode: None,
                 approval_policy: None,
+                after_plan: None,
             };
             let sink = DriverEventSink::new(
                 self.store.clone(),

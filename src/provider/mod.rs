@@ -37,7 +37,7 @@ pub use supervisor::{
     CancelOutcome, CleanupReport, CleanupThresholds, ConversationPrompt, ConversationSupervisor,
     FollowUpAddOutcome, PromptContentRef, PromptSkillRef,
 };
-pub use types::{PermissionDecision, PermissionOutcome, PermissionPolicy};
+pub use types::{AfterPlan, PermissionDecision, PermissionOutcome, PermissionPolicy};
 
 #[cfg(test)]
 mod control_tests;
