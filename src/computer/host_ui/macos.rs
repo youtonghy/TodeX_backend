@@ -22,13 +22,14 @@ use objc2::{
     define_class, msg_send,
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
-    sel, AnyThread, MainThreadMarker, MainThreadOnly,
+    sel, AnyThread, MainThreadMarker, MainThreadOnly, Message,
 };
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
-    NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession, NSDraggingSource,
-    NSEvent, NSFont, NSImageScaling, NSImageView, NSPanel, NSScreen, NSTextField,
-    NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask, NSWorkspace,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath,
+    NSButton, NSColor, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession,
+    NSDraggingSource, NSEvent, NSFont, NSImage, NSImageScaling, NSImageView, NSPanel,
+    NSPasteboardItem, NSScreen, NSTextField, NSView, NSWindowCollectionBehavior,
+    NSWindowSharingType, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSLocale, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
@@ -96,6 +97,30 @@ static ANSWER: Mutex<Option<mpsc::Sender<bool>>> = Mutex::new(None);
 /// Button tags of the confirmation.
 const ALLOW_TAG: isize = 1;
 const DENY_TAG: isize = 2;
+
+define_class!(
+    // SAFETY: NSView allows subclassing, drawRect: is the documented
+    // override point, and RedFill does not implement Drop.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TodexComputerRedFill"]
+    /// The red rounded ground of the pill's Stop button.
+    struct RedFill;
+
+    impl RedFill {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            NSColor::systemRedColor().setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(), 7.0, 7.0).fill();
+        }
+
+        // Clicks go to the button above it, never here.
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> {
+            None
+        }
+    }
+);
 
 define_class!(
     // SAFETY: NSObject has no subclassing requirements and StopTarget does
@@ -306,12 +331,22 @@ pub(super) fn show_status(strings: &Strings, summary: &str) {
                     mtm,
                 )
             };
-            button.setFrame(NSRect::new(
+            // Red so it reads as the way out at a glance. Drawn by hand: a
+            // system button's tint fades in a panel that never becomes key.
+            let stop_frame = NSRect::new(
                 NSPoint::new(PILL_WIDTH - 104.0, 6.0),
                 NSSize::new(96.0, 28.0),
-            ));
+            );
+            // SAFETY: NSView's designated initialiser.
+            let stop_background: Retained<RedFill> =
+                unsafe { msg_send![RedFill::alloc(mtm), initWithFrame: stop_frame] };
+            button.setBordered(false);
+            button.setContentTintColor(Some(&NSColor::whiteColor()));
+            button.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+            button.setFrame(stop_frame);
             if let Some(content) = panel.contentView() {
                 content.addSubview(&label);
+                content.addSubview(&stop_background);
                 content.addSubview(&button);
             }
             ui.pill = Some(Pill { panel, label });
@@ -436,8 +471,10 @@ pub(super) fn confirm(
 }
 
 const GUIDE_WIDTH: f64 = 440.0;
-const GUIDE_HEIGHT: f64 = 76.0;
-const GUIDE_ICON: f64 = 48.0;
+const GUIDE_HEIGHT: f64 = 120.0;
+const GUIDE_INSET: f64 = 14.0;
+/// Height of the draggable row.
+const GUIDE_ROW: f64 = 44.0;
 /// How often the guide follows System Settings and rereads the grants.
 const GUIDE_TICK: Duration = Duration::from_millis(300);
 /// A guide nobody acted on goes away.
@@ -482,30 +519,58 @@ impl GuideTarget {
 }
 
 define_class!(
-    // SAFETY: NSImageView allows subclassing, the overrides keep its
-    // contracts (a drag instead of the default mouse tracking), and
-    // DragIcon does not implement Drop.
-    #[unsafe(super(NSImageView))]
+    // SAFETY: NSView allows subclassing, the overrides keep its contracts
+    // (a drag instead of the default mouse handling), and DragRow does not
+    // implement Drop.
+    #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
-    #[name = "TodexComputerDragIcon"]
-    struct DragIcon;
+    #[name = "TodexComputerDragRow"]
+    struct DragRow;
 
-    impl DragIcon {
+    impl DragRow {
         // The panel never becomes key: the first click must start the drag.
         #[unsafe(method(acceptsFirstMouse:))]
         fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
             true
         }
 
+        // The whole row is the handle: its icon and name never take the
+        // mouse.
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            let frame = self.frame();
+            let inside = point.x >= frame.origin.x
+                && point.y >= frame.origin.y
+                && point.x < frame.origin.x + frame.size.width
+                && point.y < frame.origin.y + frame.size.height;
+            inside.then(|| Retained::into_super(self.retain()))
+        }
+
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             self.drag_executable(event);
         }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let bounds = self.bounds();
+            let shape = NSRect::new(
+                NSPoint::new(bounds.origin.x + 0.5, bounds.origin.y + 0.5),
+                NSSize::new(bounds.size.width - 1.0, bounds.size.height - 1.0),
+            );
+            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(shape, 8.0, 8.0);
+            // Opaque, so the drag image reads on a light System Settings too.
+            NSColor::colorWithWhite_alpha(0.2, 1.0).setFill();
+            path.fill();
+            NSColor::colorWithWhite_alpha(0.38, 1.0).setStroke();
+            path.setLineWidth(1.0);
+            path.stroke();
+        }
     }
 
-    unsafe impl NSObjectProtocol for DragIcon {}
+    unsafe impl NSObjectProtocol for DragRow {}
 
-    unsafe impl NSDraggingSource for DragIcon {
+    unsafe impl NSDraggingSource for DragRow {
         #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
         fn source_operation(
             &self,
@@ -515,8 +580,20 @@ define_class!(
             NSDragOperation::Copy
         }
 
+        #[unsafe(method(ignoreModifierKeysForDraggingSession:))]
+        fn ignore_modifier_keys(&self, _session: &NSDraggingSession) -> bool {
+            true
+        }
+
+        #[unsafe(method(draggingSession:willBeginAtPoint:))]
+        fn began(&self, _session: &NSDraggingSession, _point: NSPoint) {
+            // The row travels with the pointer; a faint copy stays behind.
+            self.setAlphaValue(0.35);
+        }
+
         #[unsafe(method(draggingSession:endedAtPoint:operation:))]
         fn ended(&self, _session: &NSDraggingSession, _point: NSPoint, operation: NSDragOperation) {
+            self.setAlphaValue(1.0);
             if operation != NSDragOperation::None {
                 GUIDE_DROPPED.store(GUIDE_GENERATION.load(Ordering::SeqCst), Ordering::SeqCst);
             }
@@ -524,34 +601,63 @@ define_class!(
     }
 );
 
-impl DragIcon {
-    /// Starts dragging this executable's file, which the privacy lists of
-    /// System Settings take like a file picked with their "+" button.
+impl DragRow {
+    /// Starts dragging this executable's file, dressed like a drag out of
+    /// Finder: System Settings' privacy lists refuse a drop that only
+    /// carries a file URL object and take one that carries every type
+    /// Finder writes (as their "+" button would).
     fn drag_executable(&self, event: &NSEvent) {
         let Some(path) = executable_path() else {
             return;
         };
         let url = NSURL::fileURLWithPath(&NSString::from_str(&path));
-        let item = NSDraggingItem::initWithPasteboardWriter(
+        let Some(address) = url.absoluteString() else {
+            return;
+        };
+        let item = NSPasteboardItem::new();
+        for kind in [
+            "public.file-url",
+            "public.url",
+            "com.apple.pasteboard.promised-file-url",
+        ] {
+            item.setString_forType(&address, &NSString::from_str(kind));
+        }
+        let path_string = NSString::from_str(&path);
+        item.setString_forType(&path_string, &NSString::from_str("public.utf8-plain-text"));
+        let paths = NSArray::from_slice(&[&*path_string]);
+        // SAFETY: an array of strings is the property list this type holds.
+        unsafe {
+            item.setPropertyList_forType(&paths, &NSString::from_str("NSFilenamesPboardType"));
+        }
+        let dragging = NSDraggingItem::initWithPasteboardWriter(
             NSDraggingItem::alloc(),
-            ProtocolObject::from_ref(&*url),
+            ProtocolObject::from_ref(&*item),
         );
-        let image = self.image();
+        let bounds = self.bounds();
+        let snapshot = self
+            .bitmapImageRepForCachingDisplayInRect(bounds)
+            .map(|rep| {
+                self.cacheDisplayInRect_toBitmapImageRep(bounds, &rep);
+                let image = NSImage::initWithSize(NSImage::alloc(), bounds.size);
+                image.addRepresentation(&rep);
+                image
+            });
         // SAFETY: an NSImage is a valid dragging-frame content.
         unsafe {
-            item.setDraggingFrame_contents(
-                self.bounds(),
-                image
+            dragging.setDraggingFrame_contents(
+                bounds,
+                snapshot
                     .as_deref()
                     .map(|image| -> &AnyObject { image.as_ref() }),
             );
         }
-        let items = NSArray::from_retained_slice(&[item]);
-        self.beginDraggingSessionWithItems_event_source(
+        let items = NSArray::from_retained_slice(&[dragging]);
+        let session = self.beginDraggingSessionWithItems_event_source(
             &items,
             event,
             ProtocolObject::from_ref(self),
         );
+        session.setAnimatesToStartingPositionsOnCancelOrFail(true);
     }
 }
 
@@ -564,9 +670,11 @@ fn executable_path() -> Option<String> {
 
 fn guide_purpose(permission: Permission) -> &'static str {
     match (permission, super::chinese()) {
-        (Permission::Screen, true) => "授予“屏幕录制”，Agent 才能看到屏幕内容",
+        // macOS applies a new Screen Recording grant to a running process
+        // only once it restarts.
+        (Permission::Screen, true) => "授予“屏幕录制”后，需重启 TodeX 后端才会生效",
         (Permission::Accessibility, true) => "授予“辅助功能”，Agent 才能点击和输入",
-        (Permission::Screen, false) => "Screen Recording lets agents see the screen",
+        (Permission::Screen, false) => "Screen Recording applies once the TodeX backend restarts",
         (Permission::Accessibility, false) => "Accessibility lets agents click and type",
     }
 }
@@ -607,43 +715,62 @@ fn build_guide(ui: &Ui, mtm: MainThreadMarker) -> Guide {
     );
     let panel = overlay_panel(mtm, frame);
     panel.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.1, 0.94)));
-    let inset = (GUIDE_HEIGHT - GUIDE_ICON) / 2.0;
-    let icon: Retained<DragIcon> = {
-        let frame = NSRect::new(
-            NSPoint::new(inset, inset),
-            NSSize::new(GUIDE_ICON, GUIDE_ICON),
-        );
-        // SAFETY: NSView's designated initialiser.
-        unsafe { msg_send![DragIcon::alloc(mtm), initWithFrame: frame] }
-    };
-    if let Some(path) = executable_path() {
-        let image = NSWorkspace::sharedWorkspace().iconForFile(&NSString::from_str(&path));
-        icon.setImage(Some(&image));
-    }
-    icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-    let text_x = inset * 2.0 + GUIDE_ICON;
-    let text_width = GUIDE_WIDTH - text_x - 88.0;
+    let text_width = GUIDE_WIDTH - GUIDE_INSET * 2.0;
     let title = NSTextField::labelWithString(
         &NSString::from_str(if chinese {
-            "把 todex-agentd 拖到上方的列表中"
+            "把下面这一条拖到上方的列表中"
         } else {
-            "Drag todex-agentd into the list above"
+            "Drag the row below into the list above"
         }),
         mtm,
     );
     title.setTextColor(Some(&NSColor::whiteColor()));
     title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
     title.setFrame(NSRect::new(
-        NSPoint::new(text_x, 40.0),
+        NSPoint::new(GUIDE_INSET, GUIDE_HEIGHT - GUIDE_INSET - 18.0),
         NSSize::new(text_width, 18.0),
     ));
     let purpose = NSTextField::labelWithString(&NSString::from_str(""), mtm);
     purpose.setTextColor(Some(&NSColor::colorWithWhite_alpha(1.0, 0.7)));
     purpose.setFont(Some(&NSFont::systemFontOfSize(12.0)));
     purpose.setFrame(NSRect::new(
-        NSPoint::new(text_x, 18.0),
+        NSPoint::new(GUIDE_INSET, GUIDE_HEIGHT - GUIDE_INSET - 38.0),
         NSSize::new(text_width, 16.0),
     ));
+
+    // The draggable row, shaped like an entry of the list it goes into.
+    let close_width = 68.0;
+    let row_width = GUIDE_WIDTH - GUIDE_INSET * 3.0 - close_width;
+    let row: Retained<DragRow> = {
+        let frame = NSRect::new(
+            NSPoint::new(GUIDE_INSET, GUIDE_INSET),
+            NSSize::new(row_width, GUIDE_ROW),
+        );
+        // SAFETY: NSView's designated initialiser.
+        unsafe { msg_send![DragRow::alloc(mtm), initWithFrame: frame] }
+    };
+    let icon_size = 28.0;
+    let icon_inset = (GUIDE_ROW - icon_size) / 2.0;
+    if let Some(path) = executable_path() {
+        let image = NSWorkspace::sharedWorkspace().iconForFile(&NSString::from_str(&path));
+        let icon = NSImageView::imageViewWithImage(&image, mtm);
+        icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        icon.setFrame(NSRect::new(
+            NSPoint::new(icon_inset + 2.0, icon_inset),
+            NSSize::new(icon_size, icon_size),
+        ));
+        row.addSubview(&icon);
+    }
+    let name = NSTextField::labelWithString(&NSString::from_str("todex-agentd"), mtm);
+    name.setTextColor(Some(&NSColor::whiteColor()));
+    name.setFont(Some(&NSFont::boldSystemFontOfSize(14.0)));
+    let name_x = icon_inset * 2.0 + icon_size + 4.0;
+    name.setFrame(NSRect::new(
+        NSPoint::new(name_x, (GUIDE_ROW - 18.0) / 2.0),
+        NSSize::new(row_width - name_x - 12.0, 18.0),
+    ));
+    row.addSubview(&name);
+
     // SAFETY: the target outlives the button (kept in `Ui`).
     let close = unsafe {
         NSButton::buttonWithTitle_target_action(
@@ -654,13 +781,16 @@ fn build_guide(ui: &Ui, mtm: MainThreadMarker) -> Guide {
         )
     };
     close.setFrame(NSRect::new(
-        NSPoint::new(GUIDE_WIDTH - 80.0, (GUIDE_HEIGHT - 28.0) / 2.0),
-        NSSize::new(68.0, 28.0),
+        NSPoint::new(
+            GUIDE_WIDTH - GUIDE_INSET - close_width,
+            GUIDE_INSET + (GUIDE_ROW - 28.0) / 2.0,
+        ),
+        NSSize::new(close_width, 28.0),
     ));
     if let Some(content) = panel.contentView() {
-        content.addSubview(&icon);
         content.addSubview(&title);
         content.addSubview(&purpose);
+        content.addSubview(&row);
         content.addSubview(&close);
     }
     Guide { panel, purpose }

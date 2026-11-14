@@ -85,7 +85,7 @@ xa11y-macos = "=0.15.2"
 core-foundation = "0.10"
 objc2 = "0.6"
 objc2-foundation = "0.3"
-objc2-app-kit = { version = "0.3", features = ["NSAlert", "NSApplication", "NSButton", "NSCell", "NSColor", "NSControl", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFont", "NSGraphics", "NSImage", "NSImageView", "NSPanel", "NSPasteboard", "NSResponder", "NSRunningApplication", "NSScreen", "NSText", "NSTextField", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-app-kit = { version = "0.3", features = ["NSAlert", "NSApplication", "NSBezierPath", "NSBitmapImageRep", "NSButton", "NSCell", "NSColor", "NSControl", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFont", "NSGraphics", "NSImage", "NSImageRep", "NSImageView", "NSPanel", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSText", "NSTextField", "NSView", "NSWindow", "NSWorkspace"] }
 global-hotkey = "0.8"
 dispatch2 = "0.3"
 
