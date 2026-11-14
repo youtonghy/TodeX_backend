@@ -76,7 +76,7 @@ pub(crate) const TOKEN_ENV: &str = "TODEX_AGENT_MCP_TOKEN";
 /// Names [`LEGACY_BRIDGE_SUBCOMMAND`] was launched with.
 pub(crate) const LEGACY_URL_ENV: &str = "TODEX_SSH_MCP_URL";
 pub(crate) const LEGACY_TOKEN_ENV: &str = "TODEX_SSH_MCP_TOKEN";
-/// Codex and Claude stop waiting for a tool call after their own timeout;
+/// Providers stop waiting for a tool call after their own timeout;
 /// leave room for an approval (ask mode), a login the call waits on, the
 /// longest `ssh_exec` and connection setup.
 const SSH_TOOL_TIMEOUT_SECONDS: u64 = authorizer::CONFIRM_TIMEOUT.as_secs()
@@ -102,11 +102,16 @@ pub(crate) const DESKTOP_SERVER: &str = "todex_desktop";
 pub(crate) const DESKTOP_ROUTE: &str = "/internal/agent-mcp/desktop";
 pub(crate) const AGENTS_SERVER: &str = "todex_agents";
 pub(crate) const AGENTS_ROUTE: &str = "/internal/agent-mcp/agents";
-/// Every TodeX MCP server and its route, for static provider configs.
-pub(crate) const ALL_SERVERS: [(&str, &str); 3] = [
-    (SSH_SERVER, SSH_ROUTE),
-    (DESKTOP_SERVER, DESKTOP_ROUTE),
-    (AGENTS_SERVER, AGENTS_ROUTE),
+/// Every TodeX MCP server, its route and how long a provider should wait
+/// for one of its tool calls, for static provider configs.
+pub(crate) const ALL_SERVERS: [(&str, &str, u64); 3] = [
+    (SSH_SERVER, SSH_ROUTE, SSH_TOOL_TIMEOUT_SECONDS),
+    (
+        DESKTOP_SERVER,
+        DESKTOP_ROUTE,
+        desktop_server::PROVIDER_TOOL_TIMEOUT_SECONDS,
+    ),
+    (AGENTS_SERVER, AGENTS_ROUTE, AGENTS_TOOL_TIMEOUT_SECONDS),
 ];
 /// An agent call may wait for an approval (ask mode) and then for the
 /// called agent's turn for up to the longest wait.

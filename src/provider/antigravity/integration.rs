@@ -6,8 +6,9 @@
 //! environment of the `agy` process it starts (see `agent_mcp`):
 //!
 //! - `mcp_config.json`: `todex_ssh` / `todex_desktop` / `todex_agents` run
-//!   `todex-agentd agent-mcp-bridge --route <route>`; outside a TodeX turn
-//!   they serve no tools.
+//!   `todex-agentd agent-mcp-bridge --route <route>`, with a
+//!   `timeoutSeconds` long enough for TodeX's approval prompts; outside a
+//!   TodeX turn they serve no tools.
 //! - `hooks.json`: `todex-approval`, a `PreToolUse` hook for every tool,
 //!   runs a small script next to it. Outside a TodeX turn the script
 //!   prints nothing and exits 0 without starting the daemon; agy then
@@ -63,7 +64,7 @@ pub(crate) fn ensure(dir: &Path, daemon: &Path) -> Result<(), AppError> {
         hook_entry(),
     )?;
     let daemon = daemon.to_string_lossy();
-    for (name, route) in ALL_SERVERS {
+    for (name, route, tool_timeout_seconds) in ALL_SERVERS {
         upsert(
             &dir.join("mcp_config.json"),
             "Antigravity MCP config",
@@ -71,6 +72,9 @@ pub(crate) fn ensure(dir: &Path, daemon: &Path) -> Result<(), AppError> {
             json!({
                 "command": daemon,
                 "args": [BRIDGE_SUBCOMMAND, ROUTE_ARG, route],
+                // agy otherwise ends a tool call after 180s, before an
+                // approval prompt has timed out.
+                "timeoutSeconds": tool_timeout_seconds,
             }),
         )?;
     }
@@ -86,7 +90,7 @@ pub(crate) fn remove(dir: &Path) -> Result<bool, AppError> {
     if removed && read_json5(&hooks, "Antigravity hooks")? == Some(json!({})) {
         remove_file_if_exists(&hooks)?;
     }
-    for (name, _) in ALL_SERVERS {
+    for (name, _, _) in ALL_SERVERS {
         removed |= remove_key(
             &dir.join("mcp_config.json"),
             "Antigravity MCP config",
@@ -225,6 +229,8 @@ mod tests {
             mcp["mcpServers"][SSH_SERVER]["args"],
             json!([BRIDGE_SUBCOMMAND, ROUTE_ARG, SSH_ROUTE])
         );
+        // Room for an approval prompt, a login and the longest command.
+        assert_eq!(mcp["mcpServers"][SSH_SERVER]["timeoutSeconds"], 1080);
         assert_eq!(
             mcp["mcpServers"][DESKTOP_SERVER]["command"],
             "/opt/todex/todex-agentd"

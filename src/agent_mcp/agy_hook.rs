@@ -158,7 +158,11 @@ fn classify(name: &str, args: &Value) -> ToolClass {
             todex: args
                 .get("ServerName")
                 .and_then(Value::as_str)
-                .is_some_and(|server| super::ALL_SERVERS.iter().any(|(name, _)| *name == server)),
+                .is_some_and(|server| {
+                    super::ALL_SERVERS
+                        .iter()
+                        .any(|(name, _, _)| *name == server)
+                }),
         },
         _ if name.starts_with("browser_") || name.starts_with("capture_browser_") => {
             ToolClass::Network
