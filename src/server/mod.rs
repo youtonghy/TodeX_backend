@@ -36,6 +36,7 @@ mod ws;
 pub(crate) use api::api_router;
 pub(crate) use history_keys::spawn_history_watch;
 pub(crate) use local_admin::LocalAdminInfo;
+#[cfg(test)]
 pub(crate) use mesh_relay::ticket_message as mesh_relay_ticket_message;
 
 use std::time::Duration;
