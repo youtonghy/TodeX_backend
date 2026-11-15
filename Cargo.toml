@@ -80,6 +80,10 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # Computer Use: unpacking the optional agent-desktop engine's release.
 tar = { version = "0.4", default-features = false }
 
+[build-dependencies]
+# The Objective-C screenshot shim on macOS (build.rs).
+cc = "1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 xa11y-macos = "=0.15.2"
 core-foundation = "0.10"
@@ -127,3 +131,6 @@ opt-level = 3
 # of the API it uses loads the library at run time instead.
 [patch.crates-io]
 xkbcommon = { path = "crates/xkbcommon" }
+# Windows in other desktop Spaces and window numbers for Computer Use (see
+# crates/xa11y-macos/Cargo.toml).
+xa11y-macos = { path = "crates/xa11y-macos" }
