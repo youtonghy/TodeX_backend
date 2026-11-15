@@ -15,6 +15,7 @@
 pub(crate) mod ax;
 mod cdp;
 pub(crate) mod engine;
+pub(crate) mod hosts;
 pub(crate) mod install;
 pub(crate) mod kitesurf;
 mod launch;
@@ -330,6 +331,8 @@ pub(crate) struct Shared {
     /// Conversations the previous daemon left with an open tab, until
     /// their closure has been journaled.
     restarted: Mutex<BTreeSet<String>>,
+    /// Hosts beyond this computer the person allowed.
+    pub(crate) hosts: hosts::HostApprovals,
 }
 
 impl Shared {
@@ -352,6 +355,7 @@ impl Shared {
             closures: broadcast::channel(64).0,
             state_path,
             restarted: Mutex::new(restarted),
+            hosts: hosts::HostApprovals::load(&data_dir.join("agent-browser")),
         }
     }
 
@@ -616,6 +620,11 @@ impl AgentBrowser {
         Ok(browser)
     }
 
+    /// Hosts beyond this computer the person allowed the agent's tab.
+    pub(crate) fn hosts(&self) -> &hosts::HostApprovals {
+        &self.inner.shared.hosts
+    }
+
     /// Tabs going away, for the journal. Subscribe before anything can
     /// open one.
     pub(crate) fn tab_closures(&self) -> broadcast::Receiver<TabClosed> {
@@ -712,7 +721,13 @@ impl AgentBrowser {
                     .await
                     .ok()
                     .and_then(|page| page["url"].as_str().map(str::to_owned))
-                    .filter(|url| policy::allowed_top_level(url) && url != "about:blank");
+                    .filter(|url| {
+                        let hosts = &self.inner.shared.hosts;
+                        url != "about:blank"
+                            && policy::allowed_top_level_for(url, |host| {
+                                hosts.allowed(&conversation_id, host)
+                            })
+                    });
                 let Some(target_id) = running.close_tab(&conversation_id).await else {
                     continue;
                 };
@@ -1385,9 +1400,19 @@ mod tests {
         let process = launch::launch_kitesurf(workerd.as_ref(), engine.as_ref())
             .await
             .expect("Kitesurf starts");
+        // Hosts allowed for the conversation, comma separated.
+        let root = std::env::temp_dir().join(format!("todex-ks-e2e-{}", uuid::Uuid::new_v4()));
+        let shared = Arc::new(Shared::load(&root));
+        for host in std::env::var("TODEX_KITESURF_E2E_ALLOW")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|host| !host.is_empty())
+        {
+            shared.hosts.allow_for("c", host);
+        }
         let running = Running::start(
             process,
-            std::sync::Weak::new(),
+            Arc::downgrade(&shared),
             KITESURF_SLOT.to_owned(),
             true,
         )
@@ -1403,6 +1428,8 @@ mod tests {
                 error.page_text.clone().unwrap_or_default()
             ),
         }
+        // Let the page's own requests finish.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
         match running.snapshot("c", false).await {
             Ok(snapshot) => {
                 let tree = snapshot["tree"].as_str().unwrap_or_default();
@@ -1412,6 +1439,7 @@ mod tests {
             Err(error) => println!("snapshot failed: {error}"),
         }
         running.shut_down();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn temp_root() -> PathBuf {

@@ -503,10 +503,12 @@ fn gunzip_executable(archive: &Path, to: &Path) -> Result<(), BrowserError> {
 /// files are embedded by paths relative to `config_dir`, where the config is
 /// written (workerd resolves `embed` relative to the config file).
 ///
-/// Page requests may reach public addresses and this machine (local dev
-/// servers); private networks and cloud metadata addresses stay out of
-/// reach. Kitesurf's own private-network check still keeps a public page
-/// from reaching this machine.
+/// Page requests may reach public addresses, this machine (local dev
+/// servers) and the local network; link-local and cloud metadata addresses
+/// never. Which local-network hosts a tab reaches is the request guard's
+/// call (`policy::guard_request`: only hosts the person allowed), and
+/// Kitesurf's own private-network check still keeps a public page from
+/// reaching this machine or the local network.
 pub(crate) fn workerd_config(
     engine: &Path,
     config_dir: &Path,
@@ -607,7 +609,7 @@ const config :Workerd.Config = (
   services = [
     (name = "kitesurf", worker = .engine),
     (name = "fonts", disk = (path = {public}, writable = false)),
-    (name = "net", network = (allow = ["public", "local"], tlsOptions = (trustBrowserCas = true))),
+    (name = "net", network = (allow = ["public", "local", "private"], deny = ["169.254.0.0/16", "fe80::/10", "fd00:ec2::254/128"], tlsOptions = (trustBrowserCas = true{roots}))),
   ],
   sockets = [ (name = "cdp", address = {socket}, http = (), service = "kitesurf") ],
 );
@@ -631,7 +633,70 @@ const engine :Workerd.Worker = (
         date = quote(date),
         modules = modules.join("\n"),
         vars = vars.join("\n"),
+        roots = trusted_roots(&quote),
     ))
+}
+
+/// `, trustedCertificates = [...]` with this computer's trusted roots, or
+/// nothing when it has none to add. workerd's own browser CA bundle lacks
+/// some current roots (sites behind SSL.com's 2022 roots fail with "TLS
+/// peer's certificate is not trusted"); the system's store has them.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn trusted_roots(quote: &dyn Fn(&str) -> String) -> String {
+    let roots = system_roots();
+    if roots.is_empty() {
+        return String::new();
+    }
+    let roots: Vec<String> = roots.iter().map(|pem| quote(pem)).collect();
+    format!(", trustedCertificates = [{}]", roots.join(", "))
+}
+
+/// The OS's trusted root certificates as PEM, read once.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn system_roots() -> &'static [String] {
+    static ROOTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        let pem = std::process::Command::new("/usr/bin/security")
+            .args([
+                "find-certificate",
+                "-a",
+                "-p",
+                "/System/Library/Keychains/SystemRootCertificates.keychain",
+            ])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        #[cfg(not(target_os = "macos"))]
+        let pem = [
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/cert.pem",
+        ]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+        pem_blocks(&pem)
+    })
+}
+
+/// The certificates of a PEM bundle, one string each.
+fn pem_blocks(pem: &str) -> Vec<String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let mut blocks = Vec::new();
+    let mut rest = pem;
+    while let Some(start) = rest.find(BEGIN) {
+        let Some(length) = rest[start..].find(END) else {
+            break;
+        };
+        let end = start + length + END.len();
+        blocks.push(format!("{}\n", &rest[start..end]));
+        rest = &rest[end..];
+    }
+    blocks
 }
 
 // Only Unix launches Kitesurf; unit tests still build these on Windows.
@@ -737,7 +802,19 @@ mod tests {
     }
 
     #[test]
-    fn the_config_embeds_the_engine_and_keeps_private_networks_closed() {
+    fn pem_bundles_split_into_certificates() {
+        let bundle = "junk\n-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n# x\n-----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\ncut";
+        assert_eq!(
+            pem_blocks(bundle),
+            vec![
+                "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n".to_owned(),
+                "-----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_config_embeds_the_engine_and_keeps_metadata_addresses_closed() {
         let root = std::env::temp_dir().join(format!("todex-kitesurf-{}", uuid::Uuid::new_v4()));
         let engine = engine_fixture(&root);
         let run = root.join("run");
@@ -751,7 +828,9 @@ mod tests {
         assert!(config.contains(r#"(name = "KITESURF_ENV", text = "production")"#));
         assert!(config.contains(r#"(name = "KITESURF_ALLOW_PRIVATE_NETWORK", text = "")"#));
         assert!(config.contains(r#"(name = "OTHER", text = "x")"#));
-        assert!(config.contains(r#"allow = ["public", "local"]"#));
+        assert!(config.contains(r#"allow = ["public", "local", "private"]"#));
+        assert!(config.contains(r#"deny = ["169.254.0.0/16", "fe80::/10", "fd00:ec2::254/128"]"#));
+        assert!(config.contains("trustBrowserCas = true"));
         assert!(config.contains("unix:"));
         let index = config.find("index.js").unwrap();
         assert!(index < config.find("a.wasm").unwrap());

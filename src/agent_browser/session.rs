@@ -14,7 +14,7 @@ use super::{
     ax,
     cdp::Cdp,
     launch::Process,
-    policy::{self, allowed_top_level, Navigation, Popup},
+    policy::{self, allowed_top_level_for, Navigation, Popup, Reach},
     BrowserError, CloseReason, Shared,
 };
 
@@ -65,6 +65,13 @@ const DENIED_PERMISSIONS: &[&str] = &[
     "windowManagement",
     "nfc",
 ];
+
+/// How long the request guard trusts a host name's addresses.
+const RESOLVED_FOR: Duration = Duration::from_secs(60);
+/// How long the request guard waits for a host name's addresses.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Every request of an agent tab is paused for the guard.
+const GUARDED_REQUESTS: &str = "*";
 
 /// Problems kept per tab since its latest navigation.
 const MAX_PROBLEMS: usize = 20;
@@ -166,6 +173,9 @@ pub(crate) struct Running {
     popups: Mutex<HashMap<String, PendingPopup>>,
     /// Tab session → what its page reported going wrong.
     problems: Mutex<HashMap<String, Problems>>,
+    /// Host name → its addresses' reach, as the request guard looked them
+    /// up (see [`RESOLVED_FOR`]).
+    resolved: Mutex<HashMap<String, (Instant, Vec<Reach>)>>,
     pub last_used: Mutex<Instant>,
     /// Slots, frames and tab-closure events of the browser service.
     shared: Weak<Shared>,
@@ -267,6 +277,7 @@ impl Running {
             sessions: Mutex::new(HashMap::new()),
             popups: Mutex::new(HashMap::new()),
             problems: Mutex::new(HashMap::new()),
+            resolved: Mutex::new(HashMap::new()),
             last_used: Mutex::new(Instant::now()),
             shared,
             profile,
@@ -366,32 +377,27 @@ impl Running {
                             params["requestId"].as_str().unwrap_or_default().to_owned();
                         let url = params["request"]["url"].as_str().unwrap_or_default();
                         // A tab not (or no longer) registered is guarded as
-                        // if every Document were top-level.
+                        // if every Document were top-level, with no host
+                        // allowed.
                         let main_frame = info.as_ref().is_none_or(|info| {
                             params["frameId"].as_str() == Some(info.main_frame_id.as_str())
                         });
                         let resource_type = params["resourceType"].as_str().unwrap_or_default();
-                        // `Aborted` cancels the navigation and keeps the current page
-                        // (other reasons commit an error page).
-                        let (method, body) = match policy::guard_request(
-                            url,
-                            resource_type,
-                            main_frame,
-                        ) {
-                            Navigation::Block => {
-                                tracing::info!(url, "agent browser blocked a top-level navigation");
-                                (
-                                    "Fetch.failRequest",
-                                    json!({ "requestId": request_id, "errorReason": "Aborted" }),
-                                )
-                            }
-                            Navigation::Continue => {
-                                ("Fetch.continueRequest", json!({ "requestId": request_id }))
-                            }
+                        let conversation_id =
+                            info.as_ref().map(|info| info.conversation_id.clone());
+                        let approved = |host: &str| {
+                            conversation_id.as_deref().is_some_and(|conversation| {
+                                running.host_allowed(conversation, host)
+                            })
                         };
-                        running
-                            .cdp
-                            .notify(method, body, event.session_id.as_deref());
+                        let verdict =
+                            policy::guard_request(url, resource_type, main_frame, approved);
+                        running.answer_paused(
+                            verdict,
+                            url,
+                            &request_id,
+                            event.session_id.as_deref(),
+                        );
                     }
                     ("Page.javascriptDialogOpening", Some(_)) => {
                         // Nobody is there to answer; a pending dialog would
@@ -551,13 +557,13 @@ impl Running {
         let reset = blank && wanted.is_some_and(|url| url != "about:blank");
         if crashed.is_some() || reset {
             let advice = if self.isolated {
-                " Open a production build of the page (a dev server's unbundled modules can exceed the Kitesurf engine's limits), or switch the agent browser to Chromium in Settings."
+                " For a dev server's page, open a production build instead (unbundled modules can exceed the Kitesurf engine's limits), or switch the agent browser to Chromium in Settings."
             } else {
                 " Reload it, or open a lighter page."
             };
             let message = match crashed {
                 Some(reason) => format!("{reason} while loading, and the tab shows nothing now.{advice}"),
-                None => format!("the page did not survive loading: the browser engine replaced it with a blank page, as it does when a page crashes it or exceeds its memory or time limits.{advice}"),
+                None => format!("the page did not load: the tab shows a blank page instead, as when the connection fails (see what was reported) or the page crashes the engine or exceeds its memory or time limits.{advice}"),
             };
             // What the engine said meanwhile (Kitesurf names the limit hit).
             let engine: Vec<String> = self
@@ -577,6 +583,95 @@ impl Running {
             page["problems"] = json!(lines);
         }
         Ok(page)
+    }
+
+    /// Whether the person allowed `host` for this conversation's tab.
+    fn host_allowed(&self, conversation_id: &str, host: &str) -> bool {
+        self.shared
+            .upgrade()
+            .is_some_and(|shared| shared.hosts.allowed(conversation_id, host))
+    }
+
+    /// Lets a paused request go on or fails it; a host name is looked up
+    /// first (off the event loop, which must keep going).
+    fn answer_paused(
+        self: &Arc<Self>,
+        verdict: Navigation,
+        url: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+    ) {
+        let answer = |running: &Running, verdict: Navigation, session_id: Option<&str>| {
+            let (method, body) = match verdict {
+                Navigation::Continue | Navigation::Resolve(_) => {
+                    ("Fetch.continueRequest", json!({ "requestId": request_id }))
+                }
+                Navigation::Block => {
+                    tracing::info!(url, "agent browser blocked a request");
+                    (
+                        "Fetch.failRequest",
+                        // `Aborted` cancels a navigation and keeps the
+                        // current page (other reasons commit an error page).
+                        json!({ "requestId": request_id, "errorReason": "Aborted" }),
+                    )
+                }
+            };
+            running.cdp.notify(method, body, session_id);
+        };
+        let Navigation::Resolve(host) = verdict else {
+            answer(self, verdict, session_id);
+            return;
+        };
+        let daemon = policy::is_daemon_port(policy::url_port(url));
+        let cached = self
+            .resolved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&host)
+            .filter(|(at, _)| at.elapsed() < RESOLVED_FOR)
+            .map(|(_, reaches)| reaches.clone());
+        if let Some(reaches) = cached {
+            answer(self, policy::judge_addresses(&reaches, daemon), session_id);
+            return;
+        }
+        let running = Arc::clone(self);
+        let (url, request_id, session_id) = (
+            url.to_owned(),
+            request_id.to_owned(),
+            session_id.map(str::to_owned),
+        );
+        let port = policy::url_port(&url).unwrap_or(443);
+        tokio::spawn(async move {
+            let looked_up = tokio::time::timeout(
+                RESOLVE_TIMEOUT,
+                tokio::net::lookup_host(format!("{host}:{port}")),
+            )
+            .await;
+            let reaches: Vec<Reach> = match looked_up {
+                Ok(Ok(addresses)) => addresses
+                    .map(|address| policy::ip_reach(address.ip()))
+                    .collect(),
+                // Unresolvable: the request fails on its own.
+                _ => Vec::new(),
+            };
+            running
+                .resolved
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(host, (Instant::now(), reaches.clone()));
+            let verdict = policy::judge_addresses(&reaches, daemon);
+            let (method, body) = match verdict {
+                Navigation::Block => {
+                    tracing::info!(url, "agent browser blocked a request to the local network");
+                    (
+                        "Fetch.failRequest",
+                        json!({ "requestId": request_id, "errorReason": "Aborted" }),
+                    )
+                }
+                _ => ("Fetch.continueRequest", json!({ "requestId": request_id })),
+            };
+            running.cdp.notify(method, body, session_id.as_deref());
+        });
     }
 
     /// The browser process's output since `since` (Kitesurf only).
@@ -637,7 +732,16 @@ impl Running {
                     .map(|(id, _)| id.clone())
             })
             .flatten();
-        let (commands, pending) = attached_target(params, opener_session.as_deref());
+        let conversation_id = opener_session
+            .as_deref()
+            .and_then(|session| self.session_info(session))
+            .map(|info| info.conversation_id);
+        let approved = |host: &str| {
+            conversation_id
+                .as_deref()
+                .is_some_and(|conversation| self.host_allowed(conversation, host))
+        };
+        let (commands, pending) = attached_target(params, opener_session.as_deref(), &approved);
         if let Some(pending) = pending {
             let session_id = params["sessionId"].as_str().unwrap_or_default().to_owned();
             self.popups
@@ -684,10 +788,19 @@ impl Running {
             json!({ "requestId": params["requestId"], "errorReason": "Aborted" }),
             session_id.map(str::to_owned),
         )];
+        let conversation_id = self
+            .session_info(&popup.opener_session)
+            .map(|info| info.conversation_id);
+        let approved = |host: &str| {
+            conversation_id
+                .as_deref()
+                .is_some_and(|conversation| self.host_allowed(conversation, host))
+        };
         commands.extend(fold_commands(
             &popup.target_id,
             params["request"]["url"].as_str().unwrap_or_default(),
             &popup.opener_session,
+            &approved,
         ));
         self.send(commands);
         true
@@ -826,7 +939,7 @@ impl Running {
         self.cdp
             .call(
                 "Fetch.enable",
-                json!({ "patterns": [{ "resourceType": "Document", "requestStage": "Request" }] }),
+                json!({ "patterns": [{ "urlPattern": GUARDED_REQUESTS, "requestStage": "Request" }] }),
                 session,
             )
             .await?;
@@ -1093,10 +1206,10 @@ impl Running {
         conversation_id: &str,
         url: &str,
     ) -> Result<Value, BrowserError> {
-        if !allowed_top_level(url) {
+        if !allowed_top_level_for(url, |host| self.host_allowed(conversation_id, host)) {
             return Err(BrowserError::new(
                 "NAVIGATION_BLOCKED",
-                format!("{url} is not a local page."),
+                format!("{url} is not a page this tab may open: only this computer's pages and hosts the user allowed."),
             ));
         }
         let (target_id, session_id) = self.tab(conversation_id).await?;
@@ -1154,7 +1267,9 @@ impl Running {
                         .ok()
                         .and_then(|index| entries.get(index))
                 }) {
-                    if allowed_top_level(entry["url"].as_str().unwrap_or_default()) {
+                    if allowed_top_level_for(entry["url"].as_str().unwrap_or_default(), |host| {
+                        self.host_allowed(conversation_id, host)
+                    }) {
                         self.cdp
                             .call(
                                 "Page.navigateToHistoryEntry",
@@ -1571,6 +1686,7 @@ impl Running {
 fn attached_target(
     params: &Value,
     opener_session: Option<&str>,
+    approved: &dyn Fn(&str) -> bool,
 ) -> (Vec<Command>, Option<PendingPopup>) {
     let info = &params["targetInfo"];
     let session_id = params["sessionId"].as_str().unwrap_or_default().to_owned();
@@ -1590,7 +1706,10 @@ fn attached_target(
     let target_id = info["targetId"].as_str().unwrap_or_default();
     let url = info["url"].as_str().unwrap_or_default();
     if !waiting || !(url.is_empty() || url == "about:blank") {
-        return (fold_commands(target_id, url, opener_session), None);
+        return (
+            fold_commands(target_id, url, opener_session, approved),
+            None,
+        );
     }
     // `window.open(url)` reports no address yet: let it run with its
     // navigations intercepted, and fold the first one.
@@ -1610,11 +1729,16 @@ fn attached_target(
     )
 }
 
-/// Closes popup `target_id` and loads `url` in the opener's tab when it is
-/// a local page.
-fn fold_commands(target_id: &str, url: &str, opener_session: &str) -> Vec<Command> {
+/// Closes popup `target_id` and loads `url` in the opener's tab when the
+/// tab may show it (`approved`: the hosts the person allowed it).
+fn fold_commands(
+    target_id: &str,
+    url: &str,
+    opener_session: &str,
+    approved: &dyn Fn(&str) -> bool,
+) -> Vec<Command> {
     let mut commands = vec![("Target.closeTarget", json!({ "targetId": target_id }), None)];
-    if policy::popup(url) == Popup::LoadInTab {
+    if policy::popup(url, approved) == Popup::LoadInTab {
         commands.push((
             "Page.navigate",
             json!({ "url": url }),
@@ -1649,6 +1773,14 @@ fn named_key(name: &str) -> Option<(&'static str, &'static str, u32, Option<&'st
 mod tests {
     use super::*;
 
+    /// [`attached_target`] for an opener whose conversation allowed no host.
+    fn attached_target_unapproved(
+        params: &Value,
+        opener_session: Option<&str>,
+    ) -> (Vec<Command>, Option<PendingPopup>) {
+        attached_target(params, opener_session, &|_| false)
+    }
+
     #[test]
     fn paused_targets_are_judged_before_they_run() {
         let attached = |opener: &str, url: &str, waiting: bool| {
@@ -1665,7 +1797,7 @@ mod tests {
             Some("S-new".to_owned()),
         );
         // A popup with a local address: closed unrun, loaded in the tab.
-        let (commands, pending) = attached_target(
+        let (commands, pending) = attached_target_unapproved(
             &attached("T-agent", "http://localhost:5173/x", true),
             Some("S-agent"),
         );
@@ -1682,7 +1814,7 @@ mod tests {
             ]
         );
         // A remote address: closed, never resumed or loaded.
-        let (commands, pending) = attached_target(
+        let (commands, pending) = attached_target_unapproved(
             &attached("T-agent", "https://example.com/", true),
             Some("S-agent"),
         );
@@ -1691,7 +1823,7 @@ mod tests {
         // intercepted, tracked as pending.
         for url in ["", "about:blank"] {
             let (commands, pending) =
-                attached_target(&attached("T-agent", url, true), Some("S-agent"));
+                attached_target_unapproved(&attached("T-agent", url, true), Some("S-agent"));
             assert_eq!(commands[0].0, "Fetch.enable");
             assert_eq!(commands[0].2.as_deref(), Some("S-new"));
             assert_eq!(commands[1], resume);
@@ -1703,21 +1835,22 @@ mod tests {
         }
         // Its first navigation is then folded like a known address.
         assert_eq!(
-            fold_commands("T-new", "https://example.com/", "S-agent"),
+            fold_commands("T-new", "https://example.com/", "S-agent", &|_| false),
             vec![close.clone()]
         );
         assert_eq!(
-            fold_commands("T-new", "http://127.0.0.1:3000/", "S-agent").len(),
+            fold_commands("T-new", "http://127.0.0.1:3000/", "S-agent", &|_| false).len(),
             2
         );
         // Not an agent tab's popup: resumed, nothing else.
         for opener in ["", "T-person"] {
             let (commands, pending) =
-                attached_target(&attached(opener, "https://example.com/", true), None);
+                attached_target_unapproved(&attached(opener, "https://example.com/", true), None);
             assert_eq!((commands, pending.is_none()), (vec![resume.clone()], true));
         }
         // Already running (an explicit attach): left alone.
-        let (commands, pending) = attached_target(&attached("", "about:blank", false), None);
+        let (commands, pending) =
+            attached_target_unapproved(&attached("", "about:blank", false), None);
         assert!(commands.is_empty() && pending.is_none());
     }
 
@@ -1836,7 +1969,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "PAGE_FAILED");
-        assert!(error.message.contains("blank page"), "{}", error.message);
+        assert!(
+            error.message.contains("blank page instead"),
+            "{}",
+            error.message
+        );
         // Once the page is back, loading works as before.
         chromium.set_blank(false);
         assert!(navigate(&browser, "http://localhost:5173/").await.is_ok());

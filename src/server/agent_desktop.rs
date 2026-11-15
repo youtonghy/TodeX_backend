@@ -90,6 +90,8 @@ pub(super) fn routes() -> Router<AppState> {
             put(rename_profile).delete(delete_profile),
         )
         .route("/v2/agent-browser/workspaces", put(assign_profile))
+        .route("/v2/agent-browser/hosts", get(list_hosts))
+        .route("/v2/agent-browser/hosts/{host}", delete(remove_host))
         .route("/v2/agent-browser/install", post(install_browser))
         .route("/v2/agent-desktop", get(settings).put(set_settings))
         .route(
@@ -394,6 +396,32 @@ async fn rename_profile(
         .rename_profile(&id, &request.name)
         .map_err(browser_error)?;
     Ok(Json(serde_json::to_value(browser.profiles())?))
+}
+
+/// Hosts beyond this computer the person always allows the agent's tab.
+async fn list_hosts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(
+        json!({ "hosts": state.agent_desktop.browser().hosts().always() }),
+    ))
+}
+
+/// Takes a host off the always-allowed list; the agent asks again next time.
+async fn remove_host(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(host): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let hosts = state.agent_desktop.browser().hosts();
+    let removed = hosts.remove(&host.to_lowercase())?;
+    if !removed {
+        return Err(AppError::NotFound(format!("{host} is not an allowed host")));
+    }
+    Ok(Json(json!({ "hosts": hosts.always() })))
 }
 
 /// Deletes the profile and its cookies, storage and cache.
