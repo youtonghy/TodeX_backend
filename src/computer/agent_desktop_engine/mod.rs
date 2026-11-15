@@ -517,11 +517,25 @@ pub(crate) fn may_fall_back(error: &ComputerError) -> bool {
 /// The action reached the control but its state did not end up as asked:
 /// a "switch" that is really a menu button opened its menu instead.
 pub(crate) fn state_unchanged(error: &ComputerError) -> bool {
-    error.code == "ACTION_FAILED"
-        && error
-            .detail
-            .as_ref()
-            .is_some_and(|detail| detail["details"]["kind"] == "post_action_verification")
+    // agent-desktop marks it as a post-action verification in general, and
+    // check/uncheck/toggle with their own reasons and message.
+    const REASONS: [&str; 4] = [
+        "post_action_verification",
+        "requested_checked_state_not_observed",
+        "stable_value_change_not_observed",
+        "postcondition_mismatch",
+    ];
+    if error.code != "ACTION_FAILED" {
+        return false;
+    }
+    let details = error
+        .detail
+        .as_ref()
+        .map(|detail| detail["details"].to_string())
+        .unwrap_or_default();
+    REASONS.iter().any(|reason| details.contains(reason))
+        || error.message.contains("did not reach the requested state")
+        || error.message.contains("did not change the element value")
 }
 
 /// The window id of `pid`'s window titled `title` (its first window when
@@ -750,6 +764,21 @@ mod tests {
             error.detail.as_ref().unwrap()["details"]["kind"],
             "post_action_verification"
         );
+
+        // A switch that is really a menu button: check/uncheck's own reason.
+        let menu = br#"{"ok":false,"error":{"code":"ACTION_FAILED","message":"check/uncheck did not reach the requested state",
+            "suggestion":"Refresh the snapshot and inspect the checked state before deciding whether to retry.",
+            "details":{"reason":"requested_checked_state_not_observed"},
+            "disposition":{"delivery":"delivered","retry":"unsafe"}}}"#;
+        assert!(state_unchanged(
+            &parse_envelope(menu).unwrap_err().into_error()
+        ));
+        // The message alone (details left out) says it too.
+        let bare = br#"{"ok":false,"error":{"code":"ACTION_FAILED","message":"check/uncheck did not reach the requested state",
+            "disposition":{"delivery":"delivered","retry":"unsafe"}}}"#;
+        assert!(state_unchanged(
+            &parse_envelope(bare).unwrap_err().into_error()
+        ));
 
         // Delivered with an unknown outcome: never repeated by another way.
         let uncertain = br#"{"ok":false,"error":{"code":"ACTION_FAILED","message":"?",

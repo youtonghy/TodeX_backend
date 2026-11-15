@@ -1390,7 +1390,10 @@ mod tests {
     #[ignore = "runs the Kitesurf engine named by TODEX_WORKERD_PATH and TODEX_AGENT_BROWSER_KITESURF_DIR"]
     async fn a_real_kitesurf_page_loads() {
         let _ = tracing_subscriber::fmt()
-            .with_env_filter("todex_agentd::agent_browser=info")
+            .with_env_filter(
+                std::env::var("TODEX_KITESURF_E2E_LOG")
+                    .unwrap_or_else(|_| "todex_agentd::agent_browser=info".to_owned()),
+            )
             .with_test_writer()
             .try_init();
         let workerd = std::env::var_os("TODEX_WORKERD_PATH").expect("TODEX_WORKERD_PATH");
