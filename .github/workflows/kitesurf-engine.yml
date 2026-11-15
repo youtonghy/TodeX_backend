@@ -1,0 +1,106 @@
+name: Kitesurf engine
+
+# Builds the Kitesurf browser engine (github.com/cloudflare/kitesurf) at a
+# pinned commit and publishes it as a prerelease asset. The daemon's
+# experimental Kitesurf engine downloads this bundle and checks the SHA-256
+# pinned in src/agent_browser/kitesurf.rs. Prereleases never become
+# /releases/latest, which install.sh and the daemon updater read.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full cloudflare/kitesurf commit SHA to build
+        required: true
+        type: string
+      version:
+        description: Engine version label, YYYY.MM.DD-<short sha> of that commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kitesurf-engine-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  BAZELISK_VERSION: v1.30.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      KITESURF_COMMIT: ${{ inputs.commit }}
+      ENGINE_VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$KITESURF_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "commit must be a full SHA" >&2; exit 1; }
+          [[ "$ENGINE_VERSION" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9a-f]{7,12}$ ]] || { echo "bad version label" >&2; exit 1; }
+          [[ "$KITESURF_COMMIT" == "${ENGINE_VERSION#*-}"* ]] || { echo "version label does not match the commit" >&2; exit 1; }
+          if gh release view "kitesurf-engine-$ENGINE_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "kitesurf-engine-$ENGINE_VERSION is already released" >&2; exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install Bazelisk
+        run: |
+          base="https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}"
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/bazel" "$base/bazelisk-linux-amd64"
+          want="$(curl -fsSL "$base/bazelisk-linux-amd64.sha256" | awk '{print $1}')"
+          echo "$want  $RUNNER_TEMP/bin/bazel" | sha256sum -c -
+          chmod 755 "$RUNNER_TEMP/bin/bazel"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Kitesurf
+        run: |
+          git init -q kitesurf
+          git -C kitesurf remote add origin https://github.com/cloudflare/kitesurf.git
+          git -C kitesurf fetch -q --depth 1 origin "$KITESURF_COMMIT"
+          git -C kitesurf checkout -q FETCH_HEAD
+          test "$(git -C kitesurf rev-parse HEAD)" = "$KITESURF_COMMIT"
+
+      - name: Build the engine
+        working-directory: kitesurf
+        run: |
+          corepack enable
+          COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm install --frozen-lockfile
+          bazel build --curses=no //packages/engine:dist
+
+      - name: Package
+        run: |
+          name="kitesurf-engine-$ENGINE_VERSION"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage"
+          cp -RL kitesurf/bazel-bin/packages/engine/dist "$stage/dist"
+          cp -RL kitesurf/packages/engine/public "$stage/public"
+          find "$stage/dist" -name '*.map' -delete
+          cp kitesurf/LICENSE kitesurf/NOTICE "$stage/"
+          cp -R kitesurf/licenses "$stage/licenses"
+          echo "$KITESURF_COMMIT" > "$stage/COMMIT"
+          chmod -R u+rwX,go+rX,go-w "$stage"
+          mkdir -p out
+          tar -C "$RUNNER_TEMP" --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime='2000-01-01 00:00:00Z' -czf "out/$name.tar.gz" "$name"
+          (cd out && sha256sum "$name.tar.gz" > SHA256SUMS && cat SHA256SUMS)
+          du -h "out/$name.tar.gz"
+
+      - name: Publish prerelease
+        run: |
+          gh release create "kitesurf-engine-$ENGINE_VERSION" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease --latest=false \
+            --target "$GITHUB_SHA" \
+            --title "Kitesurf engine $ENGINE_VERSION" \
+            --notes "Kitesurf (https://github.com/cloudflare/kitesurf) at $KITESURF_COMMIT, built for the agent browser's experimental Kitesurf engine. Apache-2.0; see LICENSE, NOTICE and licenses/ in the archive. Not a todex-agentd release."
