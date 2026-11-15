@@ -441,7 +441,7 @@ impl Engine {
         let screenshots = self.screenshots()?;
         let mut shot = screenshots
             .capture_region(rect)
-            .map_err(ComputerError::platform)?;
+            .map_err(ComputerError::capture)?;
         self.hide_protected(&mut shot, rect, own_pid)?;
         let shot = if shot.width > SCREENSHOT_MAX_WIDTH {
             let height = (u64::from(shot.height) * u64::from(SCREENSHOT_MAX_WIDTH)
@@ -552,7 +552,7 @@ impl Engine {
         let mut shot = self
             .screenshots()?
             .capture_region(rect)
-            .map_err(ComputerError::platform)?;
+            .map_err(ComputerError::capture)?;
         self.hide_protected(&mut shot, rect, own_pid)?;
         let shot = if shot.width > max_width {
             let height = (u64::from(shot.height) * u64::from(max_width) / u64::from(shot.width))

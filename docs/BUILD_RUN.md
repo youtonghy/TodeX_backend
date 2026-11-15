@@ -25,7 +25,10 @@ cd TodeX_backend && cargo run -- tui
 # target/debug/todex-agentd 签名（标识符与发布一致），Computer Use 的
 # 屏幕录制/辅助功能授权才不会随每次重编译失效。证书用
 # export TODEX_DEV_SIGN_IDENTITY="<证书名或 SHA-1>" 指定（钥匙串里只有
-# 一个有效代码签名身份时可省略）；找不到则警告并以未签名运行。
+# 一个有效代码签名身份时可省略）；找不到或有多个时以 ad-hoc 签名运行，
+# 并警告、列出可选的身份。以 ad-hoc 签名运行的后端在启动日志、Computer Use
+# 的 `computer.reason`（权限缺失时）和因权限被拒的截图错误里说明授权不会
+# 持久；固定证书后需重新授权，并重启后端让屏幕录制生效。
 
 # Desktop（三栏）
 cd TodeX_desktop && pnpm run dev

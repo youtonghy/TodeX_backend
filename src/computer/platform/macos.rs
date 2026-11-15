@@ -51,6 +51,18 @@ struct CGRect {
     size: CGSize,
 }
 
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    static kSecCodeInfoFlags: CFStringRef;
+    fn SecCodeCopySelf(flags: u32, code: *mut CFTypeRef) -> i32;
+    fn SecCodeCopyStaticCode(code: CFTypeRef, flags: u32, static_code: *mut CFTypeRef) -> i32;
+    fn SecCodeCopySigningInformation(
+        code: CFTypeRef,
+        flags: u32,
+        information: *mut CFDictionaryRef,
+    ) -> i32;
+}
+
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
@@ -152,6 +164,71 @@ pub(crate) fn adopt_own_permission_identity() {
         rc
     };
     eprintln!("todex-agentd: could not take its own permission identity (posix_spawn {rc}); Screen Recording and Accessibility follow the launching app");
+}
+
+/// `kSecCSSigningInformation`: include the code directory's flags.
+const SIGNING_INFORMATION: u32 = 1 << 1;
+/// `kSecCodeSignatureAdhoc`: no certificate (linker-signed builds included).
+const SIGNATURE_AD_HOC: u32 = 0x2;
+
+/// Whether this process runs with an ad-hoc signature. macOS files the
+/// Screen Recording and Accessibility grants of such a binary under its
+/// exact code hash, so they stop matching after every rebuild: the person
+/// at the host grants them, and the daemon keeps asking. The kernel's
+/// `csops` status does not tell ad-hoc from certificate signatures; the
+/// code directory flags (what `codesign -dv` prints) do.
+fn ad_hoc_signed() -> bool {
+    static AD_HOC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AD_HOC.get_or_init(|| {
+        // SAFETY: each out-pointer is written by its call on success and
+        // wrapped (create rule) so it is released; nothing is used on failure.
+        unsafe {
+            let mut code: CFTypeRef = std::ptr::null();
+            if SecCodeCopySelf(0, &mut code) != 0 || code.is_null() {
+                return false;
+            }
+            let code = CFType::wrap_under_create_rule(code);
+            let mut static_code: CFTypeRef = std::ptr::null();
+            if SecCodeCopyStaticCode(code.as_CFTypeRef(), 0, &mut static_code) != 0
+                || static_code.is_null()
+            {
+                return false;
+            }
+            let static_code = CFType::wrap_under_create_rule(static_code);
+            let mut info: CFDictionaryRef = std::ptr::null();
+            if SecCodeCopySigningInformation(
+                static_code.as_CFTypeRef(),
+                SIGNING_INFORMATION,
+                &mut info,
+            ) != 0
+                || info.is_null()
+            {
+                return false;
+            }
+            let info: CFDictionary<CFString, CFType> = CFDictionary::wrap_under_create_rule(info);
+            info.find(CFString::wrap_under_get_rule(kSecCodeInfoFlags))
+                .and_then(|flags| flags.downcast::<CFNumber>())
+                .and_then(|flags| flags.to_i64())
+                .is_some_and(|flags| flags as u32 & SIGNATURE_AD_HOC != 0)
+        }
+    })
+}
+
+/// Why permission grants will not stick to this build, if they will not.
+pub(crate) fn signing_hint() -> Option<&'static str> {
+    ad_hoc_signed().then_some(
+        "This todex-agentd build is ad-hoc signed, so macOS ties its Screen Recording and \
+         Accessibility grants to this exact binary and drops them after every rebuild. Sign it \
+         with one fixed certificate (set TODEX_DEV_SIGN_IDENTITY and start it with `cargo run`, \
+         see docs/BUILD_RUN.md), grant both again, then restart the backend.",
+    )
+}
+
+pub(crate) fn missing_permissions_reason(_permissions: Permissions) -> String {
+    match signing_hint() {
+        Some(hint) => format!("{} {hint}", super::MISSING_PERMISSIONS),
+        None => super::MISSING_PERMISSIONS.to_owned(),
+    }
 }
 
 /// Why Computer Use cannot run here, if it cannot.
@@ -848,6 +925,15 @@ mod tests {
             width: 100.0,
             height: 100.0,
         }
+    }
+
+    #[test]
+    fn a_linker_signed_test_binary_reads_as_ad_hoc() {
+        // `cargo test` binaries carry only the linker's ad-hoc signature.
+        assert!(ad_hoc_signed());
+        let reason = missing_permissions_reason(Permissions::default());
+        assert!(reason.starts_with(crate::computer::platform::MISSING_PERMISSIONS));
+        assert!(reason.contains("TODEX_DEV_SIGN_IDENTITY"), "{reason}");
     }
 
     #[test]

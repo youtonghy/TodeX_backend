@@ -61,6 +61,16 @@ impl ComputerError {
     pub(crate) fn platform(error: impl fmt::Display) -> Self {
         Self::new("EXECUTOR_FAILED", error.to_string())
     }
+
+    /// A screenshot that failed; a denied one also says when the grant
+    /// cannot stick to this build ([`platform::signing_hint`]).
+    pub(crate) fn capture(error: xa11y::Error) -> Self {
+        let denied = matches!(error, xa11y::Error::PermissionDenied { .. });
+        match platform::signing_hint().filter(|_| denied) {
+            Some(hint) => Self::new("EXECUTOR_FAILED", format!("{error} {hint}")),
+            None => Self::platform(error),
+        }
+    }
 }
 
 impl fmt::Display for ComputerError {
@@ -159,6 +169,9 @@ pub(crate) struct Computer(Arc<dyn ComputerHost>);
 impl Computer {
     /// `choice`: which engine reads trees and performs ref actions.
     pub(crate) fn native(choice: Arc<EngineChoice>) -> Self {
+        if let Some(hint) = platform::signing_hint() {
+            tracing::warn!("{hint}");
+        }
         Self(Arc::new(NativeComputer {
             choice: Some(choice),
             ..NativeComputer::default()

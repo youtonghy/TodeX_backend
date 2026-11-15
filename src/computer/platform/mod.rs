@@ -94,10 +94,21 @@ pub(crate) fn listed_id(app: &crate::computer::policy::Target) -> String {
 }
 
 /// What the settings screen says when permissions are missing.
+/// What Computer Use asks for when a permission is missing.
 #[cfg(not(target_os = "linux"))]
+pub(crate) const MISSING_PERMISSIONS: &str =
+    "Screen Recording and Accessibility must be granted to the TodeX backend on this computer.";
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn missing_permissions_reason(_permissions: Permissions) -> String {
-    "Screen Recording and Accessibility must be granted to the TodeX backend on this computer."
-        .to_owned()
+    MISSING_PERMISSIONS.to_owned()
+}
+
+/// Why permission grants will not stick to this build, if they will not
+/// (macOS: an ad-hoc signature). Only macOS ties grants to the signature.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn signing_hint() -> Option<&'static str> {
+    None
 }
 
 /// OS permissions Computer Use needs on this host.

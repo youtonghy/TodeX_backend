@@ -19,15 +19,24 @@ identifier="com.unbaked0692.todex.agentd"
 
 if [[ "$(basename "${binary}")" == "todex-agentd" ]]; then
   identity="${TODEX_DEV_SIGN_IDENTITY:-}"
+  listed=""
   if [[ -z "${identity}" ]]; then
-    identities="$(security find-identity -v -p codesigning | sed -nE 's/^ *[0-9]+\) ([0-9A-F]{40}) .*$/\1/p')"
-    if [[ "$(grep -c . <<<"${identities}" || true)" -eq 1 ]]; then
-      identity="${identities}"
+    listed="$(security find-identity -v -p codesigning | sed -nE 's/^ *[0-9]+\) ([0-9A-F]{40} ".*")$/\1/p')"
+    if [[ "$(grep -c . <<<"${listed}" || true)" -eq 1 ]]; then
+      identity="${listed%% *}"
     fi
   fi
 
   if [[ -z "${identity}" ]]; then
-    echo "warning: TODEX_DEV_SIGN_IDENTITY is not set and there is not exactly one code signing identity; running unsigned, so macOS Computer Use permissions will not persist." >&2
+    {
+      echo "warning: running todex-agentd ad-hoc signed, so macOS drops its Screen Recording and Accessibility grants after every rebuild."
+      if [[ -n "${listed}" ]]; then
+        echo "  TODEX_DEV_SIGN_IDENTITY is not set and the keychains hold several code signing identities; pick one, e.g.:"
+        sed -E 's/^([0-9A-F]{40}) (.*)$/    export TODEX_DEV_SIGN_IDENTITY=\1  # \2/' <<<"${listed}"
+      else
+        echo "  No code signing identity was found; create one (docs/BUILD_RUN.md) and set TODEX_DEV_SIGN_IDENTITY."
+      fi
+    } >&2
   else
     # Captured first: `grep -q` closing the pipe early would trip pipefail.
     details="$(codesign -dv "${binary}" 2>&1 || true)"
