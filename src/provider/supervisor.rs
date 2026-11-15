@@ -277,6 +277,10 @@ pub struct ConversationPrompt {
     /// Plan-mode Claude prompts: what to switch to once the plan is approved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_plan: Option<super::types::AfterPlan>,
+    /// Implement-mode Claude prompts: the plan settings Claude switches to if
+    /// it enters Plan mode on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replan: Option<super::types::Replan>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -2256,6 +2260,7 @@ impl ConversationSupervisor {
             sandbox_mode: field("sandboxMode"),
             approval_policy: field("approvalPolicy"),
             after_plan: None,
+            replan: None,
         };
         if super::types::resolve_execution_config(
             manifest.provider,
@@ -2447,6 +2452,7 @@ impl ConversationSupervisor {
                 sandbox_mode: None,
                 approval_policy: None,
                 after_plan: None,
+                replan: None,
             },
         )
         .await
@@ -2497,6 +2503,7 @@ impl ConversationSupervisor {
             sandbox_mode,
             approval_policy,
             after_plan,
+            replan,
         } = prompt;
         if client_request_id
             .as_ref()
@@ -2574,6 +2581,7 @@ impl ConversationSupervisor {
                             && request_snapshot.sandbox_mode.is_none()
                             && request_snapshot.approval_policy.is_none()
                             && request_snapshot.after_plan.is_none()
+                            && request_snapshot.replan.is_none()
                     } else if let Some(saved) = self.store.last_request(conversation_id).await? {
                         let plain = saved_request(&request_snapshot, None)?;
                         let sealed = saved_request(&request_snapshot, fingerprint_key.as_deref())?;
@@ -2642,6 +2650,9 @@ impl ConversationSupervisor {
                 after_plan,
                 &effective_permissions,
             )?;
+        }
+        if let Some(replan) = &replan {
+            super::types::validate_replan(manifest.provider, replan, &effective_permissions)?;
         }
         let driver = self.registry.driver(manifest.provider)?;
         let descriptor = driver.descriptor();
@@ -2769,6 +2780,7 @@ impl ConversationSupervisor {
                 sandbox_mode,
                 approval_policy,
                 after_plan,
+                replan,
             },
             cancel: cancel_rx,
             adopt: None,
@@ -4272,6 +4284,7 @@ mod tests {
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         };
         let read_only = |label: &str, error: AppError| {
             assert_eq!(error.code(), "HISTORY_READ_ONLY", "{label}: {error}");
@@ -4413,6 +4426,7 @@ mod tests {
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         };
         // Below the default threshold a turn leaves the active file alone.
         supervisor
@@ -4468,6 +4482,7 @@ mod tests {
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         };
         let mut turns = Vec::new();
         for text in ["first", "second"] {
@@ -4567,6 +4582,7 @@ mod tests {
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         };
         let turn = supervisor
             .prompt_owned("local", &manifest.id, request.clone())
@@ -4790,6 +4806,7 @@ mod tests {
             sandbox_mode: Some("read-only".to_owned()),
             approval_policy: Some("on-request".to_owned()),
             after_plan: None,
+            replan: None,
         };
         supervisor
             .prompt_owned("local", &manifest.id, request.clone())
@@ -5711,6 +5728,7 @@ mod tests {
                     sandbox_mode: None,
                     approval_policy: None,
                     after_plan: None,
+                    replan: None,
                 },
             )
             .await
@@ -5886,6 +5904,7 @@ mod tests {
                     sandbox_mode: None,
                     approval_policy: None,
                     after_plan: None,
+                    replan: None,
                 },
             )
             .await
@@ -6637,6 +6656,7 @@ mod tests {
                     sandbox_mode: None,
                     approval_policy: None,
                     after_plan: None,
+                    replan: None,
                 },
             )
             .await
@@ -6666,6 +6686,7 @@ mod tests {
                 reasoning_effort: Some("medium".to_owned()),
                 permission_mode: "auto".to_owned(),
             }),
+            replan: None,
         }
     }
 
@@ -6773,6 +6794,191 @@ mod tests {
                 .any(|event| event.event_type == "turn.completed"),
             "{history:?}"
         );
+    }
+
+    /// An implement Claude prompt carrying `replan` (unless `with_replan` is
+    /// false), as the execute phase of a smart conversation sends it.
+    fn execute_prompt(with_replan: bool) -> ConversationPrompt {
+        ConversationPrompt {
+            client_request_id: None,
+            text: "next task".to_owned(),
+            model: Some("claude-opus-5-5".to_owned()),
+            reasoning_effort: Some("medium".to_owned()),
+            skills: Vec::new(),
+            content: Vec::new(),
+            permission_mode: Some("auto".to_owned()),
+            work_mode: Some("implement".to_owned()),
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+            after_plan: None,
+            replan: with_replan.then(|| super::super::types::Replan {
+                model: "claude-fable-5-2".to_owned(),
+                reasoning_effort: Some("high".to_owned()),
+            }),
+        }
+    }
+
+    /// Runs an implement Claude turn against the `replan` fixture
+    /// (`behavior` is its marker), approving the plan review it may raise,
+    /// and returns the history and the lines Claude read.
+    async fn replan_turn(
+        label: &str,
+        behavior: &str,
+        with_replan: bool,
+    ) -> (Vec<ConversationEvent>, Vec<String>) {
+        let (root, store, supervisor, workspace) = control_fixture(label).await;
+        fs::write(root.join("replan"), behavior).unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        supervisor
+            .prompt_owned("local", &manifest.id, execute_prompt(with_replan))
+            .await
+            .unwrap();
+        if behavior == "exit" {
+            let request = wait_for_journal_event(&store, &manifest.id, |event| {
+                event.event_type == "permission.requested"
+            })
+            .await;
+            assert_eq!(request.payload["kind"], "plan");
+            supervisor
+                .resolve_permission(
+                    &manifest.id,
+                    request.payload["permissionId"].as_str().unwrap(),
+                    PermissionDecision {
+                        outcome: PermissionOutcome::AllowOnce,
+                        option_id: Some("approve".to_owned()),
+                        data: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let stdin = fs::read_to_string(root.join("stdin.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        fs::remove_dir_all(root).unwrap();
+        (history, stdin)
+    }
+
+    #[tokio::test]
+    async fn claude_entering_plan_mode_switches_to_the_plan_model() {
+        let (history, stdin) = replan_turn("todex-claude-replan", "stay", true).await;
+        let model = line_with(&stdin, r#""subtype":"set_model","#);
+        let effort = line_with(&stdin, r#""subtype":"apply_flag_settings","#);
+        assert!(model < effort, "{stdin:#?}");
+        assert!(stdin[model].contains(r#""model":"claude-fable-5-2""#));
+        assert!(stdin[effort].contains(r#""settings":{"effortLevel":"high"}"#));
+        // Claude already runs in Plan mode: its permission mode stays.
+        assert!(
+            !stdin
+                .iter()
+                .any(|line| line.contains("set_permission_mode")),
+            "{stdin:#?}"
+        );
+        let events = provider_events(&history, "plan_reentered");
+        assert_eq!(events.len(), 1, "{history:?}");
+        assert_eq!(
+            events[0].payload["metadata"],
+            json!({
+                "workMode": "plan",
+                "model": "claude-fable-5-2",
+                "reasoningEffort": "high",
+            })
+        );
+        assert!(provider_events(&history, "plan_handoff").is_empty());
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "turn.completed"));
+    }
+
+    #[tokio::test]
+    async fn approving_a_plan_claude_reentered_hands_back_to_the_execute_settings() {
+        let (history, stdin) = replan_turn("todex-claude-replan-exit", "exit", true).await;
+        let plan_model = line_with(&stdin, r#""model":"claude-fable-5-2""#);
+        let execute_model = line_with(&stdin, r#""model":"claude-opus-5-5""#);
+        let mode = line_with(&stdin, r#""subtype":"set_permission_mode","#);
+        let allow = line_with(&stdin, r#""behavior":"allow""#);
+        assert!(
+            plan_model < execute_model && execute_model < mode && mode < allow,
+            "{stdin:#?}"
+        );
+        assert!(stdin[mode].contains(r#""mode":"auto""#));
+        assert_eq!(provider_events(&history, "plan_reentered").len(), 1);
+        let handoff = provider_events(&history, "plan_handoff");
+        assert_eq!(handoff.len(), 1, "{history:?}");
+        assert_eq!(handoff[0].payload["metadata"]["model"], "claude-opus-5-5");
+        assert_eq!(handoff[0].payload["metadata"]["reasoningEffort"], "medium");
+        assert_eq!(handoff[0].payload["metadata"]["permissionMode"], "auto");
+        assert_eq!(handoff[0].payload["metadata"]["applied"], "now");
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "turn.completed"));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_without_replan_switches_nothing() {
+        let (history, stdin) = replan_turn("todex-claude-replan-none", "none", false).await;
+        assert!(
+            !stdin.iter().any(|line| line.contains("todex-handoff")),
+            "{stdin:#?}"
+        );
+        assert!(provider_events(&history, "plan_reentered").is_empty());
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "turn.completed"));
+    }
+
+    #[tokio::test]
+    async fn replan_needs_a_claude_prompt_in_implement_mode() {
+        let (root, _store, supervisor, workspace) =
+            control_fixture("todex-replan-validation").await;
+        let claude = supervisor
+            .create(ProviderKind::ClaudeCode, workspace.clone(), None, None)
+            .await
+            .unwrap();
+        let reject = |result: Result<String, AppError>, needle: &str| match result {
+            Err(AppError::InvalidRequest(message)) => {
+                assert!(message.contains(needle), "{message}")
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        };
+        let mut in_plan = execute_prompt(true);
+        in_plan.work_mode = Some("plan".to_owned());
+        reject(
+            supervisor.prompt_owned("local", &claude.id, in_plan).await,
+            "workMode implement",
+        );
+        let mut empty_model = execute_prompt(true);
+        empty_model.replan.as_mut().unwrap().model = " ".to_owned();
+        reject(
+            supervisor
+                .prompt_owned("local", &claude.id, empty_model)
+                .await,
+            "replan.model",
+        );
+        let codex = supervisor
+            .create(ProviderKind::Codex, workspace, None, None)
+            .await
+            .unwrap();
+        let mut codex_prompt = execute_prompt(true);
+        codex_prompt.permission_mode = None;
+        codex_prompt.model = None;
+        codex_prompt.reasoning_effort = None;
+        reject(
+            supervisor
+                .prompt_owned("local", &codex.id, codex_prompt)
+                .await,
+            "only supported for claude-code",
+        );
+        assert!(!supervisor.has_active_turns());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -8780,6 +8986,55 @@ elif [ -f "$(dirname "$0")/peer-handback" ]; then
       printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
     ) &
   done
+elif [ -f "$(dirname "$0")/replan" ]; then
+  # An implement turn in which Claude enters Plan mode on its own. The marker
+  # holds `stay` (answer the switch to the plan model, then end the turn),
+  # `exit` (then also ask ExitPlanMode and answer the handoff back), or
+  # `none` (a prompt without replan: nothing to answer).
+  behavior=$(cat "$(dirname "$0")/replan")
+  rid_of() {
+    printf '%s' "$1" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'
+  }
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$(dirname "$0")/stdin.log"
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{"current_permission_mode":"auto"}}}\n'
+        continue
+        ;;
+    esac
+    printf '{"type":"system","subtype":"init","permissionMode":"auto","model":"claude-opus-5-5"}\n'
+    printf '{"type":"system","subtype":"status","permissionMode":"plan"}\n'
+    if [ "$behavior" != none ]; then
+      answered=0
+      while [ "$answered" -lt 2 ] && IFS= read -r reply; do
+        printf '%s\n' "$reply" >> "$(dirname "$0")/stdin.log"
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$(rid_of "$reply")"
+        answered=$((answered + 1))
+      done
+    fi
+    if [ "$behavior" = exit ]; then
+      printf '{"type":"control_request","request_id":"perm-replan","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"do it again"}}}\n'
+      while IFS= read -r reply; do
+        printf '%s\n' "$reply" >> "$(dirname "$0")/stdin.log"
+        rid=$(rid_of "$reply")
+        case "$reply" in
+          *'"type":"control_response"'*) break ;;
+          *'"subtype":"set_permission_mode"'*)
+            printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"mode":"auto"}}}\n' "$rid"
+            printf '{"type":"system","subtype":"status","permissionMode":"auto"}\n'
+            ;;
+          *'"type":"control_request"'*)
+            printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$rid"
+            ;;
+        esac
+      done
+    else
+      sleep 0.2
+    fi
+    printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"planned"}}}\n'
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"planned"}\n'
+  done
 elif [ -f "$(dirname "$0")/plan-handoff" ]; then
   # A Plan-mode turn whose plan the user approves: Claude asks for
   # ExitPlanMode and answers the switches TodeX sends before the approval.
@@ -9254,6 +9509,7 @@ done
                     }],
                     content: Vec::new(),
                     after_plan: None,
+                    replan: None,
                 },
             )
             .await

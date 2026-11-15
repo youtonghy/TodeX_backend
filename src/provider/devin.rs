@@ -79,6 +79,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         modes: &["ask", "full-access"],
         default_mode: "ask",
         supports_plan: true,
+        supports_replan: false,
         sandbox_modes: &[],
         approval_policies: &[],
         permission_profiles: &[],

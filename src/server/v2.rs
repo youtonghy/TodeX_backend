@@ -28,7 +28,7 @@ use crate::error::AppError;
 use crate::provider::{
     read_current_version, run_install, run_upgrade, AfterPlan, CancelOutcome, CliOperationAction,
     CliUpgradeOperation, CliVersionsResponse, ConversationPrompt, ConversationSupervisor,
-    FollowUpAddOutcome, ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef,
+    FollowUpAddOutcome, ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef, Replan,
 };
 use crate::workspace_paths::{
     canonical_workspace_roots, containing_workspace_root, validate_workspace_directory,
@@ -2696,6 +2696,7 @@ async fn prompt_conversation(
                 skills: prompt_skills(request.skills),
                 content: request.content,
                 after_plan: request.after_plan,
+                replan: request.replan,
             },
         )
         .await?;
@@ -3999,6 +4000,7 @@ async fn dispatch_lane_command(
                         skills: prompt_skills(request.skills),
                         content: request.content,
                         after_plan: request.after_plan,
+                        replan: request.replan,
                     },
                 )
                 .await?;
@@ -4029,6 +4031,7 @@ async fn dispatch_lane_command(
                         skills: prompt_skills(request.skills),
                         content: request.content,
                         after_plan: request.after_plan,
+                        replan: request.replan,
                     },
                     request.front,
                     request.paused,
@@ -4780,6 +4783,10 @@ struct PromptRequest {
     /// Plan-mode Claude prompts: the settings to switch to once the plan is approved.
     #[serde(default)]
     after_plan: Option<AfterPlan>,
+    /// Implement-mode Claude prompts: the plan settings Claude switches to if
+    /// it enters Plan mode on its own.
+    #[serde(default)]
+    replan: Option<Replan>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4910,6 +4917,10 @@ struct WsConversationRequest {
     /// Plan-mode Claude prompts: the settings to switch to once the plan is approved.
     #[serde(default)]
     after_plan: Option<AfterPlan>,
+    /// Implement-mode Claude prompts: the plan settings Claude switches to if
+    /// it enters Plan mode on its own.
+    #[serde(default)]
+    replan: Option<Replan>,
     /// Follow-up queue item id (`conversation.queue.*`); defaults to the command id.
     #[serde(default)]
     item_id: Option<String>,

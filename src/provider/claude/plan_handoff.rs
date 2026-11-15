@@ -14,6 +14,15 @@
 //! A switch Claude refuses or never answers still lets the approval through
 //! (the user approved the plan); the settings then apply at the next prompt,
 //! whose differing launch key restarts the process with the right flags.
+//!
+//! The way back: an implement turn whose prompt carries `replan` watches for
+//! Claude entering Plan mode on its own (`EnterPlanMode`, reported as a
+//! `status` frame with `permissionMode: "plan"`). The turn then switches
+//! Claude to the plan model ([`Replan::apply`]) and arms a handoff back to the
+//! turn's own settings, so approving the new plan hands off again. Clients
+//! learn of it right away (`plan_reentered`); a model switch Claude refuses,
+//! or that is still pending when the turn ends, leaves the launch key alone
+//! so the next plan prompt restarts the process with the plan flags.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,7 +33,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::conversation::ProviderKind;
-use crate::provider::types::AfterPlan;
+use crate::provider::types::{AfterPlan, Replan};
 
 /// The tool Claude calls to leave Plan mode with a plan for approval.
 pub(super) const EXIT_PLAN_MODE_TOOL: &str = "ExitPlanMode";
@@ -41,6 +50,7 @@ static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 pub(super) enum TurnMessage {
     Send(Value),
     HandedOff(HandoffOutcome),
+    Replanned(ReplanOutcome),
 }
 
 /// Control requests TodeX sent to Claude mid-turn that a task waits on, by
@@ -63,6 +73,56 @@ impl ControlReplies {
             .lock()
             .expect("Claude control replies lock")
             .remove(request_id);
+    }
+
+    /// Sends one control request to Claude through the turn's `outgoing`
+    /// channel and waits for its answer's body.
+    pub(super) async fn switch(
+        &self,
+        outgoing: &mpsc::UnboundedSender<TurnMessage>,
+        kind: &str,
+        request: Value,
+    ) -> Result<Value, String> {
+        let request_id = format!(
+            "todex-handoff-{kind}-{}",
+            NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
+        );
+        let reply = self.expect(&request_id);
+        let frame = json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": request,
+        });
+        if outgoing.send(TurnMessage::Send(frame)).is_err() {
+            self.forget(&request_id);
+            return Err("the turn ended".to_owned());
+        }
+        let answer = tokio::select! {
+            answer = tokio::time::timeout(REPLY_TIMEOUT, reply) => answer,
+            () = outgoing.closed() => {
+                self.forget(&request_id);
+                return Err("the turn ended".to_owned());
+            }
+        };
+        let message = match answer {
+            Ok(Ok(message)) => message,
+            Ok(Err(_)) => return Err("the turn ended".to_owned()),
+            Err(_) => {
+                self.forget(&request_id);
+                return Err("no answer from Claude Code".to_owned());
+            }
+        };
+        if message.pointer("/response/subtype").and_then(Value::as_str) == Some("success") {
+            return Ok(message
+                .pointer("/response/response")
+                .cloned()
+                .unwrap_or(Value::Null));
+        }
+        Err(message
+            .pointer("/response/error")
+            .and_then(Value::as_str)
+            .unwrap_or("refused")
+            .to_owned())
     }
 
     /// Hands a `control_response` frame to the task waiting on its
@@ -133,6 +193,7 @@ impl PlanHandoff {
     ) -> HandoffOutcome {
         let mut failures = Vec::new();
         let model = self
+            .replies
             .switch(
                 outgoing,
                 "model",
@@ -147,6 +208,7 @@ impl PlanHandoff {
             }
         };
         let mode = self
+            .replies
             .switch(
                 outgoing,
                 "mode",
@@ -169,6 +231,7 @@ impl PlanHandoff {
         };
         let effort_applied = match self.after_plan.reasoning_effort.as_deref() {
             Some(effort) => match self
+                .replies
                 .switch(
                     outgoing,
                     "effort",
@@ -195,55 +258,6 @@ impl PlanHandoff {
             effort_applied,
             failure: (!failures.is_empty()).then(|| failures.join("; ")),
         }
-    }
-
-    /// One control request and its answer's body.
-    async fn switch(
-        &self,
-        outgoing: &mpsc::UnboundedSender<TurnMessage>,
-        kind: &str,
-        request: Value,
-    ) -> Result<Value, String> {
-        let request_id = format!(
-            "todex-handoff-{kind}-{}",
-            NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
-        );
-        let reply = self.replies.expect(&request_id);
-        let frame = json!({
-            "type": "control_request",
-            "request_id": request_id,
-            "request": request,
-        });
-        if outgoing.send(TurnMessage::Send(frame)).is_err() {
-            self.replies.forget(&request_id);
-            return Err("the turn ended".to_owned());
-        }
-        let answer = tokio::select! {
-            answer = tokio::time::timeout(REPLY_TIMEOUT, reply) => answer,
-            () = outgoing.closed() => {
-                self.replies.forget(&request_id);
-                return Err("the turn ended".to_owned());
-            }
-        };
-        let message = match answer {
-            Ok(Ok(message)) => message,
-            Ok(Err(_)) => return Err("the turn ended".to_owned()),
-            Err(_) => {
-                self.replies.forget(&request_id);
-                return Err("no answer from Claude Code".to_owned());
-            }
-        };
-        if message.pointer("/response/subtype").and_then(Value::as_str) == Some("success") {
-            return Ok(message
-                .pointer("/response/response")
-                .cloned()
-                .unwrap_or(Value::Null));
-        }
-        Err(message
-            .pointer("/response/error")
-            .and_then(Value::as_str)
-            .unwrap_or("refused")
-            .to_owned())
     }
 }
 
@@ -307,6 +321,81 @@ impl HandoffOutcome {
             },
         })
     }
+}
+
+/// Switches Claude to the plan model once it entered Plan mode on its own in
+/// an implement turn whose prompt carries `replan`. Claude already runs in
+/// Plan mode, so only the model and, when one was chosen, the effort change.
+pub(super) async fn replan(
+    replan: &Replan,
+    replies: &ControlReplies,
+    outgoing: &mpsc::UnboundedSender<TurnMessage>,
+) -> ReplanOutcome {
+    let model = replies
+        .switch(
+            outgoing,
+            "model",
+            json!({ "subtype": "set_model", "model": replan.model }),
+        )
+        .await;
+    if let Err(error) = &model {
+        tracing::warn!(%error, "Claude Code did not take the plan model; it applies from the next prompt");
+    }
+    let effort_applied = match replan.reasoning_effort.as_deref() {
+        Some(effort) => match replies
+            .switch(
+                outgoing,
+                "effort",
+                json!({
+                    "subtype": "apply_flag_settings",
+                    "settings": { "effortLevel": effort },
+                }),
+            )
+            .await
+        {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(%error, "Claude Code did not take the plan reasoning effort");
+                false
+            }
+        },
+        None => false,
+    };
+    ReplanOutcome {
+        replan: replan.clone(),
+        model_applied: model.is_ok(),
+        effort_applied,
+    }
+}
+
+/// The latest mid-turn switch of a turn, which the resident process's launch
+/// key follows once the turn ends.
+#[derive(Clone, Debug)]
+pub(in crate::provider) enum ModeSwitch {
+    HandedOff(HandoffOutcome),
+    Replanned(ReplanOutcome),
+}
+
+/// What the switch to the plan settings achieved.
+#[derive(Clone, Debug)]
+pub(in crate::provider) struct ReplanOutcome {
+    pub replan: Replan,
+    pub model_applied: bool,
+    pub effort_applied: bool,
+}
+
+/// The `provider.event` telling clients Claude went back to planning, sent
+/// as soon as it enters Plan mode; the switch to `replan`'s model follows.
+pub(super) fn replan_event(replan: &Replan) -> Value {
+    json!({
+        "provider": "claude-code",
+        "providerMethod": "plan_reentered",
+        "metadata": {
+            "workMode": "plan",
+            "model": replan.model,
+            "reasoningEffort": replan.reasoning_effort,
+        },
+    })
 }
 
 #[cfg(test)]

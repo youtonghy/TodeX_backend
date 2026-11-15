@@ -34,6 +34,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         modes: &["ask", "auto", "full-access"],
         default_mode: "auto",
         supports_plan: true,
+        supports_replan: false,
         sandbox_modes: &["read-only", "workspace-write", "danger-full-access"],
         approval_policies: &["untrusted", "on-request", "never"],
         permission_profiles: &["read-only", "workspace-write", "danger-full-access"],
@@ -2017,6 +2018,7 @@ mod tests {
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         };
         let input = codex_prompt_input(&prompt);
         assert_eq!(input[0]["type"], "text");
@@ -2187,6 +2189,7 @@ done
                         sandbox_mode: sandbox.map(str::to_owned),
                         approval_policy: sandbox.map(|_| "never".to_owned()),
                         after_plan: None,
+                        replan: None,
                     },
                     sink.clone(),
                     cancel_rx.clone(),

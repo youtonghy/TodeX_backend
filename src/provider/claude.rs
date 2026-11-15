@@ -34,6 +34,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         modes: &["ask", "accept-edits", "auto", "full-access"],
         default_mode: "auto",
         supports_plan: true,
+        supports_replan: true,
         sandbox_modes: &["read-only", "workspace-write", "danger-full-access"],
         approval_policies: &["on-request", "never"],
         permission_profiles: &["read-only", "workspace-write", "danger-full-access"],
@@ -2254,6 +2255,7 @@ mod tests {
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         };
 
         assert_eq!(claude_user_content(&prompt), json!("hello"));
@@ -2278,6 +2280,7 @@ mod tests {
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         };
 
         assert_eq!(
@@ -3150,7 +3153,7 @@ async fn run_claude_turn(
     work: &mut session_work::SessionWork,
     subagents: &mut ClaudeSubagents,
     start: TurnStart,
-    handoff: &mut Option<plan_handoff::HandoffOutcome>,
+    mode_switch: &mut Option<plan_handoff::ModeSwitch>,
 ) -> Result<DriverTurnResult, AppError> {
     let outcome = read_claude_turn(
         process,
@@ -3165,7 +3168,7 @@ async fn run_claude_turn(
         work,
         subagents,
         start,
-        handoff,
+        mode_switch,
     )
     .await;
     let unparsed = sink.unparsed_line_count();
@@ -3201,7 +3204,7 @@ async fn read_claude_turn(
     work: &mut session_work::SessionWork,
     subagents: &mut ClaudeSubagents,
     start: TurnStart,
-    handoff_outcome: &mut Option<plan_handoff::HandoffOutcome>,
+    mode_switch: &mut Option<plan_handoff::ModeSwitch>,
 ) -> Result<DriverTurnResult, AppError> {
     work.begin_turn();
     let adopt = start == TurnStart::Adopt;
@@ -3217,11 +3220,17 @@ async fn read_claude_turn(
     // Answers to control requests TodeX sends mid-turn, and the handoff to
     // execution an approved plan triggers (see [`plan_handoff`]).
     let replies = plan_handoff::ControlReplies::default();
-    let handoff = plan_handoff::PlanHandoff::new(
+    let mut handoff = plan_handoff::PlanHandoff::new(
         prompt.after_plan.as_ref(),
         &execution.work_mode,
         replies.clone(),
     );
+    // An implement turn's way back to planning when Claude enters Plan mode
+    // on its own; taken the first time it does.
+    let mut replan = prompt
+        .replan
+        .clone()
+        .filter(|_| execution.work_mode == "implement");
     // Start-up already showed Claude refusing full access: fail before the
     // prompt reaches the model.
     if let Some(reported) = mode.reported.as_deref() {
@@ -3375,9 +3384,17 @@ async fn read_claude_turn(
                                     .await?;
                             }
                         }
-                        *handoff_outcome = Some(outcome);
+                        *mode_switch = Some(plan_handoff::ModeSwitch::HandedOff(outcome));
                     }
-                    None => {}
+                    // Claude runs the plan model now. A plan already
+                    // approved and handed back (the switch outlasted writing
+                    // it) keeps the execute settings.
+                    Some(plan_handoff::TurnMessage::Replanned(outcome))
+                        if !matches!(mode_switch, Some(plan_handoff::ModeSwitch::HandedOff(_))) =>
+                    {
+                        *mode_switch = Some(plan_handoff::ModeSwitch::Replanned(outcome));
+                    }
+                    Some(plan_handoff::TurnMessage::Replanned(_)) | None => {}
                 }
                 continue;
             }
@@ -3750,6 +3767,29 @@ async fn read_claude_turn(
                 // `plan` comes and goes with EnterPlanMode/ExitPlanMode.
                 if message.get("subtype").and_then(Value::as_str) == Some("status") {
                     if let Some(actual) = message.get("permissionMode").and_then(Value::as_str) {
+                        if actual == "plan" && execution.work_mode == "implement" {
+                            if let Some(replan) = replan.take() {
+                                handoff = start_replan(
+                                    &replan,
+                                    &prompt,
+                                    init_model.as_deref(),
+                                    &execution.permission_mode,
+                                    &replies,
+                                    &response_tx,
+                                );
+                                if handoff.is_some() {
+                                    execution.work_mode = "plan".to_owned();
+                                    if let Some(handle) = &context.handles.mode {
+                                        handle.switch_to(&execution.permission_mode, "plan");
+                                    }
+                                    sink.emit(
+                                        "provider.event",
+                                        plan_handoff::replan_event(&replan),
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
                         let expected = expected_mode.as_deref();
                         if actual != "plan"
                             && permission_mode::bypass_mode_refused(expected, actual)
@@ -5234,6 +5274,39 @@ fn spawn_control_request(
             );
         }
     });
+}
+
+/// Claude entered Plan mode on its own in an implement turn whose prompt
+/// carries `replan`: switches it to the plan model in a detached task (its
+/// answers arrive through this loop) and returns the handoff that takes an
+/// approved plan back to the turn's own model, effort and permission mode.
+/// `None`, and no switch, when the turn's model is unknown.
+fn start_replan(
+    replan: &crate::provider::types::Replan,
+    prompt: &DriverPrompt,
+    init_model: Option<&str>,
+    permission_mode: &str,
+    replies: &plan_handoff::ControlReplies,
+    outgoing: &mpsc::UnboundedSender<plan_handoff::TurnMessage>,
+) -> Option<plan_handoff::PlanHandoff> {
+    let Some(model) = prompt.model.as_deref().or(init_model) else {
+        tracing::warn!("Claude Code entered Plan mode, but the turn's model is unknown; not switching to the plan model");
+        return None;
+    };
+    let back = crate::provider::types::AfterPlan {
+        model: model.to_owned(),
+        reasoning_effort: prompt.reasoning_effort.clone(),
+        permission_mode: permission_mode.to_owned(),
+    };
+    let handoff = plan_handoff::PlanHandoff::new(Some(&back), "plan", replies.clone())?;
+    let replan = replan.clone();
+    let replies = replies.clone();
+    let outgoing = outgoing.clone();
+    tokio::spawn(async move {
+        let outcome = plan_handoff::replan(&replan, &replies, &outgoing).await;
+        let _ = outgoing.send(plan_handoff::TurnMessage::Replanned(outcome));
+    });
+    Some(handoff)
 }
 
 /// Waits for the user's decision and builds the `can_use_tool` response body.

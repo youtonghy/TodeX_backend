@@ -84,6 +84,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         modes: &["ask", "auto", "full-access"],
         default_mode: "auto",
         supports_plan: false,
+        supports_replan: false,
         sandbox_modes: &[],
         approval_policies: &[],
         permission_profiles: &[],
@@ -859,6 +860,7 @@ mod tests {
                 sandbox_mode: None,
                 approval_policy: None,
                 after_plan: None,
+                replan: None,
             };
             let sink = DriverEventSink::new(
                 self.store.clone(),

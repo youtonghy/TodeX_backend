@@ -52,6 +52,10 @@ pub struct PermissionConfigCapabilities {
     pub modes: &'static [&'static str],
     pub default_mode: &'static str,
     pub supports_plan: bool,
+    /// Implement prompts accept `replan`: Claude entering Plan mode on its
+    /// own switches to the plan model (smart work mode). Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub supports_replan: bool,
     pub sandbox_modes: &'static [&'static str],
     pub approval_policies: &'static [&'static str],
     pub permission_profiles: &'static [&'static str],
@@ -67,6 +71,7 @@ impl PermissionConfigCapabilities {
             modes: mode,
             default_mode: mode[0],
             supports_plan: false,
+            supports_replan: false,
             sandbox_modes: &[],
             approval_policies: &[],
             permission_profiles: &[],
@@ -551,6 +556,53 @@ pub fn validate_after_plan(
     Ok(())
 }
 
+/// What an implement prompt switches to when Claude enters Plan mode on its
+/// own (`EnterPlanMode`) during the turn: the plan model and effort. The
+/// turn's own model, effort and permission mode become the handoff once that
+/// plan is approved (see [`AfterPlan`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Replan {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+/// Checks a prompt's `replan` against its provider and effective work mode:
+/// only a Claude Code prompt in implement mode can re-enter planning.
+pub fn validate_replan(
+    provider: ProviderKind,
+    replan: &Replan,
+    effective: &EffectivePermissionConfig,
+) -> Result<(), AppError> {
+    if provider != ProviderKind::ClaudeCode {
+        return Err(AppError::InvalidRequest(format!(
+            "replan is only supported for claude-code, not {}",
+            provider.as_str()
+        )));
+    }
+    if effective.work_mode != "implement" {
+        return Err(AppError::InvalidRequest(
+            "replan requires workMode implement".to_owned(),
+        ));
+    }
+    if replan.model.trim().is_empty() {
+        return Err(AppError::InvalidRequest(
+            "replan.model must not be empty".to_owned(),
+        ));
+    }
+    if replan
+        .reasoning_effort
+        .as_deref()
+        .is_some_and(|effort| effort.trim().is_empty())
+    {
+        return Err(AppError::InvalidRequest(
+            "replan.reasoningEffort must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct DriverPrompt {
     pub permission_mode: Option<String>,
@@ -567,6 +619,9 @@ pub struct DriverPrompt {
     /// Plan-mode prompts only: the settings to switch to once the plan is
     /// approved (see [`AfterPlan`]).
     pub after_plan: Option<AfterPlan>,
+    /// Implement-mode Claude prompts only: the plan settings to switch to if
+    /// Claude enters Plan mode on its own (see [`Replan`]).
+    pub replan: Option<Replan>,
 }
 
 /// Validated controls actually supported by the selected provider.

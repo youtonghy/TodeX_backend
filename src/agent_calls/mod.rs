@@ -265,6 +265,7 @@ pub(crate) async fn prepare_prompt(
         sandbox_mode: None,
         approval_policy: None,
         after_plan: None,
+        replan: None,
     })
 }
 

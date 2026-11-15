@@ -613,6 +613,42 @@ impl Live {
             settings.sandbox_mode = None;
             settings.approval_policy = None;
             settings.after_plan = None;
+            settings.replan = None;
+        }
+    }
+
+    /// Claude entered Plan mode on its own and took the plan model mid-turn
+    /// (see [`super::plan_handoff`]): the next plan prompt with that model
+    /// reuses the process, and work Claude starts on its own plans too. A
+    /// model Claude did not take leaves the key alone, so that prompt
+    /// restarts the process with the plan flags.
+    fn re_plan(&mut self, outcome: &super::plan_handoff::ReplanOutcome) {
+        if !outcome.model_applied {
+            return;
+        }
+        let replan = &outcome.replan;
+        self.key.model = Some(replan.model.clone());
+        self.key.permission_mode = Some("plan".to_owned());
+        if outcome.effort_applied {
+            self.key.effort = replan.reasoning_effort.clone();
+        }
+        if let Some((_, settings)) = &mut self.provider_work {
+            // What approving that plan hands back to: the execute settings
+            // this process ran until now.
+            settings.after_plan = match (&settings.model, &settings.permission_mode) {
+                (Some(model), Some(permission_mode)) => Some(crate::provider::types::AfterPlan {
+                    model: model.clone(),
+                    reasoning_effort: settings.reasoning_effort.clone(),
+                    permission_mode: permission_mode.clone(),
+                }),
+                _ => None,
+            };
+            settings.model = Some(replan.model.clone());
+            if outcome.effort_applied {
+                settings.reasoning_effort = replan.reasoning_effort.clone();
+            }
+            settings.work_mode = Some("plan".to_owned());
+            settings.replan = None;
         }
     }
 }
@@ -1066,8 +1102,14 @@ async fn worker(
                     &mut handoff,
                 )
                 .await;
-                if let Some(handoff) = handoff {
-                    started.hand_off(&handoff);
+                match handoff {
+                    Some(super::plan_handoff::ModeSwitch::HandedOff(handoff)) => {
+                        started.hand_off(&handoff)
+                    }
+                    Some(super::plan_handoff::ModeSwitch::Replanned(replan)) => {
+                        started.re_plan(&replan)
+                    }
+                    None => {}
                 }
                 outcome.map(Some)
             } => Some(outcome),
@@ -1581,6 +1623,18 @@ while IFS= read -r line; do
       ;;
   esac
   case "$line" in
+    *enter-plan*)
+      # Claude enters Plan mode on its own and answers the switch to the
+      # plan model (set_model, apply_flag_settings).
+      printf '{"type":"system","subtype":"status","permissionMode":"plan"}\n'
+      answered=0
+      while [ "$answered" -lt 2 ] && IFS= read -r reply; do
+        printf '%s\n' "$reply" >> "$dir/wire.jsonl"
+        rid=$(printf '%s' "$reply" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$rid"
+        answered=$((answered + 1))
+      done
+      sleep 0.2 ;;
     *exit-plan*)
       printf '{"type":"control_request","request_id":"plan-1","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"p"}}}\n'
       while IFS= read -r reply; do
@@ -1778,6 +1832,7 @@ done
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         }
     }
 
@@ -1857,6 +1912,7 @@ done
                     sandbox_mode: None,
                     approval_policy: None,
                     after_plan: None,
+                    replan: None,
                 },
             };
             tokio::time::timeout(
@@ -1995,6 +2051,59 @@ done
                 "test".to_owned(),
             ))
         }
+    }
+
+    #[tokio::test]
+    async fn claude_reentering_plan_mode_keeps_the_process_for_the_plan_settings() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let permissions = PermissionBroker::default();
+        permissions.set_policy(Arc::new(AllowAll));
+        let mut execute = prompt("enter-plan");
+        execute.model = Some("claude-opus-5-5".to_owned());
+        execute.reasoning_effort = Some("medium".to_owned());
+        execute.permission_mode = Some("auto".to_owned());
+        execute.work_mode = Some("implement".to_owned());
+        execute.replan = Some(crate::provider::types::Replan {
+            model: "claude-fable-5-2".to_owned(),
+            reasoning_effort: Some("high".to_owned()),
+        });
+        let (_cancel, cancel) = watch::channel(false);
+        fixture
+            .run_prompt(
+                &sessions,
+                &manifest,
+                execute,
+                cancel,
+                TurnHandles::default(),
+                permissions.clone(),
+            )
+            .await
+            .unwrap();
+        let mut plan = prompt("plan more");
+        plan.model = Some("claude-fable-5-2".to_owned());
+        plan.reasoning_effort = Some("high".to_owned());
+        plan.permission_mode = Some("ask".to_owned());
+        plan.work_mode = Some("plan".to_owned());
+        let (_cancel, cancel) = watch::channel(false);
+        fixture
+            .run_prompt(
+                &sessions,
+                &manifest,
+                plan,
+                cancel,
+                TurnHandles::default(),
+                permissions,
+            )
+            .await
+            .unwrap();
+        let wire = fixture.wire();
+        assert!(wire.contains(r#""model":"claude-fable-5-2""#), "{wire}");
+        let launches = fixture.launches();
+        assert_eq!(launches.len(), 1, "{launches:?}");
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
     }
 
     #[tokio::test]

@@ -1351,6 +1351,7 @@ mod tests {
                 sandbox_mode: None,
                 approval_policy: None,
                 after_plan: None,
+                replan: None,
             };
             let turns_done = |count: usize| {
                 let state = state.clone();

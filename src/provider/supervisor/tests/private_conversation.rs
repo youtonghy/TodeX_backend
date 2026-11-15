@@ -40,6 +40,7 @@ fn prompt(text: &str) -> ConversationPrompt {
         sandbox_mode: None,
         approval_policy: None,
         after_plan: None,
+        replan: None,
     }
 }
 

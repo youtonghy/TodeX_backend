@@ -472,6 +472,7 @@ mod tests {
                     sandbox_mode: None,
                     approval_policy: None,
                     after_plan: None,
+                    replan: None,
                 },
             )
             .await

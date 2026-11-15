@@ -246,6 +246,7 @@ async fn execute(
         sandbox_mode: None,
         approval_policy: None,
         after_plan: None,
+        replan: None,
     };
     let outcome = state
         .conversations

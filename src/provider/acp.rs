@@ -4092,6 +4092,7 @@ mod tests {
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         }
     }
 
@@ -4893,6 +4894,7 @@ mod tests {
                 sandbox_mode: None,
                 approval_policy: None,
                 after_plan: None,
+                replan: None,
             };
             let sink = DriverEventSink::new(
                 self.store.clone(),
@@ -4995,6 +4997,7 @@ mod tests {
                 sandbox_mode: None,
                 approval_policy: None,
                 after_plan: None,
+                replan: None,
             };
             let sink = DriverEventSink::new(
                 self.store.clone(),

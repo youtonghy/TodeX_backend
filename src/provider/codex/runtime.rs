@@ -1251,6 +1251,7 @@ done
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         };
         let context = || DriverContext {
             manifest: manifest.clone(),
@@ -1485,6 +1486,7 @@ done
             sandbox_mode: Some("read-only".into()),
             approval_policy: Some("never".into()),
             after_plan: None,
+            replan: None,
         };
         let (_cancel_tx, cancel) = watch::channel(false);
         let context = DriverContext {

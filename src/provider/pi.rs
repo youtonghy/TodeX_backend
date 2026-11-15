@@ -3954,6 +3954,7 @@ mod tests {
                 sandbox_mode: None,
                 approval_policy: None,
                 after_plan: None,
+                replan: None,
             };
             (context, prompt)
         }
@@ -5763,6 +5764,7 @@ mod tests {
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         };
         let sink = DriverEventSink::new(
             fixture.store.clone(),

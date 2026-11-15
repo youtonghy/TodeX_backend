@@ -69,6 +69,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         modes: &["ask", "auto", "full-access"],
         default_mode: "auto",
         supports_plan: true,
+        supports_replan: false,
         sandbox_modes: &[],
         approval_policies: &[],
         permission_profiles: &[],
@@ -1400,6 +1401,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             sandbox_mode: None,
             approval_policy: None,
             after_plan: None,
+            replan: None,
         };
         let images = stage_images(&data_dir, "conv-1", &prompt).await.unwrap();
         let staged = attachments_dir(&data_dir, "conv-1").join("turn1-1.jpg");
@@ -1695,6 +1697,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     sandbox_mode: None,
                     approval_policy: None,
                     after_plan: None,
+                    replan: None,
                 };
                 let sink = DriverEventSink::new(
                     self.store.clone(),
