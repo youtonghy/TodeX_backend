@@ -1,7 +1,9 @@
 //! Starting a headed Chromium for one browser profile: no startup window
 //! (tabs open in their own background windows, so nothing takes focus),
 //! no throttling of covered windows (the live view keeps its frame rate),
-//! and the DevTools connection on a pipe where the OS allows it.
+//! and the DevTools connection on a pipe where the OS allows it. Without a
+//! graphical session (and no Xvfb), or when [`HEADLESS_ENV`] asks for it,
+//! the same browser runs headless instead.
 
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -17,6 +19,9 @@ use super::{cdp::Cdp, BrowserError};
 use crate::provider::process::{drain_stderr, stderr_excerpt};
 
 const START_TIMEOUT: Duration = Duration::from_secs(20);
+/// `1` (or `true`) runs the agent browser headless on any OS, e.g. to try
+/// the mode a server without a display gets.
+pub(crate) const HEADLESS_ENV: &str = "TODEX_AGENT_BROWSER_HEADLESS";
 /// How long the X server gets to report its display number.
 #[cfg(unix)]
 const DISPLAY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -224,14 +229,18 @@ async fn launch_in(
     if cfg!(target_os = "linux") {
         command.arg("--password-store=basic");
     }
-    // A minimized Wayland window cannot be restored by the app (xdg-shell
-    // has no request for it) and renders nothing, so screenshots and live
-    // frames stop for good. An X11 window (XWayland in a Wayland session)
-    // can be restored.
-    if cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_some() {
+    // `virtual_display: false` is a test stand-in, which never runs headless.
+    let headless = virtual_display && headless();
+    if headless {
+        command.arg("--headless");
+    } else if cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_some() {
+        // A minimized Wayland window cannot be restored by the app (xdg-shell
+        // has no request for it) and renders nothing, so screenshots and live
+        // frames stop for good. An X11 window (XWayland in a Wayland session)
+        // can be restored.
         command.arg("--ozone-platform=x11");
     }
-    let mut display = if virtual_display {
+    let mut display = if virtual_display && !headless {
         self::virtual_display(&mut command, profile_dir).await?
     } else {
         None
@@ -578,8 +587,36 @@ mod job {
     }
 }
 
-/// On Linux without a graphical session, runs the browser in an Xvfb
-/// display (headed, just not visible on a screen). The server picks its own
+/// Whether the browser runs headless: when [`HEADLESS_ENV`] asks for it, or
+/// on Linux with no graphical session and no Xvfb to make one. Headless
+/// Chromium renders, screenshots and streams frames the same; it only has no
+/// window to place or restore.
+pub(crate) fn headless() -> bool {
+    if std::env::var(HEADLESS_ENV)
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
+    {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        no_graphical_session() && find_in_path("Xvfb").is_none()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Linux with neither an X nor a Wayland display.
+#[cfg(unix)]
+fn no_graphical_session() -> bool {
+    cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+}
+
+/// On Linux without a graphical session but with Xvfb, runs the browser in
+/// an Xvfb display (headed, just not visible on a screen). The server picks its own
 /// display number (`-displayfd`) and only accepts clients holding a random
 /// cookie, kept in owner-only files that go away with the display.
 #[cfg(unix)]
@@ -587,16 +624,13 @@ async fn virtual_display(
     command: &mut Command,
     profile_dir: &Path,
 ) -> Result<Option<Display>, BrowserError> {
-    if !cfg!(target_os = "linux")
-        || std::env::var_os("DISPLAY").is_some()
-        || std::env::var_os("WAYLAND_DISPLAY").is_some()
-    {
+    if !no_graphical_session() {
         return Ok(None);
     }
+    // Gone since [`headless`] looked: headless is still possible next launch.
     let Some(xvfb) = find_in_path("Xvfb") else {
-        return Err(BrowserError::new(
-            "UNAVAILABLE",
-            "this computer has no graphical session; install Xvfb (e.g. `apt install xvfb`) so the agent browser can run",
+        return Err(BrowserError::failed(
+            "Xvfb disappeared while the agent browser was starting",
         ));
     };
     // `<data>/agent-browser/profiles/<id>` -> `<data>/agent-browser/x11`.

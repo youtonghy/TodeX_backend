@@ -1197,23 +1197,15 @@ impl AgentBrowser {
     }
 }
 
-/// Why a headed browser cannot show here, if it cannot.
+/// Why the browser cannot run here, if it cannot. Linux without a graphical
+/// session runs it headless ([`launch::headless`]), so only a Windows service
+/// session, which has no desktop to show windows on, is refused.
 fn display_problem() -> Option<String> {
-    // A Windows service session has no desktop to show windows on.
     #[cfg(target_os = "windows")]
-    if let Some(reason) = crate::computer::platform::unsupported_reason() {
-        return Some(reason);
-    }
-    if cfg!(target_os = "linux")
-        && std::env::var_os("DISPLAY").is_none()
-        && std::env::var_os("WAYLAND_DISPLAY").is_none()
-        && !std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .any(|dir| dir.join("Xvfb").is_file())
-    {
-        return Some(
-            "this computer has no graphical session; install Xvfb so the agent browser can run"
-                .to_owned(),
-        );
+    if !launch::headless() {
+        if let Some(reason) = crate::computer::platform::unsupported_reason() {
+            return Some(reason);
+        }
     }
     None
 }
