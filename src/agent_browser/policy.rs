@@ -191,8 +191,12 @@ pub(crate) enum Navigation {
     Continue,
     /// Cancel it (`Fetch.failRequest` `Aborted`; a page keeps showing).
     Block,
-    /// Its host's addresses decide: see [`judge_addresses`].
-    Resolve(String),
+    /// Its host's addresses decide (see [`judge_addresses`]); `approved`:
+    /// the person allowed the host, so only forbidden addresses stop it.
+    Resolve {
+        host: String,
+        approved: bool,
+    },
 }
 
 /// A paused request of the agent's tab. The main frame's documents are
@@ -206,10 +210,19 @@ pub(crate) fn guard_request(
     approved: impl Fn(&str) -> bool,
 ) -> Navigation {
     if resource_type == "Document" && main_frame {
-        return if allowed_top_level_for(url, approved) {
-            Navigation::Continue
-        } else {
-            Navigation::Block
+        if !allowed_top_level_for(url, &approved) {
+            return Navigation::Block;
+        }
+        // An allowed name may still point at a forbidden address.
+        return match reqwest::Url::parse(url)
+            .ok()
+            .and_then(|parsed| super::hosts::host_key(&parsed))
+        {
+            Some(host) if literal_reach(&host).is_none() => Navigation::Resolve {
+                host,
+                approved: true,
+            },
+            _ => Navigation::Continue,
         };
     }
     let Ok(parsed) = reqwest::Url::parse(url) else {
@@ -229,17 +242,21 @@ pub(crate) fn guard_request(
         Some(Reach::Local | Reach::Public) => Navigation::Continue,
         Some(Reach::Private) if approved(&host) => Navigation::Continue,
         Some(Reach::Private) => Navigation::Block,
-        None if approved(&host) => Navigation::Continue,
-        None => Navigation::Resolve(host),
+        None => Navigation::Resolve {
+            approved: approved(&host),
+            host,
+        },
     }
 }
 
 /// [`Navigation::Resolve`] once the host's addresses are known (none: it
 /// does not resolve, and the request fails on its own). `daemon`: the
-/// request goes to the daemon's port.
-pub(crate) fn judge_addresses(reaches: &[Reach], daemon: bool) -> Navigation {
+/// request goes to the daemon's port; `approved`: the host was allowed, so
+/// the local network is fine.
+pub(crate) fn judge_addresses(reaches: &[Reach], daemon: bool, approved: bool) -> Navigation {
     let blocked = reaches.iter().any(|reach| match reach {
-        Reach::Forbidden | Reach::Private => true,
+        Reach::Forbidden => true,
+        Reach::Private => !approved,
         Reach::Local => daemon,
         Reach::Public => false,
     });
@@ -371,25 +388,55 @@ mod tests {
         // A name: its addresses decide.
         assert_eq!(
             guard_request("https://cdn.example/app.js", "Script", true, none),
-            Navigation::Resolve("cdn.example".to_owned())
+            Navigation::Resolve {
+                host: "cdn.example".to_owned(),
+                approved: false
+            }
+        );
+        // An allowed name is resolved too: a forbidden address still stops it.
+        let cdn = |host: &str| host == "cdn.example";
+        assert_eq!(
+            guard_request("https://cdn.example/app.js", "Script", true, cdn),
+            Navigation::Resolve {
+                host: "cdn.example".to_owned(),
+                approved: true
+            }
         );
         assert_eq!(
-            judge_addresses(&[Reach::Public], false),
+            guard_request("https://cdn.example/", "Document", true, cdn),
+            Navigation::Resolve {
+                host: "cdn.example".to_owned(),
+                approved: true
+            }
+        );
+        assert_eq!(
+            judge_addresses(&[Reach::Private], false, true),
             Navigation::Continue
         );
         assert_eq!(
-            judge_addresses(&[Reach::Public, Reach::Private], false),
+            judge_addresses(&[Reach::Forbidden], false, true),
             Navigation::Block
         );
         assert_eq!(
-            judge_addresses(&[Reach::Forbidden], false),
-            Navigation::Block
-        );
-        assert_eq!(
-            judge_addresses(&[Reach::Local], false),
+            judge_addresses(&[Reach::Public], false, false),
             Navigation::Continue
         );
-        assert_eq!(judge_addresses(&[Reach::Local], true), Navigation::Block);
+        assert_eq!(
+            judge_addresses(&[Reach::Public, Reach::Private], false, false),
+            Navigation::Block
+        );
+        assert_eq!(
+            judge_addresses(&[Reach::Forbidden], false, false),
+            Navigation::Block
+        );
+        assert_eq!(
+            judge_addresses(&[Reach::Local], false, false),
+            Navigation::Continue
+        );
+        assert_eq!(
+            judge_addresses(&[Reach::Local], true, false),
+            Navigation::Block
+        );
     }
 
     #[test]
@@ -481,7 +528,10 @@ mod tests {
         // Iframes are judged like any other request.
         assert_eq!(
             guard_request("https://evil.example/", "Document", false, none),
-            Navigation::Resolve("evil.example".to_owned())
+            Navigation::Resolve {
+                host: "evil.example".to_owned(),
+                approved: false
+            }
         );
         assert_eq!(
             guard_request("data:text/html,x", "Document", false, none),

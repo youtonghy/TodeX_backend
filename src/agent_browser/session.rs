@@ -603,7 +603,7 @@ impl Running {
     ) {
         let answer = |running: &Running, verdict: Navigation, session_id: Option<&str>| {
             let (method, body) = match verdict {
-                Navigation::Continue | Navigation::Resolve(_) => {
+                Navigation::Continue | Navigation::Resolve { .. } => {
                     ("Fetch.continueRequest", json!({ "requestId": request_id }))
                 }
                 Navigation::Block => {
@@ -618,7 +618,7 @@ impl Running {
             };
             running.cdp.notify(method, body, session_id);
         };
-        let Navigation::Resolve(host) = verdict else {
+        let Navigation::Resolve { host, approved } = verdict else {
             answer(self, verdict, session_id);
             return;
         };
@@ -631,7 +631,11 @@ impl Running {
             .filter(|(at, _)| at.elapsed() < RESOLVED_FOR)
             .map(|(_, reaches)| reaches.clone());
         if let Some(reaches) = cached {
-            answer(self, policy::judge_addresses(&reaches, daemon), session_id);
+            answer(
+                self,
+                policy::judge_addresses(&reaches, daemon, approved),
+                session_id,
+            );
             return;
         }
         let running = Arc::clone(self);
@@ -659,10 +663,10 @@ impl Running {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(host, (Instant::now(), reaches.clone()));
-            let verdict = policy::judge_addresses(&reaches, daemon);
+            let verdict = policy::judge_addresses(&reaches, daemon, approved);
             let (method, body) = match verdict {
                 Navigation::Block => {
-                    tracing::info!(url, "agent browser blocked a request to the local network");
+                    tracing::info!(url, "agent browser blocked a request by its address");
                     (
                         "Fetch.failRequest",
                         json!({ "requestId": request_id, "errorReason": "Aborted" }),

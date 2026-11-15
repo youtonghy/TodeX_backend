@@ -4,6 +4,10 @@
 //! without port, as [`host_key`] spells it; allowing it lets the agent's
 //! tab show its pages and lets pages in that tab reach it even when it is
 //! on the local network.
+//!
+//! The [`HostApproval`] mode (`host-approval.json`) decides whether hosts
+//! are asked about at all: with [`HostApproval::Auto`] every host counts as
+//! allowed once the conversation may use the browser.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -14,6 +18,23 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 const FILE: &str = "hosts.json";
+const MODE_FILE: &str = "host-approval.json";
+
+/// Whether hosts beyond this computer are asked about.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum HostApproval {
+    /// Each host once: allow once, always allow or deny.
+    #[default]
+    Ask,
+    /// Every host, without asking, once the browser itself is granted.
+    Auto,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct StoredMode {
+    mode: HostApproval,
+}
 
 #[derive(Default, Deserialize, Serialize)]
 struct Stored {
@@ -22,6 +43,8 @@ struct Stored {
 
 pub(crate) struct HostApprovals {
     path: PathBuf,
+    mode_path: PathBuf,
+    mode: Mutex<HostApproval>,
     always: Mutex<BTreeSet<String>>,
     /// Conversation id → hosts allowed for it.
     conversations: Mutex<HashMap<String, HashSet<String>>>,
@@ -47,18 +70,54 @@ impl HostApprovals {
                 }),
             Err(_) => BTreeSet::new(),
         };
+        let mode_path = dir.join(MODE_FILE);
+        let mode = match std::fs::read(&mode_path) {
+            Ok(bytes) => serde_json::from_slice::<StoredMode>(&bytes)
+                .map(|stored| stored.mode)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "ignoring an unreadable agent browser host approval mode");
+                    HostApproval::Ask
+                }),
+            Err(_) => HostApproval::Ask,
+        };
         Self {
             path,
+            mode_path,
+            mode: Mutex::new(mode),
             always: Mutex::new(always),
             conversations: Mutex::new(HashMap::new()),
         }
     }
 
-    pub(crate) fn allowed(&self, conversation_id: &str, host: &str) -> bool {
-        self.always
+    pub(crate) fn mode(&self) -> HostApproval {
+        *self
+            .mode
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(host)
+    }
+
+    /// Saves `mode`; the saved hosts stay for when hosts are asked again.
+    pub(crate) fn set_mode(&self, mode: HostApproval) -> std::io::Result<()> {
+        let mut current = self
+            .mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bytes =
+            serde_json::to_vec_pretty(&StoredMode { mode }).map_err(std::io::Error::other)?;
+        crate::secure_fs::write_owner_only_atomic(&self.mode_path, &bytes)?;
+        *current = mode;
+        Ok(())
+    }
+
+    /// Whether the conversation's tab may open and reach `host`: every host
+    /// in [`HostApproval::Auto`], else one allowed once or always.
+    pub(crate) fn allowed(&self, conversation_id: &str, host: &str) -> bool {
+        self.mode() == HostApproval::Auto
+            || self
+                .always
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(host)
             || self
                 .conversations
                 .lock()
@@ -153,6 +212,25 @@ mod tests {
         assert!(reloaded.remove("192.168.8.1").unwrap());
         assert!(!reloaded.remove("192.168.8.1").unwrap());
         assert!(!HostApprovals::load(&dir).allowed("c", "192.168.8.1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_asking_every_host_is_allowed_and_the_choice_is_saved() {
+        let dir = std::env::temp_dir().join(format!("todex-hosts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let approvals = HostApprovals::load(&dir);
+        assert_eq!(approvals.mode(), HostApproval::Ask);
+        approvals.allow_always("example.com").unwrap();
+        approvals.set_mode(HostApproval::Auto).unwrap();
+        assert!(approvals.allowed("a", "192.168.8.1"));
+        assert!(approvals.allowed("b", "other.example"));
+        let reloaded = HostApprovals::load(&dir);
+        assert_eq!(reloaded.mode(), HostApproval::Auto);
+        // Back to asking: the saved hosts still apply, nothing else does.
+        reloaded.set_mode(HostApproval::Ask).unwrap();
+        assert!(reloaded.allowed("a", "example.com"));
+        assert!(!reloaded.allowed("a", "192.168.8.1"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

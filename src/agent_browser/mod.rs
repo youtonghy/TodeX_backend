@@ -158,6 +158,8 @@ pub(crate) struct BrowserStatus {
     pub chromium: InstallState,
     pub engine: BrowserEngineKind,
     pub engines: BrowserEngines,
+    /// Whether hosts beyond this computer are asked about.
+    pub host_approval: hosts::HostApproval,
 }
 
 /// Engines besides the built-in Chromium.
@@ -813,6 +815,7 @@ impl AgentBrowser {
             chromium,
             engine,
             engines: BrowserEngines { kitesurf },
+            host_approval: self.inner.shared.hosts.mode(),
         }
     }
 

@@ -11,7 +11,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::agent_browser::BrowserEngineKind;
+use crate::agent_browser::{hosts::HostApproval, BrowserEngineKind};
 use crate::app_state::AppState;
 use crate::computer::{agent_desktop_engine::EngineKind, platform::Permission};
 use crate::error::AppError;
@@ -31,6 +31,9 @@ struct SettingsRequest {
     /// `chromium` or `kitesurf`.
     #[serde(default)]
     browser_engine: Option<BrowserEngineKind>,
+    /// `ask` (each host beyond this computer) or `auto` (every host).
+    #[serde(default)]
+    browser_host_approval: Option<HostApproval>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,10 +164,15 @@ async fn set_settings(
         && request.computer_enabled.is_none()
         && request.computer_engine.is_none()
         && request.browser_engine.is_none()
+        && request.browser_host_approval.is_none()
     {
         return Err(AppError::InvalidRequest(
-            "set enabled, computerEnabled, computerEngine and/or browserEngine".to_owned(),
+            "set enabled, computerEnabled, computerEngine, browserEngine and/or browserHostApproval"
+                .to_owned(),
         ));
+    }
+    if let Some(mode) = request.browser_host_approval {
+        state.agent_desktop.browser().hosts().set_mode(mode)?;
     }
     if let Some(engine) = request.browser_engine {
         state.agent_desktop.browser().set_engine(engine).await?;

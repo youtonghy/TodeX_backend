@@ -913,7 +913,8 @@ impl DesktopTools {
     }
 
     /// `host` (beyond this computer) is allowed for this conversation's tab:
-    /// already, or by the person now, once (this conversation) or always.
+    /// already, without asking (host approval set to `auto`), or by the
+    /// person now, once (this conversation) or always.
     /// A host that points at a link-local or cloud metadata address is
     /// never offered.
     async fn ensure_host(
@@ -924,9 +925,7 @@ impl DesktopTools {
     ) -> Result<(), String> {
         let browser = self.mcp.desktop().browser().clone();
         let hosts = browser.hosts();
-        if hosts.allowed(conversation_id, host) {
-            return Ok(());
-        }
+        // Checked even for allowed hosts (and with hosts not asked about).
         let reaches = match policy::literal_reach(host) {
             Some(reach) => vec![reach],
             None => tokio::time::timeout(
@@ -947,6 +946,9 @@ impl DesktopTools {
             return Err(format!(
                 "{host} points at a link-local or cloud metadata address, which the agent browser never opens."
             ));
+        }
+        if hosts.allowed(conversation_id, host) {
+            return Ok(());
         }
         let local_network = reaches.contains(&policy::Reach::Private);
         let authorizer = self.authorizer();
@@ -1192,6 +1194,68 @@ mod tests {
             option_id: Some(option.to_owned()),
             data: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn with_host_approval_off_every_host_opens_after_the_browser_grant() {
+        let (root, state, conversation_id, client) = harness().await;
+        let seen = fake_browser(&state);
+        let browser = state.agent_desktop.browser();
+        browser
+            .hosts()
+            .set_mode(crate::agent_browser::hosts::HostApproval::Auto)
+            .unwrap();
+        let opening = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                call(
+                    &client,
+                    "browser_open",
+                    json!({ "url": "http://10.1.2.3/" }),
+                )
+                .await
+            })
+        };
+        // The browser itself is still granted once.
+        let grant = pending_permission(&state, &conversation_id, GRANT_KIND).await;
+        state
+            .conversations
+            .resolve_permission_owned(
+                "local",
+                "dev_phone",
+                &conversation_id,
+                grant["permissionId"].as_str().unwrap(),
+                allow("allow", PermissionOutcome::AllowAlways),
+            )
+            .await
+            .unwrap();
+        let opened = opening.await.unwrap();
+        assert_ne!(opened.is_error, Some(true), "{}", text(&opened));
+        // No host question at all.
+        let navigated = call(
+            &client,
+            "browser_navigate",
+            json!({ "url": "http://192.168.8.1/" }),
+        )
+        .await;
+        assert_ne!(navigated.is_error, Some(true), "{}", text(&navigated));
+        let events = state
+            .conversations
+            .history_for_tests(&conversation_id)
+            .await;
+        assert!(!events.iter().any(|event| {
+            event.event_type == "permission.requested" && event.payload["kind"] == HOST_KIND
+        }));
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        // Never the metadata address.
+        let metadata = call(
+            &client,
+            "browser_open",
+            json!({ "url": "http://169.254.169.254/" }),
+        )
+        .await;
+        assert_eq!(metadata.is_error, Some(true));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
