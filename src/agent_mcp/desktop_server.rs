@@ -714,7 +714,13 @@ impl DesktopTools {
             Err(error) => {
                 event["ok"] = Value::Bool(false);
                 event["error"] = json!({ "code": error.code, "message": error.message });
-                tool_error(error.to_string())
+                let mut text = error.to_string();
+                // What the page said is page content.
+                if let Some(page) = &error.page_text {
+                    text.push_str("\nThe page reported:\n");
+                    text.push_str(&untrusted(PAGE_CONTENT_TAG, page));
+                }
+                tool_error(text)
             }
         };
         if let Err(error) = self
@@ -760,6 +766,18 @@ impl DesktopTools {
             );
             if result["truncated"].as_bool() == Some(true) {
                 page.push_str("\n(tree truncated)");
+            }
+            if let Some(problems) = result["problems"]
+                .as_array()
+                .filter(|lines| !lines.is_empty())
+            {
+                page.push_str(
+                    "\n\nPage problems (console errors and warnings, uncaught exceptions):",
+                );
+                for line in problems {
+                    page.push_str("\n- ");
+                    page.push_str(line.as_str().unwrap_or_default());
+                }
             }
             let mut text = String::new();
             if let Some(tunnel) = result.get("tunnel").filter(|tunnel| tunnel.is_object()) {

@@ -116,6 +116,9 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) struct BrowserError {
     pub code: String,
     pub message: String,
+    /// What the page itself said about the failure (console errors,
+    /// exceptions): page content, which the MCP layer fences as untrusted.
+    pub page_text: Option<String>,
 }
 
 impl BrowserError {
@@ -123,6 +126,7 @@ impl BrowserError {
         Self {
             code: code.to_owned(),
             message: message.into(),
+            page_text: None,
         }
     }
 
@@ -1360,6 +1364,55 @@ fn display_problem() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Loads `TODEX_KITESURF_E2E_URL` in the real Kitesurf engine, printing
+    /// the engine's own log lines and what the page reported:
+    /// `TODEX_WORKERD_PATH=<workerd> TODEX_AGENT_BROWSER_KITESURF_DIR=<engine>
+    /// TODEX_KITESURF_E2E_URL=http://127.0.0.1:5199/?demo cargo test
+    /// a_real_kitesurf_page_loads -- --ignored --nocapture`.
+    #[tokio::test]
+    #[cfg(unix)]
+    #[ignore = "runs the Kitesurf engine named by TODEX_WORKERD_PATH and TODEX_AGENT_BROWSER_KITESURF_DIR"]
+    async fn a_real_kitesurf_page_loads() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("todex_agentd::agent_browser=info")
+            .with_test_writer()
+            .try_init();
+        let workerd = std::env::var_os("TODEX_WORKERD_PATH").expect("TODEX_WORKERD_PATH");
+        let engine = std::env::var_os("TODEX_AGENT_BROWSER_KITESURF_DIR")
+            .expect("TODEX_AGENT_BROWSER_KITESURF_DIR");
+        let url = std::env::var("TODEX_KITESURF_E2E_URL").expect("TODEX_KITESURF_E2E_URL");
+        let process = launch::launch_kitesurf(workerd.as_ref(), engine.as_ref())
+            .await
+            .expect("Kitesurf starts");
+        let running = Running::start(
+            process,
+            std::sync::Weak::new(),
+            KITESURF_SLOT.to_owned(),
+            true,
+        )
+        .await
+        .expect("a session");
+        running.open_tab("c").await.expect("a tab");
+        let started = std::time::Instant::now();
+        match running.load("c", &url).await {
+            Ok(page) => println!("loaded in {:?}: {page}", started.elapsed()),
+            Err(error) => println!(
+                "failed in {:?}: {error}\npage said: {}",
+                started.elapsed(),
+                error.page_text.clone().unwrap_or_default()
+            ),
+        }
+        match running.snapshot("c", false).await {
+            Ok(snapshot) => {
+                let tree = snapshot["tree"].as_str().unwrap_or_default();
+                println!("snapshot problems: {}", snapshot["problems"]);
+                println!("{}", tree.lines().take(30).collect::<Vec<_>>().join("\n"));
+            }
+            Err(error) => println!("snapshot failed: {error}"),
+        }
+        running.shut_down();
+    }
 
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!("todex-browser-{}", uuid::Uuid::new_v4()))

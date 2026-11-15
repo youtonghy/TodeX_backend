@@ -34,6 +34,10 @@ struct State {
     minimized: AtomicBool,
     /// Paint checks still to answer "nothing drawn yet".
     unpainted: AtomicUsize,
+    /// Events sent just before answering a command: (method, event).
+    on_command: Mutex<Vec<(String, Value)>>,
+    /// The document reports a blank page (the engine reset it).
+    blank: AtomicBool,
 }
 
 #[derive(Clone, Default)]
@@ -89,6 +93,20 @@ impl ScriptedChromium {
     /// Minimizes the tab windows (as the person can).
     pub(crate) fn minimize(&self) {
         self.state.minimized.store(true, Ordering::SeqCst);
+    }
+
+    /// `event` is sent right before the next answers to `method`.
+    pub(crate) fn emit_on(&self, method: &str, event: Value) {
+        self.state
+            .on_command
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((method.to_owned(), event));
+    }
+
+    /// The document reports `about:blank`, as a page the engine replaced.
+    pub(crate) fn set_blank(&self, blank: bool) {
+        self.state.blank.store(blank, Ordering::SeqCst);
     }
 
     /// The next `checks` paint checks find nothing drawn.
@@ -191,6 +209,17 @@ impl ScriptedChromium {
                 {
                     continue;
                 }
+                let events: Vec<Value> = state
+                    .on_command
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .filter(|(on, _)| *on == method)
+                    .map(|(_, event)| event.clone())
+                    .collect();
+                for event in events {
+                    cdp.inject(&event);
+                }
                 let result = match method.as_str() {
                     "Target.createTarget" => {
                         let n = state.targets.fetch_add(1, Ordering::SeqCst) + 1;
@@ -209,7 +238,11 @@ impl ScriptedChromium {
                         if expression.contains("readyState") {
                             json!({ "result": { "value": "complete" } })
                         } else if expression.contains("location.href") {
-                            json!({ "result": { "value": { "url": "http://localhost:5173/shown", "title": "Shown" } } })
+                            if state.blank.load(Ordering::SeqCst) {
+                                json!({ "result": { "value": { "url": "about:blank", "title": "" } } })
+                            } else {
+                                json!({ "result": { "value": { "url": "http://localhost:5173/shown", "title": "Shown" } } })
+                            }
                         } else {
                             // One responder per connection: no other decrement
                             // lands between the load and the sub.
@@ -237,6 +270,9 @@ impl ScriptedChromium {
                     // A minimized window draws nothing and never answers.
                     "Page.captureScreenshot" if state.minimized.load(Ordering::SeqCst) => continue,
                     "Page.captureScreenshot" => json!({ "data": "AAAA" }),
+                    "Target.getTargetInfo" if state.blank.load(Ordering::SeqCst) => {
+                        json!({ "targetInfo": { "url": "about:blank", "title": "" } })
+                    }
                     "Target.getTargetInfo" => {
                         json!({ "targetInfo": { "url": "http://localhost:5173/", "title": "App" } })
                     }

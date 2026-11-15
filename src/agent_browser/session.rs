@@ -2,7 +2,7 @@
 //! in its own background window), the navigation guard, and the actions.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
@@ -66,6 +66,68 @@ const DENIED_PERMISSIONS: &[&str] = &[
     "nfc",
 ];
 
+/// Problems kept per tab since its latest navigation.
+const MAX_PROBLEMS: usize = 20;
+/// Longest problem line kept.
+const MAX_PROBLEM_CHARS: usize = 400;
+
+/// What a tab's page reported going wrong since its latest navigation.
+#[derive(Default)]
+struct Problems {
+    /// Console errors and warnings and uncaught exceptions, newest last:
+    /// page content.
+    lines: VecDeque<String>,
+    /// Why the page stopped running (a crash, an engine limit), if it did.
+    crashed: Option<String>,
+}
+
+/// A console problem or uncaught exception as one line of text.
+fn problem_line(method: &str, params: &Value) -> Option<String> {
+    let line = match method {
+        "Runtime.consoleAPICalled" => {
+            let text = params["args"]
+                .as_array()?
+                .iter()
+                .map(|arg| match &arg["value"] {
+                    Value::String(text) => text.clone(),
+                    Value::Null => arg["description"].as_str().unwrap_or_default().to_owned(),
+                    other => other.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            // Kitesurf's own progress notes, not the page's.
+            if text.starts_with("[ks-") || text.starts_with("[kitesurf") {
+                return None;
+            }
+            format!(
+                "console.{}: {text}",
+                params["type"].as_str().unwrap_or("error")
+            )
+        }
+        "Runtime.exceptionThrown" => {
+            let details = &params["exceptionDetails"];
+            let text = details["exception"]["description"]
+                .as_str()
+                .or_else(|| details["text"].as_str())
+                .unwrap_or("an exception");
+            match details["url"].as_str().filter(|url| !url.is_empty()) {
+                Some(url) => format!(
+                    "uncaught {text} ({url}:{})",
+                    details["lineNumber"].as_i64().unwrap_or(0) + 1
+                ),
+                None => format!("uncaught {text}"),
+            }
+        }
+        _ => return None,
+    };
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(if line.chars().count() > MAX_PROBLEM_CHARS {
+        line.chars().take(MAX_PROBLEM_CHARS).collect::<String>() + "…"
+    } else {
+        line
+    })
+}
+
 pub(crate) struct Tab {
     pub target_id: String,
     pub session_id: String,
@@ -102,6 +164,8 @@ pub(crate) struct Running {
     sessions: Mutex<HashMap<String, SessionInfo>>,
     /// Popup session → its pending popup.
     popups: Mutex<HashMap<String, PendingPopup>>,
+    /// Tab session → what its page reported going wrong.
+    problems: Mutex<HashMap<String, Problems>>,
     pub last_used: Mutex<Instant>,
     /// Slots, frames and tab-closure events of the browser service.
     shared: Weak<Shared>,
@@ -202,6 +266,7 @@ impl Running {
             tabs: tokio::sync::Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             popups: Mutex::new(HashMap::new()),
+            problems: Mutex::new(HashMap::new()),
             last_used: Mutex::new(Instant::now()),
             shared,
             profile,
@@ -338,12 +403,49 @@ impl Running {
                         );
                     }
                     ("Target.attachedToTarget", _) => running.fold_popup(&event.params),
+                    ("Runtime.consoleAPICalled" | "Runtime.exceptionThrown", Some(_)) => {
+                        if let (Some(session_id), Some(line)) = (
+                            event.session_id.as_deref(),
+                            problem_line(&event.method, &event.params),
+                        ) {
+                            running.record_problem(session_id, line);
+                        }
+                    }
+                    ("Inspector.targetCrashed", Some(_)) => {
+                        if let Some(session_id) = event.session_id.as_deref() {
+                            running.record_crash(session_id, "the page crashed".to_owned());
+                        }
+                    }
+                    ("Target.targetCrashed", _) => {
+                        let target_id = event.params["targetId"].as_str().unwrap_or_default();
+                        let session_id = running
+                            .sessions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .iter()
+                            .find(|(_, info)| info.target_id == target_id)
+                            .map(|(session_id, _)| session_id.clone());
+                        if let Some(session_id) = session_id {
+                            let reason = match event.params["status"].as_str() {
+                                Some(status) if !status.is_empty() => {
+                                    format!("the page crashed ({status})")
+                                }
+                                _ => "the page crashed".to_owned(),
+                            };
+                            running.record_crash(&session_id, reason);
+                        }
+                    }
                     ("Target.detachedFromTarget", _) => {
                         // The window was closed (by the person at the host,
                         // or a crash): the conversation has no tab now.
                         if let Some(session_id) = event.params["sessionId"].as_str() {
                             running
                                 .popups
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .remove(session_id);
+                            running
+                                .problems
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .remove(session_id);
@@ -383,6 +485,108 @@ impl Running {
                 }
             }
         });
+    }
+
+    fn record_problem(&self, session_id: &str, line: String) {
+        let mut problems = self
+            .problems
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lines = &mut problems.entry(session_id.to_owned()).or_default().lines;
+        if lines.len() >= MAX_PROBLEMS {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    fn record_crash(&self, session_id: &str, reason: String) {
+        self.problems
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(session_id.to_owned())
+            .or_default()
+            .crashed
+            .get_or_insert(reason);
+    }
+
+    /// A new navigation starts: earlier problems were the previous page's.
+    fn clear_problems(&self, session_id: &str) {
+        self.problems
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+    }
+
+    /// The tab's problem lines and why its page stopped, if it did.
+    fn problems_of(&self, session_id: &str) -> (Vec<String>, Option<String>) {
+        self.problems
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .map(|problems| {
+                (
+                    problems.lines.iter().cloned().collect(),
+                    problems.crashed.clone(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// The page a navigation ended on, or why it failed: a crash, or the
+    /// engine having replaced the page with a blank one (`wanted`: the URL
+    /// asked for, when not a blank page itself). The page's own problems
+    /// come along in either case.
+    async fn finish(
+        &self,
+        target_id: &str,
+        session_id: &str,
+        wanted: Option<&str>,
+        started: Instant,
+    ) -> Result<Value, BrowserError> {
+        let page = self.page(target_id).await;
+        let (mut lines, crashed) = self.problems_of(session_id);
+        let blank = page
+            .as_ref()
+            .is_ok_and(|page| page["url"].as_str() == Some("about:blank"));
+        let reset = blank && wanted.is_some_and(|url| url != "about:blank");
+        if crashed.is_some() || reset {
+            let advice = if self.isolated {
+                " Open a production build of the page (a dev server's unbundled modules can exceed the Kitesurf engine's limits), or switch the agent browser to Chromium in Settings."
+            } else {
+                " Reload it, or open a lighter page."
+            };
+            let message = match crashed {
+                Some(reason) => format!("{reason} while loading, and the tab shows nothing now.{advice}"),
+                None => format!("the page did not survive loading: the browser engine replaced it with a blank page, as it does when a page crashes it or exceeds its memory or time limits.{advice}"),
+            };
+            // What the engine said meanwhile (Kitesurf names the limit hit).
+            let engine: Vec<String> = self
+                .engine_lines_since(started)
+                .into_iter()
+                .filter(|line| super::launch::engine_failure(line))
+                .map(|line| format!("engine: {line}"))
+                .collect();
+            lines.splice(0..0, engine);
+            return Err(BrowserError {
+                page_text: (!lines.is_empty()).then(|| lines.join("\n")),
+                ..BrowserError::new("PAGE_FAILED", message)
+            });
+        }
+        let mut page = page?;
+        if !lines.is_empty() {
+            page["problems"] = json!(lines);
+        }
+        Ok(page)
+    }
+
+    /// The browser process's output since `since` (Kitesurf only).
+    fn engine_lines_since(&self, since: Instant) -> Vec<String> {
+        self.process
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|process| process.engine_lines_since(since))
+            .unwrap_or_default()
     }
 
     /// The conversation's tab is gone: its slot, live view and clients are
@@ -897,6 +1101,8 @@ impl Running {
         }
         let (target_id, session_id) = self.tab(conversation_id).await?;
         self.unminimize(&target_id).await;
+        self.clear_problems(&session_id);
+        let started = Instant::now();
         // Error pages (connection refused) still leave a page to inspect.
         let navigated = self
             .cdp
@@ -907,10 +1113,12 @@ impl Running {
             .filter(|error| !error.is_empty())
         {
             tracing::debug!(error, "agent browser load failed");
+            self.record_problem(&session_id, format!("loading failed: {error}"));
         }
         self.settle(&session_id).await;
         self.painted(&session_id).await;
-        self.page(&target_id).await
+        self.finish(&target_id, &session_id, Some(url), started)
+            .await
     }
 
     pub(crate) async fn navigate(
@@ -924,6 +1132,8 @@ impl Running {
         let (target_id, session_id) = self.tab(conversation_id).await?;
         self.unminimize(&target_id).await;
         let session = Some(session_id.as_str());
+        self.clear_problems(&session_id);
+        let started = Instant::now();
         match args["action"].as_str() {
             Some("reload") => {
                 self.cdp.call("Page.reload", json!({}), session).await?;
@@ -964,7 +1174,7 @@ impl Running {
         }
         self.settle(&session_id).await;
         self.painted(&session_id).await;
-        self.page(&target_id).await
+        self.finish(&target_id, &session_id, None, started).await
     }
 
     pub(crate) async fn snapshot(
@@ -990,6 +1200,13 @@ impl Running {
         let mut result = self.page(&target_id).await?;
         result["tree"] = Value::from(formatted.tree);
         result["truncated"] = Value::from(formatted.truncated);
+        let (mut lines, crashed) = self.problems_of(&session_id);
+        if let Some(reason) = crashed {
+            lines.insert(0, reason);
+        }
+        if !lines.is_empty() {
+            result["problems"] = json!(lines);
+        }
         if screenshot {
             self.unminimize(&target_id).await;
             result["screenshot"] = self.screenshot(&session_id).await?;
@@ -1566,6 +1783,103 @@ mod tests {
             .filter(|params| params["awaitPromise"] == true)
             .count();
         assert_eq!(paint_checks, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn navigate(
+        browser: &crate::agent_browser::AgentBrowser,
+        url: &str,
+    ) -> Result<Value, BrowserError> {
+        browser
+            .invoke(
+                "c",
+                &json!({ "id": "w", "path": "/w" }),
+                "browser_navigate",
+                &json!({ "url": url }),
+                true,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_page_that_crashes_while_loading_fails_with_what_it_said() {
+        let (root, browser, chromium) = opened().await;
+        chromium.emit_on(
+            "Page.navigate",
+            json!({ "method": "Runtime.consoleAPICalled", "sessionId": "S-T1", "params": {
+                "type": "error", "args": [{ "type": "string", "value": "page exceeded its memory limit and was terminated" }]
+            } }),
+        );
+        chromium.emit_on(
+            "Page.navigate",
+            json!({ "method": "Target.targetCrashed", "params": { "targetId": "T1", "status": "oom" } }),
+        );
+        let error = navigate(&browser, "http://localhost:5173/heavy")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "PAGE_FAILED");
+        assert!(error.message.contains("crashed (oom)"), "{}", error.message);
+        // The page's own words travel apart, to be fenced as page content.
+        assert!(!error.message.contains("memory limit"));
+        assert!(error
+            .page_text
+            .as_deref()
+            .is_some_and(|text| text.contains("console.error: page exceeded its memory limit")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_page_the_engine_replaced_with_a_blank_one_is_an_error() {
+        let (root, browser, chromium) = opened().await;
+        chromium.set_blank(true);
+        let error = navigate(&browser, "http://localhost:5173/?demo")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "PAGE_FAILED");
+        assert!(error.message.contains("blank page"), "{}", error.message);
+        // Once the page is back, loading works as before.
+        chromium.set_blank(false);
+        assert!(navigate(&browser, "http://localhost:5173/").await.is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn console_errors_come_with_the_snapshot() {
+        let (root, browser, chromium) = opened().await;
+        chromium.emit(
+            0,
+            &json!({ "method": "Runtime.exceptionThrown", "sessionId": "S-T1", "params": { "exceptionDetails": {
+                "text": "Uncaught", "url": "http://localhost:5173/main.tsx", "lineNumber": 41,
+                "exception": { "description": "TypeError: x is not a function" }
+            } } }),
+        );
+        // Ordinary logging is not a problem.
+        chromium.emit(
+            0,
+            &json!({ "method": "Runtime.consoleAPICalled", "sessionId": "S-T1", "params": {
+                "type": "log", "args": [{ "type": "string", "value": "hello" }]
+            } }),
+        );
+        let snapshot = loop {
+            let snapshot = browser
+                .invoke(
+                    "c",
+                    &json!({ "id": "w", "path": "/w" }),
+                    "browser_snapshot",
+                    &json!({}),
+                    true,
+                )
+                .await
+                .unwrap();
+            if snapshot.get("problems").is_some() {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            snapshot["problems"],
+            json!(["uncaught TypeError: x is not a function (http://localhost:5173/main.tsx:42)"])
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

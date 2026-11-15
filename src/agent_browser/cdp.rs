@@ -27,13 +27,28 @@ use super::BrowserError;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const SCREENCAST_FRAME: &str = "Page.screencastFrame";
 /// Events the browser session handles; everything else is dropped on
-/// arrival.
+/// arrival. The last four tell why a page failed (see
+/// [`console_problem`]).
 const HANDLED_EVENTS: &[&str] = &[
     "Fetch.requestPaused",
     "Page.javascriptDialogOpening",
     "Target.attachedToTarget",
     "Target.detachedFromTarget",
+    "Runtime.exceptionThrown",
+    "Runtime.consoleAPICalled",
+    "Target.targetCrashed",
+    "Inspector.targetCrashed",
 ];
+
+/// Whether a console call is a problem worth keeping: errors, failed
+/// assertions and warnings, not a page's ordinary logging (which could
+/// flood the queue).
+fn console_problem(params: &Value) -> bool {
+    matches!(
+        params["type"].as_str(),
+        Some("error" | "assert" | "warning")
+    )
+}
 
 /// One CDP event; `session_id` is the flat session it belongs to.
 #[derive(Debug)]
@@ -415,6 +430,9 @@ fn dispatch(inner: &Inner, bytes: &[u8]) {
     };
     let frame = method == SCREENCAST_FRAME;
     if !frame && !HANDLED_EVENTS.contains(&method) {
+        return;
+    }
+    if method == "Runtime.consoleAPICalled" && !console_problem(&message["params"]) {
         return;
     }
     let method = method.to_owned();

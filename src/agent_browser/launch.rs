@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use super::{cdp::Cdp, BrowserError};
-use crate::provider::process::{drain_stderr, stderr_excerpt};
+use crate::provider::process::{drain_stderr, redact_sensitive_text, stderr_excerpt};
 
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 /// `1` (or `true`) runs the agent browser headless on any OS, e.g. to try
@@ -30,6 +30,16 @@ const STDERR_TAIL_BYTES: usize = 16 * 1024;
 /// How long a dying process gets to finish exiting and flush its stderr
 /// before a failure message is composed.
 const SETTLE: Duration = Duration::from_millis(500);
+/// Engine output lines logged per minute at most (pages can log in a loop).
+const LOG_LINES_PER_MINUTE: u32 = 120;
+/// Longest engine output line logged.
+const LOG_LINE_CHARS: usize = 500;
+
+/// The engine's latest output lines with when they came, for telling why a
+/// page failed.
+type EngineLines = Arc<std::sync::Mutex<VecDeque<(std::time::Instant, String)>>>;
+/// Engine output lines kept for [`Process::engine_lines_since`].
+const RECENT_ENGINE_LINES: usize = 50;
 
 /// A child process with the tail of its stderr. The drain task runs for the
 /// process's whole life: a full pipe would block the child.
@@ -38,9 +48,37 @@ struct Supervised {
     child: Child,
     stderr: Arc<Mutex<VecDeque<u8>>>,
     drain: Option<JoinHandle<()>>,
+    /// Its latest output lines, when they are logged ([`Self::logged`]).
+    recent: Option<EngineLines>,
 }
 
 impl Supervised {
+    /// [`Self::new`], also logging the process's stdout and stderr lines
+    /// (Kitesurf's own diagnostics: module limits, terminated pages).
+    #[cfg(unix)]
+    fn logged(name: &'static str, mut child: Child) -> Self {
+        let stderr = Arc::new(Mutex::new(VecDeque::new()));
+        let recent = EngineLines::default();
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(log_lines(stdout, None, recent.clone(), "stdout"));
+        }
+        let drain = child.stderr.take().map(|reader| {
+            tokio::spawn(log_lines(
+                reader,
+                Some(stderr.clone()),
+                recent.clone(),
+                "stderr",
+            ))
+        });
+        Self {
+            name,
+            child,
+            stderr,
+            drain,
+            recent: Some(recent),
+        }
+    }
+
     fn new(name: &'static str, mut child: Child) -> Self {
         let stderr = Arc::new(Mutex::new(VecDeque::new()));
         let drain = child
@@ -52,6 +90,7 @@ impl Supervised {
             child,
             stderr,
             drain,
+            recent: None,
         }
     }
 
@@ -127,6 +166,20 @@ impl Drop for RunDir {
 }
 
 impl Process {
+    /// The engine's output lines since `since` (Kitesurf), oldest first.
+    pub(crate) fn engine_lines_since(&self, since: std::time::Instant) -> Vec<String> {
+        let Some(recent) = &self.browser.recent else {
+            return Vec::new();
+        };
+        recent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(at, _)| *at >= since)
+            .map(|(_, line)| line.clone())
+            .collect()
+    }
+
     /// What is known about the browser's state, for a "browser exited"
     /// message: its exit status and the tail of its stderr (secrets
     /// redacted), plus the same for the virtual display if that died.
@@ -324,13 +377,13 @@ pub(crate) async fn launch_kitesurf(
         // never above its working directory; the engine may live anywhere.
         .current_dir("/")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let child = command.spawn().map_err(|error| {
         BrowserError::failed(format!("cannot start {}: {error}", workerd.display()))
     })?;
-    let mut browser = Supervised::new("Kitesurf", child);
+    let mut browser = Supervised::logged("Kitesurf", child);
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     while !socket.exists() {
         if tokio::time::Instant::now() >= deadline {
@@ -395,6 +448,94 @@ async fn explain(
     BrowserError {
         message: format!("{} ({report})", error.message),
         ..error
+    }
+}
+
+/// An engine output line that tells why a page failed (Kitesurf logs the
+/// limits it hits and the pages it terminates); its routine notes do not.
+pub(super) fn engine_failure(line: &str) -> bool {
+    let line = line.to_lowercase();
+    [
+        "threw",
+        "exceed",
+        "terminated",
+        "crash",
+        "limit",
+        "reclaimed",
+        "error",
+    ]
+    .iter()
+    .any(|word| line.contains(word))
+}
+
+/// Logs a process's output a line at a time under
+/// `todex_agentd::agent_browser::kitesurf`: secrets redacted, lines cut
+/// short, at most [`LOG_LINES_PER_MINUTE`]. `tail` also keeps the last
+/// [`STDERR_TAIL_BYTES`] for failure messages. Runs until the pipe closes.
+#[cfg(unix)]
+async fn log_lines<R>(
+    reader: R,
+    tail: Option<Arc<Mutex<VecDeque<u8>>>>,
+    recent: EngineLines,
+    stream: &'static str,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut line = Vec::new();
+    let mut window = tokio::time::Instant::now();
+    let (mut logged, mut skipped) = (0u32, 0u32);
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if let Some(tail) = &tail {
+            let mut tail = tail.lock().await;
+            tail.extend(line.iter().copied());
+            let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+            tail.drain(..excess);
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        {
+            let mut recent = recent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if recent.len() >= RECENT_ENGINE_LINES {
+                recent.pop_front();
+            }
+            let kept: String = redact_sensitive_text(text)
+                .chars()
+                .take(LOG_LINE_CHARS)
+                .collect();
+            recent.push_back((std::time::Instant::now(), kept));
+        }
+        if window.elapsed() >= Duration::from_secs(60) {
+            if skipped > 0 {
+                tracing::info!(target: "todex_agentd::agent_browser::kitesurf", stream, skipped, "engine output lines skipped");
+            }
+            window = tokio::time::Instant::now();
+            (logged, skipped) = (0, 0);
+        }
+        if logged >= LOG_LINES_PER_MINUTE {
+            skipped += 1;
+            continue;
+        }
+        logged += 1;
+        let text = redact_sensitive_text(text);
+        let text: String = text.chars().take(LOG_LINE_CHARS).collect();
+        // Failures by default; the engine's routine notes at debug level.
+        if engine_failure(&text) {
+            tracing::info!(target: "todex_agentd::agent_browser::kitesurf", stream, "{text}");
+        } else {
+            tracing::debug!(target: "todex_agentd::agent_browser::kitesurf", stream, "{text}");
+        }
     }
 }
 
