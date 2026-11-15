@@ -217,6 +217,14 @@ key with `mesh.node.get` and pushes a chain that lists the node. Any device
 the node already trusts may do this, because a paired device controls that
 backend fully anyway.
 
+When the node is the desktop's own local backend, the desktop keeps two
+connections to it: its IPC profile, with its own device key, carries every
+request, and the group's connection (signed with the group member key, to one
+of the node's network addresses) stays open without subscriptions as a
+standby, so the device counts as present and receives `mesh.updated`. IPC
+socket paths are never group addresses. Nothing on the node changes for
+this: connections are independent and presence is counted per connection.
+
 Join codes come from `todex-agentd mesh join-code [--new]`, from the TUI,
 from `POST /v2/local-admin/mesh/join-code` (IPC only), and from the log at
 startup when the node is in no group. The code lives in
