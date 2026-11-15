@@ -2108,17 +2108,29 @@ mod tests {
         let Ok(row) = std::env::var("TODEX_CU_E2E_ROW") else {
             return;
         };
+        // The ref of the row (or its cell) showing `needle`: rows carry
+        // their text on unreferenced children.
         let ref_of = |tree: &str, needle: &str| {
-            tree.lines()
-                .find(|line| line.contains(needle) && line.contains("[ref="))
-                .and_then(|line| line.split("[ref=").nth(1))
-                .map(|rest| rest.trim_end_matches(']').to_owned())
-                .unwrap_or_else(|| panic!("no ref for {needle}"))
+            let mut last = None;
+            for line in tree.lines() {
+                if let Some(rest) = line.split("[ref=").nth(1) {
+                    last = Some(rest.trim_end_matches(']').to_owned());
+                }
+                if line.contains(needle) {
+                    return last.unwrap_or_else(|| panic!("no ref before {needle}"));
+                }
+            }
+            panic!("no {needle} in the tree")
         };
-        let selected_before = tree
-            .lines()
-            .find(|line| line.contains("[selected]") && line.contains("[ref="))
-            .map(|line| line.trim().to_owned());
+        // The text of the selected row, to select it again at the end.
+        let selected_row = |tree: &str| {
+            let mut lines = tree.lines().skip_while(|line| !line.contains("[selected]"));
+            lines
+                .find(|line| line.contains("static_text"))
+                .and_then(|line| line.split('"').nth(1))
+                .map(str::to_owned)
+        };
+        let selected_before = selected_row(tree);
         let grants = || Grants {
             allowed_apps: &[],
             confirmed: false,
@@ -2148,23 +2160,17 @@ mod tests {
         assert_eq!(acted["path"], "background");
         assert_eq!(pointer(), before, "the pointer did not move");
         let after = observe(&mut engine);
-        let line = after["tree"]
-            .as_str()
-            .unwrap()
-            .lines()
-            .find(|line| line.contains(&row))
-            .unwrap()
-            .to_owned();
-        println!("after: {line}");
-        assert!(line.contains("[selected]"), "the row is selected");
+        let now_selected = selected_row(after["tree"].as_str().unwrap());
+        println!("after: selected {now_selected:?}");
+        assert!(
+            now_selected
+                .as_deref()
+                .is_some_and(|text| text.contains(&row)),
+            "the row is selected"
+        );
         assert_eq!(after["app"]["pid"].as_u64().unwrap(), pid);
         // Put the selection back.
-        if let Some(previous) = selected_before {
-            let name = previous
-                .split('"')
-                .nth(1)
-                .expect("the selected row has a name")
-                .to_owned();
+        if let Some(name) = selected_before {
             let reference = ref_of(after["tree"].as_str().unwrap(), &name);
             engine
                 .act(
@@ -2175,6 +2181,54 @@ mod tests {
                 )
                 .expect("restore the selection");
             println!("restored {name}");
+        }
+        // A section header collapses and expands in the background.
+        if let Ok(group) = std::env::var("TODEX_CU_E2E_GROUP") {
+            for action in ["collapse", "expand"] {
+                let tree = observe(&mut engine)["tree"].as_str().unwrap().to_owned();
+                let header = tree
+                    .lines()
+                    .position(|line| line.contains(&format!("\"{group}\"")))
+                    .expect("the group header");
+                // The row holding the header button.
+                let row = tree
+                    .lines()
+                    .take(header + 1)
+                    .filter(|line| line.contains("tree_item"))
+                    .last()
+                    .unwrap();
+                let reference = row
+                    .split("[ref=")
+                    .nth(1)
+                    .unwrap()
+                    .trim_end_matches(']')
+                    .to_owned();
+                let before = pointer();
+                let acted = engine
+                    .act(
+                        &json!({ "action": action, "ref": reference }),
+                        grants_allowed(),
+                        own_pid,
+                        None,
+                    )
+                    .unwrap_or_else(|error| panic!("{action}: {error}"));
+                assert_eq!(acted["path"], "background");
+                assert_eq!(pointer(), before, "the pointer did not move");
+                let value = observe(&mut engine)["tree"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .find(|line| line.contains(&format!("\"{group}\"")))
+                    .unwrap()
+                    .to_owned();
+                println!("{action} {group}: {value}");
+                let wanted = if action == "collapse" {
+                    "Collapsed"
+                } else {
+                    "Expanded"
+                };
+                assert!(value.contains(wanted), "{action}: {value}");
+            }
         }
     }
 
