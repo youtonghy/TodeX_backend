@@ -4053,6 +4053,8 @@ mod tests {
             .any(|skill| skill.name == "late" && skill.linked));
     }
 
+    // Checks file modes and symlinks, which are Unix-only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn skill_bundles_round_trip_and_replace_the_whole_directory() {
         use std::os::unix::fs::PermissionsExt;
