@@ -1332,6 +1332,46 @@ mod tests {
     };
 
     #[test]
+    fn exit_plan_mode_is_a_plan_review() {
+        use super::{claude_plan_details, claude_plan_options, claude_plan_rejection};
+        let request = json!({
+            "subtype": "can_use_tool",
+            "tool_name": "ExitPlanMode",
+            "input": { "plan": "1. Split\n2. Test" },
+        });
+        let details = claude_plan_details(&request);
+        assert_eq!(details["plan"], "1. Split\n2. Test");
+        assert_eq!(details["tool_name"], "ExitPlanMode");
+        let kinds = claude_plan_options()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["kind"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["allow_once", "reject_once"]);
+
+        let reject = |data| PermissionDecision {
+            outcome: PermissionOutcome::RejectOnce,
+            option_id: Some("request_changes".to_owned()),
+            data,
+        };
+        let plain = claude_plan_rejection(&reject(None));
+        assert_eq!(plain["behavior"], "deny");
+        assert!(plain["message"]
+            .as_str()
+            .unwrap()
+            .contains("ask what they want changed"));
+        let blank = claude_plan_rejection(&reject(Some(json!({ "feedback": "  " }))));
+        assert_eq!(blank, plain);
+        let changes =
+            claude_plan_rejection(&reject(Some(json!({ "feedback": "Keep the CLI flag" }))));
+        assert!(changes["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("Keep the CLI flag"));
+    }
+
+    #[test]
     fn allow_for_session_is_offered_and_answered_with_a_session_rule() {
         use super::{claude_tool_options, claude_tool_response, session_rules::session_rule};
         let ids = |options: serde_json::Value| {
@@ -5237,9 +5277,27 @@ async fn tool_permission_response(
         }
     }
 
-    let rule = session_rules::session_rule(request, cwd);
-    let decision = sink
-        .request_permission(
+    // Claude's plan goes out as the shared plan review (`kind: "plan"`), so
+    // clients show the plan itself and can send changes back with a
+    // rejection, instead of a bare "allow tool ExitPlanMode?".
+    let plan_review = tool_name == plan_handoff::EXIT_PLAN_MODE_TOOL;
+    let rule = if plan_review {
+        None
+    } else {
+        session_rules::session_rule(request, cwd)
+    };
+    let decision = if plan_review {
+        sink.request_permission(
+            request_id.to_owned(),
+            "plan",
+            "Approve Claude's plan?",
+            claude_plan_details(request),
+            claude_plan_options(),
+            cancel,
+        )
+        .await?
+    } else {
+        sink.request_permission(
             request_id.to_owned(),
             "tool",
             format!("Allow Claude tool {tool_name}?"),
@@ -5247,7 +5305,8 @@ async fn tool_permission_response(
             claude_tool_options(rule.is_some()),
             cancel,
         )
-        .await?;
+        .await?
+    };
     let approved = matches!(
         decision.outcome,
         PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways
@@ -5259,7 +5318,50 @@ async fn tool_permission_response(
             let _ = outgoing.send(plan_handoff::TurnMessage::HandedOff(outcome));
         }
     }
+    if plan_review && !approved {
+        return Ok(claude_plan_rejection(&decision));
+    }
     Ok(claude_tool_response(request, rule, &decision))
+}
+
+/// A plan review's details: the raw request, with the plan text lifted to
+/// the top-level `plan` key clients read for any plan review.
+fn claude_plan_details(request: &Value) -> Value {
+    let mut details = claude_permission_details(request);
+    if let (Some(object), Some(plan)) = (
+        details.as_object_mut(),
+        request.pointer("/input/plan").and_then(Value::as_str),
+    ) {
+        object.insert("plan".to_owned(), Value::String(plan.to_owned()));
+    }
+    details
+}
+
+/// A plan review's options, named like the other providers' plan reviews.
+fn claude_plan_options() -> Value {
+    json!([
+        { "id": "approve", "kind": "allow_once", "name": "Approve" },
+        { "id": "request_changes", "kind": "reject_once", "name": "Request changes" }
+    ])
+}
+
+/// Denies `ExitPlanMode`, passing the person's requested changes (`data.feedback`)
+/// on to Claude so it keeps planning with them.
+fn claude_plan_rejection(decision: &PermissionDecision) -> Value {
+    let feedback = decision
+        .data
+        .as_ref()
+        .and_then(|data| data.get("feedback"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|feedback| !feedback.is_empty());
+    let message = match feedback {
+        Some(feedback) => format!(
+            "The user did not approve the plan and asked for these changes. Stay in plan mode and revise the plan:\n\n{feedback}"
+        ),
+        None => "The user did not approve the plan. Stay in plan mode and ask what they want changed.".to_owned(),
+    };
+    json!({ "behavior": "deny", "message": message })
 }
 
 /// The options of a Claude tool approval; "Allow for session" only when a

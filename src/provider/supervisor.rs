@@ -6692,9 +6692,15 @@ mod tests {
             event.event_type == "permission.requested"
         })
         .await;
-        let option = match outcome {
-            PermissionOutcome::AllowOnce => "allow_once",
-            _ => "reject_once",
+        // Claude's plan is asked as a plan review carrying the plan text.
+        assert_eq!(request.payload["kind"], "plan");
+        assert_eq!(request.payload["details"]["plan"], "do it");
+        let (option, data) = match outcome {
+            PermissionOutcome::AllowOnce => ("approve", None),
+            _ => (
+                "request_changes",
+                Some(json!({ "feedback": "split step two" })),
+            ),
         };
         supervisor
             .resolve_permission(
@@ -6703,7 +6709,7 @@ mod tests {
                 PermissionDecision {
                     outcome,
                     option_id: Some(option.to_owned()),
-                    data: None,
+                    data,
                 },
             )
             .await
@@ -6781,7 +6787,9 @@ mod tests {
             !stdin.iter().any(|line| line.contains("todex-handoff")),
             "{stdin:#?}"
         );
-        line_with(&stdin, r#""behavior":"deny""#);
+        let deny = &stdin[line_with(&stdin, r#""behavior":"deny""#)];
+        // The requested changes reach Claude with the denial.
+        assert!(deny.contains("split step two"), "{deny}");
         assert!(provider_events(&history, "plan_handoff").is_empty());
         assert!(history
             .iter()
