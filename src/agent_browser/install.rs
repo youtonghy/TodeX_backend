@@ -25,13 +25,13 @@ const DOWNLOAD_BASE: &str = "https://storage.googleapis.com/chrome-for-testing-p
 pub(crate) const PATH_OVERRIDE_ENV: &str = "TODEX_AGENT_BROWSER_PATH";
 /// Held (exclusive file lock) by whichever process, daemon or
 /// `browser install`, is downloading; lives in the chromium root.
-const LOCK_FILE: &str = ".install.lock";
+pub(super) const LOCK_FILE: &str = ".install.lock";
 /// The archives are ~200 MB, so no total timeout: a stalled connection is
 /// caught by the connect and per-read timeouts instead.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often a process waiting for another's install checks for the result.
-const BUSY_POLL: Duration = Duration::from_millis(500);
+pub(super) const BUSY_POLL: Duration = Duration::from_millis(500);
 
 /// One platform's package: path under the version directory to the
 /// executable, archive name and its SHA-256.
@@ -386,12 +386,12 @@ enum Acquired {
 /// Marks the install as running and, however the install ends (return,
 /// error, panic or a dropped future), clears it so the next
 /// `start_install` can retry.
-struct DownloadingGuard<'a> {
+pub(super) struct DownloadingGuard<'a> {
     state: &'a Mutex<InstallState>,
 }
 
 impl<'a> DownloadingGuard<'a> {
-    fn start(state: &'a Mutex<InstallState>) -> Self {
+    pub(super) fn start(state: &'a Mutex<InstallState>) -> Self {
         let guard = Self { state };
         let mut state = guard.lock();
         state.downloading = true;
@@ -408,7 +408,7 @@ impl<'a> DownloadingGuard<'a> {
     }
 
     /// Records how the install ended (the flags reset on drop).
-    fn finish(self, error: Option<String>) {
+    pub(super) fn finish(self, error: Option<String>) {
         self.lock().error = error;
     }
 }

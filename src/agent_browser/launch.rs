@@ -55,6 +55,12 @@ impl Supervised {
         }
     }
 
+    /// Whether the process has already exited.
+    #[cfg(unix)]
+    fn exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
     /// Whether the process has exited, and a one-line account of its state
     /// and last stderr output. With `settle`, a process that is going away
     /// (its pipe closed) gets a moment to be reaped.
@@ -104,6 +110,20 @@ pub(crate) struct Process {
     display: Option<Display>,
     #[cfg(windows)]
     _job: job::JobObject,
+    /// Kitesurf's config and socket; removed after the process ends.
+    #[cfg(unix)]
+    _run_dir: Option<RunDir>,
+}
+
+/// An owner-only directory removed when dropped.
+#[cfg(unix)]
+struct RunDir(PathBuf);
+
+#[cfg(unix)]
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl Process {
@@ -261,7 +281,107 @@ async fn launch_in(
         display,
         #[cfg(windows)]
         _job: spawned.job,
+        #[cfg(unix)]
+        _run_dir: None,
     })
+}
+
+/// Starts the Kitesurf engine on `workerd`, listening on a Unix socket in a
+/// fresh owner-only directory, and connects to its DevTools endpoint.
+#[cfg(unix)]
+pub(crate) async fn launch_kitesurf(
+    workerd: &Path,
+    engine: &Path,
+) -> Result<Process, BrowserError> {
+    let fail = |error: std::io::Error| {
+        BrowserError::failed(format!("cannot prepare the Kitesurf engine: {error}"))
+    };
+    // Short, so the socket path fits a sockaddr_un (104 bytes on macOS).
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let dir = std::env::temp_dir().join(format!("todex-ks-{}", &id[..12]));
+    crate::secure_fs::ensure_owner_only_dir(&dir).map_err(fail)?;
+    let run_dir = RunDir(dir.clone());
+    // The real path (macOS's temp dir is behind /var -> /private/var): the
+    // config's relative `embed` paths are counted from it.
+    let dir = dir.canonicalize().map_err(fail)?;
+    let socket = dir.join("cdp.sock");
+    if socket.as_os_str().len() >= 100 {
+        return Err(BrowserError::failed(format!(
+            "the Kitesurf socket path is too long: {}",
+            socket.display()
+        )));
+    }
+    let config = super::kitesurf::workerd_config(engine, &dir, &socket)?;
+    let config_path = dir.join("engine.capnp");
+    crate::secure_fs::write_owner_only_atomic(&config_path, config.as_bytes()).map_err(fail)?;
+    let mut command = Command::new(workerd);
+    command
+        .arg("serve")
+        // The Worker loader binding (one isolate per page) is experimental.
+        .arg("--experimental")
+        .arg(&config_path)
+        // workerd resolves `embed` paths from the config's directory but
+        // never above its working directory; the engine may live anywhere.
+        .current_dir("/")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = command.spawn().map_err(|error| {
+        BrowserError::failed(format!("cannot start {}: {error}", workerd.display()))
+    })?;
+    let mut browser = Supervised::new("Kitesurf", child);
+    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+    while !socket.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(explain(
+                BrowserError::failed("Kitesurf did not start in time"),
+                &mut browser,
+                None,
+                false,
+            )
+            .await);
+        }
+        if browser.exited() {
+            return Err(explain(
+                BrowserError::failed("Kitesurf exited while starting"),
+                &mut browser,
+                None,
+                true,
+            )
+            .await);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let transport = super::cdp::Transport::UnixWebSocket {
+        socket,
+        path: "/devtools/browser",
+    };
+    let cdp = match Cdp::connect(transport).await {
+        Ok(cdp) => cdp,
+        Err(error) => return Err(explain(error, &mut browser, None, true).await),
+    };
+    if let Err(error) = wait_ready(&cdp).await {
+        let settle = cdp.is_closed();
+        return Err(explain(error, &mut browser, None, settle).await);
+    }
+    Ok(Process {
+        cdp,
+        browser,
+        display: None,
+        _run_dir: Some(run_dir),
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn launch_kitesurf(
+    _workerd: &Path,
+    _engine: &Path,
+) -> Result<Process, BrowserError> {
+    Err(BrowserError::new(
+        "UNSUPPORTED",
+        "Kitesurf is not available on Windows yet.",
+    ))
 }
 
 /// `error` with what the failed process left behind appended.

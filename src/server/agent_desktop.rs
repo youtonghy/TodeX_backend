@@ -11,6 +11,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::agent_browser::BrowserEngineKind;
 use crate::app_state::AppState;
 use crate::computer::{agent_desktop_engine::EngineKind, platform::Permission};
 use crate::error::AppError;
@@ -27,6 +28,9 @@ struct SettingsRequest {
     /// `native` or `agentDesktop`.
     #[serde(default)]
     computer_engine: Option<EngineKind>,
+    /// `chromium` or `kitesurf`.
+    #[serde(default)]
+    browser_engine: Option<BrowserEngineKind>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,10 +158,14 @@ async fn set_settings(
     if request.enabled.is_none()
         && request.computer_enabled.is_none()
         && request.computer_engine.is_none()
+        && request.browser_engine.is_none()
     {
         return Err(AppError::InvalidRequest(
-            "set enabled, computerEnabled and/or computerEngine".to_owned(),
+            "set enabled, computerEnabled, computerEngine and/or browserEngine".to_owned(),
         ));
+    }
+    if let Some(engine) = request.browser_engine {
+        state.agent_desktop.browser().set_engine(engine).await?;
     }
     if let Some(engine) = request.computer_engine {
         if let Some(conversation_id) = state.agent_desktop.set_computer_engine(engine).await? {

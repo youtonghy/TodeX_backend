@@ -88,6 +88,13 @@ pub(crate) enum Transport {
     /// development against a remote debugging port.
     #[allow(dead_code)]
     WebSocket(String),
+    /// A DevTools WebSocket (`ws://localhost{path}`) served on a Unix
+    /// socket: the Kitesurf engine, reachable only by this user.
+    #[cfg(unix)]
+    UnixWebSocket {
+        socket: std::path::PathBuf,
+        path: &'static str,
+    },
 }
 
 impl Cdp {
@@ -116,7 +123,29 @@ impl Cdp {
                 to_browser,
                 from_browser,
             } => cdp.run_blocking_pipe(to_browser, from_browser, outgoing_rx),
-            Transport::WebSocket(url) => cdp.run_websocket(&url, outgoing_rx).await?,
+            Transport::WebSocket(url) => {
+                let (socket, _) = tokio_tungstenite::connect_async(url.as_str())
+                    .await
+                    .map_err(|error| {
+                        BrowserError::failed(format!("cannot reach the browser: {error}"))
+                    })?;
+                cdp.run_websocket(socket, outgoing_rx);
+            }
+            #[cfg(unix)]
+            Transport::UnixWebSocket { socket, path } => {
+                let stream = tokio::net::UnixStream::connect(&socket)
+                    .await
+                    .map_err(|error| {
+                        BrowserError::failed(format!("cannot reach the browser: {error}"))
+                    })?;
+                let (socket, _) =
+                    tokio_tungstenite::client_async(format!("ws://localhost{path}"), stream)
+                        .await
+                        .map_err(|error| {
+                            BrowserError::failed(format!("cannot reach the browser: {error}"))
+                        })?;
+                cdp.run_websocket(socket, outgoing_rx);
+            }
         }
         Ok(cdp)
     }
@@ -200,16 +229,17 @@ impl Cdp {
         });
     }
 
-    async fn run_websocket(
+    /// Text frames carry the messages; the connection ending closes the
+    /// browser session.
+    fn run_websocket<S>(
         &self,
-        url: &str,
+        socket: tokio_tungstenite::WebSocketStream<S>,
         mut outgoing: mpsc::UnboundedReceiver<String>,
-    ) -> Result<(), BrowserError> {
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
-        let (socket, _) = tokio_tungstenite::connect_async(url)
-            .await
-            .map_err(|error| BrowserError::failed(format!("cannot reach the browser: {error}")))?;
         let (mut sink, mut stream) = socket.split();
         tokio::spawn(async move {
             while let Some(message) = outgoing.recv().await {
@@ -221,13 +251,14 @@ impl Cdp {
         let inner = self.inner.clone();
         tokio::spawn(async move {
             while let Some(Ok(message)) = stream.next().await {
-                if let Message::Text(text) = message {
-                    dispatch(&inner, text.as_bytes());
+                match message {
+                    Message::Text(text) => dispatch(&inner, text.as_bytes()),
+                    Message::Close(_) => break,
+                    _ => {}
                 }
             }
             close(&inner);
         });
-        Ok(())
     }
 
     /// Whether the browser connection is gone (crash, exit).

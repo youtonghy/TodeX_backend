@@ -160,7 +160,11 @@ impl ScriptedChromium {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push((profile.clone(), cdp.clone()));
         self.respond(cdp.clone(), outgoing);
-        Running::start_scripted(cdp, shared, profile).await
+        if profile == super::KITESURF_SLOT {
+            Running::start_scripted_isolated(cdp, shared, profile).await
+        } else {
+            Running::start_scripted(cdp, shared, profile).await
+        }
     }
 
     fn respond(&self, cdp: Cdp, mut outgoing: mpsc::UnboundedReceiver<String>) {
@@ -191,6 +195,10 @@ impl ScriptedChromium {
                     "Target.createTarget" => {
                         let n = state.targets.fetch_add(1, Ordering::SeqCst) + 1;
                         json!({ "targetId": format!("T{n}") })
+                    }
+                    "Target.createBrowserContext" => {
+                        let n = state.targets.fetch_add(1, Ordering::SeqCst) + 1;
+                        json!({ "browserContextId": format!("C{n}") })
                     }
                     "Target.attachToTarget" => {
                         json!({ "sessionId": format!("S-{}", params["targetId"].as_str().unwrap_or_default()) })

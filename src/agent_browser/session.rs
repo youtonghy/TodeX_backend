@@ -74,6 +74,9 @@ pub(crate) struct Tab {
     pub last_used: Instant,
     /// `Page.startScreencast` is in effect.
     screencasting: bool,
+    /// The tab's own browser context (Kitesurf): its cookies and storage
+    /// go away with the tab.
+    context_id: Option<String>,
 }
 
 /// A popup of an agent tab, running only until its first navigation.
@@ -89,6 +92,7 @@ struct SessionInfo {
     conversation_id: String,
     target_id: String,
     main_frame_id: String,
+    context_id: Option<String>,
 }
 
 pub(crate) struct Running {
@@ -103,6 +107,8 @@ pub(crate) struct Running {
     shared: Weak<Shared>,
     /// The browser profile this Chromium runs.
     profile: String,
+    /// Each tab gets its own browser context and no window (Kitesurf).
+    isolated: bool,
 }
 
 /// Whether a `Page.javascriptDialogOpening` is accepted: leaving the page
@@ -119,6 +125,7 @@ struct PendingTarget<'a> {
     running: &'a Running,
     target_id: String,
     session_id: Option<String>,
+    context_id: Option<String>,
     armed: bool,
 }
 
@@ -145,17 +152,21 @@ impl Drop for PendingTarget<'_> {
             json!({ "targetId": self.target_id }),
             None,
         );
+        self.running.dispose_context(self.context_id.as_deref());
     }
 }
 
 impl Running {
+    /// `isolated`: each tab in its own browser context, without a window
+    /// (Kitesurf).
     pub(crate) async fn start(
         process: Process,
         shared: Weak<Shared>,
         profile: String,
+        isolated: bool,
     ) -> Result<Arc<Self>, BrowserError> {
         let cdp = process.cdp.clone();
-        Self::connect(cdp, Some(process), shared, profile).await
+        Self::connect(cdp, Some(process), shared, profile, isolated).await
     }
 
     /// A browser session over a scripted connection (no process).
@@ -165,7 +176,17 @@ impl Running {
         shared: Weak<Shared>,
         profile: String,
     ) -> Result<Arc<Self>, BrowserError> {
-        Self::connect(cdp, None, shared, profile).await
+        Self::connect(cdp, None, shared, profile, false).await
+    }
+
+    /// [`Self::start_scripted`] with a browser context per tab.
+    #[cfg(test)]
+    pub(crate) async fn start_scripted_isolated(
+        cdp: Cdp,
+        shared: Weak<Shared>,
+        profile: String,
+    ) -> Result<Arc<Self>, BrowserError> {
+        Self::connect(cdp, None, shared, profile, true).await
     }
 
     async fn connect(
@@ -173,6 +194,7 @@ impl Running {
         process: Option<Process>,
         shared: Weak<Shared>,
         profile: String,
+        isolated: bool,
     ) -> Result<Arc<Self>, BrowserError> {
         let running = Arc::new(Self {
             cdp: cdp.clone(),
@@ -183,6 +205,7 @@ impl Running {
             last_used: Mutex::new(Instant::now()),
             shared,
             profile,
+            isolated,
         });
         cdp.call(
             "Browser.setDownloadBehavior",
@@ -330,6 +353,7 @@ impl Running {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .remove(session_id);
                             if let Some(info) = removed {
+                                running.dispose_context(info.context_id.as_deref());
                                 // A late detach of an earlier tab must not
                                 // take the conversation's current one.
                                 let mut tabs = running.tabs.lock().await;
@@ -523,22 +547,40 @@ impl Running {
     /// Opens the conversation's tab in a new background window. A call that
     /// fails or is dropped part-way closes the window again.
     pub(crate) async fn open_tab(&self, conversation_id: &str) -> Result<(), BrowserError> {
-        let created = self
-            .cdp
-            .call(
-                "Target.createTarget",
-                json!({ "url": "about:blank", "newWindow": true, "background": true }),
-                None,
+        let context_id = if self.isolated {
+            let context = self
+                .cdp
+                .call("Target.createBrowserContext", json!({}), None)
+                .await?;
+            Some(
+                context["browserContextId"]
+                    .as_str()
+                    .ok_or_else(|| BrowserError::failed("the browser made no context"))?
+                    .to_owned(),
             )
-            .await?;
-        let target_id = created["targetId"]
-            .as_str()
-            .ok_or_else(|| BrowserError::failed("Chromium opened no tab"))?
-            .to_owned();
+        } else {
+            None
+        };
+        let mut target = json!({ "url": "about:blank", "newWindow": true, "background": true });
+        if let Some(context_id) = &context_id {
+            target["browserContextId"] = json!(context_id);
+        }
+        let created = match self.cdp.call("Target.createTarget", target, None).await {
+            Ok(created) => created,
+            Err(error) => {
+                self.dispose_context(context_id.as_deref());
+                return Err(error);
+            }
+        };
+        let Some(target_id) = created["targetId"].as_str().map(str::to_owned) else {
+            self.dispose_context(context_id.as_deref());
+            return Err(BrowserError::failed("the browser opened no tab"));
+        };
         let mut pending = PendingTarget {
             running: self,
             target_id: target_id.clone(),
             session_id: None,
+            context_id: context_id.clone(),
             armed: true,
         };
         let attached = self
@@ -574,6 +616,7 @@ impl Running {
                     conversation_id: conversation_id.to_owned(),
                     target_id: target_id.clone(),
                     main_frame_id,
+                    context_id: context_id.clone(),
                 },
             );
         self.cdp
@@ -583,7 +626,9 @@ impl Running {
                 session,
             )
             .await?;
-        self.place_window(&target_id).await;
+        if !self.isolated {
+            self.place_window(&target_id).await;
+        }
         let mut tabs = self.tabs.lock().await;
         // The window may have been closed meanwhile: its detach removed the
         // session.
@@ -603,6 +648,7 @@ impl Running {
                 refs: HashMap::new(),
                 last_used: Instant::now(),
                 screencasting: false,
+                context_id,
             },
         );
         pending.commit();
@@ -645,6 +691,9 @@ impl Running {
 
     /// A minimized window renders nothing; restore it (without focus).
     pub(crate) async fn unminimize(&self, target_id: &str) {
+        if self.isolated {
+            return;
+        }
         let Ok(window) = self
             .cdp
             .call(
@@ -682,7 +731,20 @@ impl Running {
             json!({ "targetId": tab.target_id }),
             None,
         );
+        self.dispose_context(tab.context_id.as_deref());
         Some(tab.target_id)
+    }
+
+    /// Drops a tab's browser context with its cookies and storage (and any
+    /// page left in it). Fire and forget, like closing the target.
+    fn dispose_context(&self, context_id: Option<&str>) {
+        if let Some(context_id) = context_id {
+            self.cdp.notify(
+                "Target.disposeBrowserContext",
+                json!({ "browserContextId": context_id }),
+                None,
+            );
+        }
     }
 
     pub(crate) async fn tab(
@@ -1552,6 +1614,7 @@ mod tests {
                 conversation_id: "c".into(),
                 target_id: "T0".into(),
                 main_frame_id: "F".into(),
+                context_id: None,
             },
         );
         let detached = |session: &str| json!({ "method": "Target.detachedFromTarget", "params": { "sessionId": session } });

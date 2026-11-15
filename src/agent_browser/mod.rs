@@ -4,13 +4,19 @@
 //! one background window per conversation ([`session`]). Clients only
 //! watch: live frames over `/v2/ws` (`agentBrowser.watch`) and the journal.
 //!
+//! The experimental Kitesurf engine ([`kitesurf`], chosen in [`engine`])
+//! runs instead as one headless `workerd` process with a browser context
+//! per tab, outside the profiles.
+//!
 //! Top-level navigation stays on loopback (the host's own `localhost`);
 //! subresources may come from anywhere. Downloads, permission prompts,
 //! dialogs and popups never reach anyone.
 
 pub(crate) mod ax;
 mod cdp;
+pub(crate) mod engine;
 pub(crate) mod install;
+pub(crate) mod kitesurf;
 mod launch;
 pub(crate) mod policy;
 pub(crate) mod profiles;
@@ -31,8 +37,10 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch};
 
+pub(crate) use self::engine::BrowserEngineKind;
 use self::{
     install::{InstallState, Installer},
+    kitesurf::{KitesurfInstaller, KitesurfStatus},
     profiles::{ProfileRecord, Profiles, ProfilesState},
     session::Running,
 };
@@ -91,6 +99,9 @@ pub(crate) fn daemon_port() -> Option<u16> {
 
 /// Agent tabs open at once on this host.
 const MAX_TABS: usize = 4;
+/// Where the Kitesurf engine runs among the profiles (profile ids are
+/// UUIDs, so this never names one).
+const KITESURF_SLOT: &str = "kitesurf";
 /// Browser profiles running at once.
 const MAX_RUNNING: usize = 2;
 /// A tab nobody watches and no tool used for this long is closed; the next
@@ -134,11 +145,30 @@ impl fmt::Display for BrowserError {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserStatus {
+    /// The chosen engine can run.
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub host: String,
     pub chromium: InstallState,
+    pub engine: BrowserEngineKind,
+    pub engines: BrowserEngines,
+}
+
+/// Engines besides the built-in Chromium.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserEngines {
+    pub kitesurf: KitesurfStatus,
+}
+
+/// What a launch starts.
+enum LaunchTarget {
+    Chromium(PathBuf),
+    Kitesurf(kitesurf::Paths),
+    /// A scripted browser (tests).
+    #[cfg(test)]
+    Scripted,
 }
 
 /// One live frame of a conversation's tab.
@@ -488,6 +518,10 @@ struct Inner {
     #[cfg(test)]
     launcher: Mutex<Option<TestLauncher>>,
     installer: Installer,
+    kitesurf: KitesurfInstaller,
+    /// The chosen engine; changed with [`AgentBrowser::set_engine`].
+    engine: Mutex<BrowserEngineKind>,
+    data_dir: PathBuf,
     profiles: Profiles,
     /// Profile → its running Chromium. Held only for short lookups and
     /// inserts, never while one launches.
@@ -561,6 +595,9 @@ impl AgentBrowser {
                 #[cfg(test)]
                 launcher: Mutex::new(None),
                 installer: Installer::new(data_dir),
+                kitesurf: KitesurfInstaller::new(data_dir),
+                engine: Mutex::new(engine::load(data_dir)),
+                data_dir: data_dir.to_path_buf(),
                 profiles,
                 running: tokio::sync::Mutex::new(HashMap::new()),
                 launching: Mutex::new(HashSet::new()),
@@ -688,9 +725,58 @@ impl AgentBrowser {
         }
     }
 
+    pub(crate) fn engine(&self) -> BrowserEngineKind {
+        *self
+            .inner
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Switches the engine: every open tab closes (`user`), the running
+    /// browsers stop, and a missing Kitesurf starts downloading.
+    pub(crate) async fn set_engine(&self, kind: BrowserEngineKind) -> Result<(), AppError> {
+        if self.engine() == kind {
+            self.start_install();
+            return Ok(());
+        }
+        let data_dir = self.inner.data_dir.clone();
+        tokio::task::spawn_blocking(move || engine::save(&data_dir, kind))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        *self
+            .inner
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = kind;
+        self.inner
+            .parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let stopped: Vec<Arc<Running>> = self
+            .inner
+            .running
+            .lock()
+            .await
+            .drain()
+            .map(|(_, running)| running)
+            .collect();
+        for running in stopped {
+            running.release_all(CloseReason::User).await;
+            running.shut_down();
+        }
+        self.start_install();
+        Ok(())
+    }
+
     pub(crate) fn status(&self) -> BrowserStatus {
+        let engine = self.engine();
+        let kitesurf = self.inner.kitesurf.status();
         let chromium = self.inner.installer.state();
-        let reason = if install::CHROMIUM_VERSION.is_empty() {
+        let reason = if engine == BrowserEngineKind::Kitesurf {
+            kitesurf.reason.clone()
+        } else if install::CHROMIUM_VERSION.is_empty() {
             Some("no Chromium is pinned for this build".to_owned())
         } else if !chromium.installed {
             Some(if chromium.downloading {
@@ -706,16 +792,34 @@ impl AgentBrowser {
             reason,
             host: crate::computer::host_name(),
             chromium,
+            engine,
+            engines: BrowserEngines { kitesurf },
         }
     }
 
     /// Starts downloading Chromium in the background (no-op when present,
     /// and in unit tests, which never download it).
     pub(crate) fn start_install(&self) {
-        if cfg!(test)
-            || self.inner.installer.executable().is_some()
-            || self.inner.installer.state().downloading
-        {
+        if cfg!(test) {
+            return;
+        }
+        if self.engine() == BrowserEngineKind::Kitesurf {
+            let kitesurf = &self.inner.kitesurf;
+            if kitesurf.paths().is_some()
+                || kitesurf.state().downloading
+                || kitesurf::unsupported_reason().is_some()
+            {
+                return;
+            }
+            let installer = kitesurf.clone();
+            tokio::spawn(async move {
+                if let Err(error) = installer.install().await {
+                    tracing::warn!(%error, "agent browser: Kitesurf install failed");
+                }
+            });
+            return;
+        }
+        if self.inner.installer.executable().is_some() || self.inner.installer.state().downloading {
             return;
         }
         let installer = self.inner.installer.clone();
@@ -733,7 +837,7 @@ impl AgentBrowser {
 
     /// The Chromium to launch: its executable (none in tests, which start
     /// scripted ones), or why it cannot start.
-    fn launch_requirements(&self) -> Result<PathBuf, BrowserError> {
+    fn launch_requirements(&self, profile: &str) -> Result<LaunchTarget, BrowserError> {
         #[cfg(test)]
         if self
             .inner
@@ -742,7 +846,27 @@ impl AgentBrowser {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some()
         {
-            return Ok(PathBuf::new());
+            return Ok(LaunchTarget::Scripted);
+        }
+        if profile == KITESURF_SLOT {
+            if let Some(reason) = kitesurf::unsupported_reason() {
+                return Err(BrowserError::new("UNAVAILABLE", reason));
+            }
+            return match self.inner.kitesurf.paths() {
+                Some(paths) => Ok(LaunchTarget::Kitesurf(paths)),
+                None => {
+                    self.start_install();
+                    let state = self.inner.kitesurf.state();
+                    Err(BrowserError::new(
+                        "BROWSER_INSTALLING",
+                        match (state.error, state.progress) {
+                            (Some(error), _) => format!("Kitesurf could not be installed ({error}); it is retrying, try again shortly."),
+                            (None, Some(progress)) => format!("Kitesurf is downloading ({:.0}%); try again shortly.", progress * 100.0),
+                            (None, None) => "Kitesurf is downloading; try again shortly.".to_owned(),
+                        },
+                    ))
+                }
+            };
         }
         let Some(executable) = self.inner.installer.executable() else {
             self.start_install();
@@ -759,10 +883,14 @@ impl AgentBrowser {
         if let Some(reason) = display_problem() {
             return Err(BrowserError::new("UNAVAILABLE", reason));
         }
-        Ok(executable)
+        Ok(LaunchTarget::Chromium(executable))
     }
 
-    async fn launch(&self, executable: &Path, profile: &str) -> Result<Arc<Running>, BrowserError> {
+    async fn launch(
+        &self,
+        target: LaunchTarget,
+        profile: &str,
+    ) -> Result<Arc<Running>, BrowserError> {
         #[cfg(test)]
         {
             let scripted = self
@@ -776,11 +904,25 @@ impl AgentBrowser {
                 return started.await;
             }
         }
-        let process = launch::launch(executable, &self.inner.profiles.dir_of(profile)).await?;
+        let (process, isolated) = match target {
+            LaunchTarget::Chromium(executable) => (
+                launch::launch(&executable, &self.inner.profiles.dir_of(profile)).await?,
+                false,
+            ),
+            LaunchTarget::Kitesurf(paths) => (
+                launch::launch_kitesurf(&paths.workerd, &paths.engine).await?,
+                true,
+            ),
+            #[cfg(test)]
+            LaunchTarget::Scripted => {
+                return Err(BrowserError::failed("no scripted launcher is set"))
+            }
+        };
         Running::start(
             process,
             Arc::downgrade(&self.inner.shared),
             profile.to_owned(),
+            isolated,
         )
         .await
     }
@@ -793,7 +935,7 @@ impl AgentBrowser {
         let _profile = lock.lock().await;
         // A deleted profile must not get its directory (or a Chromium)
         // back.
-        if !self.inner.profiles.contains(profile) {
+        if profile != KITESURF_SLOT && !self.inner.profiles.contains(profile) {
             return Err(BrowserError::invalid(format!(
                 "no browser profile {profile}"
             )));
@@ -813,7 +955,7 @@ impl AgentBrowser {
                 running.remove(profile);
             }
         }
-        let executable = self.launch_requirements()?;
+        let target = self.launch_requirements(profile)?;
         let reservation = {
             let mut running = self.inner.running.lock().await;
             let launching = self
@@ -854,7 +996,7 @@ impl AgentBrowser {
                 profile: profile.to_owned(),
             }
         };
-        let started = self.launch(&executable, profile).await?;
+        let started = self.launch(target, profile).await?;
         let mut running = self.inner.running.lock().await;
         running.insert(profile.to_owned(), started.clone());
         // Counted as running from here on.
@@ -980,7 +1122,12 @@ impl AgentBrowser {
             .rsplit(['/', '\\'])
             .find(|part| !part.is_empty())
             .unwrap_or(path);
-        let profile = self.inner.profiles.for_workspace(&key, label)?;
+        // Kitesurf keeps nothing between tabs: no workspace profile.
+        let profile = if self.engine() == BrowserEngineKind::Kitesurf {
+            KITESURF_SLOT.to_owned()
+        } else {
+            self.inner.profiles.for_workspace(&key, label)?
+        };
         // The workspace moved to another profile: reopen there.
         if self
             .inner
@@ -1017,7 +1164,7 @@ impl AgentBrowser {
         profile: &str,
     ) -> Result<SlotReservation, BrowserError> {
         self.inner.shared.reserve(conversation_id, profile, || {
-            self.inner.profiles.contains(profile)
+            profile == KITESURF_SLOT || self.inner.profiles.contains(profile)
         })?;
         Ok(SlotReservation {
             shared: self.inner.shared.clone(),
@@ -1228,6 +1375,61 @@ mod tests {
         let browser = AgentBrowser::load(&root).unwrap();
         let chromium = browser.script_chromium();
         (browser, chromium, root)
+    }
+
+    #[tokio::test]
+    async fn kitesurf_tabs_get_their_own_context_and_no_profile() {
+        let (browser, chromium, root) = scripted();
+        let mut closures = browser.tab_closures();
+        browser
+            .set_engine(BrowserEngineKind::Kitesurf)
+            .await
+            .unwrap();
+        assert_eq!(engine::load(&root), BrowserEngineKind::Kitesurf);
+        assert_eq!(browser.status().engine, BrowserEngineKind::Kitesurf);
+        open_tab(&browser, "c", "w").await.unwrap();
+        open_tab(&browser, "c2", "w").await.unwrap();
+        // Nothing of the workspace profiles is touched.
+        assert!(browser.profiles().profiles.is_empty());
+        assert_eq!(
+            browser.inner.shared.slot_of("c").as_deref(),
+            Some(KITESURF_SLOT)
+        );
+        let contexts = chromium.calls("Target.createBrowserContext");
+        assert_eq!(contexts.len(), 2);
+        let targets = chromium.calls("Target.createTarget");
+        assert_eq!(targets[0]["browserContextId"], "C1");
+        assert_eq!(targets[1]["browserContextId"], "C3");
+        assert!(!chromium
+            .methods()
+            .iter()
+            .any(|method| method.starts_with("Browser.") && method.contains("Window")));
+
+        browser
+            .invoke("c", &workspace("w"), "browser_close", &json!({}), true)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            chromium.calls("Target.disposeBrowserContext"),
+            [json!({ "browserContextId": "C1" })]
+        );
+        assert_eq!(closures.recv().await.unwrap().conversation_id, "c");
+
+        // Back to Chromium: the Kitesurf tab closes for the user.
+        browser
+            .set_engine(BrowserEngineKind::Chromium)
+            .await
+            .unwrap();
+        let closed = closures.recv().await.unwrap();
+        assert_eq!(
+            (closed.conversation_id.as_str(), closed.reason),
+            ("c2", CloseReason::User)
+        );
+        assert!(browser.inner.running.lock().await.is_empty());
+        open_tab(&browser, "c2", "w").await.unwrap();
+        assert_eq!(browser.profiles().profiles.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     async fn open_tab(
