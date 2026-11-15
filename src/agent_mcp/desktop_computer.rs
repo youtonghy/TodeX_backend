@@ -499,6 +499,12 @@ fn screen_text(result: &Value) -> String {
 pub(super) fn act_text(result: &Value) -> String {
     let path = result["path"].as_str().unwrap_or("none");
     let mut text = format!("Done (path: {path}).");
+    // TodeX's own remark on the outcome (a toggle that opened a menu).
+    if let Some(note) = result["note"].as_str() {
+        text.push(' ');
+        text.push_str(note);
+        text.push('.');
+    }
     if let Some(name) = result["app"]["name"]
         .as_str()
         .filter(|name| !name.is_empty())
@@ -1071,6 +1077,16 @@ mod tests {
         assert!(REF_ACTIONS
             .iter()
             .all(|action| actions.contains(&json!(action))));
+    }
+
+    #[test]
+    fn an_act_note_reaches_the_agent() {
+        let text =
+            act_text(&json!({ "path": "background", "note": "the control did not change state" }));
+        assert!(
+            text.starts_with("Done (path: background). the control did not change state."),
+            "{text}"
+        );
     }
 
     #[test]
