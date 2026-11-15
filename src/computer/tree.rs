@@ -21,10 +21,18 @@ pub(crate) struct Node {
     pub secure: bool,
     /// The platform reports actions (press, set_value, ...) for it.
     pub actionable: bool,
+    /// Global frame (x, y, width, height), rounded; tells duplicates apart.
+    pub bounds: Option<(i32, i32, i32, i32)>,
     /// Index into the caller's element table, used for refs.
     pub handle: usize,
     pub children: Vec<Node>,
 }
+
+/// What makes two printed elements the same thing on screen: an element
+/// some apps expose through two parents (the iOS Simulator's screen) is
+/// printed once.
+type Seen =
+    std::collections::HashSet<(String, Option<String>, Option<String>, (i32, i32, i32, i32))>;
 
 pub(crate) struct Formatted {
     pub text: String,
@@ -84,14 +92,14 @@ pub(crate) fn format(root: &Node) -> Formatted {
         refs: HashMap::new(),
         truncated: false,
     };
-    walk(root, 0, &mut out);
+    walk(root, 0, &mut out, &mut Seen::new());
     if out.text.ends_with('\n') {
         out.text.pop();
     }
     out
 }
 
-fn walk(node: &Node, depth: usize, out: &mut Formatted) {
+fn walk(node: &Node, depth: usize, out: &mut Formatted, seen: &mut Seen) {
     if out.truncated {
         return;
     }
@@ -101,7 +109,16 @@ fn walk(node: &Node, depth: usize, out: &mut Formatted) {
     } else {
         clean(node.value.as_deref())
     };
-    let printed = !(TRANSPARENT.contains(&node.role.as_str()) && name.is_none())
+    // A named element at the same place as one already printed is the same
+    // element reached twice; its children still get their own check.
+    let duplicate = match node.bounds {
+        Some(bounds) if bounds.2 > 0 && bounds.3 > 0 && (name.is_some() || value.is_some()) => {
+            !seen.insert((node.role.clone(), name.clone(), value.clone(), bounds))
+        }
+        _ => false,
+    };
+    let printed = !duplicate
+        && !(TRANSPARENT.contains(&node.role.as_str()) && name.is_none())
         && !(node.role == "static_text" && value.is_none() && name.is_none());
     if printed {
         let mut line = format!("{}- {}", "  ".repeat(depth), node.role);
@@ -146,7 +163,7 @@ fn walk(node: &Node, depth: usize, out: &mut Formatted) {
     }
     let depth = if printed { depth + 1 } else { depth };
     for child in &node.children {
-        walk(child, depth, out);
+        walk(child, depth, out, seen);
     }
 }
 
@@ -200,6 +217,41 @@ mod tests {
         assert_eq!(formatted.refs["e2"], 4);
         assert!(!formatted.text.contains("hunter2"));
         assert!(!formatted.truncated);
+    }
+
+    #[test]
+    fn an_element_reached_through_two_parents_is_printed_once() {
+        let mut back = node("button", Some("Back"), 2, vec![]);
+        back.bounds = Some((10, 10, 40, 20));
+        let mut back_again = back.clone();
+        back_again.handle = 4;
+        // Same name elsewhere: a different element.
+        let mut other = back.clone();
+        other.handle = 5;
+        other.bounds = Some((10, 50, 40, 20));
+        // No frame: nothing to compare.
+        let unplaced = node("button", Some("Back"), 6, vec![]);
+        let root = node(
+            "window",
+            Some("Simulator"),
+            0,
+            vec![
+                node("group", None, 1, vec![back]),
+                node(
+                    "group",
+                    None,
+                    3,
+                    vec![back_again, other, unplaced.clone(), unplaced],
+                ),
+            ],
+        );
+        let formatted = format(&root);
+        assert_eq!(
+            formatted.text,
+            "- window \"Simulator\"\n  - button \"Back\" [ref=e1]\n  - button \"Back\" [ref=e2]\n  - button \"Back\" [ref=e3]\n  - button \"Back\" [ref=e4]"
+        );
+        assert_eq!(formatted.refs["e1"], 2);
+        assert_eq!(formatted.refs["e2"], 5);
     }
 
     #[test]

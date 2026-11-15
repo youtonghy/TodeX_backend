@@ -169,6 +169,8 @@ fn cli_tmp_dir() -> Option<PathBuf> {
 pub(crate) struct ExternalElement {
     /// Qualified ref (`@<snapshot>:eN`).
     pub reference: String,
+    /// Role in the built-in engine's spelling (`tree_item`, `button`).
+    pub role: String,
     pub secure: bool,
     /// Global screen coordinates (x, y, width, height).
     pub bounds: Option<(f64, f64, f64, f64)>,
@@ -194,7 +196,8 @@ pub(crate) struct Snapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefAction {
     Click,
-    DoubleClick,
+    // No double-click: agent-desktop double-clicks only with `--headed`
+    // (the real pointer), which TodeX does itself.
     RightClick,
     Focus,
     Toggle,
@@ -222,7 +225,6 @@ impl RefAction {
     fn command(self) -> &'static str {
         match self {
             Self::Click => "click",
-            Self::DoubleClick => "double-click",
             Self::RightClick => "right-click",
             Self::Focus => "focus",
             Self::Toggle => "toggle",
@@ -472,11 +474,15 @@ fn parse_envelope(bytes: &[u8]) -> Result<Value, Failure> {
     if let Some(hint) = hint {
         message = format!("{message} ({hint})");
     }
-    let detail = serde_json::json!({
+    let mut detail = serde_json::json!({
         "engine": "agentDesktop",
         "delivery": error["disposition"]["delivery"],
         "retry": retry,
     });
+    // What the CLI found (a stateful action's re-read state, for one).
+    if error["details"].is_object() {
+        detail["details"] = error["details"].clone();
+    }
     let error = ComputerError {
         code: code.to_owned(),
         message,
@@ -500,6 +506,22 @@ pub(crate) fn not_delivered(error: &ComputerError) -> bool {
         .detail
         .as_ref()
         .is_some_and(|detail| detail["delivery"] == "not_delivered")
+}
+
+/// Whether the built-in engine may try the action instead: nothing reached
+/// the app, or agent-desktop has no semantic way for this element.
+pub(crate) fn may_fall_back(error: &ComputerError) -> bool {
+    not_delivered(error) || error.code == "ACTION_NOT_SUPPORTED"
+}
+
+/// The action reached the control but its state did not end up as asked:
+/// a "switch" that is really a menu button opened its menu instead.
+pub(crate) fn state_unchanged(error: &ComputerError) -> bool {
+    error.code == "ACTION_FAILED"
+        && error
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail["details"]["kind"] == "post_action_verification")
 }
 
 /// The window id of `pid`'s window titled `title` (its first window when
@@ -558,6 +580,7 @@ fn convert_node(
     // formatting only gives refs to actionable nodes, which have one.
     elements.push(ExternalElement {
         reference: reference.clone().unwrap_or_default(),
+        role: tree_role(role).to_owned(),
         secure,
         bounds,
     });
@@ -571,6 +594,14 @@ fn convert_node(
         selected: states.contains(&"selected") || states.contains(&"checked"),
         secure,
         actionable: reference.is_some(),
+        bounds: bounds.map(|(x, y, width, height)| {
+            (
+                x.round() as i32,
+                y.round() as i32,
+                width.round() as i32,
+                height.round() as i32,
+            )
+        }),
         handle,
         children: Vec::new(),
     };
@@ -696,6 +727,36 @@ mod tests {
         assert!(!not_delivered(&error));
 
         assert!(parse_envelope(b"not json").is_err());
+    }
+
+    #[test]
+    fn failures_say_whether_the_built_in_engine_may_try() {
+        // No semantic path in agent-desktop: the built-in engine may.
+        let unsupported = br#"{"ok":false,"error":{"code":"ACTION_NOT_SUPPORTED","message":"no",
+            "disposition":{"delivery":"not_delivered","retry":"unsafe"}}}"#;
+        let error = parse_envelope(unsupported).unwrap_err().into_error();
+        assert!(may_fall_back(&error));
+        assert!(!state_unchanged(&error));
+
+        // Pressed, but the state read back differs (a menu opened): it
+        // reached the control, so nothing is tried again.
+        let unchanged = br#"{"ok":false,"error":{"code":"ACTION_FAILED","message":"check/uncheck did not reach the requested state",
+            "details":{"kind":"post_action_verification","expected":"checked"},
+            "disposition":{"delivery":"delivered","retry":"unsafe"}}}"#;
+        let error = parse_envelope(unchanged).unwrap_err().into_error();
+        assert!(state_unchanged(&error));
+        assert!(!may_fall_back(&error));
+        assert_eq!(
+            error.detail.as_ref().unwrap()["details"]["kind"],
+            "post_action_verification"
+        );
+
+        // Delivered with an unknown outcome: never repeated by another way.
+        let uncertain = br#"{"ok":false,"error":{"code":"ACTION_FAILED","message":"?",
+            "disposition":{"delivery":"delivery_uncertain","retry":"unsafe"}}}"#;
+        let error = parse_envelope(uncertain).unwrap_err().into_error();
+        assert!(!may_fall_back(&error));
+        assert!(!state_unchanged(&error));
     }
 
     /// Runs the CLI `TODEX_AGENT_DESKTOP_PATH` names; without permissions it

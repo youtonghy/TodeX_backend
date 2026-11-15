@@ -40,7 +40,11 @@ const TYPE_CHUNK_CHARS: usize = 32;
 
 /// A window listed by the latest observation; agents refer to it by `id`.
 struct WindowEntry {
+    /// Its window-server number where the OS has one (stable for the
+    /// window's life, macOS), else its place in the list.
     id: u64,
+    /// Window-server number, when known.
+    number: Option<u32>,
     app: Target,
     title: String,
     /// Bounds in global coordinates.
@@ -48,11 +52,26 @@ struct WindowEntry {
     /// What moves its subtree's AT-SPI bounds into global coordinates
     /// (KDE Wayland; zero elsewhere).
     offset: (i32, i32),
+    /// Shown on the current desktop: not in another Space (a full-screen
+    /// app there included) or minimized.
+    on_screen: bool,
+}
+
+/// What a screenshot shows.
+enum Shot {
+    /// A global rectangle; with `only_pid`, that process's windows alone.
+    Region { rect: Rect, only_pid: Option<u32> },
+    /// One window on its own, wherever it is; `bounds` is its frame.
+    Window { number: u32, bounds: Rect },
 }
 
 #[derive(Default)]
 pub(super) struct Engine {
     provider: Option<Arc<dyn Provider>>,
+    /// The same provider as `provider`, for what only macOS has (windows in
+    /// other Spaces by number).
+    #[cfg(target_os = "macos")]
+    mac: Option<Arc<xa11y_macos::MacOSProvider>>,
     screenshots: Option<Arc<dyn ScreenshotProvider>>,
     input: Option<Arc<InputSim>>,
     elements: Vec<ElementData>,
@@ -68,6 +87,21 @@ pub(super) struct Engine {
     /// (`refs` index these instead of `elements` then).
     external: Vec<ExternalElement>,
     external_observed: bool,
+    /// The latest observation named an app or window (not a display): its
+    /// refs act on that window alone, never through the pointer.
+    window_mode: bool,
+    /// The window observed is not on the current screen, so pointer input
+    /// cannot reach it.
+    off_screen: bool,
+    /// Index into `windows` of the window observed.
+    observed_window: Option<usize>,
+    /// Window elements seen on the current desktop, by window-server
+    /// number. macOS lists a window's accessibility element only while the
+    /// window is in the current Space; one already held keeps working when
+    /// the window is elsewhere (TodeX full screen in its own Space), so
+    /// these reach such windows. Not per observation: kept until the window
+    /// closes.
+    known_windows: HashMap<u32, ElementData>,
 }
 
 /// What `act` may touch, decided by the daemon (never by the agent).
@@ -89,6 +123,9 @@ impl Engine {
         self.observed = None;
         self.external.clear();
         self.external_observed = false;
+        self.window_mode = false;
+        self.off_screen = false;
+        self.observed_window = None;
     }
 
     /// A call of screen lease `lease` starts: another lease's refs and
@@ -107,9 +144,31 @@ impl Engine {
         }
         // Built here rather than through `xa11y::provider()`, which would
         // cache a failure (missing permission) for the process lifetime.
+        #[cfg(target_os = "macos")]
+        let provider: Arc<dyn Provider> = {
+            let mac = Arc::new(xa11y_macos::MacOSProvider::new().map_err(ComputerError::platform)?);
+            self.mac = Some(mac.clone());
+            mac
+        };
+        #[cfg(not(target_os = "macos"))]
         let provider = native_provider().map_err(ComputerError::platform)?;
         self.provider = Some(provider.clone());
         Ok(provider)
+    }
+
+    /// `pid`'s windows numbered `numbers` in another Space, which the
+    /// accessibility API does not list (macOS).
+    #[cfg(target_os = "macos")]
+    fn windows_by_number(&self, pid: u32, numbers: &[u32]) -> Vec<ElementData> {
+        self.mac
+            .as_ref()
+            .map(|mac| mac.windows_by_number(pid, numbers))
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn windows_by_number(&self, _pid: u32, _numbers: &[u32]) -> Vec<ElementData> {
+        Vec::new()
     }
 
     fn screenshots(&mut self) -> Result<Arc<dyn ScreenshotProvider>, ComputerError> {
@@ -147,22 +206,45 @@ impl Engine {
     ) -> Result<Value, ComputerError> {
         let provider = self.provider()?;
         self.reset();
-        self.list_windows(&provider);
-        let target_window = match args["window"].as_u64() {
-            Some(id) => Some(
-                self.windows
+        let display = args["display"].as_u64();
+        // The process a window id or app name points to: its windows in
+        // other Spaces are looked up too (the accessibility API lists only
+        // the current desktop's).
+        let named_pid = match (args["window"].as_u64(), args["app"].as_str()) {
+            (Some(id), _) => platform::window_states().and_then(|states| {
+                states
+                    .into_iter()
+                    .find(|state| u64::from(state.number) == id)
+                    .map(|state| state.pid)
+            }),
+            (None, Some(identifier)) => platform::running_app(identifier).map(|app| app.pid),
+            (None, None) => None,
+        };
+        self.list_windows(&provider, named_pid);
+        let states = platform::window_states();
+        let target_window = args["window"]
+            .as_u64()
+            .and_then(|id| self.windows.iter().position(|window| window.id == id));
+        // A window in another Space whose elements this daemon never held
+        // (see `known_windows`): only the window server knows it.
+        let mut unseen = match (args["window"].as_u64(), target_window) {
+            (Some(id), None) => Some(
+                states
                     .iter()
-                    .position(|window| window.id == id)
+                    .flatten()
+                    .find(|state| u64::from(state.number) == id)
+                    .cloned()
                     .ok_or_else(|| {
-                        ComputerError::invalid(format!(
-                            "window {id} is not on screen; observe again"
-                        ))
+                        ComputerError::invalid(format!("window {id} is not open; observe again"))
                     })?,
             ),
-            None => None,
+            _ => None,
         };
         let app = match (target_window, args["app"].as_str()) {
             (Some(index), _) => self.windows[index].app.clone(),
+            (None, _) if unseen.is_some() => {
+                platform::app_identity(unseen.as_ref().map_or(0, |state| state.pid))
+            }
             (None, Some(identifier)) => platform::running_app(identifier).ok_or_else(|| {
                 ComputerError::invalid(format!("{identifier} is not running; use open_app"))
             })?,
@@ -176,21 +258,40 @@ impl Engine {
             })?,
         };
         let protected = policy::is_protected(&app, own_pid);
-        if protected && (target_window.is_some() || args["app"].is_string()) {
+        if protected && (target_window.is_some() || unseen.is_some() || args["app"].is_string()) {
             return Err(ComputerError::from(policy::blocked(label(&app))));
         }
         self.observed = Some(app.clone());
+        // An app or window named (not a display): work on that window alone.
+        let window_mode = display.is_none()
+            && (target_window.is_some() || unseen.is_some() || args["app"].is_string());
         // The front app is protected: show the display without its tree.
         // Its window on the current screen, else its first one.
         let window_index = target_window.or_else(|| {
             let mine = |window: &&WindowEntry| !protected && window.app.pid == app.pid;
             self.windows
                 .iter()
-                .position(|window| mine(&window) && window_on_screen(window))
+                .position(|window| mine(&window) && window.on_screen)
                 .or_else(|| self.windows.iter().position(|window| mine(&window)))
         });
+        if window_mode && window_index.is_none() && unseen.is_none() && !protected {
+            unseen = states
+                .iter()
+                .flatten()
+                .find(|state| state.pid == app.pid && state.is_main())
+                .cloned();
+        }
+        // A window in another Space (a full-screen app there) or minimized,
+        // or a named app with no window at all: pointer input cannot reach it.
+        let off_screen = match window_index {
+            Some(index) => !self.windows[index].on_screen,
+            None => (args["app"].is_string() || unseen.is_some()) && !protected,
+        };
+        self.window_mode = window_mode;
+        self.off_screen = off_screen;
+        self.observed_window = window_index;
         // Said to the agent above the tree: why it is not agent-desktop's,
-        // or why the screenshot is missing.
+        // or what the screenshot and the pointer can reach.
         let mut notes: Vec<String> = Vec::new();
         let (tree_text, truncated) = if protected {
             (
@@ -200,8 +301,18 @@ impl Engine {
                 ),
                 false,
             )
+        } else if let Some(state) = &unseen {
+            (
+                format!(
+                    "({}'s window is in another desktop Space and has not been on this screen since TodeX started, so macOS does not let its contents be read. The screenshot shows the window. Bring it forward once with computer_act focus_window (window {}); after that it can be read and used in the background even when it is back in its Space.)",
+                    label(&app),
+                    state.number
+                ),
+                false,
+            )
         } else {
-            let external = match cli {
+            // agent-desktop lists only windows on the current desktop.
+            let external = match cli.filter(|_| !off_screen) {
                 Some(cli) => {
                     let title = window_index.map(|index| self.windows[index].title.clone());
                     match cli.snapshot(&app, title.as_deref(), cancelled) {
@@ -212,7 +323,7 @@ impl Engine {
                         // or does not list: the built-in reader may.
                         Err(error) => {
                             notes.push(format!(
-                                "agent-desktop could not read this window ({}: {}); this tree comes from the built-in engine, so set_value, select, toggle, expand, collapse and scroll_to are unavailable until an observation succeeds with agent-desktop.",
+                                "agent-desktop could not read this window ({}: {}); this tree comes from the built-in engine.",
                                 error.code, error.message
                             ));
                             None
@@ -256,18 +367,21 @@ impl Engine {
                 }
             }
         };
-        // A window in another Space (a full-screen app there) or minimized,
-        // or a named app with no window at all here: the screen shows
-        // something else, and input would land there.
-        let off_screen = match window_index {
-            Some(index) => !window_on_screen(&self.windows[index]),
-            None => args["app"].is_string() && !protected,
-        };
-        if off_screen {
-            notes.push(format!(
-                "{} has no window on the current screen (it is in another desktop Space, a full-screen app there, minimized, or has no window open), so there is no screenshot and pointer input would not reach it. Bring it forward with computer_act focus_window (or open_app), then observe again.",
-                label(&app)
-            ));
+        if off_screen && unseen.is_none() {
+            notes.push(match window_index {
+                Some(index) if self.windows[index].element.states.minimized == Some(true) => format!(
+                    "{}'s window is minimized: it cannot be shown or reached until it is restored. Bring it back with computer_act focus_window, then observe again.",
+                    label(&app)
+                ),
+                Some(_) => format!(
+                    "{}'s window is not on the current screen (it is in another desktop Space or a full-screen app there). The screenshot shows the window itself and refs act on it in the background; pointer input (x/y, hover, drag, scroll, double_click) cannot reach it until computer_act focus_window brings it forward.",
+                    label(&app)
+                ),
+                None => format!(
+                    "{} has no window open, so there is nothing to show or reach; open one (open_app) or observe another app.",
+                    label(&app)
+                ),
+            });
         }
         let tree_text = if notes.is_empty() {
             tree_text
@@ -276,18 +390,52 @@ impl Engine {
         };
 
         let displays = platform::displays();
+        // In window mode other apps' windows are not the agent's business:
+        // only their names are listed.
+        let listed = |window: &&WindowEntry| !window_mode || window.app.pid == app.pid;
+        let mut windows: Vec<Value> = self.windows.iter().filter(listed).take(30).map(|window| json!({
+            "id": window.id,
+            "app": window.app.name,
+            "bundleId": window.app.id,
+            "title": if policy::is_protected(&window.app, own_pid) { "" } else { &window.title },
+            "onScreen": window.on_screen,
+        })).collect();
+        let unseen_json = unseen.as_ref().map(|state| {
+            json!({
+                "id": state.number,
+                "app": app.name,
+                "bundleId": app.id,
+                "title": state.title,
+                "onScreen": false,
+                "x": state.x.round(),
+                "y": state.y.round(),
+                "width": state.width.round(),
+                "height": state.height.round(),
+            })
+        });
+        if let Some(window) = &unseen_json {
+            windows.insert(0, window.clone());
+        }
         let mut result = json!({
             "app": app_json(&app),
-            "windows": self.windows.iter().take(30).map(|window| json!({
-                "id": window.id,
-                "app": window.app.name,
-                "bundleId": window.app.id,
-                "title": if policy::is_protected(&window.app, own_pid) { "" } else { &window.title },
-            })).collect::<Vec<_>>(),
+            "windows": windows,
             "displays": displays,
             "tree": tree_text,
             "truncated": truncated,
         });
+        if window_mode {
+            let mut others: Vec<&str> = Vec::new();
+            for window in &self.windows {
+                if window.app.pid != app.pid
+                    && !policy::is_protected(&window.app, own_pid)
+                    && !window.app.name.is_empty()
+                    && !others.contains(&window.app.name.as_str())
+                {
+                    others.push(&window.app.name);
+                }
+            }
+            result["otherApps"] = json!(others);
+        }
         if let Some(index) = window_index {
             let window = &self.windows[index];
             let bounds = window.element.bounds;
@@ -296,33 +444,91 @@ impl Engine {
                 "app": window.app.name,
                 "bundleId": window.app.id,
                 "title": window.title,
+                "onScreen": window.on_screen,
                 "x": bounds.map(|b| b.x).unwrap_or(0),
                 "y": bounds.map(|b| b.y).unwrap_or(0),
                 "width": bounds.map(|b| b.width).unwrap_or(0),
                 "height": bounds.map(|b| b.height).unwrap_or(0),
             });
         }
-        let wants_screenshot = args["screenshot"].as_bool() != Some(false)
-            && (args["display"].is_u64() || !off_screen);
-        if wants_screenshot {
-            let rect = match args["display"].as_u64() {
-                Some(index) => display_rect(
-                    displays
-                        .get(index as usize)
-                        .ok_or_else(|| ComputerError::invalid(format!("no display {index}")))?,
-                ),
-                None => window_index
-                    .and_then(|index| self.windows[index].element.bounds)
-                    .filter(|bounds| bounds.width > 0 && bounds.height > 0)
-                    .map(|bounds| clip_to_display(bounds, &displays))
-                    .or_else(|| displays.first().map(display_rect))
-                    .ok_or_else(|| ComputerError::platform("no display to capture"))?,
+        if let Some(window) = unseen_json {
+            result["window"] = window;
+        }
+        if args["screenshot"].as_bool() != Some(false) {
+            let shot = match &unseen {
+                Some(state) => Some(Shot::Window {
+                    number: state.number,
+                    bounds: Rect {
+                        x: state.x.round() as i32,
+                        y: state.y.round() as i32,
+                        width: state.width.round().max(1.0) as u32,
+                        height: state.height.round().max(1.0) as u32,
+                    },
+                }),
+                None => self.shot_for(display, window_mode, window_index, &app, &displays)?,
             };
-            let (screenshot, mapping) = self.capture(rect, own_pid)?;
-            self.shot = Some(mapping);
-            result["screenshot"] = screenshot;
+            if let Some(shot) = shot {
+                let (screenshot, mapping) = self.capture(shot, own_pid)?;
+                self.shot = Some(mapping);
+                result["screenshot"] = screenshot;
+            }
         }
         Ok(result)
+    }
+
+    /// What an observation's screenshot shows: the display asked for; in
+    /// window mode the app's own windows over the window's frame (its menus
+    /// and sheets included, other apps left out), or the window alone when
+    /// it is in another Space; otherwise the screen over the window. `None`
+    /// when there is nothing to show (no window, minimized).
+    fn shot_for(
+        &self,
+        display: Option<u64>,
+        window_mode: bool,
+        window_index: Option<usize>,
+        app: &Target,
+        displays: &[Display],
+    ) -> Result<Option<Shot>, ComputerError> {
+        if let Some(index) = display {
+            let display = displays
+                .get(index as usize)
+                .ok_or_else(|| ComputerError::invalid(format!("no display {index}")))?;
+            return Ok(Some(Shot::Region {
+                rect: display_rect(display),
+                only_pid: None,
+            }));
+        }
+        let window = window_index.map(|index| &self.windows[index]);
+        let bounds = window
+            .and_then(|window| window.element.bounds)
+            .filter(|bounds| bounds.width > 0 && bounds.height > 0);
+        if window_mode {
+            let (Some(window), Some(bounds)) = (window, bounds) else {
+                return Ok(None);
+            };
+            if window.element.states.minimized == Some(true) {
+                return Ok(None);
+            }
+            return Ok(Some(match (window.on_screen, window.number) {
+                (true, _) => Shot::Region {
+                    rect: clip_to_display(bounds, displays),
+                    only_pid: Some(app.pid),
+                },
+                (false, Some(number)) => Shot::Window { number, bounds },
+                (false, None) => return Ok(None),
+            }));
+        }
+        if window.is_some_and(|window| !window.on_screen) {
+            return Ok(None);
+        }
+        let rect = bounds
+            .map(|bounds| clip_to_display(bounds, displays))
+            .or_else(|| displays.first().map(display_rect))
+            .ok_or_else(|| ComputerError::platform("no display to capture"))?;
+        Ok(Some(Shot::Region {
+            rect,
+            only_pid: None,
+        }))
     }
 
     /// Running apps as `@app:` mentions name them, with the front app's
@@ -356,11 +562,32 @@ impl Engine {
         Ok((running, front))
     }
 
-    /// Windows of every app, front app first, numbered from 1.
-    fn list_windows(&mut self, provider: &Arc<dyn Provider>) {
+    /// Windows of every app (`named_pid`'s first, then the front app's),
+    /// with those of `named_pid` in other Spaces, which the accessibility
+    /// API leaves out. Ids are window-server numbers where the OS has them,
+    /// else places in the list from 1.
+    fn list_windows(&mut self, provider: &Arc<dyn Provider>, named_pid: Option<u32>) {
         let front = provider.focused_app().ok().and_then(|app| app.pid);
         let mut apps = provider.list_apps().unwrap_or_default();
-        apps.sort_by_key(|app| app.pid != front);
+        apps.sort_by_key(|app| {
+            (
+                app.pid != named_pid || named_pid.is_none(),
+                app.pid != front,
+            )
+        });
+        let states = platform::window_states();
+        let on_screen = |number: Option<u32>| match (&states, number) {
+            (Some(states), Some(number)) => states
+                .iter()
+                .find(|state| state.number == number)
+                .is_none_or(|state| state.on_screen),
+            _ => true,
+        };
+        // Closed windows are forgotten.
+        if let Some(states) = &states {
+            self.known_windows
+                .retain(|number, _| states.iter().any(|state| state.number == *number));
+        }
         let mut windows = Vec::new();
         for app in apps {
             let Some(pid) = app.pid else { continue };
@@ -373,14 +600,26 @@ impl Engine {
                 },
                 ..identity
             };
-            for window in provider.app_windows(&app).unwrap_or_default() {
+            let mut elements = provider.app_windows(&app).unwrap_or_default();
+            for element in &elements {
+                if let Some(number) = window_number(element) {
+                    self.known_windows.insert(number, element.clone());
+                }
+            }
+            if Some(pid) == named_pid {
+                elements.extend(self.other_space_windows(pid, &elements, states.as_deref()));
+            }
+            for window in elements {
                 if windows.len() >= MAX_WINDOWS {
                     break;
                 }
+                let number = window_number(&window);
                 windows.push(WindowEntry {
-                    id: windows.len() as u64 + 1,
+                    id: number.map_or(windows.len() as u64 + 1, u64::from),
+                    number,
                     app: identity.clone(),
                     title: window.name.clone().unwrap_or_default(),
+                    on_screen: on_screen(number),
                     element: window,
                     offset: (0, 0),
                 });
@@ -395,6 +634,49 @@ impl Engine {
             platform::globalize(&mut window.element, offset);
         }
         self.windows = windows;
+    }
+
+    /// `pid`'s windows the window server knows but `listed` (its
+    /// accessibility windows) lacks: those in another desktop Space, as
+    /// seen on this desktop before, else found by number.
+    fn other_space_windows(
+        &self,
+        pid: u32,
+        listed: &[ElementData],
+        states: Option<&[platform::WindowState]>,
+    ) -> Vec<ElementData> {
+        let Some(states) = states else {
+            return Vec::new();
+        };
+        let known: Vec<u32> = listed.iter().filter_map(window_number).collect();
+        let missing: Vec<u32> = states
+            .iter()
+            .filter(|state| {
+                state.pid == pid
+                    && !state.on_screen
+                    && state.is_main()
+                    && !known.contains(&state.number)
+            })
+            .map(|state| state.number)
+            .collect();
+        let mut found: Vec<ElementData> = missing
+            .iter()
+            .filter_map(|number| self.known_windows.get(number))
+            .filter(|element| element.pid == Some(pid))
+            .cloned()
+            .collect();
+        let unknown: Vec<u32> = missing
+            .into_iter()
+            .filter(|number| {
+                !found
+                    .iter()
+                    .any(|element| window_number(element) == Some(*number))
+            })
+            .collect();
+        if !unknown.is_empty() {
+            found.extend(self.windows_by_number(pid, &unknown));
+        }
+        found
     }
 
     /// Reads a subtree; `offset` moves descendants' bounds into global
@@ -421,6 +703,9 @@ impl Engine {
             selected: element.states.selected,
             secure: platform::is_secure(&element) || is_secure_role(&element),
             actionable: !element.actions.is_empty(),
+            bounds: element
+                .bounds
+                .map(|b| (b.x, b.y, b.width as i32, b.height as i32)),
             handle,
             children: Vec::new(),
         };
@@ -437,12 +722,48 @@ impl Engine {
         node
     }
 
-    fn capture(&mut self, rect: Rect, own_pid: u32) -> Result<(Value, ShotMapping), ComputerError> {
-        let screenshots = self.screenshots()?;
-        let mut shot = screenshots
-            .capture_region(rect)
-            .map_err(ComputerError::capture)?;
-        self.hide_protected(&mut shot, rect, own_pid)?;
+    /// Takes `shot`. Pictures that may show any app have protected apps
+    /// painted over; one app's windows alone, or one window, need not.
+    fn take_shot(
+        &mut self,
+        shot: &Shot,
+        own_pid: u32,
+    ) -> Result<(Rect, Screenshot), ComputerError> {
+        require_permissions(true)?;
+        Ok(match *shot {
+            Shot::Region { rect, only_pid } => {
+                let area = (
+                    f64::from(rect.x),
+                    f64::from(rect.y),
+                    f64::from(rect.width),
+                    f64::from(rect.height),
+                );
+                let (mut picture, filtered) = match platform::capture_region(area, only_pid) {
+                    Some(result) => (result.map_err(capture_failed)?, only_pid.is_some()),
+                    // Elsewhere: the whole screen content, never filtered.
+                    None => (
+                        self.screenshots()?
+                            .capture_region(rect)
+                            .map_err(ComputerError::capture)?,
+                        false,
+                    ),
+                };
+                if !filtered {
+                    self.hide_protected(&mut picture, rect, own_pid)?;
+                }
+                (rect, picture)
+            }
+            Shot::Window { number, bounds } => {
+                let picture = platform::capture_window(number)
+                    .unwrap_or_else(|| Err("this computer cannot capture one window".to_owned()))
+                    .map_err(capture_failed)?;
+                (bounds, picture)
+            }
+        })
+    }
+
+    fn capture(&mut self, shot: Shot, own_pid: u32) -> Result<(Value, ShotMapping), ComputerError> {
+        let (rect, shot) = self.take_shot(&shot, own_pid)?;
         let shot = if shot.width > SCREENSHOT_MAX_WIDTH {
             let height = (u64::from(shot.height) * u64::from(SCREENSHOT_MAX_WIDTH)
                 / u64::from(shot.width))
@@ -549,11 +870,13 @@ impl Engine {
             .or_else(|| displays.first())
             .ok_or_else(|| ComputerError::platform("no display to capture"))?;
         let rect = display_rect(display);
-        let mut shot = self
-            .screenshots()?
-            .capture_region(rect)
-            .map_err(ComputerError::capture)?;
-        self.hide_protected(&mut shot, rect, own_pid)?;
+        let (_, shot) = self.take_shot(
+            &Shot::Region {
+                rect,
+                only_pid: None,
+            },
+            own_pid,
+        )?;
         let shot = if shot.width > max_width {
             let height = (u64::from(shot.height) * u64::from(max_width) / u64::from(shot.width))
                 .max(1) as u32;
@@ -640,21 +963,31 @@ impl Engine {
             .map(|element| element.reference.clone())
             .filter(|reference| !reference.is_empty());
         let external_cli = cli.filter(|_| external_ref.is_some());
-        if named.is_some() {
-            if cli.is_none() {
-                return Err(ComputerError::new(
-                    "ENGINE_REQUIRED",
-                    format!("{action} needs the agent-desktop engine (Settings > Computer Use); use click, type or key instead"),
-                ));
-            }
-            if external_ref.is_none() {
-                return Err(ComputerError::invalid(format!(
-                    "{action} needs a ref of an actionable element from the latest computer_observe"
-                )));
-            }
+        if named.is_some() && reference.is_none() {
+            return Err(ComputerError::invalid(format!(
+                "{action} needs a ref from the latest computer_observe"
+            )));
         }
         let point = self.map_point(args["x"].as_f64(), args["y"].as_f64())?;
         let to = self.map_point(args["toX"].as_f64(), args["toY"].as_f64())?;
+        // What the latest observation allows the pointer: nothing when its
+        // window is not on this screen; in window mode, only coordinates
+        // the agent gave (a ref never falls back to the pointer there).
+        let (window_mode, off_screen) = (self.window_mode, self.off_screen);
+        let observed_label = self
+            .observed
+            .as_ref()
+            .map(|app| label(app).to_owned())
+            .unwrap_or_default();
+        let pointer = |explicit: bool| -> Result<(), ComputerError> {
+            if off_screen {
+                return Err(needs_pointer(&observed_label, true));
+            }
+            if window_mode && !explicit {
+                return Err(needs_pointer(&observed_label, false));
+            }
+            Ok(())
+        };
 
         let target = if action == "wait" {
             Target::default()
@@ -700,7 +1033,7 @@ impl Engine {
             })
             .or_else(|| external.as_ref().and_then(ExternalElement::center));
         // agent-desktop performs a ref action in the background; when it
-        // reports nothing was delivered, the pointer may still be tried.
+        // could not, `Ok(false)` lets the built-in engine try.
         let by_cli = |command: RefAction, text: Option<&str>| -> Result<bool, ComputerError> {
             let (Some(cli), Some(reference)) = (external_cli, external_ref.as_deref()) else {
                 return Ok(false);
@@ -711,52 +1044,112 @@ impl Engine {
             live(cancelled)?;
             match cli.act(command, reference, text, cancelled) {
                 Ok(()) => Ok(true),
-                Err(error)
-                    if external::not_delivered(&error) && center.is_some() && text.is_none() =>
-                {
-                    tracing::debug!(%error, "agent-desktop did not deliver the action; using the pointer");
+                Err(error) if external::may_fall_back(&error) => {
+                    tracing::debug!(%error, "agent-desktop could not perform the action; trying the built-in engine");
                     Ok(false)
                 }
                 Err(error) => Err(error),
             }
         };
+        // The built-in element a ref stands for: its own, or the one at the
+        // same place as the element agent-desktop read.
+        let native = || -> Option<ElementData> {
+            element.clone().or_else(|| {
+                let external = external.as_ref()?;
+                self.native_at(provider.as_ref()?, external)
+            })
+        };
         let pointer_at = point.or(center);
+        // Said to the agent with the result.
+        let mut note: Option<&'static str> = None;
 
         let _injecting = (!matches!(action.as_str(), "wait" | "open_app" | "focus_window"))
             .then(platform::injecting);
         let path = match action.as_str() {
-            "click" | "right_click"
-                if by_cli(
-                    if action == "click" {
-                        RefAction::Click
+            "click" | "right_click" if point.is_none() && reference.is_some() => {
+                let command = if action == "click" {
+                    RefAction::Click
+                } else {
+                    RefAction::RightClick
+                };
+                let done = by_cli(command, None)?
+                    || match (native(), provider.as_ref()) {
+                        (Some(native), Some(provider)) => {
+                            live(cancelled)?;
+                            native_action(provider, &native, &action, None)?
+                        }
+                        _ => false,
+                    };
+                if done {
+                    mark_background(center, off_screen);
+                    "background"
+                } else {
+                    // No way without the pointer.
+                    pointer(false)?;
+                    let at = require_point(pointer_at)?;
+                    landing(at, false)?;
+                    super::host_ui::mark_point(at.0, at.1);
+                    let button = if action == "click" {
+                        MouseButton::Left
                     } else {
-                        RefAction::RightClick
-                    },
-                    None,
-                )? =>
-            {
-                "background"
+                        MouseButton::Right
+                    };
+                    self.input()?
+                        .backend()
+                        .pointer_click(to_point(at), button, 1)
+                        .map_err(ComputerError::platform)?;
+                    "pointer"
+                }
             }
-            "double_click" if by_cli(RefAction::DoubleClick, None)? => "background",
             _ if named.is_some() => {
-                let element = external.as_ref().expect("named actions need a ref");
+                let named = named.expect("named action");
                 let text = args["text"].as_str();
-                if named == Some(RefAction::SetValue) && element.secure {
+                let secure = external.as_ref().is_some_and(|element| element.secure)
+                    || element.as_ref().is_some_and(|element| {
+                        platform::is_secure(element) || is_secure_role(element)
+                    });
+                if named == RefAction::SetValue && secure {
                     return Err(ComputerError::invalid(
                         "set_value cannot fill password fields; use type",
                     ));
                 }
-                if named.is_some_and(RefAction::takes_text) && text.is_none() {
+                if named.takes_text() && text.is_none() && named != RefAction::Select {
                     return Err(ComputerError::invalid(format!("{action} needs text")));
                 }
-                let cli = external_cli.expect("named actions need the engine");
-                live(cancelled)?;
-                cli.act(
-                    named.expect("named action"),
-                    external_ref.as_deref().expect("named actions need a ref"),
-                    text,
-                    cancelled,
-                )?;
+                // agent-desktop first; a toggle whose state did not change
+                // reached the control all the same (a "switch" that is a
+                // menu button opens its menu).
+                let mut done = match (external_cli, external_ref.as_deref()) {
+                    (Some(cli), Some(reference)) => {
+                        live(cancelled)?;
+                        match cli.act(named, reference, text, cancelled) {
+                            Ok(()) => true,
+                            Err(error)
+                                if named == RefAction::Toggle
+                                    && external::state_unchanged(&error) =>
+                            {
+                                note = Some("the control did not change state: it may have opened a menu or popover instead; observe to see what it shows, then select or click an item");
+                                true
+                            }
+                            Err(error) if external::may_fall_back(&error) => false,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    _ => false,
+                };
+                if !done {
+                    if let (Some(native), Some(provider)) = (native(), provider.as_ref()) {
+                        live(cancelled)?;
+                        done = native_action(provider, &native, &action, text)?;
+                    }
+                }
+                if !done {
+                    return Err(ComputerError::new(
+                        "ACTION_NOT_SUPPORTED",
+                        format!("{action} is not available for this element; observe again and try click, or another element"),
+                    ));
+                }
+                mark_background(center, off_screen);
                 "background"
             }
             "type" if external.is_some() => {
@@ -783,38 +1176,24 @@ impl Engine {
                 )?
             }
             "click" | "right_click" => {
-                let background = point.is_none()
-                    && element.as_ref().is_some_and(|element| {
-                        let verb = if action == "click" {
-                            "press"
-                        } else {
-                            "show_menu"
-                        };
-                        element.actions.iter().any(|a| a == verb)
-                            && live(cancelled).is_ok()
-                            && provider.as_ref().is_some_and(|provider| {
-                                provider.perform_action(element, verb).is_ok()
-                            })
-                    });
-                if background {
-                    "background"
+                pointer(point.is_some())?;
+                let at = require_point(pointer_at)?;
+                landing(at, point.is_some())?;
+                super::host_ui::mark_point(at.0, at.1);
+                let button = if action == "click" {
+                    MouseButton::Left
                 } else {
-                    let at = require_point(pointer_at)?;
-                    landing(at, point.is_some())?;
-                    super::host_ui::mark_point(at.0, at.1);
-                    let button = if action == "click" {
-                        MouseButton::Left
-                    } else {
-                        MouseButton::Right
-                    };
-                    self.input()?
-                        .backend()
-                        .pointer_click(to_point(at), button, 1)
-                        .map_err(ComputerError::platform)?;
-                    "pointer"
-                }
+                    MouseButton::Right
+                };
+                self.input()?
+                    .backend()
+                    .pointer_click(to_point(at), button, 1)
+                    .map_err(ComputerError::platform)?;
+                "pointer"
             }
+            // Inherently pointer actions: allowed on refs in window mode too.
             "double_click" => {
+                pointer(true)?;
                 let at = require_point(pointer_at)?;
                 landing(at, point.is_some())?;
                 super::host_ui::mark_point(at.0, at.1);
@@ -825,6 +1204,7 @@ impl Engine {
                 "pointer"
             }
             "hover" => {
+                pointer(true)?;
                 let at = require_point(pointer_at)?;
                 landing(at, point.is_some())?;
                 self.input()?
@@ -834,6 +1214,7 @@ impl Engine {
                 "pointer"
             }
             "drag" => {
+                pointer(true)?;
                 let from = require_point(pointer_at)?;
                 let to = to.ok_or_else(|| ComputerError::invalid("drag needs toX and toY"))?;
                 landing(from, point.is_some())?;
@@ -846,6 +1227,7 @@ impl Engine {
                 "pointer"
             }
             "scroll" => {
+                pointer(true)?;
                 let delta = ScrollDelta::new(
                     args["deltaX"].as_f64().unwrap_or(0.0).round() as i32,
                     args["deltaY"].as_f64().unwrap_or(0.0).round() as i32,
@@ -902,18 +1284,26 @@ impl Engine {
             "focus_window" => {
                 live(cancelled)?;
                 if let Some(id) = args["window"].as_u64() {
-                    let window = self
-                        .windows
-                        .iter()
-                        .find(|window| window.id == id)
-                        .ok_or_else(|| {
-                            ComputerError::invalid(format!("window {id} is not on screen"))
-                        })?;
-                    let _ = provider
-                        .as_ref()
-                        .map(|provider| provider.activate(&window.element));
-                    platform::activate(window.app.pid, Some(&window.title))
-                        .map_err(ComputerError::platform)?;
+                    match self.windows.iter().find(|window| window.id == id) {
+                        Some(window) => {
+                            // Raising it switches to its Space and un-minimizes it.
+                            let _ = provider
+                                .as_ref()
+                                .map(|provider| provider.activate(&window.element));
+                            platform::activate(window.app.pid, Some(&window.title))
+                                .map_err(ComputerError::platform)?;
+                        }
+                        // In another Space and never held: its app comes
+                        // forward, macOS switches to the Space it is in.
+                        None => {
+                            let pid = window_owner(id).ok_or_else(|| {
+                                ComputerError::invalid(format!(
+                                    "window {id} is not open; observe again"
+                                ))
+                            })?;
+                            platform::activate(pid, None).map_err(ComputerError::platform)?;
+                        }
+                    }
                 } else {
                     let identifier = args["app"].as_str().unwrap_or_default();
                     let app = platform::running_app(identifier).ok_or_else(|| {
@@ -943,7 +1333,53 @@ impl Engine {
                     .and_then(|app| app.pid)
                     .map(platform::app_identity)
             });
-        Ok(json!({ "app": app.as_ref().map(app_json).unwrap_or_else(|| json!({})), "path": path }))
+        let mut result =
+            json!({ "app": app.as_ref().map(app_json).unwrap_or_else(|| json!({})), "path": path });
+        if let Some(note) = note {
+            result["note"] = json!(note);
+        }
+        Ok(result)
+    }
+
+    /// The built-in element at the same place, and of the same kind, as
+    /// `external` (read by agent-desktop) in the window observed, so the
+    /// built-in engine can act where agent-desktop could not.
+    fn native_at(
+        &self,
+        provider: &Arc<dyn Provider>,
+        external: &ExternalElement,
+    ) -> Option<ElementData> {
+        let (x, y, width, height) = external.bounds?;
+        let root = match self.observed_window {
+            Some(index) => self.windows.get(index)?.element.clone(),
+            None => provider.app_by_pid(self.observed.as_ref()?.pid).ok()?,
+        };
+        let near = |a: i32, b: f64| (f64::from(a) - b).abs() <= 1.5;
+        let same_place = |element: &ElementData| {
+            element.bounds.is_some_and(|bounds| {
+                near(bounds.x, x)
+                    && near(bounds.y, y)
+                    && near(bounds.width as i32, width)
+                    && near(bounds.height as i32, height)
+            })
+        };
+        let mut fallback = None;
+        let mut queue = std::collections::VecDeque::from([root]);
+        let mut budget = MAX_NODES;
+        while let Some(element) = queue.pop_front() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            if same_place(&element) {
+                if element.role.to_snake_case() == external.role {
+                    return Some(element);
+                }
+                fallback.get_or_insert(element.clone());
+            }
+            queue.extend(provider.get_children(Some(&element)).unwrap_or_default());
+        }
+        fallback
     }
 
     fn map_point(
@@ -1015,9 +1451,8 @@ impl Engine {
                     .iter()
                     .find(|window| window.id == id)
                     .map(|window| window.app.clone())
-                    .ok_or_else(|| {
-                        ComputerError::invalid(format!("window {id} is not on screen"))
-                    });
+                    .or_else(|| window_owner(id).map(platform::app_identity))
+                    .ok_or_else(|| ComputerError::invalid(format!("window {id} is not open")));
             }
         }
         if let Some(identifier) = args["app"].as_str() {
@@ -1153,6 +1588,159 @@ fn live(cancelled: &AtomicBool) -> Result<(), ComputerError> {
     Ok(())
 }
 
+/// Why the pointer may not be used: the window observed is not on this
+/// screen, or (window mode) a ref has no way to be acted on in the
+/// background, which never silently becomes a click of the user's pointer.
+fn needs_pointer(app: &str, off_screen: bool) -> ComputerError {
+    let label = if app.is_empty() { "The app" } else { app };
+    ComputerError {
+        code: "NEEDS_POINTER".to_owned(),
+        message: if off_screen {
+            format!("{label}'s window is not on the current screen, so pointer input cannot reach it. Use refs (they act in the background), or bring the window forward with computer_act focus_window and observe again.")
+        } else {
+            format!("this element of {label} cannot be acted on in the background. Pass x and y from the screenshot to use the pointer there, or observe a display (display: 0) to work on the whole screen.")
+        },
+        // The app's name is screen text; the MCP layer fences it.
+        detail: Some(json!({ "label": label })),
+    }
+}
+
+/// Shows where a background action landed, as pointer clicks do, when the
+/// element is on this screen.
+fn mark_background(center: Option<(f64, f64)>, off_screen: bool) {
+    if let (Some((x, y)), false) = (center, off_screen) {
+        super::host_ui::mark_point(x, y);
+    }
+}
+
+/// Rows and cells: clicked by selecting them (outline and table rows
+/// publish no press action).
+fn is_selectable(element: &ElementData) -> bool {
+    matches!(
+        element.role.to_snake_case(),
+        "tree_item" | "table_row" | "list_item" | "table_cell"
+    )
+}
+
+/// Performs a ref action on a built-in element without the pointer;
+/// `Ok(false)` when the element has no way to.
+fn native_action(
+    provider: &Arc<dyn Provider>,
+    element: &ElementData,
+    action: &str,
+    text: Option<&str>,
+) -> Result<bool, ComputerError> {
+    let attempt = |result: xa11y::Result<()>| -> Result<bool, ComputerError> {
+        match result {
+            Ok(()) => Ok(true),
+            Err(xa11y::Error::ActionNotSupported { .. }) => Ok(false),
+            Err(error) => Err(ComputerError::platform(error)),
+        }
+    };
+    // Selecting is tried on the element and its row: a failure there only
+    // means "not this way".
+    let selected = |element: &ElementData| match provider.select(element) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(%error, "selecting the element did not work");
+            false
+        }
+    };
+    let has = |verb: &str| element.actions.iter().any(|name| name == verb);
+    match action {
+        "click" => {
+            if has("press") {
+                return attempt(provider.press(element));
+            }
+            if is_selectable(element) && selected(element) {
+                return Ok(true);
+            }
+            Ok(match provider.get_parent(element) {
+                Ok(Some(parent)) if is_selectable(&parent) => selected(&parent),
+                _ => false,
+            })
+        }
+        "right_click" if has("show_menu") => attempt(provider.show_menu(element)),
+        "right_click" => Ok(false),
+        "toggle" => attempt(provider.toggle(element)),
+        "expand" | "collapse" => {
+            let expand = action == "expand";
+            let result = if expand {
+                provider.expand(element)
+            } else {
+                provider.collapse(element)
+            };
+            if attempt(result)? {
+                return Ok(true);
+            }
+            // Section headers disclose through a button inside them.
+            match disclosure_button(provider, element) {
+                Some((_, open)) if open == expand => Ok(true),
+                Some((button, _)) => attempt(provider.press(&button)),
+                None => Ok(false),
+            }
+        }
+        "set_value" => attempt(provider.set_value(element, text.unwrap_or_default())),
+        "select" => match text {
+            Some(text) => {
+                let option = find_descendant(provider, element, |candidate| {
+                    candidate.name.as_deref() == Some(text)
+                        || candidate.value.as_deref() == Some(text)
+                });
+                match option {
+                    Some(option) if option.actions.iter().any(|name| name == "press") => {
+                        attempt(provider.press(&option))
+                    }
+                    Some(option) => Ok(selected(&option)),
+                    None => Ok(false),
+                }
+            }
+            None => Ok(selected(element)),
+        },
+        "scroll_to" => attempt(provider.scroll_into_view(element)),
+        _ => Ok(false),
+    }
+}
+
+/// A disclosure control inside `element` and whether it shows its content.
+fn disclosure_button(
+    provider: &Arc<dyn Provider>,
+    element: &ElementData,
+) -> Option<(ElementData, bool)> {
+    let button = find_descendant(provider, element, |candidate| {
+        matches!(
+            candidate.role.to_snake_case(),
+            "button" | "disclosure_triangle"
+        ) && (candidate.states.expanded.is_some()
+            || matches!(candidate.value.as_deref(), Some("Expanded" | "Collapsed")))
+    })?;
+    let open = button.states.expanded == Some(true) || button.value.as_deref() == Some("Expanded");
+    Some((button, open))
+}
+
+/// The first descendant of `root` (breadth first) that `wanted` accepts.
+fn find_descendant(
+    provider: &Arc<dyn Provider>,
+    root: &ElementData,
+    wanted: impl Fn(&ElementData) -> bool,
+) -> Option<ElementData> {
+    const BUDGET: usize = 500;
+    let mut queue: std::collections::VecDeque<ElementData> =
+        provider.get_children(Some(root)).unwrap_or_default().into();
+    let mut seen = 0;
+    while let Some(element) = queue.pop_front() {
+        seen += 1;
+        if seen > BUDGET {
+            return None;
+        }
+        if wanted(&element) {
+            return Some(element);
+        }
+        queue.extend(provider.get_children(Some(&element)).unwrap_or_default());
+    }
+    None
+}
+
 /// The app a ref belongs to: its own process, else the app the latest
 /// observation looked at.
 fn ref_app(
@@ -1267,20 +1855,31 @@ fn is_secure_role(element: &ElementData) -> bool {
     element.raw.get("atspi_role").and_then(Value::as_str) == Some("password text")
 }
 
-/// Whether `window` shows on the current screen (see
-/// [`platform::on_current_space`]); one without bounds is assumed to.
-fn window_on_screen(window: &WindowEntry) -> bool {
-    window.element.bounds.is_none_or(|bounds| {
-        platform::on_current_space(
-            window.app.pid,
-            (
-                f64::from(bounds.x),
-                f64::from(bounds.y),
-                f64::from(bounds.width),
-                f64::from(bounds.height),
-            ),
-        )
-    })
+/// The process owning window-server window `number`.
+fn window_owner(number: u64) -> Option<u32> {
+    platform::window_states()?
+        .into_iter()
+        .find(|state| u64::from(state.number) == number)
+        .map(|state| state.pid)
+}
+
+/// A window element's window-server number (macOS), when it has one.
+fn window_number(window: &ElementData) -> Option<u32> {
+    window
+        .raw
+        .get("ax_window_number")
+        .and_then(Value::as_u64)
+        .and_then(|number| u32::try_from(number).ok())
+}
+
+/// A failed screenshot of this module's own capture (see
+/// [`ComputerError::capture`] for xa11y's).
+fn capture_failed(error: String) -> ComputerError {
+    let denied = error.contains("Screen Recording");
+    match platform::signing_hint().filter(|_| denied) {
+        Some(hint) => ComputerError::new("EXECUTOR_FAILED", format!("{error} {hint}")),
+        None => ComputerError::platform(error),
+    }
 }
 
 fn frontmost(provider: &Arc<dyn Provider>) -> Result<Target, ComputerError> {
@@ -1384,10 +1983,6 @@ fn encode_jpeg_quality(
 }
 
 #[cfg(target_os = "macos")]
-fn native_provider() -> xa11y::Result<Arc<dyn Provider>> {
-    Ok(Arc::new(xa11y_macos::MacOSProvider::new()?))
-}
-#[cfg(target_os = "macos")]
 fn native_screenshots() -> xa11y::Result<Arc<dyn ScreenshotProvider>> {
     Ok(Arc::new(xa11y_macos::MacOSScreenshot::new()?))
 }
@@ -1461,6 +2056,139 @@ mod kde_wayland_e2e;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drives a real app on this Mac, in whatever Space it is (run it with
+    /// TodeX full screen in another Space to see that case):
+    /// `TODEX_CU_E2E_APP=com.apple.dt.Devices TODEX_CU_E2E_ROW="iPad mini"
+    /// cargo test window_mode_reaches_a_real_window -- --ignored --nocapture`.
+    /// With a row named, clicks it by ref (in the background, so the pointer
+    /// must not move) and then the previously selected row back.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "drives the app named by TODEX_CU_E2E_APP on this Mac"]
+    fn window_mode_reaches_a_real_window() {
+        use objc2_app_kit::NSEvent;
+        let app = std::env::var("TODEX_CU_E2E_APP").expect("TODEX_CU_E2E_APP");
+        let never = AtomicBool::new(false);
+        let own_pid = std::process::id();
+        let mut engine = Engine::default();
+        let observe = |engine: &mut Engine| {
+            engine
+                .observe(
+                    &json!({ "app": app, "screenshot": true }),
+                    own_pid,
+                    None,
+                    &never,
+                )
+                .expect("observe")
+        };
+        let result = observe(&mut engine);
+        let pid = result["app"]["pid"].as_u64().unwrap();
+        let window = &result["window"];
+        println!("window: {window}");
+        println!("other apps: {}", result["otherApps"]);
+        let windows = result["windows"].as_array().unwrap();
+        assert!(!windows.is_empty(), "the app's windows are listed");
+        // Window mode: no other app's window titles.
+        let own_name = result["app"]["name"].as_str().unwrap();
+        assert!(windows.iter().all(|listed| listed["app"] == own_name));
+        let shot = &result["screenshot"];
+        assert!(
+            shot.is_object(),
+            "a screenshot of the window, wherever it is"
+        );
+        let jpeg = BASE64.decode(shot["data"].as_str().unwrap()).unwrap();
+        std::fs::write("/tmp/todex-cu-e2e.jpg", jpeg).unwrap();
+        println!(
+            "screenshot {}x{} → /tmp/todex-cu-e2e.jpg",
+            shot["width"], shot["height"]
+        );
+        let tree = result["tree"].as_str().unwrap();
+        println!("{}", tree.lines().take(40).collect::<Vec<_>>().join("\n"));
+        let Ok(row) = std::env::var("TODEX_CU_E2E_ROW") else {
+            return;
+        };
+        let ref_of = |tree: &str, needle: &str| {
+            tree.lines()
+                .find(|line| line.contains(needle) && line.contains("[ref="))
+                .and_then(|line| line.split("[ref=").nth(1))
+                .map(|rest| rest.trim_end_matches(']').to_owned())
+                .unwrap_or_else(|| panic!("no ref for {needle}"))
+        };
+        let selected_before = tree
+            .lines()
+            .find(|line| line.contains("[selected]") && line.contains("[ref="))
+            .map(|line| line.trim().to_owned());
+        let grants = || Grants {
+            allowed_apps: &[],
+            confirmed: false,
+            cancelled: &never,
+        };
+        let allowed = [result["app"]["bundleId"].as_str().unwrap().to_owned()];
+        let grants_allowed = || Grants {
+            allowed_apps: &allowed,
+            ..grants()
+        };
+        // SAFETY-free AppKit read of the pointer position.
+        let pointer = || {
+            let at = NSEvent::mouseLocation();
+            (at.x.round(), at.y.round())
+        };
+        let before = pointer();
+        let reference = ref_of(tree, &row);
+        let acted = engine
+            .act(
+                &json!({ "action": "click", "ref": reference }),
+                grants_allowed(),
+                own_pid,
+                None,
+            )
+            .expect("click the row");
+        println!("click {row}: {acted}");
+        assert_eq!(acted["path"], "background");
+        assert_eq!(pointer(), before, "the pointer did not move");
+        let after = observe(&mut engine);
+        let line = after["tree"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find(|line| line.contains(&row))
+            .unwrap()
+            .to_owned();
+        println!("after: {line}");
+        assert!(line.contains("[selected]"), "the row is selected");
+        assert_eq!(after["app"]["pid"].as_u64().unwrap(), pid);
+        // Put the selection back.
+        if let Some(previous) = selected_before {
+            let name = previous
+                .split('"')
+                .nth(1)
+                .expect("the selected row has a name")
+                .to_owned();
+            let reference = ref_of(after["tree"].as_str().unwrap(), &name);
+            engine
+                .act(
+                    &json!({ "action": "click", "ref": reference }),
+                    grants_allowed(),
+                    own_pid,
+                    None,
+                )
+                .expect("restore the selection");
+            println!("restored {name}");
+        }
+    }
+
+    #[test]
+    fn a_ref_never_silently_becomes_a_pointer_click() {
+        let off = needs_pointer("Device Hub", true);
+        assert_eq!(off.code, "NEEDS_POINTER");
+        assert!(off.message.contains("focus_window"));
+        // The app's name is screen text: the MCP layer fences it.
+        assert_eq!(off.detail.as_ref().unwrap()["label"], "Device Hub");
+        let here = needs_pointer("", false);
+        assert!(here.message.contains("x and y"));
+        assert_eq!(here.detail.as_ref().unwrap()["label"], "The app");
+    }
 
     #[test]
     fn windows_are_clipped_to_their_display() {

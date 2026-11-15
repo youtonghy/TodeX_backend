@@ -138,6 +138,50 @@ AXUIElementRef safe_ax_create_application(int pid) {
     }
 }
 
+// ── TodeX: window numbers and windows in other Spaces ───────────────────────
+
+// Private HIServices calls, stable since macOS 10.x and used by window
+// managers (yabai, AltTab) for exactly this.
+extern AXError _AXUIElementGetWindow(AXUIElementRef element, CGWindowID *identifier);
+extern AXUIElementRef _AXUIElementCreateWithRemoteToken(CFDataRef token);
+
+// The window-server number of a window element. Returns the AX error code,
+// or -9999 if an ObjC exception was thrown.
+int safe_ax_get_window(AXUIElementRef element, uint32_t *outNumber) {
+    @try {
+        CGWindowID number = 0;
+        AXError err = _AXUIElementGetWindow(element, &number);
+        *outNumber = (uint32_t)number;
+        return err;
+    } @catch (NSException *e) {
+        *outNumber = 0;
+        return -9999;
+    }
+}
+
+// An element of process `pid` by its element id, which `AXWindows` cannot
+// reach for windows in another desktop Space. The token is the pid, a zero
+// word, the 'coco' marker, then the 64-bit element id. Returns NULL when no
+// such element exists or an ObjC exception was thrown.
+AXUIElementRef safe_ax_create_with_remote_token(int pid, uint64_t elementId) {
+    @try {
+        uint8_t token[20] = {0};
+        int32_t marker = 0x636f636f;
+        memcpy(token, &pid, 4);
+        memcpy(token + 8, &marker, 4);
+        memcpy(token + 12, &elementId, 8);
+        CFDataRef data = CFDataCreate(kCFAllocatorDefault, token, sizeof(token));
+        if (data == NULL) {
+            return NULL;
+        }
+        AXUIElementRef element = _AXUIElementCreateWithRemoteToken(data);
+        CFRelease(data);
+        return element;
+    } @catch (NSException *e) {
+        return NULL;
+    }
+}
+
 // ── System-Wide Element / Focused Application ────────────────────────────────
 
 // Safe wrapper for AXUIElementCreateSystemWide.

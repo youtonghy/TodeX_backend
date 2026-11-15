@@ -1,5 +1,11 @@
 # xa11y-macos 0.15.2 (MIT, https://github.com/xa11y/xa11y), taken in through
-# the root Cargo.toml's [patch.crates-io] so Computer Use can extend it.
+# the root Cargo.toml's [patch.crates-io] with additions Computer Use needs
+# and upstream lacks (0.16.0 neither): window elements carry their
+# window-server number (`ax_window_number`), and windows in another desktop
+# Space, which `AXWindows` leaves out, can be reached by number
+# (`MacOSProvider::windows_by_number`). Expand and collapse also try
+# `AXDisclosing` (outline rows) when `AXExpanded` is not settable. Every
+# change is marked `TodeX:`; the rest is upstream's code unchanged.
 [package]
 name = "xa11y-macos"
 version = "0.15.2"

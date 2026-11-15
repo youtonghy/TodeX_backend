@@ -58,12 +58,54 @@ pub(crate) fn frontmost_pid() -> Option<u32> {
     None
 }
 
-/// Whether `pid`'s window with these global bounds is visible on the
-/// current desktop (not in another Space, full screen elsewhere, or
-/// minimized); only macOS can tell, elsewhere it is assumed to be.
+/// A normal-layer window as the window server knows it, on the current
+/// desktop or not; macOS only.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct WindowState {
+    /// Window-server number: stable for the window's life.
+    pub number: u32,
+    pub pid: u32,
+    /// Shown on the current desktop (not in another Space, full screen
+    /// there, or minimized).
+    pub on_screen: bool,
+    pub title: String,
+    /// Global frame.
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl WindowState {
+    /// An app's real window rather than a helper surface (title bars,
+    /// toolbars and other strips the window server lists separately).
+    pub(crate) fn is_main(&self) -> bool {
+        !self.title.is_empty() || (self.width >= 200.0 && self.height >= 150.0)
+    }
+}
+
+/// Every normal-layer window, on the current desktop or not; only macOS
+/// can tell, elsewhere `None` (every window counts as on screen).
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn on_current_space(_pid: u32, _bounds: (f64, f64, f64, f64)) -> bool {
-    true
+pub(crate) fn window_states() -> Option<Vec<WindowState>> {
+    None
+}
+
+/// One window on its own; `None` where this OS cannot capture a window.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn capture_window(_number: u32) -> Option<Result<xa11y::Screenshot, String>> {
+    None
+}
+
+/// A global rectangle, optionally with one process's windows alone; `None`
+/// where this OS leaves it to xa11y (whole screen content, no filtering).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn capture_region(
+    _rect: (f64, f64, f64, f64),
+    _only_pid: Option<u32>,
+) -> Option<Result<xa11y::Screenshot, String>> {
+    None
 }
 
 /// A Computer Use session started.
@@ -364,6 +406,24 @@ mod tests {
         // The user was active before our click and nothing since.
         assert_eq!(user_idle(5.0, 1.0, 0.9, 0.5), 5.0);
         assert_eq!(user_idle(f64::INFINITY, 1.0, 0.9, 0.5), f64::INFINITY);
+    }
+
+    #[test]
+    fn helper_strips_are_not_windows() {
+        let window = |title: &str, width: f64, height: f64| WindowState {
+            number: 1,
+            pid: 2,
+            on_screen: false,
+            title: title.to_owned(),
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        };
+        assert!(window("iPhone 18 Pro", 1453.0, 949.0).is_main());
+        assert!(window("", 800.0, 600.0).is_main());
+        // An untitled title-bar strip.
+        assert!(!window("", 1512.0, 33.0).is_main());
     }
 
     #[test]

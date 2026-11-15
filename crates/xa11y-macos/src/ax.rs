@@ -90,6 +90,9 @@ extern "C" {
         settable: *mut bool,
     ) -> i32;
     fn safe_ax_create_application(pid: i32) -> AXUIElementRef;
+    // TodeX: window numbers and windows in other Spaces.
+    fn safe_ax_get_window(element: AXUIElementRef, out_number: *mut u32) -> i32;
+    fn safe_ax_create_with_remote_token(pid: i32, element_id: u64) -> AXUIElementRef;
     fn safe_ax_create_system_wide() -> AXUIElementRef;
     fn safe_ax_get_pid(element: AXUIElementRef, out_pid: *mut i32) -> i32;
     fn safe_ax_set_messaging_timeout(element: AXUIElementRef, timeout_seconds: f32) -> i32;
@@ -1521,6 +1524,32 @@ fn set_bool_attr(
     Ok(())
 }
 
+/// TodeX: the attribute that discloses `el_ptr`'s children — `AXExpanded`
+/// (disclosure triangles, combo boxes), else `AXDisclosing` (outline rows);
+/// `None` when neither is settable.
+fn disclosure_attr(el_ptr: AXUIElementRef) -> Result<Option<&'static str>> {
+    for attr in ["AXExpanded", "AXDisclosing"] {
+        if is_attr_settable(el_ptr, attr)? {
+            return Ok(Some(attr));
+        }
+    }
+    Ok(None)
+}
+
+/// TodeX: a window element's window-server number (`CGWindowID`).
+fn window_number(el_ptr: AXUIElementRef) -> Option<u32> {
+    let mut number = 0u32;
+    let err = unsafe { safe_ax_get_window(el_ptr, &mut number) };
+    (err == AX_ERROR_SUCCESS && number != 0).then_some(number)
+}
+
+/// TodeX: element ids tried when looking for windows by remote token.
+/// Window elements get small ids early in an app's life; window managers
+/// scan this range too.
+const MAX_REMOTE_ELEMENT_ID: u64 = 1000;
+/// TodeX: an app that does not answer within this is not scanned further.
+const REMOTE_TOKEN_TIMEOUT_SECONDS: f32 = 0.25;
+
 /// The application element owning `el_ptr`, resolved through the element's
 /// PID (`AXUIElementGetPid` / `AXUIElementCreateApplication`) — the same
 /// addressing `App::by_pid` uses.
@@ -2905,6 +2934,73 @@ impl MacOSProvider {
             })
     }
 
+    /// TodeX: `pid`'s windows with these window-server numbers, including
+    /// windows in another desktop Space (a full-screen app there among
+    /// them), which `AXWindows` leaves out. Elements are reached by remote
+    /// token, which finds a window only while its accessibility element
+    /// is alive in the app (some client used it recently); numbers not
+    /// found are left out of the result. The elements are cached like any
+    /// other, so trees read and actions run on them.
+    pub fn windows_by_number(&self, pid: u32, numbers: &[u32]) -> Vec<ElementData> {
+        let Ok(pid_i32) = i32::try_from(pid) else {
+            return Vec::new();
+        };
+        let mut wanted: Vec<u32> = numbers.to_vec();
+        let mut found = Vec::new();
+        for id in 0..MAX_REMOTE_ELEMENT_ID {
+            if wanted.is_empty() {
+                break;
+            }
+            let ptr = unsafe { safe_ax_create_with_remote_token(pid_i32, id) };
+            if ptr.is_null() {
+                continue;
+            }
+            let element = AXElement::from_owned(ptr);
+            unsafe { safe_ax_set_messaging_timeout(element.as_ptr(), REMOTE_TOKEN_TIMEOUT_SECONDS) };
+            let mut role: CFTypeRef = std::ptr::null();
+            let role_attr = CFString::new("AXRole");
+            let asked = Instant::now();
+            let err = ffi_copy_attribute_value(
+                element.as_ptr(),
+                role_attr.as_concrete_TypeRef() as CFTypeRef,
+                &mut role,
+            );
+            // Ids that name nothing fail at once; a call that waited out the
+            // timeout means the app is not answering, and every other id
+            // would wait too.
+            if err == AX_ERROR_CANNOT_COMPLETE
+                && asked.elapsed().as_secs_f32() >= REMOTE_TOKEN_TIMEOUT_SECONDS * 0.9
+            {
+                break;
+            }
+            if role.is_null() {
+                continue;
+            }
+            let is_window = unsafe {
+                let is_string = safe_cf_get_type_id(role) == safe_cf_string_get_type_id();
+                let window = is_string
+                    && CFString::wrap_under_get_rule(role as _).to_string() == "AXWindow";
+                safe_cf_release(role);
+                window
+            };
+            if !is_window {
+                continue;
+            }
+            let Some(number) = window_number(element.as_ptr()) else {
+                continue;
+            };
+            if let Some(index) = wanted.iter().position(|wanted| *wanted == number) {
+                wanted.swap_remove(index);
+                // Back to the default timeout for the reads that follow.
+                unsafe { safe_ax_set_messaging_timeout(element.as_ptr(), 0.0) };
+                if let Ok(data) = self.build_element_data(&element, Some(pid)) {
+                    found.push(data);
+                }
+            }
+        }
+        found
+    }
+
     /// Build an ElementData from an AXElement, caching the AX handle.
     /// Tries batch fetch (1 IPC call for 15 attributes) first, falls back
     /// to individual calls if the batch API fails.
@@ -2970,6 +3066,13 @@ fn build_snapshot_data(
         );
         if let Some(ref sr) = attrs.subrole_str {
             raw.insert("ax_subrole".into(), serde_json::Value::String(sr.clone()));
+        }
+        // TodeX: a window's window-server number, which identifies it to
+        // CGWindowList and ScreenCaptureKit across observations.
+        if attrs.role_str == "AXWindow" {
+            if let Some(number) = window_number(element) {
+                raw.insert("ax_window_number".into(), serde_json::Value::from(number));
+            }
         }
         if let Some(ref id) = attrs.identifier {
             raw.insert(
@@ -4451,25 +4554,22 @@ impl Provider for MacOSProvider {
         // Setting AXExpanded on an element that doesn't support it succeeds
         // and silently no-ops in every bridge — check settability first so
         // unsupported expand surfaces as ActionNotSupported (tenet 1).
-        if !is_attr_settable(ax.as_ptr(), "AXExpanded")? {
-            return Err(Error::ActionNotSupported {
-                action: "expand".to_string(),
-                role: element.role,
-            });
-        }
-        set_bool_attr(ax.as_ptr(), "AXExpanded", true, "expand", element.role)
+        // TodeX: outline rows disclose through AXDisclosing instead.
+        let attr = disclosure_attr(ax.as_ptr())?.ok_or_else(|| Error::ActionNotSupported {
+            action: "expand".to_string(),
+            role: element.role,
+        })?;
+        set_bool_attr(ax.as_ptr(), attr, true, "expand", element.role)
     }
 
     fn collapse(&self, element: &ElementData) -> Result<()> {
         let ax = self.get_cached(element.handle)?;
         // See expand(): unsupported AXExpanded sets are silent no-ops.
-        if !is_attr_settable(ax.as_ptr(), "AXExpanded")? {
-            return Err(Error::ActionNotSupported {
-                action: "collapse".to_string(),
-                role: element.role,
-            });
-        }
-        set_bool_attr(ax.as_ptr(), "AXExpanded", false, "collapse", element.role)
+        let attr = disclosure_attr(ax.as_ptr())?.ok_or_else(|| Error::ActionNotSupported {
+            action: "collapse".to_string(),
+            role: element.role,
+        })?;
+        set_bool_attr(ax.as_ptr(), attr, false, "collapse", element.role)
     }
 
     fn scroll_into_view(&self, _element: &ElementData) -> Result<()> {

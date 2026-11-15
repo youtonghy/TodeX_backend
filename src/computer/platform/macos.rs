@@ -19,9 +19,11 @@ use core_foundation::{
     string::{CFString, CFStringRef},
 };
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
-use xa11y::{input::Key, ElementData};
+use xa11y::{input::Key, ElementData, Screenshot};
 
-use super::{insertion_settled, Display, Permission, Permissions, Typed, INSERT_SETTLE};
+use super::{
+    insertion_settled, Display, Permission, Permissions, Typed, WindowState, INSERT_SETTLE,
+};
 use crate::computer::{
     keys::Chord,
     policy::{StackWindow, Target},
@@ -84,6 +86,7 @@ unsafe extern "C" {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
     fn CGRequestScreenCaptureAccess() -> bool;
     fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
     fn CGWindowListCopyWindowInfo(
@@ -96,6 +99,30 @@ unsafe extern "C" {
     fn CGEventCreateKeyboardEvent(source: *const c_void, key: u16, down: bool) -> CGEventRef;
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventPostToPid(pid: i32, event: CGEventRef);
+}
+
+// `macos_capture.m`, built by build.rs.
+unsafe extern "C" {
+    fn todex_capture_window(
+        window_number: u32,
+        timeout_seconds: f64,
+        out_pixels: *mut *mut u8,
+        out_width: *mut u32,
+        out_height: *mut u32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn todex_capture_region(
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        only_pid: i32,
+        timeout_seconds: f64,
+        out_pixels: *mut *mut u8,
+        out_width: *mut u32,
+        out_height: *mut u32,
+    ) -> i32;
+    fn todex_capture_free(pixels: *mut u8);
 }
 
 unsafe extern "C" {
@@ -350,24 +377,159 @@ pub(crate) fn frontmost_pid() -> Option<u32> {
         .filter(|pid| *pid != 0)
 }
 
-/// Whether `pid`'s window with these global bounds is visible on the
-/// current desktop. Windows in another Space (a full-screen app there
-/// included) and minimized ones are not; when the window server does not
-/// answer, the window is assumed to be.
-pub(crate) fn on_current_space(pid: u32, bounds: (f64, f64, f64, f64)) -> bool {
-    let Some(windows) = on_screen_windows() else {
-        return true;
+/// Every normal-layer window the window server knows, on the current
+/// desktop or not (another Space, a full-screen app there, minimized);
+/// `None` when it does not answer.
+pub(crate) fn window_states() -> Option<Vec<WindowState>> {
+    // SAFETY: the returned array follows the create rule.
+    let windows: CFArray<CFDictionary<CFString, CFType>> = unsafe {
+        let array = CGWindowListCopyWindowInfo(EXCLUDE_DESKTOP, 0);
+        if array.is_null() {
+            return None;
+        }
+        CFArray::wrap_under_create_rule(array)
     };
-    let (x, y, width, height) = bounds;
-    let near = |a: f64, b: f64| (a - b).abs() <= 2.0;
-    windows.iter().any(|window| {
-        window.pid == pid
-            && window.layer == 0
-            && near(window.x, x)
-            && near(window.y, y)
-            && near(window.width, width)
-            && near(window.height, height)
-    })
+    let number = |dict: &CFDictionary<CFString, CFType>, key: &'static str| {
+        dict.find(CFString::from_static_string(key))
+            .and_then(|value| value.downcast::<CFNumber>())
+            .and_then(|number| number.to_f64())
+    };
+    let mut found = Vec::new();
+    for window in windows.iter() {
+        if number(&window, "kCGWindowLayer").unwrap_or(0.0) != 0.0 {
+            continue;
+        }
+        let Some(id) = number(&window, "kCGWindowNumber").map(|n| n as u32) else {
+            continue;
+        };
+        let frame = window
+            .find(CFString::from_static_string("kCGWindowBounds"))
+            .and_then(|value| value.downcast::<CFDictionary>())
+            .map(|bounds| {
+                // SAFETY: kCGWindowBounds is a dictionary of CFString → CFNumber.
+                let bounds: CFDictionary<CFString, CFType> =
+                    unsafe { CFDictionary::wrap_under_get_rule(bounds.as_concrete_TypeRef()) };
+                (
+                    number(&bounds, "X").unwrap_or(0.0),
+                    number(&bounds, "Y").unwrap_or(0.0),
+                    number(&bounds, "Width").unwrap_or(0.0),
+                    number(&bounds, "Height").unwrap_or(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        found.push(WindowState {
+            number: id,
+            pid: number(&window, "kCGWindowOwnerPID").map_or(0, |pid| pid as u32),
+            on_screen: window
+                .find(CFString::from_static_string("kCGWindowIsOnscreen"))
+                .and_then(|value| value.downcast::<CFBoolean>())
+                .is_some_and(bool::from),
+            title: window
+                .find(CFString::from_static_string("kCGWindowName"))
+                .and_then(|value| value.downcast::<CFString>())
+                .map(|title| title.to_string())
+                .unwrap_or_default(),
+            x: frame.0,
+            y: frame.1,
+            width: frame.2,
+            height: frame.3,
+        });
+    }
+    Some(found)
+}
+
+/// How long a screenshot may take before it is given up.
+const CAPTURE_TIMEOUT_SECONDS: f64 = 5.0;
+
+/// Window `number` on its own, also in another Space; `None` where this
+/// OS cannot (never on macOS).
+pub(crate) fn capture_window(number: u32) -> Option<Result<Screenshot, String>> {
+    Some(take_capture(|pixels, width, height| {
+        // SAFETY: the out pointers are valid for the call.
+        unsafe { todex_capture_window(number, CAPTURE_TIMEOUT_SECONDS, pixels, width, height) }
+    }))
+}
+
+/// A global rectangle of the display containing it; `only_pid` keeps that
+/// process's windows alone in the picture.
+pub(crate) fn capture_region(
+    rect: (f64, f64, f64, f64),
+    only_pid: Option<u32>,
+) -> Option<Result<Screenshot, String>> {
+    let pid = only_pid
+        .and_then(|pid| i32::try_from(pid).ok())
+        .unwrap_or(0);
+    Some(take_capture(|pixels, width, height| {
+        // SAFETY: the out pointers are valid for the call.
+        unsafe {
+            todex_capture_region(
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                pid,
+                CAPTURE_TIMEOUT_SECONDS,
+                pixels,
+                width,
+                height,
+            )
+        }
+    }))
+}
+
+/// Runs one capture of `macos_capture.m` and takes over its pixels.
+fn take_capture(
+    capture: impl FnOnce(*mut *mut u8, *mut u32, *mut u32) -> i32,
+) -> Result<Screenshot, String> {
+    let mut pixels: *mut u8 = std::ptr::null_mut();
+    let (mut width, mut height) = (0u32, 0u32);
+    let status = capture(&mut pixels, &mut width, &mut height);
+    if status != 0 || pixels.is_null() {
+        if !pixels.is_null() {
+            // SAFETY: allocated by the shim, not yet freed.
+            unsafe { todex_capture_free(pixels) };
+        }
+        if screen_locked() {
+            return Err(
+                "the screen is locked, so nothing can be captured until the user unlocks it"
+                    .to_owned(),
+            );
+        }
+        return Err(capture_failure(status));
+    }
+    let len = width as usize * height as usize * 4;
+    // SAFETY: on success the shim returns `width * height` RGBA pixels.
+    let rgba = unsafe { std::slice::from_raw_parts(pixels, len) }.to_vec();
+    // SAFETY: allocated by the shim, freed once.
+    unsafe { todex_capture_free(pixels) };
+    Ok(Screenshot::new(width, height, rgba, 1.0))
+}
+
+/// Whether the login session's screen is locked (the lock screen covers
+/// every window, and captures fail).
+fn screen_locked() -> bool {
+    // SAFETY: returns an owned dictionary or null.
+    let session = unsafe { CGSessionCopyCurrentDictionary() };
+    if session.is_null() {
+        return false;
+    }
+    // SAFETY: an owned CFDictionary of CFString keys.
+    let session: CFDictionary<CFString, CFType> =
+        unsafe { CFDictionary::wrap_under_create_rule(session) };
+    session
+        .find(CFString::from_static_string("CGSSessionScreenIsLocked"))
+        .and_then(|value| value.downcast::<CFBoolean>())
+        .is_some_and(bool::from)
+}
+
+fn capture_failure(status: i32) -> String {
+    match status {
+        -1 => "ScreenCaptureKit listed no screen content (Screen Recording permission?)".to_owned(),
+        -2 => "the window is gone or cannot be captured (closed or minimized?)".to_owned(),
+        -5 => "the window has no area to capture".to_owned(),
+        -6 => "ScreenCaptureKit did not answer in time".to_owned(),
+        other => format!("the screenshot failed (status {other})"),
+    }
 }
 
 /// Seconds since the user last touched the mouse or keyboard. Events this
