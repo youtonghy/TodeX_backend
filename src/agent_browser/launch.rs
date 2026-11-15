@@ -16,7 +16,9 @@ use tokio::{
 };
 
 use super::{cdp::Cdp, BrowserError};
-use crate::provider::process::{drain_stderr, redact_sensitive_text, stderr_excerpt};
+#[cfg(unix)]
+use crate::provider::process::redact_sensitive_text;
+use crate::provider::process::{drain_stderr, stderr_excerpt};
 
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 /// `1` (or `true`) runs the agent browser headless on any OS, e.g. to try
@@ -31,14 +33,17 @@ const STDERR_TAIL_BYTES: usize = 16 * 1024;
 /// before a failure message is composed.
 const SETTLE: Duration = Duration::from_millis(500);
 /// Engine output lines logged per minute at most (pages can log in a loop).
+#[cfg(unix)]
 const LOG_LINES_PER_MINUTE: u32 = 120;
 /// Longest engine output line logged.
+#[cfg(unix)]
 const LOG_LINE_CHARS: usize = 500;
 
 /// The engine's latest output lines with when they came, for telling why a
 /// page failed.
 type EngineLines = Arc<std::sync::Mutex<VecDeque<(std::time::Instant, String)>>>;
 /// Engine output lines kept for [`Process::engine_lines_since`].
+#[cfg(unix)]
 const RECENT_ENGINE_LINES: usize = 50;
 
 /// A child process with the tail of its stderr. The drain task runs for the

@@ -683,6 +683,7 @@ fn system_roots() -> &'static [String] {
 }
 
 /// The certificates of a PEM bundle, one string each.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn pem_blocks(pem: &str) -> Vec<String> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
