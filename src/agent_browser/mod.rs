@@ -1432,6 +1432,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn kitesurf_pages_report_the_document_location_not_a_refused_target() {
+        let (browser, _chromium, root) = scripted();
+        browser
+            .set_engine(BrowserEngineKind::Kitesurf)
+            .await
+            .unwrap();
+        // The scripted target says "App" at /; the document says "Shown".
+        let opened = open_tab(&browser, "c", "w").await.unwrap();
+        assert_eq!(
+            opened,
+            json!({ "url": "http://localhost:5173/shown", "title": "Shown" })
+        );
+        // Chromium keeps reading the target.
+        browser
+            .set_engine(BrowserEngineKind::Chromium)
+            .await
+            .unwrap();
+        let opened = open_tab(&browser, "c", "w").await.unwrap();
+        assert_eq!(
+            opened,
+            json!({ "url": "http://localhost:5173/", "title": "App" })
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     async fn open_tab(
         browser: &AgentBrowser,
         conversation: &str,

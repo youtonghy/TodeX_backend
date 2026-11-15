@@ -833,6 +833,11 @@ impl Running {
     // ---- Tools ----------------------------------------------------------
 
     pub(crate) async fn page(&self, target_id: &str) -> Result<Value, BrowserError> {
+        if self.isolated {
+            if let Some(page) = self.document_location(target_id).await {
+                return Ok(page);
+            }
+        }
         let info = self
             .cdp
             .call(
@@ -844,6 +849,38 @@ impl Running {
         Ok(json!({
             "url": info["targetInfo"]["url"],
             "title": info["targetInfo"]["title"],
+        }))
+    }
+
+    /// The page's URL and title as its document reports them. Kitesurf
+    /// moves its target (and frame) to a navigation even when the guard
+    /// refused it, while the document, its title and the history stay on the
+    /// page that is still shown. `None` when the document cannot answer.
+    async fn document_location(&self, target_id: &str) -> Option<Value> {
+        let session_id = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|(_, info)| info.target_id == target_id)
+            .map(|(session_id, _)| session_id.clone())?;
+        let answer = self
+            .cdp
+            .call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": "({ url: location.href, title: document.title })",
+                    "returnByValue": true
+                }),
+                Some(&session_id),
+            )
+            .await
+            .ok()?;
+        let value = &answer["result"]["value"];
+        let url = value["url"].as_str().filter(|url| !url.is_empty())?;
+        Some(json!({
+            "url": url,
+            "title": value["title"].as_str().unwrap_or_default(),
         }))
     }
 

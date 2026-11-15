@@ -208,6 +208,8 @@ impl ScriptedChromium {
                         let expression = params["expression"].as_str().unwrap_or_default();
                         if expression.contains("readyState") {
                             json!({ "result": { "value": "complete" } })
+                        } else if expression.contains("location.href") {
+                            json!({ "result": { "value": { "url": "http://localhost:5173/shown", "title": "Shown" } } })
                         } else {
                             // One responder per connection: no other decrement
                             // lands between the load and the sub.
