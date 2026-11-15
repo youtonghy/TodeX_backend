@@ -497,6 +497,8 @@ fn gunzip_executable(archive: &Path, to: &Path) -> Result<(), BrowserError> {
     Ok(())
 }
 
+// Only Unix launches Kitesurf; unit tests still build these on Windows.
+#[cfg_attr(not(unix), allow(dead_code))]
 /// The `workerd` config serving the engine in `engine` on `socket`. Module
 /// files are embedded by paths relative to `config_dir`, where the config is
 /// written (workerd resolves `embed` relative to the config file).
@@ -632,6 +634,8 @@ const engine :Workerd.Worker = (
     ))
 }
 
+// Only Unix launches Kitesurf; unit tests still build these on Windows.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -645,6 +649,8 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
+// Only Unix launches Kitesurf; unit tests still build these on Windows.
+#[cfg_attr(not(unix), allow(dead_code))]
 /// The module type of a `dist/` file, by Kitesurf's wrangler rules
 /// (`*.glue.js`, `*.css`, `*.dat` as text) and wrangler's defaults.
 fn module_kind(name: &str) -> Option<&'static str> {
@@ -661,6 +667,8 @@ fn module_kind(name: &str) -> Option<&'static str> {
     }
 }
 
+// Only Unix launches Kitesurf; unit tests still build these on Windows.
+#[cfg_attr(not(unix), allow(dead_code))]
 /// `to` relative to directory `from`; both absolute.
 fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
     let from: Vec<_> = from.components().collect();
