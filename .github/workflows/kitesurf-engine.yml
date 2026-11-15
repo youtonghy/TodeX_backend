@@ -85,6 +85,8 @@ jobs:
           mkdir -p "$stage"
           cp -RL kitesurf/bazel-bin/packages/engine/dist "$stage/dist"
           cp -RL kitesurf/packages/engine/public "$stage/public"
+          # Bazel outputs are read-only.
+          chmod -R u+rwX,go+rX,go-w "$stage"
           find "$stage/dist" -name '*.map' -delete
           cp kitesurf/LICENSE kitesurf/NOTICE "$stage/"
           cp -R kitesurf/licenses "$stage/licenses"
