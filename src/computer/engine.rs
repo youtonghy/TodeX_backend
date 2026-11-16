@@ -640,7 +640,7 @@ impl Engine {
     /// accessibility windows) lacks: those in another desktop Space, as
     /// seen on this desktop before, else found by number.
     fn other_space_windows(
-        &self,
+        &mut self,
         pid: u32,
         listed: &[ElementData],
         states: Option<&[platform::WindowState]>,
@@ -674,7 +674,15 @@ impl Engine {
             })
             .collect();
         if !unknown.is_empty() {
-            found.extend(self.windows_by_number(pid, &unknown));
+            // Kept like windows seen on this desktop: a later lookup by
+            // number can come back empty (the app busy, the element gone
+            // from its registry), the element held stays usable.
+            for element in self.windows_by_number(pid, &unknown) {
+                if let Some(number) = window_number(&element) {
+                    self.known_windows.insert(number, element.clone());
+                }
+                found.push(element);
+            }
         }
         found
     }
