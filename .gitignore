@@ -1,3 +1,7 @@
 target/
 Screenshot_*.png
 .DS_Store
+
+# agent tooling
+.pi/
+.claude/
