@@ -1706,7 +1706,7 @@ mod tests {
             }
             self.acted.lock().unwrap().push(args);
             Ok(
-                json!({ "app": { "name": "TextEdit", "bundleId": "com.apple.TextEdit", "pid": 7 }, "path": "background" }),
+                json!({ "app": { "name": "TextEdit", "bundleId": "com.apple.TextEdit", "pid": 7 }, "path": "background", "point": { "x": 0.25, "y": 0.5 } }),
             )
         }
 
@@ -1944,6 +1944,8 @@ mod tests {
         assert!(actions[0]["shotId"].is_string());
         assert_eq!(actions[0]["deviceName"], "test-host");
         assert_eq!(actions[1]["path"], "background");
+        // Live viewers draw the AI cursor there.
+        assert_eq!(actions[1]["point"], json!({ "x": 0.25, "y": 0.5 }));
         assert!(!events
             .iter()
             .any(|event| event.payload.to_string().contains("hunter2")));

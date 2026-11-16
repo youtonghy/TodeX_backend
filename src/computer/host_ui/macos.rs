@@ -53,8 +53,21 @@ pub(super) fn stop_shortcut() -> Option<&'static str> {
 const STATUS_LEVEL: isize = 25;
 const PILL_WIDTH: f64 = 380.0;
 const PILL_HEIGHT: f64 = 40.0;
-const MARKER_SIZE: f64 = 18.0;
+/// Side of the AI cursor's panel; the arrow's tip sits `CURSOR_INSET` in
+/// from its top-left corner, so the shadow and outline are not clipped.
+const CURSOR_SIZE: f64 = 28.0;
+const CURSOR_INSET: f64 = 3.0;
+/// How long the cursor stays after an action, then how long it fades.
 const MARKER_VISIBLE: Duration = Duration::from_millis(1500);
+const CURSOR_FADE: Duration = Duration::from_millis(200);
+/// The press: the arrow shrinks this long when it arrives.
+const CURSOR_PRESS: Duration = Duration::from_millis(100);
+/// One animation step, about a display frame.
+const CURSOR_STEP: Duration = Duration::from_millis(16);
+/// The glide to the next point: proportional to the distance, within these.
+const GLIDE_MIN_MS: f64 = 80.0;
+const GLIDE_MAX_MS: f64 = 250.0;
+const GLIDE_MS_PER_POINT: f64 = 0.4;
 
 thread_local! {
     /// Main-thread-only objects.
@@ -88,6 +101,11 @@ struct Pill {
 }
 
 static MARKER_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Where the AI cursor last pointed, in global points: the next glide
+/// starts there. Cleared when the session's pill goes away.
+static CURSOR_AT: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+/// The arrow is drawn pressed (smaller) while set.
+static CURSOR_PRESSED: AtomicBool = AtomicBool::new(false);
 /// `windowNumber` of the marker panel; 0 before it exists.
 static MARKER_WINDOW: AtomicU64 = AtomicU64::new(0);
 /// One confirmation dialog at a time.
@@ -97,6 +115,47 @@ static ANSWER: Mutex<Option<mpsc::Sender<bool>>> = Mutex::new(None);
 /// Button tags of the confirmation.
 const ALLOW_TAG: isize = 1;
 const DENY_TAG: isize = 2;
+
+define_class!(
+    // SAFETY: NSView allows subclassing, drawRect: is the documented
+    // override point, and CursorView does not implement Drop.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TodexComputerCursor"]
+    /// The AI cursor: an arrow whose tip is the point an action hits.
+    struct CursorView;
+
+    impl CursorView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let height = self.bounds().size.height;
+            let pressed = CURSOR_PRESSED.load(Ordering::SeqCst);
+            let path = NSBezierPath::bezierPath();
+            for (index, (x, y)) in cursor_outline(pressed).into_iter().enumerate() {
+                // The outline is top-left based; views draw bottom-left up.
+                let point = NSPoint::new(CURSOR_INSET + x, height - CURSOR_INSET - y);
+                if index == 0 {
+                    path.moveToPoint(point);
+                } else {
+                    path.lineToPoint(point);
+                }
+            }
+            path.closePath();
+            path.setLineWidth(1.5);
+            // The marker's orange, so the AI's pointer never reads as the
+            // person's own.
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.96, 0.62, 0.04, 1.0).setFill();
+            path.fill();
+            NSColor::whiteColor().setStroke();
+            path.stroke();
+        }
+
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> {
+            None
+        }
+    }
+);
 
 define_class!(
     // SAFETY: NSView allows subclassing, drawRect: is the documented
@@ -371,43 +430,152 @@ pub(super) fn hide_status() {
             marker.orderOut(None);
         }
     });
+    // The next session's cursor starts where its first action lands.
+    *CURSOR_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
+/// Shows the AI cursor gliding from where it last pointed to `(x, y)`
+/// (global points) and pressing there; returns once it has arrived, so the
+/// action follows the cursor. Reduce Motion places it at once.
 pub(super) fn mark_point(x: f64, y: f64) {
     let generation = MARKER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    with_ui(move |ui, mtm| {
-        let frame = NSRect::new(
-            NSPoint::new(
-                x - MARKER_SIZE / 2.0,
-                primary_height(mtm) - y - MARKER_SIZE / 2.0,
-            ),
-            NSSize::new(MARKER_SIZE, MARKER_SIZE),
-        );
-        let marker = ui.marker.get_or_insert_with(|| {
-            let panel = overlay_panel(mtm, frame);
-            panel.setIgnoresMouseEvents(true);
-            panel.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
-                0.96, 0.62, 0.04, 0.75,
-            )));
-            panel
-        });
-        marker.setFrame_display(frame, true);
-        marker.orderFrontRegardless();
-        // Known once on screen (a window gets its number when ordered in).
-        if let Ok(number) = u64::try_from(marker.windowNumber()) {
-            MARKER_WINDOW.store(number, Ordering::SeqCst);
+    let reduce = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+    let from = CURSOR_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace((x, y));
+    let frames = glide(from, (x, y), reduce);
+    let last = frames.len() - 1;
+    for (index, (fx, fy)) in frames.into_iter().enumerate() {
+        if MARKER_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
         }
-    });
+        let arrived = index == last;
+        with_ui(move |ui, mtm| {
+            let origin = NSPoint::new(
+                fx - CURSOR_INSET,
+                primary_height(mtm) - fy - (CURSOR_SIZE - CURSOR_INSET),
+            );
+            let cursor = ui.marker.get_or_insert_with(|| cursor_panel(mtm, origin));
+            cursor.setFrameOrigin(origin);
+            cursor.setAlphaValue(1.0);
+            if arrived && !reduce {
+                CURSOR_PRESSED.store(true, Ordering::SeqCst);
+                if let Some(view) = cursor.contentView() {
+                    view.setNeedsDisplay(true);
+                }
+            }
+            cursor.orderFrontRegardless();
+            // Known once on screen (a window gets its number when ordered in).
+            if let Ok(number) = u64::try_from(cursor.windowNumber()) {
+                MARKER_WINDOW.store(number, Ordering::SeqCst);
+            }
+        });
+        if !arrived {
+            std::thread::sleep(CURSOR_STEP);
+        }
+    }
     std::thread::spawn(move || {
-        std::thread::sleep(MARKER_VISIBLE);
+        if !reduce {
+            std::thread::sleep(CURSOR_PRESS);
+            CURSOR_PRESSED.store(false, Ordering::SeqCst);
+            with_ui(|ui, _| {
+                if let Some(view) = ui.marker.as_ref().and_then(|cursor| cursor.contentView()) {
+                    view.setNeedsDisplay(true);
+                }
+            });
+        }
+        std::thread::sleep(MARKER_VISIBLE.saturating_sub(CURSOR_PRESS));
+        let steps = if reduce {
+            0
+        } else {
+            (CURSOR_FADE.as_millis() / CURSOR_STEP.as_millis()).max(1) as u32
+        };
+        for step in 1..=steps {
+            if MARKER_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let alpha = 1.0 - f64::from(step) / f64::from(steps);
+            with_ui(move |ui, _| {
+                if let Some(cursor) = &ui.marker {
+                    cursor.setAlphaValue(alpha);
+                }
+            });
+            std::thread::sleep(CURSOR_STEP);
+        }
         if MARKER_GENERATION.load(Ordering::SeqCst) == generation {
             with_ui(|ui, _| {
-                if let Some(marker) = &ui.marker {
-                    marker.orderOut(None);
+                if let Some(cursor) = &ui.marker {
+                    cursor.orderOut(None);
+                    cursor.setAlphaValue(1.0);
                 }
             });
         }
     });
+}
+
+/// The click-through panel that carries the AI cursor.
+fn cursor_panel(mtm: MainThreadMarker, origin: NSPoint) -> Retained<NSPanel> {
+    let frame = NSRect::new(origin, NSSize::new(CURSOR_SIZE, CURSOR_SIZE));
+    let panel = overlay_panel(mtm, frame);
+    panel.setIgnoresMouseEvents(true);
+    panel.setBackgroundColor(Some(&NSColor::clearColor()));
+    panel.setHasShadow(true);
+    // SAFETY: NSView's designated initialiser.
+    let view: Retained<CursorView> = unsafe {
+        msg_send![
+            CursorView::alloc(mtm),
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), frame.size)
+        ]
+    };
+    panel.setContentView(Some(&view));
+    panel
+}
+
+/// The arrow's outline, tip first, in points from the tip with y down.
+/// Pressed, it shrinks towards the tip.
+fn cursor_outline(pressed: bool) -> Vec<(f64, f64)> {
+    let scale = if pressed { 0.82 } else { 1.0 };
+    [
+        (0.0, 0.0),
+        (0.0, 17.0),
+        (4.2, 13.2),
+        (7.0, 19.5),
+        (9.8, 18.3),
+        (7.0, 12.2),
+        (12.6, 12.2),
+    ]
+    .into_iter()
+    .map(|(x, y)| (x * scale, y * scale))
+    .collect()
+}
+
+/// The cursor's positions on the way from `from` to `to`, one per
+/// `CURSOR_STEP`, eased out and ending at `to`. Just `to` with Reduce
+/// Motion or nowhere to come from.
+fn glide(from: Option<(f64, f64)>, to: (f64, f64), reduce: bool) -> Vec<(f64, f64)> {
+    let Some(from) = from.filter(|_| !reduce) else {
+        return vec![to];
+    };
+    let distance = (to.0 - from.0).hypot(to.1 - from.1);
+    if distance < 1.0 {
+        return vec![to];
+    }
+    let ms = (distance * GLIDE_MS_PER_POINT).clamp(GLIDE_MIN_MS, GLIDE_MAX_MS);
+    let steps = (ms / CURSOR_STEP.as_millis() as f64).ceil().max(1.0) as u32;
+    (1..=steps)
+        .map(|step| {
+            let t = f64::from(step) / f64::from(steps);
+            // Ease-out cubic: quick to leave, gentle to land.
+            let eased = 1.0 - (1.0 - t).powi(3);
+            (
+                from.0 + (to.0 - from.0) * eased,
+                from.1 + (to.1 - from.1) * eased,
+            )
+        })
+        .collect()
 }
 
 pub(super) fn marker_window() -> Option<u32> {
@@ -946,5 +1114,29 @@ pub(super) fn show_permission_guide(mut missing: Vec<Permission>) {
     if let Err(error) = spawned {
         eprintln!("todex-agentd: could not follow the permission guide: {error}");
         dismiss_guide(generation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cursor_glides_to_the_point_unless_motion_is_reduced() {
+        let frames = glide(Some((0.0, 0.0)), (300.0, 400.0), false);
+        // 500 points: 200 ms, eased out, ending exactly on the point.
+        assert_eq!(frames.len(), 13);
+        assert_eq!(frames.last(), Some(&(300.0, 400.0)));
+        assert!(
+            frames[0].0 > 300.0 / 13.0,
+            "eases out: the first step is the longest"
+        );
+        // Far away: capped.
+        assert_eq!(glide(Some((0.0, 0.0)), (5000.0, 0.0), false).len(), 16);
+        assert_eq!(
+            glide(Some((0.0, 0.0)), (300.0, 400.0), true),
+            [(300.0, 400.0)]
+        );
+        assert_eq!(glide(None, (300.0, 400.0), false), [(300.0, 400.0)]);
     }
 }

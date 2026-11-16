@@ -869,13 +869,7 @@ impl Engine {
     ) -> Result<Vec<u8>, ComputerError> {
         let displays = platform::displays();
         let display = self
-            .shot
-            .and_then(|shot| {
-                displays
-                    .iter()
-                    .find(|display| display.contains(shot.origin_x, shot.origin_y))
-            })
-            .or_else(|| displays.first())
+            .live_display(&displays)
             .ok_or_else(|| ComputerError::platform("no display to capture"))?;
         let rect = display_rect(display);
         let (_, shot) = self.take_shot(
@@ -894,6 +888,18 @@ impl Engine {
             shot
         };
         encode_jpeg_quality(&shot.pixels, shot.width, shot.height, quality)
+    }
+
+    /// The display live viewers see: the one the latest screenshot starts
+    /// on, else the primary one.
+    fn live_display<'a>(&self, displays: &'a [Display]) -> Option<&'a Display> {
+        self.shot
+            .and_then(|shot| {
+                displays
+                    .iter()
+                    .find(|display| display.contains(shot.origin_x, shot.origin_y))
+            })
+            .or_else(|| displays.first())
     }
 
     // ---- Act --------------------------------------------------------------
@@ -1071,6 +1077,9 @@ impl Engine {
         // Said to the agent with the result.
         let mut note: Option<&'static str> = None;
 
+        // The global point the action landed on, shown on the host and to
+        // live viewers.
+        let mut landed: Option<(f64, f64)> = None;
         let _injecting = (!matches!(action.as_str(), "wait" | "open_app" | "focus_window"))
             .then(platform::injecting);
         let path = match action.as_str() {
@@ -1089,14 +1098,14 @@ impl Engine {
                         _ => false,
                     };
                 if done {
-                    mark_background(center, off_screen);
+                    landed = mark_background(center, off_screen);
                     "background"
                 } else {
                     // No way without the pointer.
                     pointer(false)?;
                     let at = require_point(pointer_at)?;
                     landing(at, false)?;
-                    super::host_ui::mark_point(at.0, at.1);
+                    landed = mark(at);
                     let button = if action == "click" {
                         MouseButton::Left
                     } else {
@@ -1157,7 +1166,7 @@ impl Engine {
                         format!("{action} is not available for this element; observe again and try click, or another element"),
                     ));
                 }
-                mark_background(center, off_screen);
+                landed = mark_background(center, off_screen);
                 "background"
             }
             "type" if external.is_some() => {
@@ -1187,7 +1196,7 @@ impl Engine {
                 pointer(point.is_some())?;
                 let at = require_point(pointer_at)?;
                 landing(at, point.is_some())?;
-                super::host_ui::mark_point(at.0, at.1);
+                landed = mark(at);
                 let button = if action == "click" {
                     MouseButton::Left
                 } else {
@@ -1204,7 +1213,7 @@ impl Engine {
                 pointer(true)?;
                 let at = require_point(pointer_at)?;
                 landing(at, point.is_some())?;
-                super::host_ui::mark_point(at.0, at.1);
+                landed = mark(at);
                 self.input()?
                     .backend()
                     .pointer_click(to_point(at), MouseButton::Left, 2)
@@ -1215,6 +1224,7 @@ impl Engine {
                 pointer(true)?;
                 let at = require_point(pointer_at)?;
                 landing(at, point.is_some())?;
+                landed = mark(at);
                 self.input()?
                     .mouse()
                     .move_to(to_point(at))
@@ -1227,7 +1237,7 @@ impl Engine {
                 let to = to.ok_or_else(|| ComputerError::invalid("drag needs toX and toY"))?;
                 landing(from, point.is_some())?;
                 landing(to, false)?;
-                super::host_ui::mark_point(from.0, from.1);
+                landed = mark(from);
                 self.input()?
                     .mouse()
                     .drag(to_point(from), to_point(to))
@@ -1245,6 +1255,7 @@ impl Engine {
                     None => self.default_point()?,
                 };
                 landing(at, point.is_some())?;
+                landed = mark(at);
                 self.input()?
                     .mouse()
                     .scroll(to_point(at), delta)
@@ -1345,6 +1356,13 @@ impl Engine {
             json!({ "app": app.as_ref().map(app_json).unwrap_or_else(|| json!({})), "path": path });
         if let Some(note) = note {
             result["note"] = json!(note);
+        }
+        let displays = platform::displays();
+        if let Some((x, y)) = landed.and_then(|(x, y)| {
+            self.live_display(&displays)
+                .and_then(|display| normalized(display, x, y))
+        }) {
+            result["point"] = json!({ "x": x, "y": y });
         }
         Ok(result)
     }
@@ -1613,12 +1631,31 @@ fn needs_pointer(app: &str, off_screen: bool) -> ComputerError {
     }
 }
 
+/// Shows the AI cursor at a global point an action is about to hit;
+/// returns the point.
+fn mark(at: (f64, f64)) -> Option<(f64, f64)> {
+    super::host_ui::mark_point(at.0, at.1);
+    Some(at)
+}
+
 /// Shows where a background action landed, as pointer clicks do, when the
 /// element is on this screen.
-fn mark_background(center: Option<(f64, f64)>, off_screen: bool) {
-    if let (Some((x, y)), false) = (center, off_screen) {
-        super::host_ui::mark_point(x, y);
+fn mark_background(center: Option<(f64, f64)>, off_screen: bool) -> Option<(f64, f64)> {
+    match (center, off_screen) {
+        (Some(at), false) => mark(at),
+        _ => None,
     }
+}
+
+/// A global point as a fraction of `display` (0 at its top-left, 1 at its
+/// bottom-right), for live viewers; `None` off that display.
+fn normalized(display: &Display, x: f64, y: f64) -> Option<(f64, f64)> {
+    (display.contains(x, y) && display.width > 0.0 && display.height > 0.0).then(|| {
+        (
+            (x - display.x) / display.width,
+            (y - display.y) / display.height,
+        )
+    })
 }
 
 /// Rows and cells: clicked by selecting them (outline and table rows
@@ -2275,6 +2312,23 @@ mod tests {
             (clipped.x, clipped.y, clipped.width, clipped.height),
             (0, 700, 300, 100)
         );
+    }
+
+    #[test]
+    fn landing_points_are_fractions_of_the_live_display() {
+        // A second display, left of and above the primary one.
+        let display = Display {
+            index: 1,
+            x: -1000.0,
+            y: -200.0,
+            width: 1000.0,
+            height: 800.0,
+            scale: 2.0,
+        };
+        assert_eq!(normalized(&display, -750.0, 0.0), Some((0.25, 0.25)));
+        assert_eq!(normalized(&display, -1000.0, -200.0), Some((0.0, 0.0)));
+        // On the primary display: not shown in this display's frames.
+        assert_eq!(normalized(&display, 10.0, 10.0), None);
     }
 
     fn app(id: &str, pid: u32) -> Target {

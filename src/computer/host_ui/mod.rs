@@ -144,7 +144,8 @@ pub(crate) fn show_permission_guide(missing: Vec<Permission>) {
     }
 }
 
-/// Briefly marks a global point a pointer action is about to hit.
+/// Briefly marks a global point an action is about to hit. On macOS an AI
+/// cursor glides there first, and this returns once it has arrived.
 pub(crate) fn mark_point(x: f64, y: f64) {
     if available() {
         native::mark_point(x, y);
@@ -182,7 +183,7 @@ pub(crate) fn confirming() -> bool {
     CONFIRMING.load(Ordering::SeqCst) > 0
 }
 
-/// The window number of the pointer marker, which lets clicks through;
+/// The window number of the AI cursor, which lets clicks through;
 /// hit tests skip it.
 #[cfg(target_os = "macos")]
 pub(crate) fn marker_window() -> Option<u32> {

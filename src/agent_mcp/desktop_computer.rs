@@ -772,6 +772,12 @@ impl DesktopTools {
                 if let Some(path) = result["path"].as_str() {
                     event["path"] = Value::from(path);
                 }
+                // Where it landed, as fractions of the live view's display.
+                if let (Some(x), Some(y)) =
+                    (result["point"]["x"].as_f64(), result["point"]["y"].as_f64())
+                {
+                    event["point"] = json!({ "x": x, "y": y });
+                }
                 self.success(conversation_id, call.tool, result, &mut event)
                     .await
             }
