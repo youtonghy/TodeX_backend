@@ -1601,6 +1601,31 @@ while IFS= read -r line; do
         printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
       ) &
       ;;
+    *bg-pair*)
+      printf '{"type":"system","subtype":"task_started","task_id":"bg-1","is_backgrounded":true,"task_type":"local_bash","description":"first"}\n'
+      printf '{"type":"system","subtype":"task_started","task_id":"bg-2","is_backgrounded":true,"task_type":"local_bash","description":"second"}\n'
+      printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bg-1"},{"task_id":"bg-2"}]}\n'
+      parent=$$
+      (
+        for task in bg-1 bg-2; do
+          while [ ! -f "$dir/finish-bg" ] && kill -0 "$parent" 2>/dev/null; do sleep 0.02; done
+          [ -f "$dir/finish-bg" ] || exit 0
+          rm -f "$dir/finish-bg"
+          printf '{"type":"system","subtype":"task_notification","task_id":"%s","status":"completed","task_type":"local_bash"}\n' "$task"
+          if [ "$task" = bg-1 ]; then
+            printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bg-2"}]}\n'
+          else
+            printf '{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n'
+          fi
+          sleep 0.1
+          printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+          printf '{"type":"system","subtype":"init"}\n'
+          printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s reported"}]}}\n' "$task"
+          printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"%s reported"}\n' "$task"
+          printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+        done
+      ) &
+      ;;
     *background*)
       printf '{"type":"system","subtype":"task_started","task_id":"bg-1","is_backgrounded":true,"task_type":"local_bash"}\n'
       printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bg-1"}]}\n'
@@ -2413,6 +2438,45 @@ done
         fixture.turn(&sessions, &manifest, "after").await;
         assert_eq!(fixture.launches().len(), 1);
         assert!(fixture.overlaps().is_empty());
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    /// The incident behind this: two backgrounded commands ran, one finished
+    /// and Claude reported on it in an invocation of its own. That turn knew
+    /// nothing of the other command, so it never re-announced it and clients
+    /// showed the conversation as done while it still waited.
+    #[tokio::test]
+    async fn a_follow_up_turn_re_announces_the_background_tasks_still_running() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (handle, mut offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &manifest, "bg-pair", offering(&handle))
+            .await;
+        for task in ["bg-1", "bg-2"] {
+            fixture.finish_background();
+            let work = next_offer(&mut offers).await;
+            assert_eq!(work.trigger["taskIds"], json!([task]));
+            fixture
+                .turn_with(&sessions, &manifest, "unused", adopting(&work.adoption))
+                .await;
+        }
+        let history = fixture.store.complete_history(&manifest.id).await.unwrap();
+        let announced: Vec<_> = history
+            .iter()
+            .filter(|event| event.payload["providerMethod"] == "background_tasks_pending")
+            .map(|event| &event.payload["metadata"])
+            .collect();
+        let ids: Vec<_> = announced
+            .iter()
+            .map(|meta| meta["taskIds"].clone())
+            .collect();
+        assert_eq!(ids, [json!(["bg-1", "bg-2"]), json!(["bg-2"])]);
+        // The re-announced task keeps what its start described.
+        assert_eq!(announced[1]["tasks"][0]["description"], "second");
+        assert_eq!(fixture.launches().len(), 1);
         sessions.stop_all().await;
         cleanup(&fixture.root);
     }

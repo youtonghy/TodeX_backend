@@ -47,7 +47,10 @@ optional and canonical aliases are recomputed when old journals are replayed.
   settings), which reads them on the same process. If that turn cannot open
   within 10 s the process is retired as before; a prompt that gets there
   first reads Claude's invocation together with its own answer, ending only
-  at the `idle` after Claude replayed the prompt. Cancel returns at once,
+  at the `idle` after Claude replayed the prompt. The background tasks a turn
+  waits on and reports in `background_tasks_pending` are tracked per process,
+  not per turn: when one of several tasks finishes, the provider-initiated turn
+  it starts still announces the others when it ends. Cancel returns at once,
   then sends `interrupt` and keeps the process only if it settles to `idle`
   within 5 s.
 - Claude Code `result` frames close a model turn, not the process. Claude runs

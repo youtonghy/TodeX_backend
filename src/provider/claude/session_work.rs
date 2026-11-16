@@ -53,6 +53,10 @@ pub(super) struct SessionWork {
     scheduling: HashMap<String, Option<u64>>,
     /// `CronCreate` calls awaiting their result.
     cron_creating: HashSet<String>,
+    /// The background tasks a turn reports to clients and waits on. Kept for
+    /// the process, not the turn: a task that finishes between turns starts
+    /// a follow-up turn that must still announce the tasks left running.
+    pub(super) tasks: super::BackgroundTasks,
 }
 
 impl SessionWork {
@@ -70,6 +74,7 @@ impl SessionWork {
 
     /// Tracks a `system` frame, in or between turns.
     pub(super) fn apply_system(&mut self, message: &Value) {
+        self.tasks.apply(message);
         let task_id = message.get("task_id").and_then(Value::as_str);
         match message.get("subtype").and_then(Value::as_str) {
             Some("task_started") => {
@@ -404,6 +409,34 @@ mod tests {
         // Taken by that trigger.
         assert_eq!(work.trigger(now)["kind"], "unknown");
         assert!(work.task_ids().is_empty());
+    }
+
+    /// One of two tasks finishes between turns: the follow-up invocation owes
+    /// its report until `init`, then still waits on the other task.
+    #[test]
+    fn the_tasks_a_turn_reports_carry_over_to_the_next() {
+        let mut work = SessionWork::default();
+        for id in ["a", "b"] {
+            work.apply_system(&system(
+                "task_started",
+                json!({ "task_id": id, "is_backgrounded": true, "task_type": "local_bash" }),
+            ));
+        }
+        work.end_turn();
+        work.apply_system(&system("task_notification", json!({ "task_id": "a" })));
+        work.apply_system(&system(
+            "background_tasks_changed",
+            json!({ "tasks": [{ "task_id": "b" }] }),
+        ));
+        work.begin_turn();
+        work.apply_system(&system("init", json!({})));
+        assert!(work.tasks.pending());
+        assert_eq!(work.tasks.ids(), [json!("b")]);
+
+        work.apply_system(&system("task_notification", json!({ "task_id": "b" })));
+        work.apply_system(&system("background_tasks_changed", json!({ "tasks": [] })));
+        work.apply_system(&system("init", json!({})));
+        assert!(!work.tasks.pending());
     }
 
     #[test]

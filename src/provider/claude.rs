@@ -3271,7 +3271,6 @@ async fn read_claude_turn(
 
     let mut saw_output = false;
     let mut tools = ClaudeToolCalls::default();
-    let mut background_tasks = BackgroundTasks::default();
     // Epoch from a rejected `rate_limit_event` or `quotaLimits`. Preferred
     // over the wall clock in the error text, which Claude rounds.
     let mut rejected_reset: Option<DateTime<Utc>> = None;
@@ -3422,7 +3421,7 @@ async fn read_claude_turn(
                     // unreplayed until Claude replays it, so the resends add up.
                     prompt_resends += 1;
                     process.send(&user_message).await?;
-                    wait = Some(IdleWait::start(after_idle, &background_tasks));
+                    wait = Some(IdleWait::start(after_idle, &work.tasks));
                     continue;
                 }
                 let Some(result) = settled.take() else {
@@ -3439,8 +3438,8 @@ async fn read_claude_turn(
                     return Err(idle_without_result(sink));
                 };
                 tracing::warn!(
-                    grace_ms = idle_confirm_grace(&background_tasks).as_millis() as u64,
-                    background_tasks = background_tasks.pending(),
+                    grace_ms = idle_confirm_grace(&work.tasks).as_millis() as u64,
+                    background_tasks = work.tasks.pending(),
                     "Claude Code did not report idle after its result; ending the turn"
                 );
                 sink.emit(
@@ -3449,8 +3448,8 @@ async fn read_claude_turn(
                         "provider": "claude-code",
                         "providerMethod": "idle_timeout",
                         "metadata": {
-                            "taskIds": background_tasks.ids(),
-                            "tasks": background_tasks.tasks(),
+                            "taskIds": work.tasks.ids(),
+                            "tasks": work.tasks.tasks(),
                         },
                     }),
                 )
@@ -3521,15 +3520,15 @@ async fn read_claude_turn(
                 // The `result` is the turn's answer either way, so it is kept
                 // even while that work is outstanding: dropping it left the
                 // turn with nothing to end on when the `idle` never came.
-                if background_tasks.pending() {
+                if work.tasks.pending() {
                     sink.emit(
                         "provider.event",
                         json!({
                             "provider": "claude-code",
                             "providerMethod": "background_tasks_pending",
                             "metadata": {
-                                "taskIds": background_tasks.ids(),
-                                "tasks": background_tasks.tasks(),
+                                "taskIds": work.tasks.ids(),
+                                "tasks": work.tasks.tasks(),
                             },
                         }),
                     )
@@ -3537,16 +3536,16 @@ async fn read_claude_turn(
                 }
                 if session_states {
                     settled = Some(message);
-                    wait = Some(IdleWait::start(false, &background_tasks));
+                    wait = Some(IdleWait::start(false, &work.tasks));
                     continue;
                 }
                 // No session state events (an older CLI): only outstanding
                 // work keeps the turn open.
-                if !background_tasks.pending() {
+                if !work.tasks.pending() {
                     break (message, true);
                 }
                 settled = Some(message);
-                wait = Some(IdleWait::start(false, &background_tasks));
+                wait = Some(IdleWait::start(false, &work.tasks));
                 continue;
             }
             Some("stream_event") => {
@@ -3598,7 +3597,7 @@ async fn read_claude_turn(
                 {
                     unreplayed = None;
                 }
-                background_tasks.delivered(&message);
+                work.tasks.delivered(&message);
                 let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
                 for block in content_blocks(&message, "tool_result") {
                     if subagent.is_none() {
@@ -3695,13 +3694,12 @@ async fn read_claude_turn(
                             // the wait; silence resends the queued prompt or
                             // ends the turn.
                             wait = (!open_requests.outstanding())
-                                .then(|| IdleWait::start(true, &background_tasks));
+                                .then(|| IdleWait::start(true, &work.tasks));
                         }
                         _ => {}
                     }
                     continue;
                 }
-                background_tasks.apply(&message);
                 work.apply_system(&message);
                 if let Some((event, payload)) = subagents.system_event(&message, &prompt.turn_id) {
                     sink.emit(event, payload).await?;
@@ -3862,7 +3860,7 @@ async fn read_claude_turn(
         // is never on a deadline.
         if let Some(current) = wait {
             wait = (!open_requests.outstanding())
-                .then(|| IdleWait::start(current.after_idle, &background_tasks));
+                .then(|| IdleWait::start(current.after_idle, &work.tasks));
         }
     };
     if session_states {
@@ -4329,7 +4327,9 @@ async fn confirmation_due(deadline: Option<Instant>) {
     }
 }
 
-/// Background work that keeps a Claude turn open.
+/// Background work that keeps a Claude turn open. One lives as long as the
+/// process (in [`session_work::SessionWork`]): a task can outlast the turn that
+/// started it, and the turns Claude starts on finished tasks report it too.
 ///
 /// `live` mirrors the Agent SDK: `task_started` adds (unless explicitly
 /// foreground), `task_notification` removes, and `background_tasks_changed`
@@ -4344,15 +4344,15 @@ async fn confirmation_due(deadline: Option<Instant>) {
 /// current `result`. `owed` holds notified tasks not handed over yet; ending
 /// on the earlier `result` would kill the process with the hand-back still
 /// queued, while waiting for a hand-back that already happened never ends.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct BackgroundTasks {
     /// Live background tasks by task_id, with what clients show while the
     /// turn only waits on them.
     live: HashMap<String, BackgroundTaskInfo>,
-    /// Known task metadata seen this turn (foreground or background):
+    /// Known task metadata seen on this process (foreground or background):
     /// task_id -> info.
     known: HashMap<String, BackgroundTaskInfo>,
-    /// Main-session background tasks seen this turn. Tasks a subagent owns
+    /// Main-session background tasks seen on this process. Tasks a subagent owns
     /// notify that subagent, not the main session, so they owe no follow-up.
     main: HashSet<String>,
     /// Notified main-session tasks (task_id → run_id) whose notification the
