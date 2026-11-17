@@ -25,6 +25,11 @@
 //! cached `--mode auto -p=/help` probe decides first; without Auto the turn
 //! runs like `ask`, and TodeX's own MCP tools, which the supervisor set to
 //! follow `auto`, are switched to asking as well.
+//!
+//! agy's own review (plan and native Auto turns) denies every MCP call
+//! headless, the hook's `allow` notwithstanding, so those launches pass a
+//! session-only `--settings` allowing TodeX's own MCP servers: they gate
+//! their tools by the turn's mode themselves.
 
 mod integration;
 
@@ -264,14 +269,30 @@ impl AntigravityDriver {
             == Some("auto"))
     }
 
+    /// `<gemini>/antigravity-cli/settings.json`, next to TodeX's integration
+    /// directory (`<gemini>/config`).
+    fn settings_path(&self) -> Option<PathBuf> {
+        let gemini = self.integration_dir.parent()?;
+        Some(gemini.join("antigravity-cli").join("settings.json"))
+    }
+
+    /// The `--settings` value for [`todex_mcp_settings`].
+    async fn todex_mcp_settings(&self) -> Result<String, AppError> {
+        let settings = self.settings_path().ok_or_else(|| {
+            AppError::ProviderUnavailable("agy's settings directory is unknown".to_owned())
+        })?;
+        tokio::task::spawn_blocking(move || todex_mcp_settings(&settings))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))?
+    }
+
     /// Ensures `<gemini>/antigravity-cli/settings.json` does not pin
     /// `agentMode` to a non-`"auto"` value that would override post-auth
     /// `initAgentMode` on `agy` 1.5.9+.
     async fn ensure_agy_settings_allow_auto(&self) {
-        let Some(gemini) = self.integration_dir.parent() else {
+        let Some(settings) = self.settings_path() else {
             return;
         };
-        let settings = gemini.join("antigravity-cli").join("settings.json");
         let result = tokio::task::spawn_blocking(move || ensure_settings_allow_auto(&settings))
             .await
             .map_err(|error| AppError::Anyhow(error.into()));
@@ -465,6 +486,18 @@ impl ProviderDriver for AntigravityDriver {
         // Only a native Auto launch may tell the hook to leave calls to agy.
         if !native_auto {
             spec.env.remove(AGY_NATIVE_AUTO_ENV);
+        }
+        if bridged && (controls.work_mode == "plan" || native_auto) {
+            // agy's own review stays on and, headless, denies every MCP call
+            // even when the hook allows it; TodeX's own MCP servers gate
+            // their tools by the turn's mode, so agy lets them through.
+            match self.todex_mcp_settings().await {
+                Ok(settings) => spec.push_flag_value("--settings", &settings)?,
+                Err(error) => tracing::warn!(
+                    %error,
+                    "could not allow TodeX's MCP tools through agy's own review; agy will deny them"
+                ),
+            }
         }
         if controls.work_mode == "plan" {
             spec.args.extend(["--mode".to_owned(), "plan".to_owned()]);
@@ -840,6 +873,37 @@ async fn install_integration(dir: &Path, daemon: &Path) -> Result<(), AppError> 
     })
     .await
     .map_err(|error| AppError::Anyhow(error.into()))?
+}
+
+/// agy's session-only `--settings` that allows every tool of TodeX's own MCP
+/// servers (`mcp(<server>/*)`; a bare `mcp(<server>)` matches nothing).
+/// `--settings` replaces the `permissions` of `settings.json` as a whole, so
+/// the user's own rules, deny and ask included, are carried over.
+fn todex_mcp_settings(path: &Path) -> Result<String, AppError> {
+    let invalid = |key: &str, kind: &str| {
+        AppError::InvalidRequest(format!(
+            "Antigravity CLI settings `{key}` must be a JSON {kind}: {}",
+            path.display()
+        ))
+    };
+    let settings = crate::agent_providers::files::read_json5(path, "Antigravity CLI settings")?;
+    let mut permissions = match settings.as_ref().and_then(|s| s.get("permissions")) {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(permissions)) => permissions.clone(),
+        Some(_) => return Err(invalid("permissions", "object")),
+    };
+    let allow = permissions
+        .entry("allow")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| invalid("permissions.allow", "array"))?;
+    for (server, _, _) in crate::agent_mcp::ALL_SERVERS {
+        let rule = Value::String(format!("mcp({server}/*)"));
+        if !allow.contains(&rule) {
+            allow.push(rule);
+        }
+    }
+    Ok(json!({ "permissions": permissions }).to_string())
 }
 
 fn ensure_settings_allow_auto(path: &Path) -> Result<(), AppError> {
@@ -1778,6 +1842,12 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 .expect("the Auto mode probe starts");
             }
 
+            /// The parsed `--settings` value of a launch.
+            fn settings_arg(launch: &[String]) -> Option<Value> {
+                let index = launch.iter().position(|arg| arg == "--settings")?;
+                Some(serde_json::from_str(&launch[index + 1]).unwrap())
+            }
+
             fn mark(&self, name: &str) {
                 std::fs::write(self.root.join(name), "").unwrap();
             }
@@ -1942,6 +2012,58 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             assert_eq!(launch[mode + 1], "auto");
             assert_eq!(fixture.last_auto_hint(), "1");
             assert_eq!(fixture.tool_mode(), Some(ToolMode::Auto));
+        }
+
+        #[tokio::test]
+        async fn turns_under_agys_own_review_allow_todex_mcp_and_keep_the_users_rules() {
+            let fixture = Fixture::with_bridge().await;
+            let settings = fixture.root.join("antigravity-cli");
+            std::fs::create_dir_all(&settings).unwrap();
+            std::fs::write(
+                settings.join("settings.json"),
+                r#"{ "permissions": { "allow": ["command(ls)", "mcp(todex_ssh/*)"],
+                     "deny": ["mcp(todex_ssh/ssh_exec)"] } }"#,
+            )
+            .unwrap();
+            fixture
+                .run("turn-1", "hello", Some("plan"), None)
+                .await
+                .unwrap();
+            fixture
+                .run("turn-2", "again", Some("auto"), None)
+                .await
+                .unwrap();
+            fixture
+                .run("turn-3", "more", Some("ask"), None)
+                .await
+                .unwrap();
+            let launches = fixture.launches();
+            for launch in &launches[..2] {
+                assert_eq!(
+                    Fixture::settings_arg(launch),
+                    Some(json!({ "permissions": {
+                        "allow": [
+                            "command(ls)",
+                            "mcp(todex_ssh/*)",
+                            "mcp(todex_desktop/*)",
+                            "mcp(todex_agents/*)",
+                        ],
+                        "deny": ["mcp(todex_ssh/ssh_exec)"],
+                    } }))
+                );
+            }
+            // Ask turns skip agy's review; TodeX's hook decides.
+            assert_eq!(Fixture::settings_arg(&launches[2]), None);
+        }
+
+        #[tokio::test]
+        async fn unbridged_turns_do_not_allow_todex_mcp() {
+            let fixture = Fixture::new().await;
+            fixture
+                .run("turn-1", "hello", Some("plan"), None)
+                .await
+                .unwrap();
+            assert_eq!(Fixture::settings_arg(&fixture.launches()[0]), None);
         }
 
         #[tokio::test]
