@@ -785,7 +785,7 @@ daemon 按文件修改时间重新加载 key，修改无需重启就会生效。
 
 | `approval` | 行为 |
 | --- | --- |
-| `ask` | Agent 请求权限时推送 `permission.requested` 事件，由调用方 `POST …/permissions/{permissionId}` 回答；超时或取消时的处理与设备端相同 |
+| `ask` | Agent 请求权限时推送 `permission.requested` 事件，由调用方 `POST …/permissions/{permissionId}` 回答；请求不会过期，一直等到回答或取消本轮，取消时的处理与设备端相同 |
 | `auto-approve` | 后端立即选择 `allow_once` 选项；没有该选项的请求（例如提问）仍交给调用方回答 |
 | `reject` | 后端立即依次尝试 `reject_once`、`reject_always`、`abort_turn` 选项 |
 

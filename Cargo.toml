@@ -110,6 +110,8 @@ wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 png = "0.18"
 
 [dev-dependencies]
+# Paused-clock tests (`#[tokio::test(start_paused = true)]`).
+tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.29"
 tungstenite = "0.29"
 

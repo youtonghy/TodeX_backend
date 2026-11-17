@@ -9,7 +9,7 @@ use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch};
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::conversation::{
@@ -20,7 +20,6 @@ use crate::error::AppError;
 
 use super::process::ProviderRead;
 
-const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Unparseable provider lines journalled per turn; later ones are only logged.
 const MAX_REPORTED_UNPARSED_LINES: usize = 20;
 /// Snapshot events a provider may repeat verbatim (rate-limit and token
@@ -1865,13 +1864,12 @@ impl PermissionBroker {
             }
         }
 
+        // No deadline: the request waits until the user answers, the turn is
+        // cancelled, or the broker drops it (daemon shutdown or restart). A
+        // user who steps away comes back to the same prompt.
         let decision = tokio::select! {
-            result = timeout(PERMISSION_TIMEOUT, receiver) => {
-                match result {
-                    Ok(Ok(decision)) => Ok(decision),
-                    Ok(Err(_)) => Err(AppError::InvalidRequest("permission request was closed".to_owned())),
-                    Err(_) => Err(AppError::InvalidRequest("permission request expired".to_owned())),
-                }
+            result = receiver => {
+                result.map_err(|_| AppError::InvalidRequest("permission request was closed".to_owned()))
             }
             changed = cancel.changed() => {
                 let _ = changed;
@@ -1944,7 +1942,7 @@ impl PermissionBroker {
     }
 
     /// Whether a dialog for this conversation is waiting on the user; such a
-    /// wait is bounded by its own timeout, not the provider idle watchdog.
+    /// wait has no deadline and is exempt from the provider idle watchdog.
     pub fn has_pending(&self, conversation_id: &str) -> bool {
         self.pending
             .iter()
@@ -2592,6 +2590,72 @@ mod tests {
                 ("plan.updated", None, Some("turn-1")),
             ]
         );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// A user who steps away for hours comes back to the same prompt.
+    #[tokio::test(start_paused = true)]
+    async fn pending_permissions_wait_for_the_user_without_a_deadline() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-permission-no-deadline-{}",
+            Uuid::new_v4().simple()
+        ));
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::ClaudeCode,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let broker = PermissionBroker::default();
+        let sink = DriverEventSink::new(
+            store.clone(),
+            ConversationEventHub::default(),
+            broker.clone(),
+            &manifest.id,
+        );
+        let (_cancel, mut cancel_rx) = watch::channel(false);
+        let request = {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                sink.request_permission(
+                    "r".to_owned(),
+                    "plan",
+                    "Approve Claude's plan?",
+                    Value::Null,
+                    json!([{ "id": "allow", "kind": "allow_once", "name": "Approve" }]),
+                    &mut cancel_rx,
+                )
+                .await
+            })
+        };
+        let permission_id = loop {
+            if let Some(entry) = broker.pending.iter().next() {
+                break entry.key().clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+        assert!(!request.is_finished());
+        assert!(broker.has_pending(&manifest.id));
+        broker
+            .resolve(
+                &manifest.id,
+                &permission_id,
+                "dev",
+                PermissionDecision {
+                    outcome: PermissionOutcome::AllowOnce,
+                    option_id: Some("allow".to_owned()),
+                    data: None,
+                },
+            )
+            .await
+            .unwrap();
+        let decision = request.await.unwrap().unwrap();
+        assert!(matches!(decision.outcome, PermissionOutcome::AllowOnce));
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

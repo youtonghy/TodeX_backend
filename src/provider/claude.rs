@@ -3318,7 +3318,7 @@ async fn read_claude_turn(
     let mut wait: Option<IdleWait> = None;
     // Prompts queued behind Claude's own invocation that it never took.
     let mut prompt_resends = 0_u32;
-    // `can_use_tool` waits on the user for up to the permission timeout, so
+    // `can_use_tool` waits on the user for as long as they take, so
     // control requests are answered by detached tasks while this loop keeps
     // draining stdout — awaiting a prompt inline would let the pipe fill and
     // freeze the whole Claude process, async subagents included, until its
@@ -5310,7 +5310,7 @@ fn start_replan(
 }
 
 /// Waits for the user's decision and builds the `can_use_tool` response body.
-/// Errors mean the prompt itself failed (cancelled, expired, or journal
+/// Errors mean the prompt itself failed (cancelled, closed, or journal
 /// write), not that the user denied the tool. `cwd` is Claude's working
 /// directory, which relative file paths in the request refer to. An approved
 /// `ExitPlanMode` in a turn with `handoff` switches Claude to the execute

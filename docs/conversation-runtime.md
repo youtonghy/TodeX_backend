@@ -200,6 +200,10 @@ optional and canonical aliases are recomputed when old journals are replayed.
   permission request of the conversation is pending. The turn is cancelled
   normally, the driver is aborted if it has not finished 30 s later, and the
   turn ends with `turn.failed` code `PROVIDER_IDLE_TIMEOUT`.
+- A pending permission request (tool approval, question, plan review) has no
+  deadline: it waits until a device answers it, the turn is cancelled, or the
+  daemon stops (restart recovery then resolves it as `cancelled` with reason
+  `daemon_restarted`).
 - `[agent].provider_keepalive_seconds` (default 300, clamped to 30..=604800; env
   `TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS`) is how long a resident provider
   process (Codex, Claude Code, Pi, OpenCode, Grok Build, Devin, DeepSeek Harness and ACP

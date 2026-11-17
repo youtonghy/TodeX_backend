@@ -2683,7 +2683,7 @@ async fn handle_client_request(
 
 /// The option a tool permission request is answered with: chosen client-side
 /// in `auto`/`full-access`, otherwise by the user. `None` when the request
-/// lapsed (expired or closed broker request), so the turn continues without
+/// lapsed (the broker closed it, e.g. on daemon shutdown), so the turn continues without
 /// the tool; a user-initiated cancel is an error that ends the turn.
 async fn decide_permission(
     request: &RequestPermissionRequest,
