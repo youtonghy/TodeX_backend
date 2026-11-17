@@ -67,6 +67,8 @@ session = "agy-session-1"
 active = None
 permission = None
 background_work = False
+early_permission = False
+idle_queries = 0
 log_path = next((args[index + 1] for index, arg in enumerate(args[:-1]) if arg == "--log-file"), None)
 if log_path:
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -74,7 +76,14 @@ if log_path:
 
     class IdleHandler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
+            global idle_queries
+            idle_queries += 1
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            # The first EARLY_PERMISSION query reports idle before approval.
+            # Later queries observe work started by that approval.
+            if early_permission and idle_queries > 1:
+                while permission is not None:
+                    time.sleep(0.01)
             with open(os.path.join(here, "idle-requests.jsonl"), "a") as journal:
                 journal.write(json.dumps(body) + "\n")
             if marked("native-error"):
@@ -94,6 +103,8 @@ if log_path:
             self.send_header("Content-Length", str(len(response)))
             self.end_headers()
             self.wfile.write(response)
+            with open(os.path.join(here, "idle-completed"), "a") as journal:
+                journal.write("complete\n")
 
         def log_message(self, *unused):
             pass
@@ -189,7 +200,7 @@ def ask(call_id, name, raw):
 
 
 def prompt(request_id, params):
-    global active, background_work
+    global active, background_work, early_permission
     active = request_id
     blocks = params["prompt"]
     text = next((block["text"] for block in blocks if block.get("type") == "text"), "")
@@ -218,6 +229,7 @@ def prompt(request_id, params):
             time.sleep(0.15)
         ask("call-write", "write_file", raw)
         if text == "EARLY_PERMISSION":
+            early_permission = True
             finish()
         return
     if text == "TODEX_MCP":
@@ -308,8 +320,12 @@ for line in sys.stdin:
                "error": {"code": -32601, "message": f"Method not found: {method}"}})
     elif request_id == 99 and permission is not None:
         call_id, name, raw = permission
+        if early_permission:
+            background_work = True
         permission = None
         allowed = request.get("result", {}).get("outcome", {}).get("optionId") == "allow"
+        if early_permission:
+            time.sleep(0.15)
         tool_call("tool_call_update", call_id, name, raw, "completed" if allowed else "failed")
         update("agent_message_chunk", content={"type": "text",
                "text": "allowed" if allowed else "denied"})

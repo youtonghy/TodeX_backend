@@ -29,6 +29,6 @@ Connect-Protocol-Version: 1
 
 请求包含 `conversationId`、`inactivityTimeoutSeconds`、`stabilizationDurationSeconds`、`returnOnExecutorError`。响应的 `timedOut` 省略时为 protobuf 默认值 false。此探测没有发送模型 prompt；它验证了接口可访问与空会话响应，真实后台工作的返回分支由静态分析验证，TodeX 的生命周期处理由模拟 ACP / HTTP 回归测试验证。
 
-TodeX 在收到正常 ACP `end_turn` 后保留原 turn，同时接收 ACP 输出、处理权限与取消；等待原生确认空闲、答复完未决反向请求、处理已缓冲的 ACP 帧后才完成。`timedOut: true` 会重新等待。状态查询失败会使 turn 明确失败并丢弃进程。取消仍走有界 ACP 取消流程，不等待原生空闲。
+TodeX 在收到正常 ACP `end_turn` 后保留原 turn，同时接收 ACP 输出、处理权限与取消；等待原生确认空闲、答复完未决反向请求、处理已缓冲的 ACP 帧后才完成。`timedOut: true` 会重新等待。状态查询失败会使 turn 明确失败并丢弃进程。审批答复可能启动新工具或模型执行，因此答复后会重新确认空闲，不能复用答复前的状态。取消仍走有界 ACP 取消流程，不等待原生空闲。
 
 这是 AGY 的内部接口，后续 CLI 版本可能改变日志格式或 RPC。没有可验证的状态时必须明确报错，不能退回按静默时间推断成功。真实付费任务未用于本次验证。

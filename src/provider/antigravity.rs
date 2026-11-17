@@ -1376,6 +1376,14 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 assert!(tokio::time::timeout(Duration::from_millis(100), &mut turn)
                     .await
                     .is_err());
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !fixture.root.join("idle-completed").exists() {
+                        tokio::select! {
+                            result = &mut turn => panic!("turn ended before its permission was answered: {result:?}"),
+                            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                        }
+                    }
+                }).await.unwrap();
                 fixture
                     .permissions
                     .resolve(
@@ -1400,6 +1408,17 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 })
                 .await
                 .expect("the permission answer reaches agy before the turn ends");
+                assert!(
+                    std::fs::read_to_string(fixture.root.join("idle-requests.jsonl"))
+                        .unwrap()
+                        .lines()
+                        .count()
+                        >= 2,
+                    "idle must be reconfirmed after answering a permission"
+                );
+                assert!(fixture.events().await.iter().any(|(kind, payload)| {
+                    kind == "tool.updated" && payload["status"] == "completed"
+                }));
             }
             fixture.finish().await;
         }

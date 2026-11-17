@@ -46,7 +46,7 @@ impl NativeIdle {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        builder.create(&directory)?;
+        builder.recursive(false).create(&directory)?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]

@@ -1030,6 +1030,12 @@ async fn run_acp_turn_steps(
                     match response {
                         Some(Ok((responses, outcome))) => {
                             for response in responses { process.send(&response).await?; }
+                            if let Some(native_idle) = options.native_idle.as_ref().filter(|_| terminal_response.is_some()) {
+                                // Answering a permission can start fresh work;
+                                // an idle result from before the answer is stale.
+                                native_idle_confirmed = false;
+                                idle_wait = Some(Box::pin(native_idle.wait(&native_session_id)));
+                            }
                             if let Err(error) = outcome {
                                 if !matches!(error, AppError::TurnCancelled) { return Err(error); }
                             }
