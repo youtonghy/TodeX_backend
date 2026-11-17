@@ -210,7 +210,6 @@ async fn agent_mcp_injection_matrix_is_frozen() {
             McpInjection::AcpServers => Some("acp-servers"),
             McpInjection::ClaudeArgs => Some("claude-args"),
             McpInjection::PiExtension => Some("pi-extension"),
-            McpInjection::GlobalConfigEnv => Some("global-config-env"),
         };
         assert_eq!(declared, format, "{provider:?}");
     }
@@ -255,7 +254,6 @@ async fn supervisor_provider_branches_are_frozen() {
             .await
             .unwrap();
         let (file_text, file_content) = prepare_prompt_content(
-            provider,
             &workspace,
             None,
             vec![PromptContentRef::File {

@@ -1,40 +1,28 @@
-//! TodeX's entries in the Antigravity global config (`~/.gemini/config`,
-//! shared by the CLI, the desktop app and the IDE).
+//! What earlier TodeX versions left in the Antigravity global config
+//! (`~/.gemini/config`, shared by the CLI, the desktop app and the IDE),
+//! and its removal.
 //!
-//! `agy` has no per-launch flag for MCP servers or hooks, so TodeX keeps
-//! static entries there and points them at a conversation through the
-//! environment of the `agy` process it starts (see `agent_mcp`):
+//! Before TodeX drove `agy acp` it drove agy's print mode, which has no
+//! per-launch MCP servers or approvals, through static entries:
 //!
-//! - `mcp_config.json`: `todex_ssh` / `todex_desktop` / `todex_agents` run
-//!   `todex-agentd agent-mcp-bridge --route <route>`, with a
-//!   `timeoutSeconds` long enough for TodeX's approval prompts; outside a
+//! - `mcp_config.json`: `todex_ssh` / `todex_desktop` / `todex_agents`
+//!   running `todex-agentd agent-mcp-bridge --route <route>`; outside a
 //!   TodeX turn they serve no tools.
-//! - `hooks.json`: `todex-approval`, a `PreToolUse` hook for every tool,
-//!   runs a small script next to it. Outside a TodeX turn the script
-//!   prints nothing and exits 0 without starting the daemon; agy then
-//!   applies its own permissions as if no hook were installed. Inside one it
-//!   runs `todex-agentd agy-hook`.
+//! - `hooks.json`: `todex-approval`, a `PreToolUse` hook running a script
+//!   next to it that answers nothing outside a TodeX turn.
 //!
-//! Only TodeX's own keys are written; everything else in those files is
-//! kept (JSONC comments are not). Files are rewritten only when an entry
-//! differs.
+//! Only those keys and the script are removed; everything else in those
+//! files is kept (JSONC comments are not).
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::agent_mcp::{
-    AGY_HOOK_SUBCOMMAND, ALL_SERVERS, BRIDGE_SUBCOMMAND, ENDPOINT_ENV, ROUTE_ARG,
-};
-use crate::agent_providers::files::{
-    atomic_write_private, modify_json5_file, read_json5, read_text, remove_file_if_exists,
-};
+use crate::agent_mcp::ALL_SERVERS;
+use crate::agent_providers::files::{modify_json5_file, read_json5, remove_file_if_exists};
 use crate::error::AppError;
 
-pub(crate) const HOOK_NAME: &str = "todex-approval";
-/// agy kills a hook after its `timeout`; TodeX's own prompt timeout
-/// decides first.
-const HOOK_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+const HOOK_NAME: &str = "todex-approval";
 #[cfg(not(windows))]
 const HOOK_SCRIPT: &str = "todex-agy-hook.sh";
 #[cfg(windows)]
@@ -48,37 +36,6 @@ pub(crate) fn config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".gemini")
         .join("config")
-}
-
-/// Brings TodeX's entries in `dir` up to date for `daemon`. Blocking.
-pub(crate) fn ensure(dir: &Path, daemon: &Path) -> Result<(), AppError> {
-    let script = dir.join(HOOK_SCRIPT);
-    let content = hook_script(daemon);
-    if read_text(&script, "Antigravity hook script")?.as_deref() != Some(content.as_str()) {
-        atomic_write_private(&script, content.as_bytes())?;
-    }
-    upsert(
-        &dir.join("hooks.json"),
-        "Antigravity hooks",
-        &[HOOK_NAME],
-        hook_entry(),
-    )?;
-    let daemon = daemon.to_string_lossy();
-    for (name, route, tool_timeout_seconds) in ALL_SERVERS {
-        upsert(
-            &dir.join("mcp_config.json"),
-            "Antigravity MCP config",
-            &["mcpServers", name],
-            json!({
-                "command": daemon,
-                "args": [BRIDGE_SUBCOMMAND, ROUTE_ARG, route],
-                // agy otherwise ends a tool call after 180s, before an
-                // approval prompt has timed out.
-                "timeoutSeconds": tool_timeout_seconds,
-            }),
-        )?;
-    }
-    Ok(())
 }
 
 /// Removes TodeX's entries from `dir`. Returns whether anything was there.
@@ -99,69 +56,6 @@ pub(crate) fn remove(dir: &Path) -> Result<bool, AppError> {
     }
     removed |= remove_file_if_exists(&dir.join(HOOK_SCRIPT))?;
     Ok(removed)
-}
-
-fn hook_entry() -> Value {
-    #[cfg(not(windows))]
-    let command = format!("sh {HOOK_SCRIPT}");
-    #[cfg(windows)]
-    let command = HOOK_SCRIPT.to_owned();
-    // Hooks run in the directory holding hooks.json, which also holds the
-    // script, so the command needs no path quoting on any shell.
-    json!({
-        "PreToolUse": [{
-            "matcher": "*",
-            "hooks": [{ "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECONDS }],
-        }],
-    })
-}
-
-#[cfg(not(windows))]
-fn hook_script(daemon: &Path) -> String {
-    let daemon = daemon.to_string_lossy().replace('\'', r"'\''");
-    format!(
-        "#!/bin/sh\n\
-         # Installed by TodeX (todex-agentd) for the Antigravity CLI; remove it from TodeX's CLI settings.\n\
-         # Outside a TodeX turn it answers nothing, leaving agy's own permissions in charge.\n\
-         if [ -z \"${ENDPOINT_ENV}\" ]; then\n  cat >/dev/null\n  exit 0\nfi\n\
-         exec '{daemon}' {AGY_HOOK_SUBCOMMAND}\n"
-    )
-}
-
-#[cfg(windows)]
-fn hook_script(daemon: &Path) -> String {
-    let daemon = daemon.to_string_lossy();
-    format!(
-        "@echo off\r\n\
-         rem Installed by TodeX (todex-agentd) for the Antigravity CLI; remove it from TodeX's CLI settings.\r\n\
-         rem Outside a TodeX turn it answers nothing, leaving agy's own permissions in charge.\r\n\
-         if not defined {ENDPOINT_ENV} exit /b 0\r\n\
-         \"{daemon}\" {AGY_HOOK_SUBCOMMAND}\r\n"
-    )
-}
-
-/// Sets `path` (a key path) in the JSON document at `file` to `value`
-/// unless it already holds it.
-fn upsert(file: &Path, label: &str, path: &[&str], value: Value) -> Result<(), AppError> {
-    let current = read_json5(file, label)?;
-    if current.as_ref().and_then(|document| lookup(document, path)) == Some(&value) {
-        return Ok(());
-    }
-    modify_json5_file(file, label, |document| {
-        let mut node = document;
-        for key in &path[..path.len() - 1] {
-            let object = node
-                .as_object_mut()
-                .ok_or_else(|| not_object(file, label))?;
-            node = object
-                .entry((*key).to_owned())
-                .or_insert_with(|| Value::Object(Default::default()));
-        }
-        node.as_object_mut()
-            .ok_or_else(|| not_object(file, label))?
-            .insert(path[path.len() - 1].to_owned(), value);
-        Ok(())
-    })
 }
 
 fn remove_key(file: &Path, label: &str, path: &[&str]) -> Result<bool, AppError> {
@@ -187,17 +81,10 @@ fn lookup<'a>(document: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter().try_fold(document, |node, key| node.get(*key))
 }
 
-fn not_object(file: &Path, label: &str) -> AppError {
-    AppError::InvalidRequest(format!(
-        "{label} is not a JSON object where TodeX keeps its entry: {}",
-        file.display()
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_mcp::{AGENTS_ROUTE, AGENTS_SERVER, DESKTOP_SERVER, SSH_ROUTE, SSH_SERVER};
+    use crate::agent_mcp::{AGENTS_SERVER, SSH_SERVER};
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("todex-agy-config-{}", uuid::Uuid::new_v4()));
@@ -205,72 +92,39 @@ mod tests {
         dir
     }
 
+    fn read(path: PathBuf) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
     #[test]
-    fn ensure_adds_todex_entries_and_keeps_the_users() {
+    fn remove_takes_todex_entries_and_keeps_the_users() {
         let dir = temp_dir();
         std::fs::write(
             dir.join("mcp_config.json"),
-            r#"{ "mcpServers": { "mine": { "command": "x" } }, "other": 1 }"#,
+            json!({ "mcpServers": {
+                "mine": { "command": "x" },
+                SSH_SERVER: { "command": "todex-agentd", "args": ["agent-mcp-bridge", "--route", "/r"] },
+                AGENTS_SERVER: { "command": "todex-agentd" },
+            }, "other": 1 })
+            .to_string(),
         )
         .unwrap();
         std::fs::write(
             dir.join("hooks.json"),
-            r#"{ "lint": { "PostToolUse": [] } }"#,
+            json!({ "lint": { "PostToolUse": [] }, HOOK_NAME: { "PreToolUse": [] } }).to_string(),
         )
         .unwrap();
-        let daemon = Path::new("/opt/todex/todex-agentd");
-        ensure(&dir, daemon).unwrap();
-
-        let mcp: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("mcp_config.json")).unwrap()).unwrap();
-        assert_eq!(mcp["other"], 1);
-        assert_eq!(mcp["mcpServers"]["mine"]["command"], "x");
-        assert_eq!(
-            mcp["mcpServers"][SSH_SERVER]["args"],
-            json!([BRIDGE_SUBCOMMAND, ROUTE_ARG, SSH_ROUTE])
-        );
-        // Room for an approval prompt, a login and the longest command.
-        assert_eq!(mcp["mcpServers"][SSH_SERVER]["timeoutSeconds"], 1080);
-        assert_eq!(
-            mcp["mcpServers"][DESKTOP_SERVER]["command"],
-            "/opt/todex/todex-agentd"
-        );
-        assert_eq!(
-            mcp["mcpServers"][AGENTS_SERVER]["args"],
-            json!([BRIDGE_SUBCOMMAND, ROUTE_ARG, AGENTS_ROUTE])
-        );
-        let hooks: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("hooks.json")).unwrap()).unwrap();
-        assert!(hooks["lint"].is_object());
-        assert_eq!(hooks[HOOK_NAME]["PreToolUse"][0]["matcher"], "*");
-        let script = std::fs::read_to_string(dir.join(HOOK_SCRIPT)).unwrap();
-        assert!(script.contains("todex-agentd"));
-        assert!(script.contains(ENDPOINT_ENV));
-
-        // Up to date: nothing is rewritten.
-        let before = std::fs::metadata(dir.join("hooks.json"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        ensure(&dir, daemon).unwrap();
-        assert_eq!(
-            std::fs::metadata(dir.join("hooks.json"))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            before
-        );
+        std::fs::write(dir.join(HOOK_SCRIPT), "#!/bin/sh\n").unwrap();
 
         assert!(remove(&dir).unwrap());
-        let mcp: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("mcp_config.json")).unwrap()).unwrap();
-        assert!(mcp["mcpServers"].get(SSH_SERVER).is_none());
-        assert!(mcp["mcpServers"].get(AGENTS_SERVER).is_none());
-        assert_eq!(mcp["mcpServers"]["mine"]["command"], "x");
-        let hooks: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("hooks.json")).unwrap()).unwrap();
-        assert!(hooks.get(HOOK_NAME).is_none());
-        assert!(hooks["lint"].is_object());
+        assert_eq!(
+            read(dir.join("mcp_config.json")),
+            json!({ "mcpServers": { "mine": { "command": "x" } }, "other": 1 })
+        );
+        assert_eq!(
+            read(dir.join("hooks.json")),
+            json!({ "lint": { "PostToolUse": [] } })
+        );
         assert!(!dir.join(HOOK_SCRIPT).exists());
         assert!(!remove(&dir).unwrap());
         let _ = std::fs::remove_dir_all(dir);
@@ -279,38 +133,22 @@ mod tests {
     #[test]
     fn removing_the_only_hook_removes_the_hooks_file() {
         let dir = temp_dir();
-        ensure(&dir, Path::new("/opt/todex/todex-agentd")).unwrap();
+        std::fs::write(
+            dir.join("hooks.json"),
+            json!({ HOOK_NAME: { "PreToolUse": [] } }).to_string(),
+        )
+        .unwrap();
         assert!(remove(&dir).unwrap());
         assert!(!dir.join("hooks.json").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn the_hook_script_defers_to_agy_outside_todex_without_the_daemon() {
+    fn nothing_to_remove_touches_nothing() {
         let dir = temp_dir();
-        ensure(&dir, Path::new("/nonexistent/todex-agentd")).unwrap();
-        let output = std::process::Command::new("sh")
-            .arg(HOOK_SCRIPT)
-            .current_dir(&dir)
-            .env_remove(ENDPOINT_ENV)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
-        // No answer and exit 0: agy applies its own permissions, as if no
-        // hook were installed (an explicit "allow" would speak for TodeX).
-        assert!(output.status.success());
-        assert!(output.stdout.is_empty(), "{:?}", output.stdout);
-        // Inside a turn the daemon decides; a missing daemon fails, which agy
-        // reads as a denial.
-        let output = std::process::Command::new("sh")
-            .arg(HOOK_SCRIPT)
-            .current_dir(&dir)
-            .env(ENDPOINT_ENV, "http://127.0.0.1:1")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
+        assert!(!remove(&dir).unwrap());
+        assert!(!dir.join("hooks.json").exists());
+        assert!(!dir.join("mcp_config.json").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

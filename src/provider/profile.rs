@@ -27,10 +27,6 @@ pub enum McpInjection {
     ClaudeArgs,
     /// Pi `-e` extension plus environment variables for the bridge servers.
     PiExtension,
-    /// Static entries in the provider's global config (Antigravity
-    /// `mcp_config.json`, plus its approval hook) pointed at the
-    /// conversation through the provider process's environment.
-    GlobalConfigEnv,
 }
 
 /// How selected skills reach the provider.
@@ -45,8 +41,6 @@ pub enum SkillInjection {
 /// Process lifetime of a conversation's native runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessModel {
-    /// A process per turn.
-    PerTurn,
     /// One process per conversation kept between turns, stopped after
     /// `idle` without a turn (never, when `None`), at most `max_sessions`
     /// at a time.
@@ -59,14 +53,12 @@ pub enum ProcessModel {
 impl ProcessModel {
     pub const fn idle_timeout(self) -> Option<Duration> {
         match self {
-            Self::PerTurn => None,
             Self::Resident { idle, .. } => idle,
         }
     }
 
     pub const fn max_sessions(self) -> Option<usize> {
         match self {
-            Self::PerTurn => None,
             Self::Resident { max_sessions, .. } => Some(max_sessions),
         }
     }

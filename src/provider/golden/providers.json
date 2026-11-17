@@ -810,7 +810,7 @@
         "approvalPolicies": [],
         "permissionProfiles": [],
         "enforcement": "agent-policy",
-        "description": "ask and full-access run agy with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network, non-TodeX MCP tools and reads outside the workspace; full-access allows everything. auto runs agy --mode auto, whose own review runs what it judges safe and refuses the rest without prompting; accounts without agy's Auto preview fall back to ask. Plan uses agy --mode plan and only reads. Not an operating-system sandbox."
+        "description": "agy session modes over ACP. ask runs agy's default mode and asks before what agy asks about (edits, commands, network, other MCP tools); full-access runs the same mode and TodeX approves everything; auto runs agy's own Auto review, which runs what it judges safe and asks about the rest (accounts without agy's Auto run as ask). Plan uses agy's plan mode. TodeX's own MCP tools follow their own approval rules in every mode. Not an operating-system sandbox."
       },
       "nativeFork": false,
       "nativeCompact": false,
@@ -837,7 +837,11 @@
       "backendQueue": true,
       "backendQueueControl": true,
       "scheduledConversations": true,
-      "backgroundTaskStop": false
+      "backgroundTaskStop": false,
+      "runtimeStop": true,
+      "sessionCommands": true,
+      "extensionMessages": false,
+      "extensionUi": []
     },
     "models": []
   },

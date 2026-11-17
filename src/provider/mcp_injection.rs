@@ -163,7 +163,6 @@ mod tests {
             ],
             config_file: root.join("claude.json"),
             pi_extension: root.join("todex-pi-mcp.mjs"),
-            global: None,
         };
 
         let codex = codex_configs(&launch);

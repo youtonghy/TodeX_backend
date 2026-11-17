@@ -1,67 +1,58 @@
-//! Antigravity CLI (`agy`) driver.
+//! Antigravity CLI (`agy`) driver over ACP (`agy acp`).
 //!
-//! `agy` has no ACP or app-server mode; its print mode speaks its own
-//! NDJSON (`--input-format stream-json --output-format stream-json`): one
-//! `{"event":"user"}` frame in, then `init`, `step_update` and a terminal
-//! `result` out. A process runs one turn and exits once stdin closes, which
-//! lets it flush the conversation history it keeps under
-//! `~/.gemini/antigravity-cli`; the next turn resumes it with
-//! `--conversation <id>`.
+//! Each conversation runs one resident `agy acp` process (see
+//! [`super::resident`]); the shared ACP engine in [`super::acp`] drives it.
+//! agy specifics live in [`ACP_QUIRKS`]:
 //!
-//! Headless `agy` cannot ask for approval: a tool needing it is denied, and
-//! a hook's `allow` does not override that. So ask and full-access turns run
-//! with `--dangerously-skip-permissions` and TodeX gates tools itself through
-//! a global `PreToolUse` hook ([`integration`], decided in
-//! `agent_mcp::agy_hook` by the turn's mode). The same static config carries
-//! TodeX's MCP servers; both reach the conversation through variables in the
-//! `agy` process environment. When the hook cannot be installed or reached,
-//! ask turns keep agy's own review instead, which refuses whatever would need
-//! approval. Plan turns always keep it (`--mode plan`), so anything beyond
-//! reading is refused.
+//! - agy binds a session to the working directory of the process that
+//!   created it and ignores `session/new`'s `cwd`, so the process starts in
+//!   the conversation's workspace.
+//! - The model is chosen through the `model` config option with agy's own
+//!   variant id (`gemini-3.8-flash-low`, the TodeX model plus its effort);
+//!   agy sets `thought_level` from it, and restores neither model nor mode on
+//!   `session/resume`, so both are restated every turn.
+//! - Permission modes map onto agy's session modes: `plan` and `auto` are
+//!   agy's own, `ask` and `full-access` run `default`, where agy asks through
+//!   `session/request_permission`; TodeX answers `full-access` itself and
+//!   passes the rest to the user. Calls to TodeX's own MCP servers are
+//!   approved in every mode: those servers gate their tools by the turn's
+//!   mode themselves. Without agy's Auto (an account preview) an `auto` turn
+//!   runs as `ask` and says so (`auto_mode_unavailable`).
+//! - agy streams a failed turn's error (quota, sign-in) as message text and
+//!   ends it like a normal one, without usage; see [`agy_turn_error`].
 //!
-//! Auto turns use agy's own Auto review (`--mode auto`, a preview offered per
-//! account): it runs what it judges safe and, headless, refuses the rest.
-//! agy silently falls back to its default mode on accounts without it, so a
-//! cached `--mode auto -p=/help` probe decides first; without Auto the turn
-//! runs like `ask`, and TodeX's own MCP tools, which the supervisor set to
-//! follow `auto`, are switched to asking as well.
-//!
-//! agy's own review (plan and native Auto turns) denies every MCP call
-//! headless, the hook's `allow` notwithstanding, so those launches pass a
-//! session-only `--settings` allowing TodeX's own MCP servers: they gate
-//! their tools by the turn's mode themselves.
+//! TodeX's MCP servers reach agy through `session/new`'s `mcpServers`.
+//! Earlier TodeX versions drove agy's print mode through a global hook and
+//! static MCP entries in `~/.gemini/config`; they are removed once per
+//! daemon ([`integration`]).
 
 mod integration;
 
 pub(crate) use integration::{config_dir as integration_dir, remove as remove_integration};
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::agent_mcp::AGY_NATIVE_AUTO_ENV;
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
 
+use super::acp::{AcpQuirks, AcpRuntimeOptions, PromptUsage, PLAIN_ACP};
 use super::discovery::CatalogCache;
-use super::process::{
-    executable_available, provider_exit_error, run_bounded_command, stderr_excerpt, CommandSpec,
-    JsonLineProcess, StderrWatch,
-};
+use super::process::{executable_available, run_bounded_command, stderr_excerpt, CommandSpec};
 use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, McpInjection, ProcessModel, ProviderProfile,
     SkillInjection, UserConfigFile,
 };
+use super::resident::{ResidentLaunch, ResidentSessions};
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverTurnResult,
-    ImageInputMode, PermissionConfigCapabilities, ProviderDescriptor, ProviderDriver,
-    ProviderModelDescriptor,
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
+    PermissionConfigCapabilities, ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
+    ProviderPrewarm,
 };
 
 const PROVIDER: &str = "antigravity";
@@ -79,7 +70,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         approval_policies: &[],
         permission_profiles: &[],
         enforcement: "agent-policy",
-        description: "ask and full-access run agy with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network, non-TodeX MCP tools and reads outside the workspace; full-access allows everything. auto runs agy --mode auto, whose own review runs what it judges safe and refuses the rest without prompting; accounts without agy's Auto preview fall back to ask. Plan uses agy --mode plan and only reads. Not an operating-system sandbox.",
+        description: "agy session modes over ACP. ask runs agy's default mode and asks before what agy asks about (edits, commands, network, other MCP tools); full-access runs the same mode and TodeX approves everything; auto runs agy's own Auto review, which runs what it judges safe and asks about the rest (accounts without agy's Auto run as ask). Plan uses agy's plan mode. TodeX's own MCP tools follow their own approval rules in every mode. Not an operating-system sandbox.",
     },
     native_fork: false,
     native_compact: false,
@@ -92,11 +83,14 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     model_selection: true,
     image_input: true,
     image_input_mode: ImageInputMode::Model,
-    mcp_injection: McpInjection::GlobalConfigEnv,
+    mcp_injection: McpInjection::AcpServers,
     skill_injection: SkillInjection::PromptText,
     profile_required: false,
     recovery_full_scan: false,
-    process_model: ProcessModel::PerTurn,
+    process_model: ProcessModel::Resident {
+        idle: Some(Duration::from_secs(300)),
+        max_sessions: 32,
+    },
     discovery_cache_ttl: Some(Duration::from_secs(60)),
     catalog: CatalogProfile {
         source: CatalogSource::Filesystem,
@@ -112,6 +106,60 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     },
 };
 
+/// Where `agy acp` deviates from plain ACP.
+pub(super) const ACP_QUIRKS: AcpQuirks = AcpQuirks {
+    full_access_approval: true,
+    trusted_permission: Some(todex_mcp_permission),
+    auto_mode_fallback: Some("default"),
+    turn_error: Some(agy_turn_error),
+    // Reattach without replaying history.
+    prefer_resume: true,
+    recreate_unloadable_session: true,
+    prompt_usage: PromptUsage::ResultUsage,
+    // Tool calls carry agy's own `name`/`args` next to the schema fields.
+    lenient_updates: true,
+    command_updates: true,
+    usage_updates: true,
+    mode_updates: true,
+    effort_config: "thought_level",
+    session_mode: Some(antigravity_session_mode),
+    ..PLAIN_ACP
+};
+
+/// agy's session mode for a prompt. Restated every turn: agy resumes a
+/// session in `default`, and a resident one keeps the last turn's mode.
+fn antigravity_session_mode(prompt: &DriverPrompt) -> Option<&'static str> {
+    if prompt.work_mode.as_deref() == Some("plan") {
+        return Some("plan");
+    }
+    Some(match prompt.permission_mode.as_deref() {
+        Some("auto") => "auto",
+        _ => "default",
+    })
+}
+
+/// Whether a permission request is for one of TodeX's own MCP tools, which
+/// agy names `mcp_<server>_<tool>`. The name does not delimit the server, so
+/// a user's own server named like `todex_ssh_<more>` would match too.
+fn todex_mcp_permission(params: &Value) -> bool {
+    let Some(name) = params.pointer("/toolCall/name").and_then(Value::as_str) else {
+        return false;
+    };
+    crate::agent_mcp::ALL_SERVERS
+        .iter()
+        .any(|(server, _, _)| name.starts_with(&format!("mcp_{server}_")))
+}
+
+/// agy ends a failed turn (quota, sign-in) as `end_turn` without usage, its
+/// error streamed as message text behind a warning sign.
+fn agy_turn_error(result: &Value, text: &str) -> Option<String> {
+    if result.get("usage").is_some() {
+        return None;
+    }
+    let error = text.trim().strip_prefix('\u{26a0}')?.trim();
+    (!error.is_empty()).then(|| error.to_owned())
+}
+
 /// Effort suffixes `agy models` appends to one model's variants
 /// (`gemini-3.8-flash-high`), lowest first.
 const EFFORT_SUFFIXES: [&str; 3] = ["low", "medium", "high"];
@@ -121,37 +169,6 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(20);
 const LAUNCH_CATALOG_TIMEOUT: Duration = Duration::from_secs(2);
 const USAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
-/// How long a finished turn's process may take to flush its history and
-/// exit after stdin closes, before it is stopped.
-const EXIT_GRACE: Duration = Duration::from_secs(10);
-/// What `agy --mode auto` prints (agy 1.3.5) on an account without its Auto
-/// preview, before continuing in the default mode. It is the only signal:
-/// `init.permission_mode` reads `request-review` in every mode, including
-/// plan and skipped permissions (agy 1.3.6).
-const AUTO_UNAVAILABLE: &str = "--mode auto is not available";
-/// The probe starts a full `agy` (about 10 s), so its answer is kept.
-const AUTO_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-const AUTO_PROBE_TTL: Duration = Duration::from_secs(30 * 60);
-/// A failed probe (timeout, crash) is retried after this long; until then
-/// auto turns run as `ask` without probing again.
-const AUTO_PROBE_FAILURE_TTL: Duration = Duration::from_secs(2 * 60);
-
-/// The answer of the last Auto mode probe.
-#[derive(Clone, Copy, Debug)]
-struct AutoProbe {
-    expires: std::time::Instant,
-    available: bool,
-    /// `agy` 1.5.9+ warns `--mode auto is not available` pre-auth before
-    /// silent auth runs even when `/config` confirms Auto is enabled.
-    pre_auth_warning: bool,
-}
-
-impl AutoProbe {
-    fn fresh(self) -> Option<(bool, bool)> {
-        (std::time::Instant::now() < self.expires)
-            .then_some((self.available, self.pre_auth_warning))
-    }
-}
 
 pub struct AntigravityDriver {
     binary: String,
@@ -159,170 +176,79 @@ pub struct AntigravityDriver {
     /// provider processes otherwise start from a cleared environment.
     env_allowlist: Vec<String>,
     models: CatalogCache<Vec<ProviderModelDescriptor>>,
-    /// The account's last Auto mode probe. The lock is held while probing,
-    /// so concurrent turns share one probe.
-    auto_mode: tokio::sync::Mutex<Option<AutoProbe>>,
-    /// Where TodeX's hook and MCP entries go: agy's global config.
-    integration_dir: std::path::PathBuf,
-    /// TodeX's data directory; prompt images are staged under it, see
-    /// [`attachments_dir`].
-    data_dir: PathBuf,
+    sessions: ResidentSessions,
+    /// agy's global config, where earlier TodeX versions put a hook and MCP
+    /// entries; `None` leaves it alone (tests).
+    legacy_integration: Option<PathBuf>,
+    legacy_removed: tokio::sync::OnceCell<()>,
 }
 
 impl AntigravityDriver {
-    pub fn new(config: &AgentConfig, data_dir: &Path) -> Self {
+    pub fn new(config: &AgentConfig) -> Self {
         Self {
             binary: config.antigravity_bin.clone(),
             env_allowlist: config.antigravity_env_allowlist.clone(),
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
-            auto_mode: tokio::sync::Mutex::new(None),
-            integration_dir: integration::config_dir(),
-            data_dir: data_dir.to_path_buf(),
+            sessions: ResidentSessions::new(&PROFILE, "Antigravity")
+                .with_idle_timeout(config.provider_keepalive()),
+            legacy_integration: (!cfg!(test)).then(integration::config_dir),
+            legacy_removed: tokio::sync::OnceCell::new(),
         }
-    }
-
-    /// The cached `(available, pre_auth_warning)` answer, without waiting for
-    /// a probe in progress.
-    fn cached_auto_mode(&self) -> Option<(bool, bool)> {
-        let cached = self.auto_mode.try_lock().ok()?;
-        cached.and_then(AutoProbe::fresh)
-    }
-
-    /// Whether the signed-in account offers `--mode auto` (and whether `agy`
-    /// emits a pre-auth unavailability warning on stderr even when Auto is
-    /// active), probing when the cached answer expired. A failed probe counts
-    /// as unavailable, so the turn falls back to `ask`, and is retried after
-    /// [`AUTO_PROBE_FAILURE_TTL`]. The probe runs outside any workspace: the
-    /// answer is per account.
-    async fn auto_mode_status(&self) -> (bool, bool) {
-        let mut cached = self.auto_mode.lock().await;
-        if let Some(status) = cached.and_then(AutoProbe::fresh) {
-            return status;
-        }
-        self.ensure_agy_settings_allow_auto().await;
-        let spec = self.command_spec(&std::env::temp_dir(), &["--mode", "auto", "-p=/help"]);
-        let (available, pre_auth_warning, ttl) = match run_bounded_command(
-            &spec,
-            MAX_COMMAND_OUTPUT_BYTES,
-            AUTO_PROBE_TIMEOUT,
-        )
-        .await
-        {
-            Ok(output) if output.success => {
-                if !String::from_utf8_lossy(&output.stderr).contains(AUTO_UNAVAILABLE) {
-                    (true, false, AUTO_PROBE_TTL)
-                } else {
-                    match self.config_reports_auto_mode().await {
-                        Ok(true) => (true, true, AUTO_PROBE_TTL),
-                        Ok(false) => (false, false, AUTO_PROBE_TTL),
-                        Err(error) => {
-                            tracing::warn!(
-                                %error,
-                                "agy Auto /config confirmation failed; running auto turns as ask"
-                            );
-                            (false, false, AUTO_PROBE_FAILURE_TTL)
-                        }
-                    }
-                }
-            }
-            Ok(output) => {
-                tracing::warn!(
-                    stderr = stderr_excerpt(&output.stderr).unwrap_or_default(),
-                    "agy Auto mode probe failed; running auto turns as ask"
-                );
-                (false, false, AUTO_PROBE_FAILURE_TTL)
-            }
-            Err(error) => {
-                tracing::warn!(%error, "agy Auto mode probe failed; running auto turns as ask");
-                (false, false, AUTO_PROBE_FAILURE_TTL)
-            }
-        };
-        *cached = Some(AutoProbe {
-            expires: std::time::Instant::now() + ttl,
-            available,
-            pre_auth_warning,
-        });
-        (available, pre_auth_warning)
-    }
-
-    /// Confirms post-auth Auto mode via `-p=/config` when `--mode auto -p=/help`
-    /// warns pre-auth on `agy` 1.5.9+.
-    async fn config_reports_auto_mode(&self) -> Result<bool, AppError> {
-        let spec = self.command_spec(
-            &std::env::temp_dir(),
-            &["--mode", "auto", "--output-format", "json", "-p=/config"],
-        );
-        let output =
-            run_bounded_command(&spec, MAX_COMMAND_OUTPUT_BYTES, AUTO_PROBE_TIMEOUT).await?;
-        if !output.success {
-            return Err(AppError::ProviderUnavailable(format!(
-                "agy -p=/config failed: {}",
-                stderr_excerpt(&output.stderr).unwrap_or_default()
-            )));
-        }
-        let json: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
-            AppError::ProviderUnavailable(format!("agy -p=/config returned invalid JSON: {error}"))
-        })?;
-        Ok(json
-            .pointer("/command/data/config/agentMode")
-            .and_then(Value::as_str)
-            == Some("auto"))
-    }
-
-    /// `<gemini>/antigravity-cli/settings.json`, next to TodeX's integration
-    /// directory (`<gemini>/config`).
-    fn settings_path(&self) -> Option<PathBuf> {
-        let gemini = self.integration_dir.parent()?;
-        Some(gemini.join("antigravity-cli").join("settings.json"))
-    }
-
-    /// The `--settings` value for [`todex_mcp_settings`].
-    async fn todex_mcp_settings(&self) -> Result<String, AppError> {
-        let settings = self.settings_path().ok_or_else(|| {
-            AppError::ProviderUnavailable("agy's settings directory is unknown".to_owned())
-        })?;
-        tokio::task::spawn_blocking(move || todex_mcp_settings(&settings))
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()))?
-    }
-
-    /// Ensures `<gemini>/antigravity-cli/settings.json` does not pin
-    /// `agentMode` to a non-`"auto"` value that would override post-auth
-    /// `initAgentMode` on `agy` 1.5.9+.
-    async fn ensure_agy_settings_allow_auto(&self) {
-        let Some(settings) = self.settings_path() else {
-            return;
-        };
-        let result = tokio::task::spawn_blocking(move || ensure_settings_allow_auto(&settings))
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()));
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) | Err(error) => {
-                tracing::warn!(%error, "could not update agy settings for auto mode");
-            }
-        }
-    }
-
-    /// Whether an auto turn runs agy's own Auto and whether agy prints the
-    /// pre-auth warning unconditionally. `None`: the turn was cancelled while
-    /// waiting for the probe.
-    async fn native_auto(&self, cancel: &mut watch::Receiver<bool>) -> Option<(bool, bool)> {
-        if let Some(status) = self.cached_auto_mode() {
-            return Some(status);
-        }
-        tokio::select! {
-            status = self.auto_mode_status() => Some(status),
-            _ = cancel.changed() => None,
-        }
-    }
-
-    async fn forget_auto_mode(&self) {
-        *self.auto_mode.lock().await = None;
     }
 
     fn command_spec(&self, cwd: &Path, args: &[&str]) -> CommandSpec {
         command_spec(&self.binary, &self.env_allowlist, cwd, args)
+    }
+
+    /// How a conversation's resident process is started: in its workspace,
+    /// which agy binds the session to.
+    fn resident_launch(
+        &self,
+        context: &DriverContext,
+        uploads: Option<&Path>,
+    ) -> Result<ResidentLaunch, AppError> {
+        let mut spec = self.command_spec(&context.manifest.workspace, &["acp"]);
+        if let Some(uploads) = uploads {
+            spec.push_flag_value("--add-dir", &uploads.to_string_lossy())?;
+        }
+        Ok(ResidentLaunch {
+            spec,
+            runtime: AcpRuntimeOptions {
+                suppress_load_replay: true,
+                ..Default::default()
+            },
+        })
+    }
+
+    /// What a prompt asks of agy: the model as agy's variant id, which also
+    /// sets its thinking level.
+    async fn agy_prompt(&self, workspace: &Path, mut prompt: DriverPrompt) -> DriverPrompt {
+        prompt.model = self.launch_model(workspace, &prompt).await;
+        prompt.reasoning_effort = None;
+        prompt
+    }
+
+    /// Removes the hook and MCP entries earlier TodeX versions wrote into
+    /// agy's global config, once per daemon. Best effort.
+    async fn remove_legacy_integration(&self) {
+        let Some(dir) = self.legacy_integration.clone() else {
+            return;
+        };
+        self.legacy_removed
+            .get_or_init(|| async move {
+                match tokio::task::spawn_blocking(move || integration::remove(&dir)).await {
+                    Ok(Ok(true)) => {
+                        tracing::info!("removed TodeX's old hook and MCP entries from agy's config")
+                    }
+                    Ok(Ok(false)) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        %error,
+                        "could not remove TodeX's old hook and MCP entries from agy's config"
+                    ),
+                    Err(error) => tracing::warn!(%error, "agy config cleanup did not finish"),
+                }
+            })
+            .await;
     }
 
     /// The `--model` id for a turn: catalog entries group the effort
@@ -406,406 +332,67 @@ impl ProviderDriver for AntigravityDriver {
         MODELS_TIMEOUT
     }
 
+    async fn shutdown_session(&self, conversation_id: &str) {
+        self.sessions.stop(conversation_id).await;
+    }
+
+    async fn shutdown_session_with_reason(&self, conversation_id: &str, _reason: &str) {
+        self.shutdown_session(conversation_id).await;
+    }
+
+    fn supports_runtime_stop(&self) -> bool {
+        true
+    }
+
+    async fn stop_runtime(&self, conversation_id: &str) -> Result<Value, AppError> {
+        self.shutdown_session(conversation_id).await;
+        Ok(
+            json!({"provider":PROVIDER,"conversationId":conversation_id,"status":"stopped","reason":"user_closed"}),
+        )
+    }
+
+    async fn shutdown(&self) {
+        self.sessions.stop_all().await;
+    }
+
+    async fn prewarm(
+        &self,
+        context: DriverContext,
+        settings: DriverPrompt,
+        sink: DriverEventSink,
+    ) -> Result<ProviderPrewarm, AppError> {
+        self.remove_legacy_integration().await;
+        let uploads = crate::prompt_uploads::readable_root().await;
+        let settings = self.agy_prompt(&context.manifest.workspace, settings).await;
+        self.sessions
+            .prewarm(context, settings, sink, |context, _| {
+                self.resident_launch(context, uploads.as_deref())
+            })
+            .await
+    }
+
     async fn run_turn(
         &self,
         context: DriverContext,
-        mut prompt: DriverPrompt,
+        prompt: DriverPrompt,
         sink: DriverEventSink,
-        mut cancel: watch::Receiver<bool>,
+        cancel: watch::Receiver<bool>,
     ) -> Result<DriverTurnResult, AppError> {
-        let controls = super::types::resolve_execution_config(
-            context.manifest.provider,
-            prompt.permission_mode.as_deref(),
-            prompt.work_mode.as_deref(),
-            prompt.permission_profile.as_deref(),
-            prompt.sandbox_mode.as_deref(),
-            prompt.approval_policy.as_deref(),
-        )?;
-        let workspace = context.manifest.workspace.clone();
-        let global = context
-            .agent_mcp
-            .as_ref()
-            .and_then(|launch| launch.global.clone());
-        let bridged = match &global {
-            Some(global) => {
-                match install_integration(&self.integration_dir, &global.daemon).await {
-                    Ok(()) => true,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not install TodeX's Antigravity hook and MCP entries");
-                        false
-                    }
-                }
+        self.remove_legacy_integration().await;
+        let uploads = crate::prompt_uploads::readable_root().await;
+        let prompt = self.agy_prompt(&context.manifest.workspace, prompt).await;
+        let model = prompt.model.clone();
+        let result = self
+            .sessions
+            .run_turn(context, prompt, sink.clone(), cancel, |context, _| {
+                self.resident_launch(context, uploads.as_deref())
+            })
+            .await;
+        match result {
+            Err(AppError::ProviderUnavailable(detail)) => {
+                Err(fail_turn(self, model.as_deref(), &detail, &sink).await)
             }
-            None => false,
-        };
-        let mut spec = self.command_spec(
-            &workspace,
-            &[
-                "--input-format",
-                "stream-json",
-                "--output-format",
-                "stream-json",
-            ],
-        );
-        if let (true, Some(global)) = (bridged, &global) {
-            spec.env.extend(global.env.iter().cloned());
-        }
-        let auto = controls.work_mode != "plan" && controls.permission_mode == "auto";
-        let (native_auto, pre_auth_warning) = if auto {
-            match self.native_auto(&mut cancel).await {
-                Some(status) => status,
-                None => {
-                    return Ok(DriverTurnResult {
-                        native_session_id: context.provider_state.native_session_id.clone(),
-                        stop_reason: "cancelled".to_owned(),
-                        cancelled: true,
-                    })
-                }
-            }
-        } else {
-            (false, false)
-        };
-        if auto && !native_auto {
-            // The supervisor recorded `auto` for TodeX's own MCP tools; the
-            // turn runs as `ask`, so they ask too.
-            if let Some(mode) = &context.handles.mode {
-                mode.downgrade_to_ask(&controls.work_mode);
-            }
-            sink.emit(
-                "provider.event",
-                json!({
-                    "provider": PROVIDER,
-                    "providerMethod": "auto_mode_unavailable",
-                    "metadata": {
-                        "reason": "This Antigravity account does not offer agy's Auto mode (or it could not be checked); the turn asks for approval as in ask mode.",
-                    },
-                }),
-            )
-            .await?;
-        }
-        // Only a native Auto launch may tell the hook to leave calls to agy.
-        if !native_auto {
-            spec.env.remove(AGY_NATIVE_AUTO_ENV);
-        }
-        if bridged && (controls.work_mode == "plan" || native_auto) {
-            // agy's own review stays on and, headless, denies every MCP call
-            // even when the hook allows it; TodeX's own MCP servers gate
-            // their tools by the turn's mode, so agy lets them through.
-            match self.todex_mcp_settings().await {
-                Ok(settings) => spec.push_flag_value("--settings", &settings)?,
-                Err(error) => tracing::warn!(
-                    %error,
-                    "could not allow TodeX's MCP tools through agy's own review; agy will deny them"
-                ),
-            }
-        }
-        if controls.work_mode == "plan" {
-            spec.args.extend(["--mode".to_owned(), "plan".to_owned()]);
-        } else if native_auto {
-            self.ensure_agy_settings_allow_auto().await;
-            spec.args.extend(["--mode".to_owned(), "auto".to_owned()]);
-            spec.env
-                .insert(AGY_NATIVE_AUTO_ENV.to_owned(), "1".to_owned());
-        } else if bridged || controls.permission_mode == "full-access" {
-            spec.args.push("--dangerously-skip-permissions".to_owned());
-        } else {
-            // Without TodeX's hook nothing would gate tools: keep agy's own
-            // review, which refuses what needs approval.
-            sink.emit(
-                "provider.event",
-                json!({
-                    "provider": PROVIDER,
-                    "providerMethod": "approval_bridge_unavailable",
-                    "metadata": {
-                        "reason": "TodeX could not install its Antigravity approval hook; tools that need approval are refused. Use full access or check the daemon log.",
-                    },
-                }),
-            )
-            .await?;
-        }
-        let requested = context.provider_state.native_session_id.clone();
-        if let Some(conversation) = &requested {
-            spec.push_flag_value("--conversation", conversation)?;
-        }
-        let model = self.launch_model(&workspace, &prompt).await;
-        if let Some(model) = &model {
-            spec.push_flag_value("--model", model)?;
-        }
-        let images = stage_images(&self.data_dir, &context.manifest.id, &prompt).await?;
-        if !images.is_empty() {
-            let staged = attachments_dir(&self.data_dir, &context.manifest.id);
-            spec.push_flag_value("--add-dir", &staged.to_string_lossy())?;
-            prompt.text = image_prompt(&prompt.text, &images);
-        }
-        if let Some(uploads) = crate::prompt_uploads::readable_root().await {
-            spec.push_flag_value("--add-dir", &uploads.to_string_lossy())?;
-        }
-        // `-p` takes a value and would swallow the next flag; the prompt
-        // arrives on stdin, so the flag closes the argument list empty.
-        spec.args.push("-p=".to_owned());
-
-        // agy only warns on stderr when Auto is unavailable after all; it is
-        // watched as it streams, so later output cannot push it out of view.
-        // agy 1.5.9+ prints that warning unconditionally pre-auth even when
-        // Auto is enabled (`pre_auth_warning`), so skip the watch there.
-        let auto_watch =
-            (native_auto && !pre_auth_warning).then(|| StderrWatch::new(AUTO_UNAVAILABLE));
-        let mut process = JsonLineProcess::spawn_watching(&spec, auto_watch.clone()).await?;
-        let result = run_agy_turn(
-            &mut process,
-            self,
-            context,
-            &prompt,
-            requested,
-            model.as_deref(),
-            &sink,
-            &mut cancel,
-        )
-        .await;
-        if result.as_ref().is_ok_and(|result| !result.cancelled) {
-            process.close_stdin();
-            if !process.wait_exit(EXIT_GRACE).await {
-                tracing::warn!("agy did not exit after its turn; stopping it");
-            }
-        }
-        process.terminate().await;
-        // The probe's answer went stale: agy ran in its default mode, which
-        // refused whatever needed approval. The next turn probes again.
-        if auto_watch.as_ref().is_some_and(StderrWatch::seen) {
-            self.forget_auto_mode().await;
-            if let Err(error) = sink
-                .emit(
-                    "provider.event",
-                    json!({
-                        "provider": PROVIDER,
-                        "providerMethod": "auto_mode_unavailable",
-                        "metadata": {
-                            "reason": "agy reported that this account no longer offers its Auto mode and ran the turn in its default mode, refusing tools that needed approval. The next auto turn asks for approval as in ask mode.",
-                        },
-                    }),
-                )
-                .await
-            {
-                tracing::warn!(%error, "could not record that agy's Auto mode was unavailable");
-            }
-        }
-        result
-    }
-}
-
-/// Where a conversation's pasted prompt images are written for agy to open.
-/// TodeX's approval hook lets agy read here without asking.
-pub(crate) fn attachments_dir(data_dir: &Path, conversation_id: &str) -> PathBuf {
-    data_dir
-        .join("antigravity-attachments")
-        .join(conversation_id)
-}
-
-/// agy's stream-json input takes only text blocks, so images reach the
-/// model as files its `view_file` tool opens. Images already in the
-/// workspace are named where they are; pasted ones are written to
-/// [`attachments_dir`] and kept, so later turns can open them again.
-async fn stage_images(
-    data_dir: &Path,
-    conversation_id: &str,
-    prompt: &DriverPrompt,
-) -> Result<Vec<PathBuf>, AppError> {
-    let mut images = Vec::new();
-    for content in &prompt.content {
-        let DriverPromptContent::Image {
-            path,
-            data,
-            mime_type,
-        } = content
-        else {
-            continue;
-        };
-        if let Some(path) = path {
-            images.push(path.clone());
-            continue;
-        }
-        let extension = match mime_type.as_str() {
-            "image/jpeg" => "jpg",
-            "image/gif" => "gif",
-            "image/webp" => "webp",
-            _ => "png",
-        };
-        let bytes = BASE64_STANDARD.decode(data).map_err(|error| {
-            AppError::InvalidRequest(format!("invalid prompt image base64: {error}"))
-        })?;
-        let dir = attachments_dir(data_dir, conversation_id);
-        tokio::fs::create_dir_all(&dir).await?;
-        let turn: String = prompt
-            .turn_id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-            .collect();
-        let file = dir.join(format!("{turn}-{}.{extension}", images.len() + 1));
-        tokio::fs::write(&file, bytes).await?;
-        images.push(file);
-    }
-    Ok(images)
-}
-
-fn image_prompt(text: &str, images: &[PathBuf]) -> String {
-    let mut lines = vec![text.to_owned()];
-    lines.extend(images.iter().map(|image| {
-        format!(
-            "Attached image: {} (open it with view_file to see it)",
-            image.display()
-        )
-    }));
-    lines.retain(|line| !line.is_empty());
-    lines.join("\n\n")
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_agy_turn(
-    process: &mut JsonLineProcess,
-    driver: &AntigravityDriver,
-    context: DriverContext,
-    prompt: &DriverPrompt,
-    requested: Option<String>,
-    model: Option<&str>,
-    sink: &DriverEventSink,
-    cancel: &mut watch::Receiver<bool>,
-) -> Result<DriverTurnResult, AppError> {
-    process
-        .send(&json!({
-            "event": "user",
-            "message": { "role": "user", "content": prompt.text },
-        }))
-        .await?;
-    let mut turn = AgyTurn::new(&prompt.turn_id);
-    let mut provider_state = context.provider_state;
-    let mut conversation = requested.clone();
-    loop {
-        let frame = tokio::select! {
-            frame = process.read_frame() => sink.provider_frame(frame?).await?,
-            changed = cancel.changed() => {
-                let _ = changed;
-                return Ok(DriverTurnResult {
-                    native_session_id: conversation,
-                    stop_reason: "cancelled".to_owned(),
-                    cancelled: true,
-                });
-            }
-        };
-        let Some(frame) = frame else {
-            return Err(provider_exit_error(process, "Antigravity CLI closed stdout").await);
-        };
-        match frame.get("event").and_then(Value::as_str) {
-            Some("init") => {
-                let Some(id) = frame.get("conversation_id").and_then(Value::as_str) else {
-                    continue;
-                };
-                if requested
-                    .as_deref()
-                    .is_some_and(|requested| requested != id)
-                {
-                    // agy starts a new conversation when the recorded one is
-                    // gone (deleted, or another machine's state).
-                    sink.emit(
-                        "provider.event",
-                        json!({
-                            "provider": PROVIDER,
-                            "providerMethod": "session/recreated",
-                            "metadata": {
-                                "reason": "Antigravity could not find the previous conversation",
-                                "previousSessionId": requested,
-                            },
-                        }),
-                    )
-                    .await?;
-                }
-                // Persist at once so a failed or cancelled turn still resumes
-                // the conversation agy has already written.
-                if provider_state.native_session_id.as_deref() != Some(id) {
-                    provider_state.native_session_id = Some(id.to_owned());
-                    provider_state.recoverable = true;
-                    sink.save_provider_state(provider_state.clone()).await?;
-                }
-                conversation = Some(id.to_owned());
-                sink.emit(
-                    "provider.event",
-                    json!({
-                        "provider": PROVIDER,
-                        "providerMethod": "init",
-                        "metadata": {
-                            "sessionId": id,
-                            "model": frame.pointer("/init/model"),
-                            "permissionMode": frame.pointer("/init/permission_mode"),
-                        },
-                    }),
-                )
-                .await?;
-            }
-            Some("step_update") => {
-                let Some(step) = frame.get("step_update") else {
-                    continue;
-                };
-                for emit in turn.step(step) {
-                    emit.send(sink).await?;
-                }
-            }
-            Some("result") => {
-                let result = frame.get("result").cloned().unwrap_or(Value::Null);
-                if let Some(usage) = result.get("usage").filter(|usage| usage.is_object()) {
-                    sink.emit(
-                        "usage.updated",
-                        json!({ "provider": PROVIDER, "turnId": prompt.turn_id, "source": "provider", "scope": "turn", "usage": usage }),
-                    )
-                    .await?;
-                }
-                if let Some(denied) = result
-                    .get("denied_actions")
-                    .and_then(Value::as_array)
-                    .filter(|denied| !denied.is_empty())
-                {
-                    sink.emit(
-                        "provider.event",
-                        json!({
-                            "provider": PROVIDER,
-                            "providerMethod": "denied_actions",
-                            "metadata": { "deniedActions": denied },
-                        }),
-                    )
-                    .await?;
-                }
-                let native_session_id = result
-                    .get("conversation_id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(ToOwned::to_owned)
-                    .or(conversation);
-                if result.get("status").and_then(Value::as_str) != Some("SUCCESS") {
-                    let detail = result
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .filter(|error| !error.is_empty())
-                        .map(ToOwned::to_owned)
-                        .or_else(|| turn.error_text.clone())
-                        .unwrap_or_else(|| "Antigravity returned an error".to_owned());
-                    return Err(fail_turn(driver, model, &detail, sink).await);
-                }
-                provider_state.native_session_id = native_session_id.clone();
-                provider_state.recoverable = true;
-                provider_state.last_error = None;
-                sink.save_provider_state(provider_state).await?;
-                return Ok(DriverTurnResult {
-                    native_session_id,
-                    stop_reason: "completed".to_owned(),
-                    cancelled: false,
-                });
-            }
-            Some(other) => {
-                sink.emit(
-                    "provider.event",
-                    json!({ "provider": PROVIDER, "providerMethod": other }),
-                )
-                .await?;
-            }
-            None => {}
+            other => other,
         }
     }
 }
@@ -856,298 +443,6 @@ fn command_spec(binary: &str, env_allowlist: &[String], cwd: &Path, args: &[&str
     spec.args = args.iter().map(|arg| (*arg).to_owned()).collect();
     spec.env = super::resident::allowlisted_environment(&[("NO_COLOR", "1")], env_allowlist);
     spec
-}
-
-/// Serializes writes to agy's global config between concurrent turns.
-static INTEGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Brings TodeX's hook and MCP entries in `~/.gemini/config` up to date,
-/// retrying once when another tool edited a file meanwhile.
-async fn install_integration(dir: &Path, daemon: &Path) -> Result<(), AppError> {
-    let _serial = INTEGRATION_LOCK.lock().await;
-    let daemon = daemon.to_owned();
-    let dir = dir.to_owned();
-    tokio::task::spawn_blocking(move || match integration::ensure(&dir, &daemon) {
-        Err(AppError::Conflict(_)) => integration::ensure(&dir, &daemon),
-        other => other,
-    })
-    .await
-    .map_err(|error| AppError::Anyhow(error.into()))?
-}
-
-/// agy's session-only `--settings` that allows every tool of TodeX's own MCP
-/// servers (`mcp(<server>/*)`; a bare `mcp(<server>)` matches nothing).
-/// `--settings` replaces the `permissions` of `settings.json` as a whole, so
-/// the user's own rules, deny and ask included, are carried over.
-fn todex_mcp_settings(path: &Path) -> Result<String, AppError> {
-    let invalid = |key: &str, kind: &str| {
-        AppError::InvalidRequest(format!(
-            "Antigravity CLI settings `{key}` must be a JSON {kind}: {}",
-            path.display()
-        ))
-    };
-    let settings = crate::agent_providers::files::read_json5(path, "Antigravity CLI settings")?;
-    let mut permissions = match settings.as_ref().and_then(|s| s.get("permissions")) {
-        None | Some(Value::Null) => serde_json::Map::new(),
-        Some(Value::Object(permissions)) => permissions.clone(),
-        Some(_) => return Err(invalid("permissions", "object")),
-    };
-    let allow = permissions
-        .entry("allow")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .ok_or_else(|| invalid("permissions.allow", "array"))?;
-    for (server, _, _) in crate::agent_mcp::ALL_SERVERS {
-        let rule = Value::String(format!("mcp({server}/*)"));
-        if !allow.contains(&rule) {
-            allow.push(rule);
-        }
-    }
-    Ok(json!({ "permissions": permissions }).to_string())
-}
-
-fn ensure_settings_allow_auto(path: &Path) -> Result<(), AppError> {
-    let rewrite = || -> Result<(), AppError> {
-        let Some(current) =
-            crate::agent_providers::files::read_json5(path, "Antigravity CLI settings")?
-        else {
-            return Ok(());
-        };
-        if !current.is_object() {
-            return Err(AppError::InvalidRequest(format!(
-                "Antigravity CLI settings root must be a JSON object: {}",
-                path.display()
-            )));
-        }
-        let Some(mode) = current.get("agentMode") else {
-            return Ok(());
-        };
-        if mode.as_str() == Some("auto") {
-            return Ok(());
-        }
-        crate::agent_providers::files::modify_json5_file(
-            path,
-            "Antigravity CLI settings",
-            |document| {
-                let object = document.as_object_mut().ok_or_else(|| {
-                    AppError::InvalidRequest(format!(
-                        "Antigravity CLI settings root must be a JSON object: {}",
-                        path.display()
-                    ))
-                })?;
-                object.insert("agentMode".to_owned(), Value::String("auto".to_owned()));
-                Ok(())
-            },
-        )
-    };
-    match rewrite() {
-        Err(AppError::Conflict(_)) => rewrite(),
-        other => other,
-    }
-}
-
-/// One emitted conversation event.
-#[derive(Debug, PartialEq)]
-enum Emit {
-    Delta {
-        event: &'static str,
-        payload: Value,
-        text: &'static [&'static str],
-        block: String,
-    },
-    Event {
-        event: &'static str,
-        payload: Value,
-    },
-}
-
-impl Emit {
-    async fn send(self, sink: &DriverEventSink) -> Result<(), AppError> {
-        match self {
-            Self::Delta {
-                event,
-                payload,
-                text,
-                block,
-            } => sink.emit_delta(event, payload, text, Some(&block)).await,
-            Self::Event { event, payload } => sink.emit(event, payload).await.map(|_| ()),
-        }
-    }
-}
-
-/// Maps `step_update` frames to conversation events. A step is identified by
-/// its `step_index`; tool steps report ACTIVE then DONE or ERROR, response
-/// steps stream `text_delta` fragments and end DONE.
-struct AgyTurn {
-    turn_id: String,
-    /// Text streamed so far per response step.
-    responses: HashMap<u64, String>,
-    /// Tool steps already announced.
-    tools: HashSet<u64>,
-    /// The last `error_message` step, for a failing `result` without one.
-    error_text: Option<String>,
-}
-
-impl AgyTurn {
-    fn new(turn_id: &str) -> Self {
-        Self {
-            turn_id: turn_id.to_owned(),
-            responses: HashMap::new(),
-            tools: HashSet::new(),
-            error_text: None,
-        }
-    }
-
-    fn step(&mut self, step: &Value) -> Vec<Emit> {
-        let index = step.get("step_index").and_then(Value::as_u64).unwrap_or(0);
-        let state = step.get("state").and_then(Value::as_str).unwrap_or("");
-        let kind = step.get("step_type").and_then(Value::as_str).unwrap_or("");
-        let mut out = Vec::new();
-        if let Some(thinking) = step
-            .get("thinking_delta")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
-            out.push(Emit::Delta {
-                event: "thought.delta",
-                payload: json!({ "provider": PROVIDER, "role": "assistant", "delta": { "type": "thinking_delta", "thinking": thinking } }),
-                text: &["/delta/thinking"],
-                block: format!("thinking-{index}"),
-            });
-        }
-        match kind {
-            "tool" | "subagent" => out.extend(self.tool(index, state, kind, step)),
-            "user_input" => {}
-            _ => {
-                if let Some(text) = step
-                    .get("text_delta")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                {
-                    self.responses.entry(index).or_default().push_str(text);
-                    out.push(Emit::Delta {
-                        event: "message.delta",
-                        payload: json!({ "provider": PROVIDER, "role": "assistant", "delta": { "type": "text_delta", "text": text } }),
-                        text: &["/delta/text"],
-                        block: format!("text-{index}"),
-                    });
-                }
-                if kind == "error_message" {
-                    if let Some(text) = self.responses.get(&index).filter(|text| !text.is_empty()) {
-                        self.error_text = Some(text.clone());
-                    }
-                }
-                if state != "ACTIVE" {
-                    if let Some(text) = self.responses.remove(&index) {
-                        if kind != "error_message" && !text.trim().is_empty() {
-                            out.push(Emit::Event {
-                                event: "message.completed",
-                                payload: json!({
-                                    "provider": PROVIDER,
-                                    "message": { "role": "assistant", "content": [{ "type": "text", "text": text }] },
-                                }),
-                            });
-                        }
-                    }
-                    if !matches!(kind, "agent_response" | "planner_response") {
-                        out.push(Emit::Event {
-                            event: "provider.event",
-                            payload: json!({ "provider": PROVIDER, "providerMethod": kind, "metadata": { "state": state } }),
-                        });
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    fn tool(&mut self, index: u64, state: &str, kind: &str, step: &Value) -> Vec<Emit> {
-        let info = step.get("tool_info").cloned().unwrap_or(Value::Null);
-        let name = step
-            .get("tool_name")
-            .or_else(|| info.get("name"))
-            .cloned()
-            .unwrap_or_else(|| json!(kind));
-        let error = info
-            .pointer("/error/message")
-            .or_else(|| info.get("error"))
-            .filter(|error| !error.is_null())
-            .cloned();
-        let finished = state != "ACTIVE";
-        let started = self.tools.insert(index);
-        let phase = if finished {
-            "completed"
-        } else if started {
-            "started"
-        } else {
-            "delta"
-        };
-        let event = match phase {
-            "completed" => "tool.completed",
-            "started" => "tool.started",
-            _ => "tool.updated",
-        };
-        let result = if finished {
-            error.clone().or_else(|| info.get("output").cloned())
-        } else {
-            None
-        };
-        let id = format!("step-{index}");
-        let mut events = Vec::new();
-        if finished && started {
-            // A step first seen finished still opens its card.
-            events.push(Emit::Event {
-                event: "tool.started",
-                payload: tool_payload(
-                    &id,
-                    &name,
-                    &info,
-                    None,
-                    None,
-                    step,
-                    &self.turn_id,
-                    "started",
-                ),
-            });
-        }
-        events.push(Emit::Event {
-            event,
-            payload: tool_payload(
-                &id,
-                &name,
-                &info,
-                result,
-                finished.then_some(state == "ERROR" || error.is_some()),
-                step,
-                &self.turn_id,
-                phase,
-            ),
-        });
-        events
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn tool_payload(
-    id: &str,
-    name: &Value,
-    info: &Value,
-    result: Option<Value>,
-    is_error: Option<bool>,
-    step: &Value,
-    turn_id: &str,
-    phase: &str,
-) -> Value {
-    json!({
-        "provider": PROVIDER,
-        "toolCallId": id,
-        "toolName": name,
-        "arguments": info.get("parameters").cloned().unwrap_or(Value::Null),
-        "result": result,
-        "isError": is_error,
-        "subagent": step.get("subagent_info"),
-        "block": { "category": "tool", "id": id, "turnId": turn_id, "phase": phase },
-    })
 }
 
 /// `agy models` prints `<id>\t<display name>` per line. Variants of one
@@ -1434,53 +729,6 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
         );
     }
 
-    #[tokio::test]
-    async fn pasted_images_are_staged_as_files_the_prompt_names() {
-        let data_dir = std::env::temp_dir().join(format!(
-            "todex-agy-images-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let in_workspace = PathBuf::from("/workspace/shot.png");
-        let prompt = DriverPrompt {
-            turn_id: "turn/1".to_owned(),
-            text: "What does it say?".to_owned(),
-            content: vec![
-                DriverPromptContent::Image {
-                    path: None,
-                    data: BASE64_STANDARD.encode(b"jpeg bytes"),
-                    mime_type: "image/jpeg".to_owned(),
-                },
-                DriverPromptContent::Image {
-                    path: Some(in_workspace.clone()),
-                    data: String::new(),
-                    mime_type: "image/png".to_owned(),
-                },
-            ],
-            skills: vec![],
-            model: None,
-            reasoning_effort: None,
-            permission_mode: None,
-            work_mode: None,
-            permission_profile: None,
-            sandbox_mode: None,
-            approval_policy: None,
-            after_plan: None,
-            replan: None,
-        };
-        let images = stage_images(&data_dir, "conv-1", &prompt).await.unwrap();
-        let staged = attachments_dir(&data_dir, "conv-1").join("turn1-1.jpg");
-        assert_eq!(images, [staged.clone(), in_workspace]);
-        assert_eq!(std::fs::read(&staged).unwrap(), b"jpeg bytes");
-        assert_eq!(
-            image_prompt(&prompt.text, &images[..1]),
-            format!(
-                "What does it say?\n\nAttached image: {} (open it with view_file to see it)",
-                staged.display()
-            )
-        );
-        std::fs::remove_dir_all(data_dir).unwrap();
-    }
-
     #[test]
     fn the_selected_effort_picks_the_variant() {
         let efforts = vec!["low".to_owned(), "high".to_owned()];
@@ -1503,52 +751,61 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
     }
 
     #[test]
-    fn steps_map_to_text_tool_and_completion_events() {
-        let mut turn = AgyTurn::new("turn-1");
-        let mut events = Vec::new();
-        for step in [
-            json!({"step_index":0,"state":"DONE","step_type":"user_input"}),
-            json!({"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Hel"}),
-            json!({"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"lo"}),
-            json!({"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"date"}}}),
-            json!({"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"date"},"output":"Fri\n"}}),
-            json!({"step_index":3,"state":"ERROR","step_type":"tool","tool_name":"write_to_file","tool_info":{"name":"write_to_file","parameters":{"TargetFile":"/x"},"error":{"type":"TOOL_ERROR","message":"denied"}}}),
-        ] {
-            events.extend(turn.step(&step));
-        }
-        let kinds: Vec<_> = events
-            .iter()
-            .map(|emit| match emit {
-                Emit::Delta { event, .. } | Emit::Event { event, .. } => *event,
-            })
-            .collect();
+    fn only_todex_mcp_calls_are_trusted() {
+        let request = |name: &str| json!({"toolCall": {"name": name}});
+        assert!(todex_mcp_permission(&request(
+            "mcp_todex_ssh_ssh_list_hosts"
+        )));
+        assert!(todex_mcp_permission(&request(
+            "mcp_todex_agents_agents_call"
+        )));
+        assert!(!todex_mcp_permission(&request(
+            "mcp_context7_resolve-library-id"
+        )));
+        assert!(!todex_mcp_permission(&request("run_command")));
+        assert!(!todex_mcp_permission(&json!({"toolCall": {}})));
+    }
+
+    #[test]
+    fn a_quota_error_streamed_as_text_fails_the_turn() {
+        let text = "\n\u{26a0} Individual quota reached. Resets in 1h.\n";
         assert_eq!(
-            kinds,
-            [
-                "message.delta",
-                "message.delta",
-                "message.completed",
-                "tool.started",
-                "tool.completed",
-                "tool.started",
-                "tool.completed",
-            ]
+            agy_turn_error(&json!({"stopReason": "end_turn"}), text).as_deref(),
+            Some("Individual quota reached. Resets in 1h.")
         );
-        let Emit::Event { payload, .. } = &events[2] else {
-            panic!("message.completed is a plain event");
+        // A real answer reports usage, even one that mentions a warning sign.
+        assert_eq!(
+            agy_turn_error(&json!({"stopReason": "end_turn", "usage": {}}), text),
+            None
+        );
+        assert_eq!(
+            agy_turn_error(&json!({"stopReason": "end_turn"}), "Hi"),
+            None
+        );
+    }
+
+    #[test]
+    fn session_modes_follow_the_permission_and_work_modes() {
+        let prompt = |permission: &str, work: &str| DriverPrompt {
+            turn_id: "turn".to_owned(),
+            text: String::new(),
+            content: vec![],
+            skills: vec![],
+            model: None,
+            reasoning_effort: None,
+            permission_mode: Some(permission.to_owned()),
+            work_mode: Some(work.to_owned()),
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+            after_plan: None,
+            replan: None,
         };
-        assert_eq!(payload["message"]["content"][0]["text"], "Hello");
-        let Emit::Event { payload, .. } = &events[4] else {
-            panic!("tool.completed is a plain event");
-        };
-        assert_eq!(payload["result"], "Fri\n");
-        assert_eq!(payload["isError"], false);
-        assert_eq!(payload["arguments"]["CommandLine"], "date");
-        let Emit::Event { payload, .. } = &events[6] else {
-            panic!("tool.completed is a plain event");
-        };
-        assert_eq!(payload["result"], "denied");
-        assert_eq!(payload["isError"], true);
+        let mode = |permission, work| antigravity_session_mode(&prompt(permission, work));
+        assert_eq!(mode("ask", "implement"), Some("default"));
+        assert_eq!(mode("full-access", "implement"), Some("default"));
+        assert_eq!(mode("auto", "implement"), Some("auto"));
+        assert_eq!(mode("auto", "plan"), Some("plan"));
     }
 
     fn usage(gemini_weekly: f64) -> Value {
@@ -1611,54 +868,44 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
     mod wire {
         use super::super::*;
         use crate::conversation::{ConversationEventHub, ConversationManifest, ConversationStore};
-        use crate::provider::types::PermissionBroker;
-        use std::path::PathBuf;
+        use crate::provider::types::{DriverPromptContent, PermissionBroker};
 
         struct Fixture {
             root: PathBuf,
             driver: AntigravityDriver,
             store: ConversationStore,
             manifest: ConversationManifest,
-            /// TodeX's agent MCP with its approval hook, for bridged turns.
+            /// TodeX's agent MCP, for turns that get TodeX's MCP servers.
             bridge: Option<crate::agent_mcp::AgentMcp>,
         }
 
         impl Fixture {
             async fn new() -> Self {
-                Self::with_binary(None).await
-            }
-
-            /// `binary` runs a real `agy`; `None` installs the fixture.
-            async fn with_binary(binary: Option<String>) -> Self {
                 use std::os::unix::fs::PermissionsExt;
                 let root = std::env::temp_dir()
-                    .join(format!("todex-agy-wire-{}", uuid::Uuid::new_v4().simple()));
-                std::fs::create_dir_all(&root).unwrap();
+                    .join(format!("todex-agy-acp-{}", uuid::Uuid::new_v4().simple()));
+                std::fs::create_dir_all(root.join("workspace")).unwrap();
                 let root = std::fs::canonicalize(root).unwrap();
-                let binary = binary.unwrap_or_else(|| {
-                    let binary = root.join("agy-fixture");
-                    std::fs::write(
-                        &binary,
-                        include_str!("../../tests/fixtures/antigravity_stream_fixture.py"),
-                    )
-                    .unwrap();
-                    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
-                        .unwrap();
-                    binary.to_string_lossy().to_string()
-                });
+                let binary = root.join("agy-fixture");
+                std::fs::write(
+                    &binary,
+                    include_str!("../../tests/fixtures/agy_acp_fixture.py"),
+                )
+                .unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
                 let driver = AntigravityDriver {
-                    binary,
+                    binary: binary.to_string_lossy().into_owned(),
                     env_allowlist: Vec::new(),
                     models: CatalogCache::new(None),
-                    auto_mode: tokio::sync::Mutex::new(None),
-                    integration_dir: root.join("gemini-config"),
-                    data_dir: root.join("data"),
+                    sessions: ResidentSessions::new(&PROFILE, "Antigravity"),
+                    legacy_integration: Some(root.join("gemini-config")),
+                    legacy_removed: tokio::sync::OnceCell::new(),
                 };
                 let store = ConversationStore::new(root.join("data")).await.unwrap();
                 let manifest = store
                     .create(ConversationManifest::new(
                         ProviderKind::Antigravity,
-                        root.clone(),
+                        root.join("workspace"),
                         None,
                         None,
                     ))
@@ -1673,11 +920,15 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 }
             }
 
-            /// Turns get TodeX's approval hook, as when agent MCP is on.
+            /// Turns get TodeX's MCP servers and tool modes, as when agent
+            /// MCP is on.
             async fn with_bridge() -> Self {
                 let mut fixture = Self::new().await;
                 let data = fixture.root.join("bridge");
                 let ssh = crate::ssh::SshService::with_home(&data, "ssh".into(), None)
+                    .await
+                    .unwrap();
+                ssh.set_agent_local(crate::ssh::AgentLocal { enabled: true })
                     .await
                     .unwrap();
                 let desktop = crate::agent_desktop::AgentDesktop::load(&data)
@@ -1696,59 +947,18 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 fixture
             }
 
-            /// The mode TodeX's own MCP tools follow in this conversation.
-            fn tool_mode(&self) -> Option<crate::agent_mcp::ToolMode> {
-                self.bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.authorizer_state().mode(&self.manifest.id))
+            fn mark(&self, name: &str) {
+                std::fs::write(self.root.join(name), "").unwrap();
             }
 
-            async fn run(
-                &self,
-                turn_id: &str,
-                text: &str,
-                // `plan`, a permission mode, or `None` for full access.
-                mode: Option<&str>,
-                cancel_after: Option<Duration>,
-            ) -> Result<DriverTurnResult, AppError> {
-                let (permission, work) = match mode {
-                    None => ("full-access", "implement"),
-                    Some("plan") => ("full-access", "plan"),
-                    Some(mode) => (mode, "implement"),
-                };
-                self.run_with(turn_id, text, permission, work, cancel_after)
-                    .await
-            }
-
-            async fn run_with(
+            fn prompt(
                 &self,
                 turn_id: &str,
                 text: &str,
                 permission: &str,
                 work: &str,
-                cancel_after: Option<Duration>,
-            ) -> Result<DriverTurnResult, AppError> {
-                let mut handles = crate::provider::types::TurnHandles {
-                    mode: None,
-                    ..Default::default()
-                };
-                let mut agent_mcp = None;
-                if let Some(bridge) = &self.bridge {
-                    // What the supervisor does as the turn starts.
-                    bridge.record_turn_mode(&self.manifest.id, permission, work);
-                    agent_mcp = bridge.launch_global(&self.manifest.id).await;
-                    handles.mode = Some(crate::provider::types::TurnModeHandle {
-                        agent_mcp: bridge.clone(),
-                        conversation_id: self.manifest.id.clone(),
-                    });
-                }
-                let context = DriverContext {
-                    manifest: self.manifest.clone(),
-                    provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
-                    agent_mcp,
-                    handles,
-                };
-                let prompt = DriverPrompt {
+            ) -> DriverPrompt {
+                DriverPrompt {
                     turn_id: turn_id.to_owned(),
                     text: text.to_owned(),
                     content: vec![],
@@ -1762,26 +972,67 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     approval_policy: None,
                     after_plan: None,
                     replan: None,
+                }
+            }
+
+            async fn context(&self, prompt: &DriverPrompt) -> DriverContext {
+                let mut handles = crate::provider::types::TurnHandles {
+                    mode: None,
+                    ..Default::default()
                 };
-                let sink = DriverEventSink::new(
+                let mut agent_mcp = None;
+                if let Some(bridge) = &self.bridge {
+                    // What the supervisor does as the turn starts.
+                    bridge.record_turn_mode(
+                        &self.manifest.id,
+                        prompt.permission_mode.as_deref().unwrap(),
+                        prompt.work_mode.as_deref().unwrap(),
+                    );
+                    agent_mcp = bridge.launch(&self.manifest.id).await;
+                    handles.mode = Some(crate::provider::types::TurnModeHandle {
+                        agent_mcp: bridge.clone(),
+                        conversation_id: self.manifest.id.clone(),
+                    });
+                }
+                DriverContext {
+                    manifest: self.manifest.clone(),
+                    provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
+                    agent_mcp,
+                    handles,
+                }
+            }
+
+            fn sink(&self, turn_id: &str) -> DriverEventSink {
+                DriverEventSink::new(
                     self.store.clone(),
                     ConversationEventHub::default(),
                     PermissionBroker::default(),
                     &self.manifest.id,
                 )
-                .with_turn_id(turn_id);
-                let (cancel, receiver) = watch::channel(false);
-                if let Some(delay) = cancel_after {
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = cancel.send(true);
-                    });
-                    self.driver.run_turn(context, prompt, sink, receiver).await
-                } else {
-                    let result = self.driver.run_turn(context, prompt, sink, receiver).await;
-                    drop(cancel);
-                    result
-                }
+                .with_turn_id(turn_id)
+            }
+
+            async fn run_prompt(&self, prompt: DriverPrompt) -> Result<DriverTurnResult, AppError> {
+                let context = self.context(&prompt).await;
+                let sink = self.sink(&prompt.turn_id);
+                let (_cancel, receiver) = watch::channel(false);
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    self.driver.run_turn(context, prompt, sink, receiver),
+                )
+                .await
+                .expect("the turn ends")
+            }
+
+            async fn run(
+                &self,
+                turn_id: &str,
+                text: &str,
+                permission: &str,
+                work: &str,
+            ) -> Result<DriverTurnResult, AppError> {
+                self.run_prompt(self.prompt(turn_id, text, permission, work))
+                    .await
             }
 
             async fn events(&self) -> Vec<(String, Value)> {
@@ -1794,536 +1045,401 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     .collect()
             }
 
-            /// The argv of every launch, one JSON array per line.
+            async fn provider_events(&self, method: &str) -> Vec<Value> {
+                self.events()
+                    .await
+                    .into_iter()
+                    .filter(|(kind, payload)| {
+                        kind == "provider.event" && payload["providerMethod"] == method
+                    })
+                    .map(|(_, payload)| payload)
+                    .collect()
+            }
+
+            fn requests(&self) -> Vec<Value> {
+                std::fs::read_to_string(self.root.join("agy-requests.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect()
+            }
+
+            /// `(configId, value)` of every `session/set_config_option`.
+            fn config_writes(&self) -> Vec<(String, String)> {
+                self.requests()
+                    .into_iter()
+                    .filter(|request| request["method"] == "session/set_config_option")
+                    .map(|request| {
+                        (
+                            request["params"]["configId"].as_str().unwrap().to_owned(),
+                            request["params"]["value"].as_str().unwrap().to_owned(),
+                        )
+                    })
+                    .collect()
+            }
+
             fn launches(&self) -> Vec<Vec<String>> {
                 std::fs::read_to_string(self.root.join("argv.log"))
                     .unwrap_or_default()
                     .lines()
                     .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
-                    .filter(|argv| argv.first().map(String::as_str) != Some("models"))
-                    .filter(|argv| !argv.contains(&"-p=/help".to_owned()))
-                    .filter(|argv| !argv.contains(&"-p=/config".to_owned()))
+                    .filter(|argv| argv.first().map(String::as_str) == Some("acp"))
                     .collect()
             }
 
-            /// How many times the Auto mode probe ran.
-            fn auto_probes(&self) -> usize {
-                std::fs::read_to_string(self.root.join("argv.log"))
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|line| line.contains("-p=/help"))
-                    .count()
-            }
-
-            /// The native-auto hint of the last process started.
-            fn last_auto_hint(&self) -> String {
-                std::fs::read_to_string(self.root.join("auto-hint.log"))
-                    .unwrap_or_default()
-                    .lines()
-                    .last()
-                    .unwrap_or_default()
-                    .to_owned()
-            }
-
-            /// Waits until `count` gated probes have started.
-            async fn probes_started(&self, count: usize) {
-                let path = self.root.join("probe-started");
-                tokio::time::timeout(Duration::from_secs(20), async {
-                    while std::fs::read_to_string(&path)
-                        .unwrap_or_default()
-                        .lines()
-                        .count()
-                        < count
-                    {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                })
-                .await
-                .expect("the Auto mode probe starts");
-            }
-
-            /// The parsed `--settings` value of a launch.
-            fn settings_arg(launch: &[String]) -> Option<Value> {
-                let index = launch.iter().position(|arg| arg == "--settings")?;
-                Some(serde_json::from_str(&launch[index + 1]).unwrap())
-            }
-
-            fn mark(&self, name: &str) {
-                std::fs::write(self.root.join(name), "").unwrap();
-            }
-
-            fn unmark(&self, name: &str) {
-                std::fs::remove_file(self.root.join(name)).unwrap();
-            }
-
-            async fn auto_unavailable_events(&self) -> usize {
-                self.events()
-                    .await
-                    .iter()
-                    .filter(|(kind, payload)| {
-                        kind == "provider.event"
-                            && payload["providerMethod"] == "auto_mode_unavailable"
-                    })
-                    .count()
-            }
-        }
-
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.root);
+            async fn finish(self) {
+                self.driver.shutdown().await;
+                std::fs::remove_dir_all(self.root).unwrap();
             }
         }
 
         #[tokio::test]
-        async fn a_turn_streams_text_and_tools_then_the_next_resumes_it() {
+        async fn a_turn_streams_text_and_tools_and_the_next_reuses_the_process() {
             let fixture = Fixture::new().await;
-            let result = fixture.run("turn-1", "hello", None, None).await.unwrap();
-            assert_eq!(result.native_session_id.as_deref(), Some("agy-conv-1"));
+            let result = fixture
+                .run("turn-1", "hello", "ask", "implement")
+                .await
+                .unwrap();
+            assert_eq!(result.stop_reason, "end_turn");
+            assert_eq!(result.native_session_id.as_deref(), Some("agy-session-1"));
             let events = fixture.events().await;
             let text: String = events
                 .iter()
                 .filter(|(kind, _)| kind == "message.delta")
-                .filter_map(|(_, payload)| payload.pointer("/delta/text").and_then(Value::as_str))
+                .filter_map(|(_, payload)| payload.pointer("/content/text").and_then(Value::as_str))
                 .collect();
             assert_eq!(text, "Hi there");
-            assert!(events.iter().any(|(kind, payload)| kind == "tool.completed"
-                && payload["toolName"] == "run_command"
-                && payload["result"] == "ok\n"));
+            let tool = events
+                .iter()
+                .find(|(kind, _)| kind == "tool.started")
+                .map(|(_, payload)| payload)
+                .expect("a tool call");
+            assert_eq!(tool["toolName"], "run_command");
+            assert_eq!(tool["arguments"]["CommandLine"], "true");
+            assert!(events
+                .iter()
+                .any(|(kind, payload)| kind == "tool.updated" && payload["status"] == "completed"));
             assert!(events.iter().any(|(kind, _)| kind == "usage.updated"));
 
-            fixture.run("turn-2", "again", None, None).await.unwrap();
-            let launches = fixture.launches();
-            assert_eq!(launches.len(), 2);
-            assert!(launches[0].contains(&"--dangerously-skip-permissions".to_owned()));
-            assert!(launches[0].contains(&"gemini-3.8-flash-low".to_owned()));
-            assert!(!launches[0].contains(&"--conversation".to_owned()));
-            let resume = launches[1]
+            fixture
+                .run("turn-2", "again", "ask", "implement")
+                .await
+                .unwrap();
+            assert_eq!(fixture.launches().len(), 1, "one resident process");
+            let requests = fixture.requests();
+            // agy binds the session to the process' working directory.
+            assert!(requests
                 .iter()
-                .position(|arg| arg == "--conversation")
-                .unwrap();
-            assert_eq!(launches[1][resume + 1], "agy-conv-1");
-            assert_eq!(launches[1].last().map(String::as_str), Some("-p="));
+                .all(|request| request["cwd"] == fixture.root.join("workspace").to_str().unwrap()));
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["method"] == "session/new")
+                    .count(),
+                1
+            );
+            fixture.finish().await;
         }
 
         #[tokio::test]
-        async fn plan_turns_keep_agys_own_review() {
+        async fn a_new_process_resumes_the_session() {
             let fixture = Fixture::new().await;
             fixture
-                .run("turn-1", "hello", Some("plan"), None)
+                .run("turn-1", "hello", "ask", "implement")
                 .await
                 .unwrap();
-            let launch = &fixture.launches()[0];
-            assert!(!launch.contains(&"--dangerously-skip-permissions".to_owned()));
-            let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
-            assert_eq!(launch[mode + 1], "plan");
+            fixture.driver.shutdown_session(&fixture.manifest.id).await;
+            fixture
+                .run("turn-2", "again", "ask", "implement")
+                .await
+                .unwrap();
+            let methods: Vec<_> = fixture
+                .requests()
+                .into_iter()
+                .filter_map(|request| request["method"].as_str().map(str::to_owned))
+                .filter(|method| {
+                    method.starts_with("session/") && method != "session/set_config_option"
+                })
+                .collect();
+            assert_eq!(
+                methods,
+                [
+                    "session/new",
+                    "session/prompt",
+                    "session/resume",
+                    "session/prompt"
+                ]
+            );
+            fixture.finish().await;
         }
 
         #[tokio::test]
-        async fn auto_turns_use_agys_auto_review_once_probed() {
+        async fn the_model_and_effort_select_agys_variant_and_modes_follow_the_turn() {
             let fixture = Fixture::new().await;
             fixture
-                .run("turn-1", "hello", Some("auto"), None)
+                .run("turn-1", "hello", "ask", "implement")
                 .await
                 .unwrap();
-            assert_eq!(fixture.last_auto_hint(), "1");
             fixture
-                .run("turn-2", "again", Some("auto"), None)
+                .run("turn-2", "hello", "auto", "implement")
                 .await
                 .unwrap();
-            for launch in fixture.launches() {
-                assert!(!launch.contains(&"--dangerously-skip-permissions".to_owned()));
-                let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
-                assert_eq!(launch[mode + 1], "auto");
-            }
-            assert_eq!(fixture.auto_probes(), 1);
-            assert_eq!(fixture.auto_unavailable_events().await, 0);
+            fixture
+                .run("turn-3", "hello", "full-access", "plan")
+                .await
+                .unwrap();
+            fixture
+                .run("turn-4", "hello", "full-access", "implement")
+                .await
+                .unwrap();
+            let writes = fixture.config_writes();
+            assert!(writes.contains(&("model".to_owned(), "gemini-3.8-flash-low".to_owned())));
+            assert!(!writes.iter().any(|(id, _)| id == "thought_level"));
+            let modes: Vec<_> = writes
+                .iter()
+                .filter(|(id, _)| id == "mode")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(modes, ["auto", "plan", "default"]);
+            fixture.finish().await;
         }
 
         #[tokio::test]
-        async fn auto_without_agys_auto_preview_runs_as_ask() {
-            let fixture = Fixture::new().await;
-            std::fs::write(fixture.root.join("auto-unavailable"), "").unwrap();
-            fixture
-                .run("turn-1", "hello", Some("auto"), None)
-                .await
-                .unwrap();
-            let launch = &fixture.launches()[0];
-            assert!(!launch.contains(&"--mode".to_owned()));
-            assert_eq!(fixture.last_auto_hint(), "-");
-            assert_eq!(fixture.auto_unavailable_events().await, 1);
-        }
-
-        #[tokio::test]
-        async fn bridged_auto_without_agys_auto_asks_for_todex_tools_too() {
+        async fn auto_without_agys_auto_runs_as_ask() {
             use crate::agent_mcp::ToolMode;
             let fixture = Fixture::with_bridge().await;
-            std::fs::write(fixture.root.join("auto-unavailable"), "").unwrap();
+            fixture.mark("no-auto");
             fixture
-                .run("turn-1", "hello", Some("auto"), None)
+                .run("turn-1", "hello", "auto", "implement")
                 .await
                 .unwrap();
-            let launch = &fixture.launches()[0];
-            assert!(launch.contains(&"--dangerously-skip-permissions".to_owned()));
-            assert!(!launch.contains(&"--mode".to_owned()));
-            assert_eq!(fixture.last_auto_hint(), "-");
-            assert_eq!(fixture.tool_mode(), Some(ToolMode::Ask));
+            assert_eq!(
+                fixture.provider_events("auto_mode_unavailable").await.len(),
+                1
+            );
+            assert!(!fixture
+                .config_writes()
+                .iter()
+                .any(|(id, value)| id == "mode" && value == "auto"));
             let bridge = fixture.bridge.as_ref().unwrap();
             assert_eq!(
-                bridge.turn_mode(&fixture.manifest.id),
-                Some(("ask".to_owned(), "implement".to_owned()))
+                bridge.authorizer_state().mode(&fixture.manifest.id),
+                Some(ToolMode::Ask)
             );
-            assert_eq!(fixture.auto_unavailable_events().await, 1);
+            fixture.finish().await;
         }
 
         #[tokio::test]
-        async fn an_allowlisted_native_auto_marker_never_reaches_a_fallback_launch() {
-            // Set in the daemon's environment and named by an operator's
-            // allowlist; only TodeX itself may set it, for native Auto.
-            std::env::set_var(AGY_NATIVE_AUTO_ENV, "1");
-            let mut fixture = Fixture::with_bridge().await;
-            fixture.driver.env_allowlist = vec![AGY_NATIVE_AUTO_ENV.to_owned()];
-            fixture.mark("auto-unavailable");
-            fixture
-                .run("turn-1", "hello", Some("auto"), None)
-                .await
-                .unwrap();
-            assert!(fixture.launches()[0].contains(&"--dangerously-skip-permissions".to_owned()));
-            assert_eq!(fixture.last_auto_hint(), "-");
-            fixture
-                .run("turn-2", "again", Some("ask"), None)
-                .await
-                .unwrap();
-            assert_eq!(fixture.last_auto_hint(), "-");
-            fixture.run("turn-3", "more", None, None).await.unwrap();
-            assert_eq!(fixture.last_auto_hint(), "-");
-        }
-
-        #[tokio::test]
-        async fn bridged_native_auto_keeps_todex_tools_in_auto() {
-            use crate::agent_mcp::ToolMode;
+        async fn todex_mcp_servers_go_to_the_session_and_their_calls_are_approved() {
             let fixture = Fixture::with_bridge().await;
-            fixture
-                .run("turn-1", "hello", Some("auto"), None)
-                .await
-                .unwrap();
-            let launch = &fixture.launches()[0];
-            assert!(!launch.contains(&"--dangerously-skip-permissions".to_owned()));
-            let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
-            assert_eq!(launch[mode + 1], "auto");
-            assert_eq!(fixture.last_auto_hint(), "1");
-            assert_eq!(fixture.tool_mode(), Some(ToolMode::Auto));
-        }
-
-        #[tokio::test]
-        async fn turns_under_agys_own_review_allow_todex_mcp_and_keep_the_users_rules() {
-            let fixture = Fixture::with_bridge().await;
-            let settings = fixture.root.join("antigravity-cli");
-            std::fs::create_dir_all(&settings).unwrap();
-            std::fs::write(
-                settings.join("settings.json"),
-                r#"{ "permissions": { "allow": ["command(ls)", "mcp(todex_ssh/*)"],
-                     "deny": ["mcp(todex_ssh/ssh_exec)"] } }"#,
-            )
-            .unwrap();
-            fixture
-                .run("turn-1", "hello", Some("plan"), None)
-                .await
-                .unwrap();
-            fixture
-                .run("turn-2", "again", Some("auto"), None)
-                .await
-                .unwrap();
-            fixture
-                .run("turn-3", "more", Some("ask"), None)
-                .await
-                .unwrap();
-            let launches = fixture.launches();
-            for launch in &launches[..2] {
-                assert_eq!(
-                    Fixture::settings_arg(launch),
-                    Some(json!({ "permissions": {
-                        "allow": [
-                            "command(ls)",
-                            "mcp(todex_ssh/*)",
-                            "mcp(todex_desktop/*)",
-                            "mcp(todex_agents/*)",
-                        ],
-                        "deny": ["mcp(todex_ssh/ssh_exec)"],
-                    } }))
-                );
-            }
-            // Ask turns skip agy's review; TodeX's hook decides.
-            assert_eq!(Fixture::settings_arg(&launches[2]), None);
-        }
-
-        #[tokio::test]
-        async fn unbridged_turns_do_not_allow_todex_mcp() {
-            let fixture = Fixture::new().await;
-            fixture
-                .run("turn-1", "hello", Some("plan"), None)
-                .await
-                .unwrap();
-            assert_eq!(Fixture::settings_arg(&fixture.launches()[0]), None);
-        }
-
-        #[tokio::test]
-        async fn auto_with_preauth_warning_still_runs_native_auto_when_config_confirms_auto() {
-            let fixture = Fixture::new().await;
-            fixture.mark("auto-preauth-warning");
-            let settings = fixture.root.join("antigravity-cli/settings.json");
-            std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-            std::fs::write(&settings, r#"{"agentMode":"default","theme":"dark"}"#).unwrap();
-
-            fixture
-                .run("turn-1", "hello", Some("auto"), None)
-                .await
-                .unwrap();
-            let launch = &fixture.launches()[0];
-            assert!(!launch.contains(&"--dangerously-skip-permissions".to_owned()));
-            let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
-            assert_eq!(launch[mode + 1], "auto");
-            assert_eq!(fixture.last_auto_hint(), "1");
-            assert_eq!(fixture.auto_unavailable_events().await, 0);
-            let updated: Value =
-                serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
-            assert_eq!(updated["agentMode"], "auto");
-            assert_eq!(updated["theme"], "dark");
-
-            // A second turn reuses the cached status and still emits no false unavailable event.
-            fixture
-                .run("turn-2", "again", Some("auto"), None)
-                .await
-                .unwrap();
-            assert_eq!(fixture.auto_probes(), 1);
-            assert_eq!(fixture.auto_unavailable_events().await, 0);
-        }
-
-        #[tokio::test]
-        async fn a_stale_auto_probe_is_reported_and_retried() {
-            let fixture = Fixture::new().await;
-            fixture
-                .run("turn-1", "hello", Some("auto"), None)
-                .await
-                .unwrap();
-            std::fs::write(fixture.root.join("auto-revoked"), "").unwrap();
-            fixture
-                .run("turn-2", "again", Some("auto"), None)
-                .await
-                .unwrap();
-            assert_eq!(fixture.auto_unavailable_events().await, 1);
-            fixture
-                .run("turn-3", "more", Some("auto"), None)
-                .await
-                .unwrap();
-            assert_eq!(fixture.auto_probes(), 2);
-        }
-
-        #[tokio::test]
-        async fn a_failed_probe_is_cached_briefly_then_retried() {
-            let fixture = Fixture::new().await;
-            fixture.mark("auto-probe-fails");
-            fixture
-                .run("turn-1", "hello", Some("auto"), None)
-                .await
-                .unwrap();
-            assert!(!fixture.launches()[0].contains(&"--mode".to_owned()));
-            let cached = fixture.driver.auto_mode.lock().await.unwrap();
-            assert!(!cached.available);
-            let left = cached
-                .expires
-                .saturating_duration_since(std::time::Instant::now());
-            assert!(left > Duration::from_secs(60) && left <= AUTO_PROBE_FAILURE_TTL);
-
-            fixture
-                .run("turn-2", "again", Some("auto"), None)
-                .await
-                .unwrap();
-            assert_eq!(fixture.auto_probes(), 1);
-
-            // Two minutes later the probe runs again.
-            fixture.unmark("auto-probe-fails");
-            fixture
-                .driver
-                .auto_mode
-                .lock()
-                .await
-                .as_mut()
-                .unwrap()
-                .expires = std::time::Instant::now();
-            fixture
-                .run("turn-3", "more", Some("auto"), None)
-                .await
-                .unwrap();
-            assert_eq!(fixture.auto_probes(), 2);
-            let launch = fixture.launches().pop().unwrap();
-            let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
-            assert_eq!(launch[mode + 1], "auto");
-        }
-
-        #[tokio::test]
-        async fn concurrent_auto_turns_share_one_probe() {
-            let fixture = Fixture::new().await;
-            fixture.mark("auto-probe-gate");
-            let release = async {
-                fixture.probes_started(1).await;
-                // Give the second turn time to queue behind the probe.
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                fixture.unmark("auto-probe-gate");
-            };
-            let (first, second, ()) = tokio::join!(
-                fixture.run("turn-1", "hello", Some("auto"), None),
-                fixture.run("turn-2", "again", Some("auto"), None),
-                release,
-            );
-            first.unwrap();
-            second.unwrap();
-            assert_eq!(fixture.auto_probes(), 1);
-            assert_eq!(fixture.launches().len(), 2);
-        }
-
-        #[tokio::test]
-        async fn cancel_during_the_probe_ends_the_turn_before_agy_starts() {
-            let fixture = Fixture::new().await;
-            fixture.mark("auto-probe-gate");
             let result = fixture
-                .run(
-                    "turn-1",
-                    "hello",
-                    Some("auto"),
-                    Some(Duration::from_millis(500)),
-                )
+                .run("turn-1", "TODEX_MCP", "ask", "implement")
                 .await
                 .unwrap();
-            assert!(result.cancelled);
-            assert_eq!(result.stop_reason, "cancelled");
-            assert_eq!(fixture.auto_probes(), 1);
-            assert!(fixture.launches().is_empty());
-            // An abandoned probe leaves nothing cached.
-            assert!(fixture.driver.auto_mode.lock().await.is_none());
+            assert_eq!(result.stop_reason, "end_turn");
+            let requests = fixture.requests();
+            let new = requests
+                .iter()
+                .find(|request| request["method"] == "session/new")
+                .unwrap();
+            let servers: Vec<_> = new["params"]["mcpServers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|server| server["name"].as_str().unwrap())
+                .collect();
+            assert!(servers.contains(&"todex_ssh"), "{servers:?}");
+            assert!(requests.iter().any(|request| request["id"] == 99
+                && request["result"]["outcome"]["optionId"] == "allow"));
+            let approved = fixture.events().await.into_iter().any(|(kind, payload)| {
+                kind == "permission.resolved" && payload["autoApproved"] == true
+            });
+            assert!(approved);
+            fixture.finish().await;
         }
 
         #[tokio::test]
-        async fn the_probe_runs_outside_the_workspace() {
+        async fn full_access_approves_and_ask_asks() {
             let fixture = Fixture::new().await;
             fixture
-                .run("turn-1", "hello", Some("auto"), None)
+                .run("turn-1", "PERMISSION", "full-access", "implement")
                 .await
                 .unwrap();
-            assert_eq!(fixture.launches().len(), 1);
-            let cwd = std::fs::read_to_string(fixture.root.join("probe-cwd.log")).unwrap();
-            assert!(
-                !cwd.trim_end().starts_with(&*fixture.root.to_string_lossy()),
-                "{cwd}"
-            );
+            assert!(fixture.requests().iter().any(|request| request["id"] == 99
+                && request["result"]["outcome"]["optionId"] == "allow"));
+
+            let prompt = fixture.prompt("turn-2", "PERMISSION", "ask", "implement");
+            let context = fixture.context(&prompt).await;
+            let sink = fixture.sink("turn-2");
+            let (cancel, receiver) = watch::channel(false);
+            let turn = fixture.driver.run_turn(context, prompt, sink, receiver);
+            let asked = async {
+                loop {
+                    let pending = fixture
+                        .events()
+                        .await
+                        .into_iter()
+                        .filter(|(kind, _)| kind == "permission.requested")
+                        .count();
+                    if pending == 2 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                cancel.send(true).unwrap();
+            };
+            let (result, ()) =
+                tokio::time::timeout(Duration::from_secs(20), async { tokio::join!(turn, asked) })
+                    .await
+                    .expect("the turn ends");
+            assert!(result.unwrap().cancelled);
+            fixture.finish().await;
         }
 
         #[tokio::test]
-        async fn auto_unavailable_is_seen_behind_lots_of_stderr() {
+        async fn a_quota_error_fails_the_turn_and_records_the_window() {
             let fixture = Fixture::new().await;
-            fixture
-                .run("turn-1", "hello", Some("auto"), None)
+            fixture.mark("quota-exhausted");
+            let error = fixture
+                .run("turn-1", "QUOTA", "ask", "implement")
                 .await
-                .unwrap();
-            fixture.mark("auto-revoked");
-            fixture.mark("stderr-noise");
-            fixture
-                .run("turn-2", "again", Some("auto"), None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Individual quota reached"), "{error}");
+            let quota = fixture
+                .events()
                 .await
-                .unwrap();
-            assert_eq!(fixture.auto_unavailable_events().await, 1);
-            assert!(fixture.driver.auto_mode.lock().await.is_none());
+                .into_iter()
+                .find(|(kind, _)| kind == "quota.updated")
+                .map(|(_, payload)| payload)
+                .expect("quota.updated");
+            assert_eq!(quota["status"], "rejected");
+            fixture.finish().await;
         }
 
         #[tokio::test]
-        async fn auto_plan_turns_do_not_probe() {
+        async fn an_error_response_fails_the_turn_with_its_message() {
             let fixture = Fixture::new().await;
-            fixture
-                .run_with("turn-1", "hello", "auto", "plan", None)
+            let error = fixture
+                .run("turn-1", "FAIL model exploded", "ask", "implement")
                 .await
-                .unwrap();
-            assert_eq!(fixture.auto_probes(), 0);
-            let launch = &fixture.launches()[0];
-            let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
-            assert_eq!(launch[mode + 1], "plan");
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("model exploded"), "{error}");
+            fixture.finish().await;
         }
 
         #[tokio::test]
-        async fn ask_without_the_approval_hook_keeps_agys_own_review() {
+        async fn images_go_as_content_blocks() {
+            use base64::Engine as _;
             let fixture = Fixture::new().await;
-            fixture
-                .run("turn-1", "hello", Some("ask"), None)
-                .await
-                .unwrap();
-            assert!(!fixture.launches()[0].contains(&"--dangerously-skip-permissions".to_owned()));
-            assert!(fixture
+            let mut prompt = fixture.prompt("turn-1", "IMAGE", "ask", "implement");
+            prompt.content = vec![DriverPromptContent::Image {
+                path: None,
+                data: base64::engine::general_purpose::STANDARD.encode(b"png bytes"),
+                mime_type: "image/png".to_owned(),
+            }];
+            fixture.run_prompt(prompt).await.unwrap();
+            let text: String = fixture
                 .events()
                 .await
                 .iter()
-                .any(|(kind, payload)| kind == "provider.event"
-                    && payload["providerMethod"] == "approval_bridge_unavailable"));
+                .filter(|(kind, _)| kind == "message.delta")
+                .filter_map(|(_, payload)| payload.pointer("/content/text").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(text, "images: 1");
+            fixture.finish().await;
         }
 
         #[tokio::test]
-        async fn an_error_result_fails_the_turn_with_its_message() {
+        async fn cancel_ends_a_running_turn_and_keeps_the_process() {
             let fixture = Fixture::new().await;
-            let error = fixture
-                .run("turn-1", "FAIL model exploded", None, None)
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("model exploded"), "{error}");
-        }
-
-        #[tokio::test]
-        async fn cancel_stops_a_running_turn() {
-            let fixture = Fixture::new().await;
-            let started = std::time::Instant::now();
-            let result = fixture
-                .run("turn-1", "HANG", None, Some(Duration::from_secs(2)))
+            let prompt = fixture.prompt("turn-1", "HANG", "ask", "implement");
+            let context = fixture.context(&prompt).await;
+            let sink = fixture.sink("turn-1");
+            let (cancel, receiver) = watch::channel(false);
+            let turn = fixture.driver.run_turn(context, prompt, sink, receiver);
+            let stop = async {
+                while !fixture
+                    .requests()
+                    .iter()
+                    .any(|request| request["method"] == "session/prompt")
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                cancel.send(true).unwrap();
+            };
+            let (result, ()) =
+                tokio::time::timeout(Duration::from_secs(20), async { tokio::join!(turn, stop) })
+                    .await
+                    .expect("the turn ends");
+            assert!(result.unwrap().cancelled);
+            fixture
+                .run("turn-2", "again", "ask", "implement")
                 .await
                 .unwrap();
-            assert!(result.cancelled);
-            assert_eq!(result.native_session_id.as_deref(), Some("agy-conv-1"));
-            assert!(started.elapsed() < Duration::from_secs(10));
+            assert_eq!(fixture.launches().len(), 1);
+            fixture.finish().await;
         }
 
-        /// Opt-in: drives the installed `agy` (or `$TODEX_AGY_LIVE_BIN`)
-        /// through a tool turn and a resumed turn, then reads its quota.
-        /// Uses the signed-in account and a little of its quota.
+        #[tokio::test]
+        async fn the_old_hook_and_mcp_entries_are_removed() {
+            let fixture = Fixture::new().await;
+            let dir = fixture.root.join("gemini-config");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("hooks.json"),
+                r#"{"todex-approval": {"PreToolUse": []}, "mine": {"Stop": []}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("mcp_config.json"),
+                r#"{"mcpServers": {"todex_ssh": {"command": "x"}, "mine": {"command": "y"}}}"#,
+            )
+            .unwrap();
+            fixture
+                .run("turn-1", "hello", "ask", "implement")
+                .await
+                .unwrap();
+            let hooks: Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("hooks.json")).unwrap())
+                    .unwrap();
+            assert_eq!(hooks, json!({"mine": {"Stop": []}}));
+            let mcp: Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.join("mcp_config.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(mcp, json!({"mcpServers": {"mine": {"command": "y"}}}));
+            fixture.finish().await;
+        }
+
+        /// Runs real `agy acp` turns: `TODEX_LIVE_AGY=1`, a signed-in `agy`
+        /// (`TODEX_LIVE_AGY_BIN`, default `agy` on PATH), and a model with
+        /// quota (`TODEX_LIVE_AGY_MODEL`, default `gemini-3.8-flash`).
         #[tokio::test]
         #[ignore = "opt-in: runs the real Antigravity CLI and spends quota"]
-        async fn live_agy_turns_resume_and_quota() {
-            let binary = std::env::var("TODEX_AGY_LIVE_BIN").unwrap_or_else(|_| "agy".to_owned());
-            let fixture = Fixture::with_binary(Some(binary.clone())).await;
-            let first = fixture
-                .run(
-                    "turn-1",
-                    "Run the shell command `echo todex-live-check` and reply with its output only.",
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            let conversation = first.native_session_id.clone().unwrap();
-            let events = fixture.events().await;
-            assert!(
-                events.iter().any(|(kind, payload)| kind == "tool.completed"
-                    && payload["toolName"] == "run_command"
-                    && payload["isError"] == false),
-                "{events:#?}"
-            );
-            let second = fixture
-                .run("turn-2", "Reply with the single word: resumed", None, None)
-                .await
-                .unwrap();
-            assert_eq!(
-                second.native_session_id.as_deref(),
-                Some(conversation.as_str())
-            );
-            let usage = fetch_usage(&binary, &[]).await.unwrap();
-            assert!(!quota_payload(&usage)["windows"]
-                .as_array()
-                .unwrap()
-                .is_empty());
+        async fn live_agy_turns_resume() {
+            if std::env::var("TODEX_LIVE_AGY").as_deref() != Ok("1") {
+                return;
+            }
+            let mut fixture = Fixture::new().await;
+            fixture.driver.binary =
+                std::env::var("TODEX_LIVE_AGY_BIN").unwrap_or_else(|_| "agy".to_owned());
+            let model = std::env::var("TODEX_LIVE_AGY_MODEL")
+                .unwrap_or_else(|_| "gemini-3.8-flash".to_owned());
+            let mut prompt =
+                fixture.prompt("turn-1", "Reply with exactly: pong", "ask", "implement");
+            prompt.model = Some(model.clone());
+            let first = fixture.run_prompt(prompt).await.unwrap();
+            assert_eq!(first.stop_reason, "end_turn");
+            fixture.driver.shutdown_session(&fixture.manifest.id).await;
+            let mut prompt =
+                fixture.prompt("turn-2", "Reply with exactly: ping", "ask", "implement");
+            prompt.model = Some(model);
+            let second = fixture.run_prompt(prompt).await.unwrap();
+            assert_eq!(second.native_session_id, first.native_session_id);
+            fixture.finish().await;
         }
     }
 }

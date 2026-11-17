@@ -343,10 +343,8 @@ impl DriverRegistry {
             ),
             (
                 ProviderKind::Antigravity,
-                Arc::new(super::antigravity::AntigravityDriver::new(
-                    &config.agent,
-                    &config.data_dir,
-                )) as Arc<dyn ProviderDriver>,
+                Arc::new(super::antigravity::AntigravityDriver::new(&config.agent))
+                    as Arc<dyn ProviderDriver>,
             ),
             (
                 ProviderKind::DeepseekHarness,
@@ -654,9 +652,6 @@ impl ConversationSupervisor {
         let agent_mcp = self.agent_mcp.as_ref()?;
         match profile(provider).mcp_injection {
             McpInjection::None => None,
-            McpInjection::GlobalConfigEnv => {
-                agent_mcp.launch_global_for(conversation_id, child).await
-            }
             _ => agent_mcp.launch_for(conversation_id, child).await,
         }
     }
@@ -2608,7 +2603,6 @@ impl ConversationSupervisor {
             }
         }
         let (content_text, driver_content, content_hashes) = prepare_prompt_content_hashed(
-            manifest.provider,
             &manifest.workspace,
             manifest.ephemeral.then_some(manifest.id.as_str()),
             content,
@@ -3758,12 +3752,11 @@ async fn fingerprint_file(path: &Path) -> Result<String, AppError> {
 }
 
 async fn prepare_prompt_content(
-    provider: ProviderKind,
     workspace: &Path,
     private_conversation: Option<&str>,
     content: Vec<PromptContentRef>,
 ) -> Result<(String, Vec<DriverPromptContent>), AppError> {
-    prepare_prompt_content_hashed(provider, workspace, private_conversation, content)
+    prepare_prompt_content_hashed(workspace, private_conversation, content)
         .await
         .map(|(text, content, _)| (text, content))
 }
@@ -3773,7 +3766,6 @@ async fn prepare_prompt_content(
 /// `private_conversation` names a private conversation, whose private
 /// upload folder prompt files may also come from.
 async fn prepare_prompt_content_hashed(
-    provider: ProviderKind,
     workspace: &Path,
     private_conversation: Option<&str>,
     content: Vec<PromptContentRef>,
@@ -3798,11 +3790,8 @@ async fn prepare_prompt_content_hashed(
             PromptContentRef::LocalImage { path } => {
                 let path = canonical_workspace_file(&workspace, private_conversation, path).await?;
                 // An uploaded image is also named by its path, so the agent
-                // can work with the file and not only look at it; agy names
-                // every image itself.
-                if provider != ProviderKind::Antigravity
-                    && is_uploaded(private_conversation, &path).await
-                {
+                // can work with the file and not only look at it.
+                if is_uploaded(private_conversation, &path).await {
                     text.push(format!("Attached image: {}", path.display()));
                 }
                 let file_bytes =
@@ -5665,6 +5654,26 @@ mod tests {
         }
     }
 
+    /// An available driver that starts a process per turn: no prewarm.
+    struct PerTurnDriver(Arc<dyn ProviderDriver>);
+
+    #[async_trait::async_trait]
+    impl ProviderDriver for PerTurnDriver {
+        fn descriptor(&self) -> ProviderDescriptor {
+            AvailableDriver(self.0.clone()).descriptor()
+        }
+
+        async fn run_turn(
+            &self,
+            context: DriverContext,
+            prompt: DriverPrompt,
+            sink: DriverEventSink,
+            cancel: watch::Receiver<bool>,
+        ) -> Result<DriverTurnResult, AppError> {
+            self.0.run_turn(context, prompt, sink, cancel).await
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn warm_starts_a_resident_agent_without_recording_anything() {
@@ -5764,7 +5773,7 @@ mod tests {
 
         // A provider that starts a process per turn has nothing to warm.
         replace_driver(&mut supervisor, ProviderKind::Antigravity, |real| {
-            Arc::new(AvailableDriver(real))
+            Arc::new(PerTurnDriver(real))
         });
         let antigravity = supervisor
             .create_owned(
@@ -8745,14 +8754,6 @@ elif [ "$mode" = "app-server" ]; then
         ;;
     esac
   done
-elif [ "$mode" = "--input-format" ]; then
-  # Antigravity print mode: one prompt in, then like agy it exits only once
-  # stdin closes.
-  IFS= read -r line
-  printf '{"event":"init","conversation_id":"agy-native","init":{"permission_mode":"request-review"}}\n'
-  printf '{"event":"step_update","step_update":{"conversation_id":"agy-native","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"agy fixture"}}\n'
-  printf '{"event":"result","result":{"conversation_id":"agy-native","status":"SUCCESS","response":"agy fixture","num_turns":1}}\n'
-  cat > /dev/null
 elif [ "$mode" = "--mode" ]; then
   while IFS= read -r line; do
     case "$line" in
@@ -9296,7 +9297,6 @@ done
         fs::write(&outside, b"outside").unwrap();
 
         let (text, content) = prepare_prompt_content(
-            ProviderKind::Codex,
             &workspace,
             None,
             vec![
@@ -9315,7 +9315,6 @@ done
         ));
 
         let error = prepare_prompt_content(
-            ProviderKind::Codex,
             &workspace,
             None,
             vec![PromptContentRef::File {
@@ -9343,7 +9342,6 @@ done
             .unwrap();
 
         let (text, content) = prepare_prompt_content(
-            ProviderKind::Codex,
             &workspace,
             None,
             vec![
@@ -9378,7 +9376,6 @@ done
 
         // A path that climbs back out of the upload directory is refused.
         let error = prepare_prompt_content(
-            ProviderKind::Codex,
             &workspace,
             None,
             vec![PromptContentRef::File {
@@ -9399,29 +9396,20 @@ done
     async fn typed_image_support_matches_provider_capabilities() {
         let root = temp_dir("todex-provider-image-capabilities");
         fs::create_dir_all(&root).unwrap();
-        for provider in [
-            ProviderKind::Codex,
-            ProviderKind::Pi,
-            ProviderKind::ClaudeCode,
-            ProviderKind::Acp,
-            ProviderKind::GrokBuild,
-        ] {
-            let (_, content) = prepare_prompt_content(
-                provider,
-                &root,
-                None,
-                vec![PromptContentRef::Image {
-                    data: "cG5n".to_owned(),
-                    mime_type: "image/png".to_owned(),
-                }],
-            )
-            .await
-            .expect("typed image input passes through to every provider");
-            assert!(matches!(
-                content.as_slice(),
-                [DriverPromptContent::Image { path: None, .. }]
-            ));
-        }
+        let (_, content) = prepare_prompt_content(
+            &root,
+            None,
+            vec![PromptContentRef::Image {
+                data: "cG5n".to_owned(),
+                mime_type: "image/png".to_owned(),
+            }],
+        )
+        .await
+        .expect("typed image input passes through to every provider");
+        assert!(matches!(
+            content.as_slice(),
+            [DriverPromptContent::Image { path: None, .. }]
+        ));
         let _ = fs::remove_dir_all(root);
     }
 

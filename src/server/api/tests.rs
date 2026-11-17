@@ -29,7 +29,7 @@ impl Drop for Fixture {
     }
 }
 
-/// A daemon state whose Antigravity CLI is the stream-json fixture, with
+/// A daemon state whose Antigravity CLI is the `agy acp` fixture, with
 /// no paired device and no history recipient at all: API key
 /// conversations must not need one.
 async fn fixture() -> Fixture {
@@ -43,7 +43,7 @@ async fn fixture() -> Fixture {
     let agy = root.join("agy-fixture");
     fs::write(
         &agy,
-        include_str!("../../../tests/fixtures/antigravity_stream_fixture.py"),
+        include_str!("../../../tests/fixtures/agy_acp_fixture.py"),
     )
     .unwrap();
     fs::set_permissions(&agy, fs::Permissions::from_mode(0o755)).unwrap();
@@ -296,7 +296,7 @@ async fn runs_return_plaintext_while_history_stays_encrypted_and_isolated() {
     // Streamed fragments are journalled merged.
     assert!(events
         .iter()
-        .any(|event| event["payload"].pointer("/delta/text") == Some(&json!("Hi there"))));
+        .any(|event| event["payload"].pointer("/content/text") == Some(&json!("Hi there"))));
     let (_, manifest) = fixture
         .call(
             "GET",

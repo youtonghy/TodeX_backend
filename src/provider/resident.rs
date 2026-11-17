@@ -671,7 +671,7 @@ impl SessionActor {
 /// allowlisted variable set in the daemon's environment. Invalid names and
 /// every `TODEX_*` name are never forwarded: besides the daemon's own
 /// `TODEX_AGENTD_*` settings, that prefix carries what TodeX itself sets for
-/// a launch (agent MCP endpoints and tokens, `TODEX_AGY_NATIVE_AUTO`), which
+/// a launch (agent MCP endpoints and tokens), which
 /// must not leak in from the daemon's environment.
 pub(super) fn allowlisted_environment(
     defaults: &[(&str, &str)],

@@ -903,11 +903,10 @@ mod tests {
         }
     }
 
-    /// A daemon whose Antigravity CLI is the stream-json fixture, agent
+    /// A daemon whose Antigravity CLI is the `agy acp` fixture, agent
     /// calling switched on, and a Codex parent conversation in a
     /// full-access turn. The agent MCP endpoint stays unset, so no provider
-    /// launch injects TodeX's servers (Antigravity would write them into
-    /// the user's global config); tests reach the route directly.
+    /// launch injects TodeX's servers; tests reach the route directly.
     async fn harness() -> Harness {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
@@ -920,7 +919,7 @@ mod tests {
         let agy = root.join("agy-fixture");
         std::fs::write(
             &agy,
-            include_str!("../../tests/fixtures/antigravity_stream_fixture.py"),
+            include_str!("../../tests/fixtures/agy_acp_fixture.py"),
         )
         .unwrap();
         std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o755)).unwrap();

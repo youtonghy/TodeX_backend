@@ -153,6 +153,19 @@ pub(super) struct AcpQuirks {
     pub subagents: bool,
     /// `auto`/`full-access` are approved client side instead of asking.
     pub client_side_approval: bool,
+    /// Only `full-access` is approved client side; `auto` is a session mode
+    /// the agent reviews itself, and what it asks goes to the user.
+    pub full_access_approval: bool,
+    /// Permission requests (their params) approved client side in every
+    /// mode: TodeX's own MCP tools, which TodeX gates by mode itself.
+    pub trusted_permission: Option<fn(&Value) -> bool>,
+    /// The `mode` used when the requested `auto` is not offered by the
+    /// session; the turn then runs as `ask` and says so.
+    pub auto_mode_fallback: Option<&'static str>,
+    /// A prompt response the agent reports as a normal end of turn although
+    /// the turn failed (its error streamed as message text): the error, from
+    /// the response and the turn's message text.
+    pub turn_error: Option<fn(&Value, &str) -> Option<String>>,
     /// Reattach with `session/resume` (no history replay) when advertised.
     pub prefer_resume: bool,
     /// A stored session the agent cannot load (held by another process or
@@ -218,6 +231,10 @@ pub(super) struct ExtensionUpdates {
 pub(super) const PLAIN_ACP: AcpQuirks = AcpQuirks {
     subagents: false,
     client_side_approval: false,
+    full_access_approval: false,
+    trusted_permission: None,
+    auto_mode_fallback: None,
+    turn_error: None,
     prefer_resume: false,
     recreate_unloadable_session: false,
     control_commands: None,
@@ -255,11 +272,9 @@ fn quirks(provider: ProviderKind) -> &'static AcpQuirks {
         ProviderKind::Opencode => &super::opencode::ACP_QUIRKS,
         ProviderKind::DeepseekHarness => &super::deepseek_harness::ACP_QUIRKS,
         ProviderKind::Omp => &super::omp::ACP_QUIRKS,
+        ProviderKind::Antigravity => &super::antigravity::ACP_QUIRKS,
         ProviderKind::Acp => &GENERIC_ACP,
-        ProviderKind::Codex
-        | ProviderKind::Pi
-        | ProviderKind::ClaudeCode
-        | ProviderKind::Antigravity => &PLAIN_ACP,
+        ProviderKind::Codex | ProviderKind::Pi | ProviderKind::ClaudeCode => &PLAIN_ACP,
     }
 }
 
@@ -707,7 +722,13 @@ pub(super) struct AcpConnectionState {
     /// Set when the last turn's cancel completed cleanly; see
     /// [`AcpConnectionState::take_clean_cancel`].
     clean_cancel: bool,
+    /// The running turn's agent message text (up to [`TURN_TEXT_LIMIT`]),
+    /// for `quirks.turn_error`.
+    turn_text: String,
 }
+
+/// How much of a turn's message text `quirks.turn_error` sees.
+const TURN_TEXT_LIMIT: usize = 4096;
 
 /// Minimum spacing between in-progress snapshots of one tool call. Streaming
 /// shell output otherwise journals the whole accumulated output per line.
@@ -795,13 +816,29 @@ pub(super) enum AutoApprove {
 
 impl AutoApprove {
     fn for_turn(provider: ProviderKind, permission_mode: Option<&str>) -> Self {
-        if !quirks(provider).client_side_approval {
-            return Self::Mediate;
-        }
+        let quirks = quirks(provider);
         match permission_mode {
-            Some("auto") => Self::Once,
-            Some("full-access") => Self::Always,
+            Some("auto") if quirks.client_side_approval => Self::Once,
+            Some("full-access") if quirks.client_side_approval || quirks.full_access_approval => {
+                Self::Always
+            }
             _ => Self::Mediate,
+        }
+    }
+
+    /// How one client request is answered: as the turn says, except that a
+    /// permission request the provider trusts is approved.
+    fn for_request(self, provider: ProviderKind, message: &Value) -> Self {
+        let trusted = message.get("method").and_then(Value::as_str)
+            == Some("session/request_permission")
+            && quirks(provider)
+                .trusted_permission
+                .zip(message.get("params"))
+                .is_some_and(|(trusted, params)| trusted(params));
+        if trusted {
+            Self::Always
+        } else {
+            self
         }
     }
 }
@@ -906,6 +943,14 @@ async fn run_acp_turn_steps(
 
     let legacy_models =
         legacy_models.or_else(|| initialize_value.pointer("/_meta/modelState").cloned());
+    let session_mode = requested_session_mode(
+        provider,
+        context.handles.mode.as_ref(),
+        &prompt,
+        config_options.as_deref(),
+        sink,
+    )
+    .await?;
     let applied_options = apply_requested_config(
         process,
         config_options.as_deref(),
@@ -918,10 +963,12 @@ async fn run_acp_turn_steps(
             provider,
             runtime: &options,
             auto_approve,
+            session_mode,
         },
         connection,
     )
     .await?;
+    connection.turn_text.clear();
     if let (Some((_, response)), Some(options)) = (&mut connection.session, applied_options) {
         response["configOptions"] = serde_json::to_value(options)?;
     }
@@ -941,7 +988,16 @@ async fn run_acp_turn_steps(
     let mut terminal_response = None;
     loop {
         if terminal_response.is_some() && pending.is_empty() {
-            return finish_prompt(terminal_response.take().unwrap(), native_session_id);
+            let response: Value = terminal_response.take().unwrap();
+            if let Some(error) = quirks(provider).turn_error.and_then(|turn_error| {
+                turn_error(
+                    response.get("result").unwrap_or(&Value::Null),
+                    &connection.turn_text,
+                )
+            }) {
+                return Err(AppError::ProviderUnavailable(error));
+            }
+            return finish_prompt(response, native_session_id);
         }
         let control_deadline = pending.values().map(|entry| entry.deadline).min();
         let tool_deadline = connection.tool_flush_deadline();
@@ -1025,6 +1081,7 @@ async fn run_acp_turn_steps(
             }
             let sink = sink.clone();
             let mut cancel = cancel.clone();
+            let auto_approve = auto_approve.for_request(provider, &message);
             client_requests.spawn(async move {
                 let mut writer = BufferedAcpWriter::default();
                 let result =
@@ -2233,6 +2290,7 @@ pub(super) async fn handle_acp_message(
         return Ok(());
     }
     if is_client_request(&message) {
+        let auto_approve = auto_approve.for_request(provider, &message);
         return handle_client_request(process, &message, sink, cancel, auto_approve).await;
     }
     // Updates arrive at streaming rates: move the params out instead of
@@ -2352,8 +2410,11 @@ pub(super) async fn handle_acp_message(
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 normalized["toolCallId"] = json!(tool_id);
+                // agy names its tool (`run_command`, `mcp_<server>_<tool>`)
+                // in a non-schema `name` next to the display `title`.
                 if let Some(name) = update
                     .pointer("/_meta/cognition.ai~1inferenceToolName")
+                    .or_else(|| update.get("name"))
                     .or_else(|| update.get("title"))
                     .or_else(|| update.get("kind"))
                     .and_then(Value::as_str)
@@ -2484,6 +2545,16 @@ pub(super) async fn handle_acp_message(
         if quirks.subagents {
             if let Some(agent_id) = devin_subagent_context(&update) {
                 payload["subagentId"] = json!(agent_id);
+            }
+        }
+        if event_type == "message.delta" && connection.turn_text.len() < TURN_TEXT_LIMIT {
+            if let Some(text) = payload.pointer("/content/text").and_then(Value::as_str) {
+                let room = TURN_TEXT_LIMIT - connection.turn_text.len();
+                let end = (0..=text.len().min(room))
+                    .rev()
+                    .find(|end| text.is_char_boundary(*end))
+                    .unwrap_or(0);
+                connection.turn_text.push_str(&text[..end]);
             }
         }
         if matches!(event_type, "message.delta" | "thought.delta")
@@ -3576,6 +3647,68 @@ struct SessionConfigContext<'a> {
     provider: ProviderKind,
     runtime: &'a AcpRuntimeOptions,
     auto_approve: AutoApprove,
+    /// The `mode` config value to request, see [`requested_session_mode`].
+    session_mode: Option<&'static str>,
+}
+
+/// The `mode` config value a prompt requests (`quirks.session_mode`). When it
+/// asks for `auto` and the session does not offer it, the provider's
+/// `auto_mode_fallback` runs instead: TodeX's own tools ask as in `ask`, and
+/// the turn says so with `auto_mode_unavailable`.
+async fn requested_session_mode(
+    provider: ProviderKind,
+    tool_mode: Option<&super::types::TurnModeHandle>,
+    prompt: &DriverPrompt,
+    options: Option<&[SessionConfigOption]>,
+    sink: &DriverEventSink,
+) -> Result<Option<&'static str>, AppError> {
+    let quirks = quirks(provider);
+    let requested = quirks.session_mode.and_then(|mode| mode(prompt));
+    let (Some("auto"), Some(fallback)) = (requested, quirks.auto_mode_fallback) else {
+        return Ok(requested);
+    };
+    if options.is_some_and(|options| config_offers(options, "mode", "auto")) {
+        return Ok(requested);
+    }
+    if let Some(mode) = tool_mode {
+        mode.downgrade_to_ask(prompt.work_mode.as_deref().unwrap_or("implement"));
+    }
+    sink.emit(
+        "provider.event",
+        json!({
+            "provider": provider.as_str(),
+            "providerMethod": "auto_mode_unavailable",
+            "metadata": {
+                "reason": format!(
+                    "This {} account does not offer the agent's Auto mode; the turn asks for approval as in ask mode.",
+                    super::profile::profile(provider).display_name
+                ),
+            },
+        }),
+    )
+    .await?;
+    Ok(Some(fallback))
+}
+
+/// Whether the select option `config_id` offers `value`.
+fn config_offers(options: &[SessionConfigOption], config_id: &str, value: &str) -> bool {
+    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
+    options
+        .iter()
+        .find(|option| option.id.0.as_ref() == config_id)
+        .is_some_and(|option| match &option.kind {
+            SessionConfigKind::Select(select) => match &select.options {
+                SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .any(|option| option.value.0.as_ref() == value),
+                SessionConfigSelectOptions::Grouped(groups) => groups
+                    .iter()
+                    .flat_map(|group| &group.options)
+                    .any(|option| option.value.0.as_ref() == value),
+                _ => false,
+            },
+            _ => false,
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3609,8 +3742,8 @@ async fn apply_requested_config(
         ("model", prompt.model.as_deref()),
         (quirks.effort_config, prompt.reasoning_effort.as_deref()),
     ];
-    if let Some(session_mode) = quirks.session_mode {
-        requested_configs.push(("mode", session_mode(prompt)));
+    if quirks.session_mode.is_some() {
+        requested_configs.push(("mode", context.session_mode));
     }
     let mut current_options = options.map(<[SessionConfigOption]>::to_vec);
     for (config_id, requested) in requested_configs {

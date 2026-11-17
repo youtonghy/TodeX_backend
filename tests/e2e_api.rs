@@ -1,7 +1,7 @@
 //! The external API end to end against the real binary: a key issued through
 //! `/v2/api-keys` (what Settings → Agent 调用 uses; device authentication is
 //! off here, so loopback requests need no signature) runs an Agent (the
-//! Antigravity stream-json fixture) through `/api/v1/runs`, reads plaintext
+//! Antigravity `agy acp` fixture) through `/api/v1/runs`, reads plaintext
 //! back while the history on disk stays encrypted, and stops working once
 //! revoked.
 #![cfg(unix)]
@@ -64,7 +64,7 @@ async fn api_key_runs_an_agent_and_revocation_locks_it_out() {
     let workspace = fs::canonicalize(&workspace).unwrap();
     let data_dir = root.join("data");
     let agy = root.join("agy");
-    fs::write(&agy, include_str!("fixtures/antigravity_stream_fixture.py")).unwrap();
+    fs::write(&agy, include_str!("fixtures/agy_acp_fixture.py")).unwrap();
     fs::set_permissions(&agy, fs::Permissions::from_mode(0o755)).unwrap();
 
     let (port, api_port) = (free_port(), free_port());

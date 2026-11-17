@@ -2,11 +2,10 @@
 //! relays every JSON-RPC message, unchanged, to one of the daemon's
 //! Streamable HTTP endpoints and back. Tools live only in the daemon.
 //!
-//! With `--route`, the bridge runs from a static global config entry
-//! (Antigravity): the daemon URL, token and the routes enabled for the turn
-//! come from the provider's environment. Started outside a TodeX turn, or
-//! for a route the turn did not enable, it serves no tools instead of
-//! failing, so the agent's own sessions are unaffected.
+//! `--route` marks a static entry earlier TodeX versions wrote into agy's
+//! global `mcp_config.json`. Such an entry outlives the upgrade until TodeX
+//! next drives Antigravity and removes it; meanwhile it serves no tools
+//! instead of failing, so agy's own sessions are unaffected.
 
 use rmcp::{
     transport::{
@@ -21,28 +20,13 @@ use tokio::{
     sync::mpsc,
 };
 
-use super::{ENDPOINT_ENV, LEGACY_TOKEN_ENV, LEGACY_URL_ENV, ROUTES_ENV, TOKEN_ENV, URL_ENV};
+use super::{LEGACY_TOKEN_ENV, LEGACY_URL_ENV, TOKEN_ENV, URL_ENV};
 
 /// Runs the bridge on stdin/stdout. stdout carries the protocol, so errors
 /// are returned for `main` to print on stderr with a non-zero exit status.
 pub(crate) async fn run_bridge(route: Option<String>) -> anyhow::Result<()> {
-    if let Some(route) = route {
-        let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
-        let enabled =
-            env(ROUTES_ENV).is_some_and(|routes| routes.split(',').any(|enabled| enabled == route));
-        return match (env(ENDPOINT_ENV), env(TOKEN_ENV)) {
-            (Some(endpoint), Some(token)) if enabled => {
-                proxy(
-                    &format!("{endpoint}{route}"),
-                    &token,
-                    tokio::io::stdin(),
-                    tokio::io::stdout(),
-                )
-                .await?;
-                Ok(())
-            }
-            _ => Ok(serve_inert(BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await?),
-        };
+    if route.is_some() {
+        return Ok(serve_inert(BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await?);
     }
     let var = |name: &str, legacy: &str| {
         std::env::var(name)

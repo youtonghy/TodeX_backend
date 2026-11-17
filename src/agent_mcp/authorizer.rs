@@ -174,6 +174,7 @@ impl CancelSignal {
     }
 
     /// Cancelled through the returned sender (never, once it is dropped).
+    #[cfg(test)]
     pub(super) fn manual() -> (watch::Sender<bool>, Self) {
         let (sender, receiver) = watch::channel(false);
         (sender, Self(receiver))

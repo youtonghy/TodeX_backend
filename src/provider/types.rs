@@ -1206,51 +1206,9 @@ impl DriverEventSink {
     }
 
     /// Streaming text fragment (`message.delta` / `thought.delta`). Adjacent
-    /// fragments whose payloads differ only in the `text_pointers` fields (and
-    /// in `extra`, for provider identity that is not part of the payload) are
-    /// journalled as one event carrying the concatenated text; see
-    /// [`ConversationStore::append_delta_and_publish`]. Payloads without string
-    /// text at every pointer are emitted unmerged.
-    pub async fn emit_delta(
-        &self,
-        event_type: &str,
-        mut payload: Value,
-        text_pointers: &'static [&'static str],
-        extra: Option<&str>,
-    ) -> Result<(), AppError> {
-        match self.muted_route().await {
-            MutedRoute::Unmuted => {}
-            MutedRoute::Held => return Ok(()),
-            MutedRoute::To(target) => {
-                return Box::pin(target.emit_delta(event_type, payload, text_pointers, extra)).await
-            }
-        }
-        self.touch();
-        self.decorate(event_type, &mut payload);
-        let result = match DeltaFragment::from_payload(&payload, text_pointers, extra) {
-            Some(fragment) => {
-                self.store
-                    .append_delta_and_publish(
-                        &self.conversation_id,
-                        event_type,
-                        payload,
-                        fragment,
-                        &self.hub,
-                    )
-                    .await
-            }
-            None => self
-                .store
-                .append_and_publish(&self.conversation_id, event_type, payload, &self.hub)
-                .await
-                .map(|_| ()),
-        };
-        self.touch();
-        result
-    }
-
-    /// [`Self::emit_delta`] with the merge identity computed by the provider
-    /// instead of by cloning and serializing every fragment. `key` must
+    /// fragments with the same `key` are journalled as one event carrying the
+    /// concatenated text at `text_pointers`; see
+    /// [`ConversationStore::append_delta_and_publish`]. `key` must
     /// cover every field of `payload` outside `text_pointers` that can
     /// differ between fragments (a merged event keeps the newest
     /// fragment's other fields); the sink adds the fields it decorates

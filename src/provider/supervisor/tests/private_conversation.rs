@@ -272,24 +272,14 @@ async fn private_uploads_are_prompt_files_of_their_conversation_only() {
         path: stored.path.clone(),
         name: None,
     };
-    prepare_prompt_content(
-        ProviderKind::Codex,
-        &workspace,
-        Some(manifest.id.as_str()),
-        vec![file()],
-    )
-    .await
-    .unwrap();
+    prepare_prompt_content(&workspace, Some(manifest.id.as_str()), vec![file()])
+        .await
+        .unwrap();
     // Another conversation (and a normal one) cannot name it.
     for other in [Some(uuid::Uuid::new_v4().to_string()), None] {
-        let error = prepare_prompt_content(
-            ProviderKind::Codex,
-            &workspace,
-            other.as_deref(),
-            vec![file()],
-        )
-        .await
-        .unwrap_err();
+        let error = prepare_prompt_content(&workspace, other.as_deref(), vec![file()])
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), "INVALID_REQUEST");
     }
     supervisor

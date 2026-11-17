@@ -133,13 +133,11 @@ enum Command {
         hide = true
     )]
     AgentMcpBridge {
-        /// Route of a static config entry; see `agent_mcp::ROUTE_ARG`.
+        /// Route of a static entry earlier versions wrote into agy's
+        /// global config; such an entry serves no tools.
         #[arg(long)]
         route: Option<String>,
     },
-    /// `PreToolUse` hook TodeX installs for the Antigravity CLI.
-    #[command(name = agent_mcp::AGY_HOOK_SUBCOMMAND, hide = true)]
-    AgyHook,
     /// Checks a release's `SHA256SUMS.sig` with this binary's release keys,
     /// so `install.sh update` needs no Ed25519-capable OpenSSL. Exit 0:
     /// verified; 3: not signed by a release key; 1: unusable input (clap's
@@ -338,8 +336,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         // No logging: stdout carries the MCP protocol.
         Command::AgentMcpBridge { route } => agent_mcp::run_bridge(route).await,
-        // No logging: stdout carries the hook's decision.
-        Command::AgyHook => agent_mcp::run_agy_hook().await,
         Command::VerifyRelease {
             tag,
             manifest,

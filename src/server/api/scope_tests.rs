@@ -29,8 +29,8 @@ impl Drop for Fixture {
     }
 }
 
-/// Like `tests::fixture`: Antigravity is the stream-json fixture, which
-/// lists `gemini-3.8-flash` (efforts `high`, `low`) and logs its argv.
+/// Like `tests::fixture`: Antigravity is the `agy acp` fixture, which
+/// lists `gemini-3.8-flash` (efforts `high`, `low`) and journals its requests.
 async fn fixture() -> Fixture {
     use std::os::unix::fs::PermissionsExt;
 
@@ -43,7 +43,7 @@ async fn fixture() -> Fixture {
     let agy = root.join("agy-fixture");
     fs::write(
         &agy,
-        include_str!("../../../tests/fixtures/antigravity_stream_fixture.py"),
+        include_str!("../../../tests/fixtures/agy_acp_fixture.py"),
     )
     .unwrap();
     fs::set_permissions(&agy, fs::Permissions::from_mode(0o755)).unwrap();
@@ -134,16 +134,17 @@ impl Fixture {
         body
     }
 
-    /// The `--model` values the fixture was launched with.
+    /// The models turns selected (`session/set_config_option` `model`).
     fn launched_models(&self) -> Vec<String> {
-        fs::read_to_string(self.root.join("argv.log"))
+        fs::read_to_string(self.root.join("agy-requests.jsonl"))
             .unwrap_or_default()
             .lines()
-            .filter_map(|line| serde_json::from_str::<Vec<String>>(line).ok())
-            .filter_map(|argv| {
-                let index = argv.iter().position(|arg| arg == "--model")?;
-                argv.get(index + 1).cloned()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|request| {
+                request["method"] == "session/set_config_option"
+                    && request["params"]["configId"] == "model"
             })
+            .filter_map(|request| request["params"]["value"].as_str().map(str::to_owned))
             .collect()
     }
 }

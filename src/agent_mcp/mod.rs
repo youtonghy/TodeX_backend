@@ -23,7 +23,6 @@
 //! against agents acting unasked, not a security boundary.
 
 mod agents_server;
-mod agy_hook;
 mod authorizer;
 mod bridge;
 mod desktop_computer;
@@ -48,7 +47,6 @@ use crate::{
     ssh::SshService,
 };
 
-pub(crate) use agy_hook::run_hook as run_agy_hook;
 pub(crate) use authorizer::ToolMode;
 use authorizer::{Authorizer, AuthorizerState};
 pub(crate) use bridge::run_bridge;
@@ -60,7 +58,6 @@ pub(crate) fn routes(
     server::routes(state)
         .merge(desktop_server::routes(state))
         .merge(agents_server::routes(state))
-        .merge(agy_hook::routes())
 }
 
 /// MCP server name the agents see; tools appear as e.g. `todex_ssh.ssh_exec`.
@@ -83,21 +80,6 @@ const SSH_TOOL_TIMEOUT_SECONDS: u64 = authorizer::CONFIRM_TIMEOUT.as_secs()
     + crate::ssh::login::LOGIN_TIMEOUT.as_secs()
     + server::MAX_TIMEOUT_SECONDS
     + 60;
-/// For providers whose MCP servers and hooks come from one static global
-/// config (Antigravity): the daemon's base URL and the routes enabled for
-/// the turn, passed in the provider's environment; each static entry names
-/// its route with `--route`.
-pub(crate) const ENDPOINT_ENV: &str = "TODEX_AGENT_MCP_ENDPOINT";
-pub(crate) const ROUTES_ENV: &str = "TODEX_AGENT_MCP_ROUTES";
-/// Bridge argument naming the route of a static config entry.
-pub(crate) const ROUTE_ARG: &str = "--route";
-/// Hidden subcommand an Antigravity `PreToolUse` hook runs; see [`agy_hook`].
-pub(crate) const AGY_HOOK_SUBCOMMAND: &str = "agy-hook";
-pub(crate) const AGY_HOOK_ROUTE: &str = "/internal/agent-mcp/agy-permission";
-/// Set in the `agy` environment when the turn runs agy's own Auto review
-/// (`--mode auto`); the hook forwards it as [`AGY_NATIVE_AUTO_HEADER`].
-pub(crate) const AGY_NATIVE_AUTO_ENV: &str = "TODEX_AGY_NATIVE_AUTO";
-pub(crate) const AGY_NATIVE_AUTO_HEADER: &str = "x-todex-agy-native-auto";
 pub(crate) const DESKTOP_SERVER: &str = "todex_desktop";
 pub(crate) const DESKTOP_ROUTE: &str = "/internal/agent-mcp/desktop";
 pub(crate) const AGENTS_SERVER: &str = "todex_agents";
@@ -409,41 +391,6 @@ impl AgentMcp {
         self.launch_servers(conversation_id, enabled)
     }
 
-    /// For a provider reading TodeX's servers and approval hook from a static
-    /// global config: the enabled servers (possibly none) plus the variables
-    /// that point the static entries at this conversation. `None` only when
-    /// the endpoint or the daemon executable is unavailable.
-    #[cfg(test)]
-    pub(crate) async fn launch_global(&self, conversation_id: &str) -> Option<AgentMcpLaunch> {
-        self.launch_global_for(conversation_id, false).await
-    }
-
-    /// [`Self::launch_global`]; `child` as in [`Self::launch_for`].
-    pub(crate) async fn launch_global_for(
-        &self,
-        conversation_id: &str,
-        child: bool,
-    ) -> Option<AgentMcpLaunch> {
-        let enabled = self.enabled_servers(child).await;
-        let mut launch = self.launch_servers(conversation_id, enabled)?;
-        let endpoint = self.inner.endpoint.get()?.clone();
-        let routes = launch
-            .servers
-            .iter()
-            .map(|server| server.route)
-            .collect::<Vec<_>>()
-            .join(",");
-        launch.global = Some(GlobalLaunch {
-            daemon: self.inner.bridge_command.clone()?,
-            env: vec![
-                (ENDPOINT_ENV.to_owned(), endpoint),
-                (TOKEN_ENV.to_owned(), self.token_for(conversation_id)),
-                (ROUTES_ENV.to_owned(), routes),
-            ],
-        });
-        Some(launch)
-    }
-
     async fn enabled_servers(&self, child: bool) -> Vec<(&'static str, &'static str, u64)> {
         let mut enabled = Vec::new();
         if self.inner.ssh.agent_local().await.enabled || self.inner.ssh.has_agent_hosts().await {
@@ -496,7 +443,6 @@ impl AgentMcp {
                 .collect(),
             config_file: self.claude_config_path(conversation_id),
             pi_extension: self.pi_extension_path(),
-            global: None,
         })
     }
 
@@ -604,17 +550,6 @@ pub struct AgentMcpLaunch {
     /// Owner-only Pi extension script (`-e <path>`), written once in
     /// `state_dir` when [`AgentMcp`] starts.
     pub(crate) pi_extension: PathBuf,
-    /// Set by [`AgentMcp::launch_global`].
-    pub(crate) global: Option<GlobalLaunch>,
-}
-
-/// What a provider with a static global config of TodeX's servers and hook
-/// needs per turn: the executable those entries run, and the variables its
-/// process must carry so they reach this conversation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GlobalLaunch {
-    pub(crate) daemon: PathBuf,
-    pub(crate) env: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -751,11 +686,6 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             [SSH_SERVER]
         );
-        let global = mcp.launch_global_for("conv_child", true).await.unwrap();
-        let routes = global.global.unwrap().env;
-        assert!(routes
-            .iter()
-            .any(|(name, value)| name == ROUTES_ENV && value == SSH_ROUTE));
         mcp.revoke("conv_a").await;
         mcp.revoke("conv_child").await;
     }

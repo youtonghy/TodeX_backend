@@ -13,7 +13,7 @@
 
 ## Overview
 
-`todex-agentd` is the core backend service of the TodeX ecosystem. Built with Rust, Tokio, and Axum, it orchestrates multiple AI coding assistants—including **Codex app-server**, **Agent Client Protocol (ACP 2.0)**, **Pi RPC**, **Claude Code stream-json**, **Grok Build**, **Devin** (`devin acp`), **OpenCode** (`opencode acp`), the **Antigravity CLI** (`agy` stream-json), **DeepSeek Harness** (`dsh --profile acp`), and **omp** (oh-my-pi, `omp acp`)—behind a unified, secure, and persistent API.
+`todex-agentd` is the core backend service of the TodeX ecosystem. Built with Rust, Tokio, and Axum, it orchestrates multiple AI coding assistants—including **Codex app-server**, **Agent Client Protocol (ACP 2.0)**, **Pi RPC**, **Claude Code stream-json**, **Grok Build**, **Devin** (`devin acp`), **OpenCode** (`opencode acp`), the **Antigravity CLI** (`agy acp`), **DeepSeek Harness** (`dsh --profile acp`), and **omp** (oh-my-pi, `omp acp`)—behind a unified, secure, and persistent API.
 
 In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST endpoints and a unified `/v2/ws` WebSocket). Conversation folders serve as the single source of truth for message histories, journals, snapshots, and native provider sessions.
 

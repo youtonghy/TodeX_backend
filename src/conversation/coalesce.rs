@@ -40,6 +40,7 @@ impl DeltaFragment {
     /// for provider state that is not part of the payload (for example a
     /// native content-block index). Returns `None` when a text field is not a
     /// string, so such payloads are journalled unmerged.
+    #[cfg(test)]
     pub fn from_payload(
         payload: &Value,
         text_pointers: &'static [&'static str],

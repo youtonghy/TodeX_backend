@@ -363,7 +363,6 @@ impl ConversationSupervisor {
             }
         }
         prepare_prompt_content(
-            manifest.provider,
             &manifest.workspace,
             manifest.ephemeral.then_some(manifest.id.as_str()),
             prompt.content.clone(),
