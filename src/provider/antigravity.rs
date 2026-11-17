@@ -27,6 +27,7 @@
 //! daemon ([`integration`]).
 
 mod integration;
+pub(super) mod native_idle;
 
 pub(crate) use integration::{config_dir as integration_dir, remove as remove_integration};
 
@@ -208,6 +209,8 @@ impl AntigravityDriver {
         uploads: Option<&Path>,
     ) -> Result<ResidentLaunch, AppError> {
         let mut spec = self.command_spec(&context.manifest.workspace, &["acp"]);
+        let native_idle = native_idle::NativeIdle::new()?;
+        spec.push_flag_value("--log-file", &native_idle.log_path().to_string_lossy())?;
         if let Some(uploads) = uploads {
             spec.push_flag_value("--add-dir", &uploads.to_string_lossy())?;
         }
@@ -215,6 +218,7 @@ impl AntigravityDriver {
             spec,
             runtime: AcpRuntimeOptions {
                 suppress_load_replay: true,
+                native_idle: Some(native_idle),
                 ..Default::default()
             },
         })
@@ -868,13 +872,16 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
     mod wire {
         use super::super::*;
         use crate::conversation::{ConversationEventHub, ConversationManifest, ConversationStore};
-        use crate::provider::types::{DriverPromptContent, PermissionBroker};
+        use crate::provider::types::{
+            DriverPromptContent, PermissionBroker, PermissionDecision, PermissionOutcome,
+        };
 
         struct Fixture {
             root: PathBuf,
             driver: AntigravityDriver,
             store: ConversationStore,
             manifest: ConversationManifest,
+            permissions: PermissionBroker,
             /// TodeX's agent MCP, for turns that get TodeX's MCP servers.
             bridge: Option<crate::agent_mcp::AgentMcp>,
         }
@@ -916,6 +923,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     driver,
                     store,
                     manifest,
+                    permissions: PermissionBroker::default(),
                     bridge: None,
                 }
             }
@@ -1006,7 +1014,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 DriverEventSink::new(
                     self.store.clone(),
                     ConversationEventHub::default(),
-                    PermissionBroker::default(),
+                    self.permissions.clone(),
                     &self.manifest.id,
                 )
                 .with_turn_id(turn_id)
@@ -1297,6 +1305,106 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
         }
 
         #[tokio::test]
+        async fn background_permission_remains_in_the_original_turn_until_agy_is_idle() {
+            let fixture = Fixture::new().await;
+            {
+                let turn = fixture.run("turn-1", "BACKGROUND_PERMISSION", "ask", "implement");
+                tokio::pin!(turn);
+                let permission_id = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut turn => panic!("AGY background work ended before approval: {result:?}"),
+                            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                        }
+                        if let Some((_, event)) = fixture.events().await.into_iter()
+                            .find(|(kind, _)| kind == "permission.requested")
+                        {
+                            assert_eq!(event["turnId"], "turn-1");
+                            break event["permissionId"].as_str().unwrap().to_owned();
+                        }
+                    }
+                }).await.unwrap();
+                assert!(tokio::time::timeout(Duration::from_millis(1300), &mut turn)
+                    .await
+                    .is_err());
+                assert!(
+                    std::fs::read_to_string(fixture.root.join("idle-requests.jsonl"))
+                        .unwrap()
+                        .lines()
+                        .count()
+                        >= 2,
+                    "a native timeout re-arms the wait without completing the turn"
+                );
+                fixture
+                    .permissions
+                    .resolve(
+                        &fixture.manifest.id,
+                        &permission_id,
+                        "device",
+                        PermissionDecision {
+                            outcome: PermissionOutcome::AllowOnce,
+                            option_id: Some("allow".to_owned()),
+                            data: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(turn.await.unwrap().stop_reason, "end_turn");
+                assert!(fixture.requests().iter().any(|request| request["id"] == 99
+                    && request["result"]["outcome"]["optionId"] == "allow"));
+            }
+            fixture.finish().await;
+        }
+
+        #[tokio::test]
+        async fn a_prompt_response_waits_for_an_unanswered_permission() {
+            let fixture = Fixture::new().await;
+            {
+                let turn = fixture.run("turn-1", "EARLY_PERMISSION", "ask", "implement");
+                tokio::pin!(turn);
+                let permission_id = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut turn => panic!("turn ended before its permission was answered: {result:?}"),
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    }
+                    if let Some((_, event)) = fixture.events().await.into_iter().find(|(kind, _)| kind == "permission.requested") {
+                        break event["permissionId"].as_str().unwrap().to_owned();
+                    }
+                }
+            }).await.unwrap();
+                assert!(tokio::time::timeout(Duration::from_millis(100), &mut turn)
+                    .await
+                    .is_err());
+                fixture
+                    .permissions
+                    .resolve(
+                        &fixture.manifest.id,
+                        &permission_id,
+                        "device",
+                        PermissionDecision {
+                            outcome: PermissionOutcome::AllowOnce,
+                            option_id: Some("allow".to_owned()),
+                            data: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(turn.await.unwrap().stop_reason, "end_turn");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !fixture.requests().iter().any(|request| {
+                        request["id"] == 99 && request["result"]["outcome"]["optionId"] == "allow"
+                    }) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the permission answer reaches agy before the turn ends");
+            }
+            fixture.finish().await;
+        }
+
+        #[tokio::test]
         async fn a_quota_error_fails_the_turn_and_records_the_window() {
             let fixture = Fixture::new().await;
             fixture.mark("quota-exhausted");
@@ -1381,6 +1489,62 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 .unwrap();
             assert_eq!(fixture.launches().len(), 1);
             fixture.finish().await;
+        }
+
+        #[tokio::test]
+        async fn cancelling_background_work_discards_the_unsettled_process() {
+            let fixture = Fixture::new().await;
+            let prompt = fixture.prompt("turn-1", "BACKGROUND_HANG", "ask", "implement");
+            let context = fixture.context(&prompt).await;
+            let sink = fixture.sink("turn-1");
+            let (cancel, receiver) = watch::channel(false);
+            let turn = fixture.driver.run_turn(context, prompt, sink, receiver);
+            let stop = async {
+                while !fixture.root.join("idle-requests.jsonl").exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                cancel.send(true).unwrap();
+            };
+            let (result, ()) =
+                tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(turn, stop) })
+                    .await
+                    .expect("background cancellation does not wait for native idle");
+            assert!(result.unwrap().cancelled);
+            fixture
+                .run("turn-2", "again", "ask", "implement")
+                .await
+                .unwrap();
+            assert_eq!(fixture.launches().len(), 2);
+            fixture.finish().await;
+        }
+
+        #[tokio::test]
+        async fn native_status_failures_fail_the_turn_and_recreate_the_process() {
+            for marker in [
+                "native-no-port",
+                "native-error",
+                "native-malformed",
+                "native-large",
+            ] {
+                let fixture = Fixture::new().await;
+                fixture.mark(marker);
+                let error = fixture
+                    .run("turn-1", "hello", "ask", "implement")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, AppError::ProviderUnavailable(_)),
+                    "{marker}: {error:?}"
+                );
+                assert!(error.to_string().contains("could not confirm completion"));
+                std::fs::remove_file(fixture.root.join(marker)).unwrap();
+                fixture
+                    .run("turn-2", "again", "ask", "implement")
+                    .await
+                    .unwrap();
+                assert_eq!(fixture.launches().len(), 2, "{marker}");
+                fixture.finish().await;
+            }
         }
 
         #[tokio::test]

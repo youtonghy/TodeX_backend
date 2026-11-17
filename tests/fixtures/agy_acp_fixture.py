@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stands in for the Antigravity CLI (`agy` 1.5.9) in tests.
+"""Stands in for the Antigravity CLI (`agy` 1.5.10) in tests.
 
 Frames follow what the real `agy acp` sends (recorded 2026-11-17): both
 camelCase and snake_case capability keys, `session/new` with `models`,
@@ -19,6 +19,9 @@ to agy-requests.jsonl, both next to itself.
     FAIL <message>  a JSON-RPC error
     QUOTA           agy's quota error as message text
     PERMISSION      a write_file call that asks permission first
+    EARLY_PERMISSION  ends the prompt while its permission is still unanswered
+    BACKGROUND_PERMISSION  ends the prompt, then asks permission during background work
+    BACKGROUND_HANG  ends the prompt but keeps native activity until cancelled
     TODEX_MCP       a todex_ssh MCP call that asks permission first
     IMAGE           replies with the number of image blocks
     anything else   thought, "Hi there", one run_command call, usage
@@ -29,6 +32,8 @@ import json
 import os
 import sys
 import time
+import http.server
+import threading
 
 here = os.path.dirname(os.path.abspath(__file__))
 args = sys.argv[1:]
@@ -61,6 +66,43 @@ state = {"model": "gemini-3.8-flash", "thought": "medium", "mode": "default"}
 session = "agy-session-1"
 active = None
 permission = None
+background_work = False
+log_path = next((args[index + 1] for index, arg in enumerate(args[:-1]) if arg == "--log-file"), None)
+if log_path:
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    open(log_path, "a").close()
+
+    class IdleHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            with open(os.path.join(here, "idle-requests.jsonl"), "a") as journal:
+                journal.write(json.dumps(body) + "\n")
+            if marked("native-error"):
+                self.send_error(503)
+                return
+            deadline = time.monotonic() + body.get("inactivityTimeoutSeconds", 1)
+            while background_work and time.monotonic() < deadline:
+                time.sleep(0.01)
+            timed_out = background_work
+            response = json.dumps({"timedOut": True} if timed_out else {}).encode()
+            if marked("native-malformed"):
+                response = b"not JSON"
+            elif marked("native-large"):
+                response = b" " * 8192
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, *unused):
+            pass
+
+    idle_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), IdleHandler)
+    threading.Thread(target=idle_server.serve_forever, daemon=True).start()
+    if not marked("native-no-port"):
+        with open(log_path, "a") as log:
+            log.write(f"Language server listening on random port at {idle_server.server_port} for HTTP\n")
 
 
 def write(value):
@@ -147,10 +189,14 @@ def ask(call_id, name, raw):
 
 
 def prompt(request_id, params):
-    global active
+    global active, background_work
     active = request_id
     blocks = params["prompt"]
     text = next((block["text"] for block in blocks if block.get("type") == "text"), "")
+    if text == "BACKGROUND_HANG":
+        background_work = True
+        finish()
+        return
     if text == "HANG":
         return
     if text.startswith("FAIL "):
@@ -163,10 +209,16 @@ def prompt(request_id, params):
                "increase your limits. Resets in 1h.\n"})
         finish(usage=False)
         return
-    if text == "PERMISSION":
+    if text in ("PERMISSION", "EARLY_PERMISSION", "BACKGROUND_PERMISSION"):
         raw = {"Content": "hi", "Path": os.path.join(os.getcwd(), "hello.txt")}
         tool_call("tool_call", "call-write", "write_file", raw, "in_progress", tool_kind="edit")
+        if text == "BACKGROUND_PERMISSION":
+            background_work = True
+            finish()
+            time.sleep(0.15)
         ask("call-write", "write_file", raw)
+        if text == "EARLY_PERMISSION":
+            finish()
         return
     if text == "TODEX_MCP":
         raw = {"toolSummary": "List hosts"}
@@ -246,6 +298,7 @@ for line in sys.stdin:
     elif method == "session/prompt":
         prompt(request_id, params)
     elif method == "session/cancel":
+        background_work = False
         if active is not None:
             finish("cancelled")
     elif method == "session/close":
@@ -253,11 +306,15 @@ for line in sys.stdin:
     elif method is not None:
         write({"jsonrpc": "2.0", "id": request_id,
                "error": {"code": -32601, "message": f"Method not found: {method}"}})
-    elif request_id == 99 and permission is not None and active is not None:
+    elif request_id == 99 and permission is not None:
         call_id, name, raw = permission
         permission = None
         allowed = request.get("result", {}).get("outcome", {}).get("optionId") == "allow"
         tool_call("tool_call_update", call_id, name, raw, "completed" if allowed else "failed")
         update("agent_message_chunk", content={"type": "text",
                "text": "allowed" if allowed else "denied"})
-        finish()
+        if active is not None:
+            finish()
+        elif background_work:
+            time.sleep(0.15)
+            background_work = False

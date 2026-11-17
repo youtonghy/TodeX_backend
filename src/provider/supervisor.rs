@@ -7981,6 +7981,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_first_release_drivers_complete_native_fixture_turns() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = temp_dir("todex-provider-contract");
         let workspace_root = root.join("workspaces");
         let workspace = workspace_root.join("project");
@@ -7989,6 +7991,13 @@ mod tests {
         let workspace = fs::canonicalize(workspace).unwrap();
         let fixture = write_provider_fixture(&root);
         let fixture_text = fixture.to_string_lossy().to_string();
+        let agy_fixture = root.join("agy-fixture");
+        fs::write(
+            &agy_fixture,
+            include_str!("../../tests/fixtures/agy_acp_fixture.py"),
+        )
+        .unwrap();
+        fs::set_permissions(&agy_fixture, fs::Permissions::from_mode(0o755)).unwrap();
         let mut profiles = BTreeMap::new();
         profiles.insert(
             "fixture".to_owned(),
@@ -8028,7 +8037,7 @@ mod tests {
                 dsh_env_allowlist: Vec::new(),
                 omp_bin: fixture_text.clone(),
                 omp_env_allowlist: Vec::new(),
-                antigravity_bin: fixture_text,
+                antigravity_bin: agy_fixture.to_string_lossy().into_owned(),
                 antigravity_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
                 ssh_bin: "ssh".to_owned(),

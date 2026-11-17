@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::{
@@ -15,6 +16,7 @@ use agent_client_protocol::schema::{
     ProtocolVersion,
 };
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
@@ -133,6 +135,8 @@ pub(super) struct AcpRuntimeOptions {
     pub request_ask_mode: bool,
     pub legacy_model_state: bool,
     pub snake_case_image_mime: bool,
+    /// AGY resolves `session/prompt` before its background work is idle.
+    pub native_idle: Option<Arc<super::antigravity::native_idle::NativeIdle>>,
 }
 
 impl AcpRuntimeOptions {
@@ -986,65 +990,96 @@ async fn run_acp_turn_steps(
     let mut client_requests: tokio::task::JoinSet<(Vec<Value>, Result<(), AppError>)> =
         tokio::task::JoinSet::new();
     let mut terminal_response = None;
+    let mut native_idle_confirmed = options.native_idle.is_none();
+    let mut idle_wait: Option<futures_util::future::BoxFuture<'_, Result<bool, AppError>>> = None;
     loop {
-        if terminal_response.is_some() && pending.is_empty() {
-            let response: Value = terminal_response.take().unwrap();
-            if let Some(error) = quirks(provider).turn_error.and_then(|turn_error| {
-                turn_error(
-                    response.get("result").unwrap_or(&Value::Null),
-                    &connection.turn_text,
-                )
-            }) {
-                return Err(AppError::ProviderUnavailable(error));
+        // A terminal response may race a permission answer. Dropping this
+        // JoinSet here would abort the broker wait and strand the agent's RPC.
+        let buffered = if terminal_response.is_some()
+            && pending.is_empty()
+            && client_requests.is_empty()
+            && native_idle_confirmed
+        {
+            // Native status and ACP use different transports. Deliver ACP
+            // frames already queued before declaring this turn complete.
+            if let Some(frame) = options
+                .native_idle
+                .as_ref()
+                .and_then(|_| process.read_frame().now_or_never())
+            {
+                Some(sink.provider_frame(frame?).await?)
+            } else {
+                let response: Value = terminal_response.take().unwrap();
+                return finish_prompt(response, native_session_id.clone());
             }
-            return finish_prompt(response, native_session_id);
-        }
+        } else {
+            None
+        };
         let control_deadline = pending.values().map(|entry| entry.deadline).min();
         let tool_deadline = connection.tool_flush_deadline();
-        let message = tokio::select! {
-            message = process.read_frame() => sink.provider_frame(message?).await?,
-            _ = async { if let Some(deadline) = tool_deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending::<()>().await } } => {
-                connection.flush_tool_updates(false).await?;
-                continue;
-            }
-            response = client_requests.join_next(), if !client_requests.is_empty() => {
-                if let Some(Ok((responses, outcome))) = response {
-                    for response in responses { process.send(&response).await?; }
-                    if let Err(error) = outcome {
-                        if !matches!(error, AppError::TurnCancelled) { return Err(error); }
-                    }
+        let message = if let Some(message) = buffered {
+            message
+        } else {
+            tokio::select! {
+                message = process.read_frame() => sink.provider_frame(message?).await?,
+                _ = async { if let Some(deadline) = tool_deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending::<()>().await } } => {
+                    connection.flush_tool_updates(false).await?;
+                    continue;
                 }
-                continue;
-            }
-            request = receive_control(&mut controls), if terminal_response.is_none() => {
-                if let Some(request) = request {
-                    if request.expected_turn_id != prompt.turn_id {
-                        let _ = request.respond_to.send(Err(AppError::InvalidRequest("control targets a stale turn".to_owned())));
+                response = client_requests.join_next(), if !client_requests.is_empty() => {
+                    match response {
+                        Some(Ok((responses, outcome))) => {
+                            for response in responses { process.send(&response).await?; }
+                            if let Err(error) = outcome {
+                                if !matches!(error, AppError::TurnCancelled) { return Err(error); }
+                            }
+                        }
+                        Some(Err(error)) => return Err(AppError::ProviderUnavailable(format!("ACP client request task failed: {error}"))),
+                        None => {}
+                    }
+                    continue;
+                }
+                idle = async { idle_wait.as_mut().expect("native idle wait is running").await }, if idle_wait.is_some() => {
+                    if idle? {
+                        // A native inactivity timeout explicitly says work is
+                        // still running. Re-arm without ending this turn.
+                        idle_wait = Some(Box::pin(options.native_idle.as_ref().expect("native idle is enabled").wait(&native_session_id)));
                     } else {
-                        start_live_control(process, request, &native_session_id, &mut pending, provider).await?;
+                        native_idle_confirmed = true;
+                        idle_wait = None;
                     }
-                } else { controls = None; }
-                continue;
-            }
-            _ = async { if let Some(deadline) = control_deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending::<()>().await } } => {
-                let now = tokio::time::Instant::now();
-                let expired: Vec<_> = pending.iter().filter(|(_,value)| value.deadline <= now).map(|(id,_)| id.clone()).collect();
-                for id in expired {
-                    if let Some(request) = pending.remove(&id) {
-                        let _ = request.request.respond_to.send(Err(AppError::ProviderUnavailable(format!("{} control timed out; effective configuration is unknown", provider.as_str()))));
-                    }
+                    continue;
                 }
-                // A timed-out mutation must never remain in a reusable process.
-                return Err(AppError::ProviderUnavailable(format!("{} control acknowledgement timed out", provider.as_str())));
-            }
-            changed = cancel.changed() => {
-                let _ = changed;
-                send_notification(
-                    process,
-                    "session/cancel",
-                    CancelNotification::new(native_session_id.clone()),
-                ).await?;
-                return drain_cancelled_turn(process, &native_session_id, &prompt_request_id, sink, provider, auto_approve, &mut client_requests, terminal_response.as_ref(), pending.is_empty(), connection).await;
+                request = receive_control(&mut controls), if terminal_response.is_none() => {
+                    if let Some(request) = request {
+                        if request.expected_turn_id != prompt.turn_id {
+                            let _ = request.respond_to.send(Err(AppError::InvalidRequest("control targets a stale turn".to_owned())));
+                        } else {
+                            start_live_control(process, request, &native_session_id, &mut pending, provider).await?;
+                        }
+                    } else { controls = None; }
+                    continue;
+                }
+                _ = async { if let Some(deadline) = control_deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending::<()>().await } } => {
+                    let now = tokio::time::Instant::now();
+                    let expired: Vec<_> = pending.iter().filter(|(_,value)| value.deadline <= now).map(|(id,_)| id.clone()).collect();
+                    for id in expired {
+                        if let Some(request) = pending.remove(&id) {
+                            let _ = request.request.respond_to.send(Err(AppError::ProviderUnavailable(format!("{} control timed out; effective configuration is unknown", provider.as_str()))));
+                        }
+                    }
+                    // A timed-out mutation must never remain in a reusable process.
+                    return Err(AppError::ProviderUnavailable(format!("{} control acknowledgement timed out", provider.as_str())));
+                }
+                changed = cancel.changed() => {
+                    let _ = changed;
+                    send_notification(
+                        process,
+                        "session/cancel",
+                        CancelNotification::new(native_session_id.clone()),
+                    ).await?;
+                    return drain_cancelled_turn(process, &native_session_id, &prompt_request_id, sink, provider, auto_approve, &mut client_requests, terminal_response.as_ref(), pending.is_empty(), connection).await;
+                }
             }
         };
         let Some(message) = message else {
@@ -1052,6 +1087,16 @@ async fn run_acp_turn_steps(
         };
         if message.is_null() {
             continue;
+        }
+        if let Some(native_idle) = options
+            .native_idle
+            .as_ref()
+            .filter(|_| native_idle_confirmed && terminal_response.is_some())
+        {
+            // A queued permission may start another tool/model follow-up.
+            // Reconfirm native idle after servicing that activity.
+            native_idle_confirmed = false;
+            idle_wait = Some(Box::pin(native_idle.wait(&native_session_id)));
         }
         if let Some(id) = jsonrpc_id(&message) {
             if let Some(request) = pending.remove(id) {
@@ -1070,7 +1115,27 @@ async fn run_acp_turn_steps(
         }
         if jsonrpc_id(&message) == Some(prompt_request_id.as_str()) {
             emit_prompt_metadata(&message, sink, provider).await?;
+            if let Some(error) = quirks(provider).turn_error.and_then(|turn_error| {
+                turn_error(
+                    message.get("result").unwrap_or(&Value::Null),
+                    &connection.turn_text,
+                )
+            }) {
+                return Err(AppError::ProviderUnavailable(error));
+            }
             terminal_response = Some(message);
+            if let Some(native_idle) = &options.native_idle {
+                if terminal_response
+                    .as_ref()
+                    .and_then(|response| response.pointer("/result/stopReason"))
+                    .and_then(Value::as_str)
+                    == Some("end_turn")
+                {
+                    idle_wait = Some(Box::pin(native_idle.wait(&native_session_id)));
+                } else {
+                    native_idle_confirmed = true;
+                }
+            }
             continue;
         }
         observe_config_options(connection, &message);

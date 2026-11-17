@@ -123,6 +123,7 @@ impl GrokBuildDriver {
                 request_ask_mode: true,
                 legacy_model_state: true,
                 snake_case_image_mime: false,
+                native_idle: None,
             },
         })
     }
