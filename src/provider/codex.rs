@@ -24,6 +24,8 @@ use super::types::{
 };
 
 mod capabilities;
+#[cfg(test)]
+mod real_tests;
 mod runtime;
 
 /// What Codex CLI supports and how TodeX adapts to it.
@@ -689,6 +691,19 @@ fn codex_notice_event(method: &str, params: &Value) -> Option<Value> {
     }))
 }
 
+/// Journals a [`codex_notice_event`]. A warning is shown once per text:
+/// Codex 0.169 reports a config problem both as `configWarning` and as a
+/// plain `warning`.
+async fn emit_codex_notice(sink: &DriverEventSink, notice: Value) -> Result<(), AppError> {
+    if notice["providerMethod"] == "provider_warning" {
+        let key = format!("provider_warning:{}", notice["metadata"]["reason"]);
+        sink.emit_once(key, "provider.event", notice).await?;
+    } else {
+        sink.emit("provider.event", notice).await?;
+    }
+    Ok(())
+}
+
 /// What an auto-review looked at, in one line: the command, program,
 /// stdin, patched files, network target, MCP tool or permission reason
 /// (`GuardianApprovalReviewAction`).
@@ -1174,7 +1189,7 @@ async fn handle_codex_message(
     }
 
     if let Some(notice) = codex_notice_event(method, &params) {
-        sink.emit("provider.event", notice).await?;
+        emit_codex_notice(sink, notice).await?;
         return Ok(());
     }
     if method == "item/autoApprovalReview/started" {

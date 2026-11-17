@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -983,6 +983,9 @@ pub struct DriverEventSink {
     /// Last journalled payload (after attribution) and event per
     /// [`REPEATABLE_SNAPSHOT_EVENTS`] type, shared like `unparsed_lines`.
     snapshots: Arc<Mutex<HashMap<String, (Value, ConversationEvent)>>>,
+    /// Keys of the events [`Self::emit_once`] journalled, shared like
+    /// `unparsed_lines`.
+    emitted_once: Arc<Mutex<HashSet<String>>>,
     /// Set for a provider prewarm (see [`Self::muted`]); shared by clones.
     muted: Option<Arc<tokio::sync::Mutex<MutedState>>>,
 }
@@ -1026,6 +1029,7 @@ impl DriverEventSink {
             activity: None,
             quota: crate::quota_store::QuotaStore::default(),
             snapshots: Arc::default(),
+            emitted_once: Arc::default(),
             muted: None,
         }
     }
@@ -1116,10 +1120,31 @@ impl DriverEventSink {
         self.unparsed_lines = Arc::default();
         self.oversized_lines = Arc::default();
         self.snapshots = Arc::default();
+        self.emitted_once = Arc::default();
         if self.runtime_id.is_some() {
             self.scope = Some("turn");
         }
         self
+    }
+
+    /// Journals the event unless one with the same `key` already was through
+    /// this sink (or a clone of it): a provider that reports one problem on
+    /// several channels shows it once.
+    pub async fn emit_once(
+        &self,
+        key: String,
+        event_type: impl Into<String>,
+        payload: Value,
+    ) -> Result<Option<ConversationEvent>, AppError> {
+        if !self
+            .emitted_once
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key)
+        {
+            return Ok(None);
+        }
+        self.emit(event_type, payload).await.map(Some)
     }
 
     /// A resident provider can emit between turns without attributing those

@@ -282,7 +282,7 @@ async fn worker(binary: String, pinned: bool, mut commands: mpsc::Receiver<Comma
                                 }
                             } else if let Some(notice) = codex_notice_event(method, message.get("params").unwrap_or(&Value::Null)) {
                                 if let Some(sink) = &last_sink {
-                                    let _ = sink.emit("provider.event", notice).await;
+                                    let _ = emit_codex_notice(sink, notice).await;
                                 }
                             } else if method == "item/autoApprovalReview/started" {
                                 // Only the review's outcome is shown.
@@ -1215,7 +1215,8 @@ while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
       printf '{"id":"%s","result":{"userAgent":"todex-agentd/0.169.0"}}\n' "$id"
-      printf '{"method":"configWarning","params":{"summary":"`mcp_servers.x.type` is ignored.","details":null},"emittedAtMs":1}\n' ;;
+      printf '{"method":"configWarning","params":{"summary":"`mcp_servers.x.type` is ignored.","details":null},"emittedAtMs":1}\n'
+      printf '{"method":"warning","params":{"message":"`mcp_servers.x.type` is ignored.","threadId":null},"emittedAtMs":1}\n' ;;
     *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"native"},"model":"fixture-model"}}\n' "$id" ;;
     *'"method":"turn/start"'*)
       printf '{"id":"%s","result":{"turn":{"id":"active","status":"inProgress"}}}\n' "$id"
@@ -1375,7 +1376,8 @@ done
             .filter(|event| event.event_type == "provider.event")
             .map(|event| &event.payload)
             .collect();
-        // Sent during the prewarm's handshake: journalled once, with the turn.
+        // Sent during the prewarm's handshake, as `configWarning` and again as
+        // `warning` (Codex 0.169): journalled once, with the turn.
         let warnings: Vec<_> = notices
             .iter()
             .filter(|notice| notice["providerMethod"] == "provider_warning")
