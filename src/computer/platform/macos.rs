@@ -2,7 +2,7 @@
 //! posted to one app's process without activating it.
 
 use std::{
-    ffi::{c_void, CString},
+    ffi::{c_char, c_void, CStr, CString},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -109,6 +109,8 @@ unsafe extern "C" {
         out_pixels: *mut *mut u8,
         out_width: *mut u32,
         out_height: *mut u32,
+        out_error: *mut c_char,
+        out_error_len: usize,
     ) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn todex_capture_region(
@@ -121,6 +123,8 @@ unsafe extern "C" {
         out_pixels: *mut *mut u8,
         out_width: *mut u32,
         out_height: *mut u32,
+        out_error: *mut c_char,
+        out_error_len: usize,
     ) -> i32;
     fn todex_capture_free(pixels: *mut u8);
 }
@@ -444,9 +448,19 @@ const CAPTURE_TIMEOUT_SECONDS: f64 = 5.0;
 /// Window `number` on its own, also in another Space; `None` where this
 /// OS cannot (never on macOS).
 pub(crate) fn capture_window(number: u32) -> Option<Result<Screenshot, String>> {
-    Some(take_capture(|pixels, width, height| {
+    Some(take_capture(|pixels, width, height, error, error_len| {
         // SAFETY: the out pointers are valid for the call.
-        unsafe { todex_capture_window(number, CAPTURE_TIMEOUT_SECONDS, pixels, width, height) }
+        unsafe {
+            todex_capture_window(
+                number,
+                CAPTURE_TIMEOUT_SECONDS,
+                pixels,
+                width,
+                height,
+                error,
+                error_len,
+            )
+        }
     }))
 }
 
@@ -459,7 +473,7 @@ pub(crate) fn capture_region(
     let pid = only_pid
         .and_then(|pid| i32::try_from(pid).ok())
         .unwrap_or(0);
-    Some(take_capture(|pixels, width, height| {
+    Some(take_capture(|pixels, width, height, error, error_len| {
         // SAFETY: the out pointers are valid for the call.
         unsafe {
             todex_capture_region(
@@ -472,18 +486,30 @@ pub(crate) fn capture_region(
                 pixels,
                 width,
                 height,
+                error,
+                error_len,
             )
         }
     }))
 }
 
+/// Room for ScreenCaptureKit's error text, NUL included.
+const CAPTURE_ERROR_CAPACITY: usize = 512;
+
 /// Runs one capture of `macos_capture.m` and takes over its pixels.
 fn take_capture(
-    capture: impl FnOnce(*mut *mut u8, *mut u32, *mut u32) -> i32,
+    capture: impl FnOnce(*mut *mut u8, *mut u32, *mut u32, *mut c_char, usize) -> i32,
 ) -> Result<Screenshot, String> {
     let mut pixels: *mut u8 = std::ptr::null_mut();
     let (mut width, mut height) = (0u32, 0u32);
-    let status = capture(&mut pixels, &mut width, &mut height);
+    let mut error = [0 as c_char; CAPTURE_ERROR_CAPACITY];
+    let status = capture(
+        &mut pixels,
+        &mut width,
+        &mut height,
+        error.as_mut_ptr(),
+        error.len(),
+    );
     if status != 0 || pixels.is_null() {
         if !pixels.is_null() {
             // SAFETY: allocated by the shim, not yet freed.
@@ -495,7 +521,10 @@ fn take_capture(
                     .to_owned(),
             );
         }
-        return Err(capture_failure(status));
+        // SAFETY: the shim leaves a NUL-terminated string in the buffer
+        // (empty when it had nothing to say).
+        let detail = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
+        return Err(capture_failure(status, &detail));
     }
     let len = width as usize * height as usize * 4;
     // SAFETY: on success the shim returns `width * height` RGBA pixels.
@@ -522,13 +551,24 @@ fn screen_locked() -> bool {
         .is_some_and(bool::from)
 }
 
-fn capture_failure(status: i32) -> String {
-    match status {
+/// What a failed capture means, with ScreenCaptureKit's own `detail`
+/// (its error or exception text) when it gave one.
+fn capture_failure(status: i32, detail: &str) -> String {
+    let message = match status {
         -1 => "ScreenCaptureKit listed no screen content (Screen Recording permission?)".to_owned(),
         -2 => "the window is gone or cannot be captured (closed or minimized?)".to_owned(),
         -5 => "the window has no area to capture".to_owned(),
         -6 => "ScreenCaptureKit did not answer in time".to_owned(),
+        -7 => "the app shows no window here that can be captured (the Finder's desktop never is); \
+               observe a window of it, or the whole display"
+            .to_owned(),
         other => format!("the screenshot failed (status {other})"),
+    };
+    let detail = detail.trim();
+    if detail.is_empty() {
+        message
+    } else {
+        format!("{message} [{detail}]")
     }
 }
 
@@ -1087,6 +1127,22 @@ mod tests {
             width: 100.0,
             height: 100.0,
         }
+    }
+
+    #[test]
+    fn capture_failures_carry_screen_capture_kit_detail() {
+        let denied = capture_failure(
+            -1,
+            "com.apple.ScreenCaptureKit.SCStreamErrorDomain -3801: denied",
+        );
+        // `engine::capture_failed` adds the signing hint on this wording.
+        assert!(denied.contains("Screen Recording"));
+        assert!(denied.ends_with("[com.apple.ScreenCaptureKit.SCStreamErrorDomain -3801: denied]"));
+        assert_eq!(
+            capture_failure(-3, " "),
+            "the screenshot failed (status -3)"
+        );
+        assert!(capture_failure(-7, "").contains("desktop"));
     }
 
     #[test]

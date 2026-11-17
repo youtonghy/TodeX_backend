@@ -10,12 +10,15 @@
 // Every entry point runs inside @try/@catch so an Objective-C exception
 // never unwinds into Rust, and waits for ScreenCaptureKit at most
 // `timeoutSeconds`. Pixels come back as RGBA8, row-major, owned by the
-// caller (free with todex_capture_free).
+// caller (free with todex_capture_free). When ScreenCaptureKit reports an
+// error or an exception is raised, its text goes into `outError` (a
+// NUL-terminated buffer of `outErrorLen` bytes) so failures say why.
 
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,8 +30,28 @@ enum {
     TODEX_CAPTURE_NO_MEMORY = -4,
     TODEX_CAPTURE_BAD_SIZE = -5,
     TODEX_CAPTURE_TIMEOUT = -6,
+    TODEX_CAPTURE_NO_WINDOWS = -7,
     TODEX_CAPTURE_EXCEPTION = -9999,
 };
+
+// Writes `error` as "domain code: description" into `out`, if both exist.
+static void todex_note_error(NSError *error, char *out, size_t outLen) {
+    if (error == nil || out == NULL || outLen == 0) {
+        return;
+    }
+    NSString *text = [NSString stringWithFormat:@"%@ %ld: %@", error.domain, (long)error.code,
+                                                error.localizedDescription];
+    snprintf(out, outLen, "%s", text.UTF8String ?: "");
+}
+
+// Writes an Objective-C exception's name and reason into `out`.
+static void todex_note_exception(NSException *exception, char *out, size_t outLen) {
+    if (out == NULL || outLen == 0) {
+        return;
+    }
+    NSString *text = [NSString stringWithFormat:@"%@: %@", exception.name, exception.reason];
+    snprintf(out, outLen, "%s", text.UTF8String ?: "");
+}
 
 // Waits for `semaphore`; whether it was signalled in time.
 static BOOL todex_wait(dispatch_semaphore_t semaphore, double timeoutSeconds) {
@@ -38,14 +61,16 @@ static BOOL todex_wait(dispatch_semaphore_t semaphore, double timeoutSeconds) {
 }
 
 // Shareable content including windows not on screen (other Spaces).
-static SCShareableContent *todex_content(double timeoutSeconds, int *status) {
+static SCShareableContent *todex_content(double timeoutSeconds, int *status, char *outError,
+                                         size_t outErrorLen) {
     __block SCShareableContent *content = nil;
+    __block NSError *failure = nil;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     [SCShareableContent getShareableContentExcludingDesktopWindows:YES
                                                onScreenWindowsOnly:NO
                                                  completionHandler:^(SCShareableContent *c, NSError *e) {
-        (void)e;
         content = c;
+        failure = e;
         dispatch_semaphore_signal(done);
     }];
     if (!todex_wait(done, timeoutSeconds)) {
@@ -54,6 +79,7 @@ static SCShareableContent *todex_content(double timeoutSeconds, int *status) {
     }
     if (content == nil) {
         *status = TODEX_CAPTURE_NO_CONTENT;
+        todex_note_error(failure, outError, outErrorLen);
     }
     return content;
 }
@@ -61,18 +87,22 @@ static SCShareableContent *todex_content(double timeoutSeconds, int *status) {
 // One image of `filter`; the result is retained (the caller releases it).
 // A completion arriving after the timeout releases its own image.
 static CGImageRef todex_shoot(SCContentFilter *filter, SCStreamConfiguration *config,
-                              double timeoutSeconds, int *status) {
+                              double timeoutSeconds, int *status, char *outError,
+                              size_t outErrorLen) {
     __block CGImageRef image = NULL;
+    __block NSError *failure = nil;
     __block BOOL abandoned = NO;
     NSObject *lock = [NSObject new];
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     [SCScreenshotManager captureImageWithFilter:filter
                                   configuration:config
                               completionHandler:^(CGImageRef captured, NSError *e) {
-        (void)e;
         @synchronized(lock) {
             if (!abandoned && captured != NULL) {
                 image = CGImageRetain(captured);
+            }
+            if (!abandoned) {
+                failure = e;
             }
         }
         dispatch_semaphore_signal(done);
@@ -90,6 +120,9 @@ static CGImageRef todex_shoot(SCContentFilter *filter, SCStreamConfiguration *co
     }
     if (image == NULL) {
         *status = TODEX_CAPTURE_FAILED;
+        @synchronized(lock) {
+            todex_note_error(failure, outError, outErrorLen);
+        }
     }
     return image;
 }
@@ -124,20 +157,26 @@ static int todex_pixels(CGImageRef image, uint8_t **outPixels, uint32_t *outWidt
     return TODEX_CAPTURE_OK;
 }
 
-static void todex_reset(uint8_t **outPixels, uint32_t *outWidth, uint32_t *outHeight) {
+static void todex_reset(uint8_t **outPixels, uint32_t *outWidth, uint32_t *outHeight,
+                        char *outError, size_t outErrorLen) {
     *outPixels = NULL;
     *outWidth = 0;
     *outHeight = 0;
+    if (outError != NULL && outErrorLen > 0) {
+        outError[0] = '\0';
+    }
 }
 
 // The window numbered `windowNumber`, on its own, at the display's pixel
 // density. `TODEX_CAPTURE_NOT_FOUND` when ScreenCaptureKit does not list it.
 int todex_capture_window(uint32_t windowNumber, double timeoutSeconds, uint8_t **outPixels,
-                         uint32_t *outWidth, uint32_t *outHeight) {
+                         uint32_t *outWidth, uint32_t *outHeight, char *outError,
+                         size_t outErrorLen) {
     @try {
-        todex_reset(outPixels, outWidth, outHeight);
+        todex_reset(outPixels, outWidth, outHeight, outError, outErrorLen);
         int status = TODEX_CAPTURE_OK;
-        SCShareableContent *content = todex_content(timeoutSeconds, &status);
+        SCShareableContent *content =
+            todex_content(timeoutSeconds, &status, outError, outErrorLen);
         if (content == nil) {
             return status;
         }
@@ -166,7 +205,8 @@ int todex_capture_window(uint32_t windowNumber, double timeoutSeconds, uint8_t *
         config.colorSpaceName = kCGColorSpaceSRGB;
         config.showsCursor = NO;
         config.ignoreShadowsSingleWindow = YES;
-        CGImageRef image = todex_shoot(filter, config, timeoutSeconds, &status);
+        CGImageRef image =
+            todex_shoot(filter, config, timeoutSeconds, &status, outError, outErrorLen);
         if (image == NULL) {
             return status;
         }
@@ -174,7 +214,8 @@ int todex_capture_window(uint32_t windowNumber, double timeoutSeconds, uint8_t *
         CGImageRelease(image);
         return status;
     } @catch (NSException *e) {
-        todex_reset(outPixels, outWidth, outHeight);
+        todex_reset(outPixels, outWidth, outHeight, outError, outErrorLen);
+        todex_note_exception(e, outError, outErrorLen);
         return TODEX_CAPTURE_EXCEPTION;
     }
 }
@@ -184,14 +225,15 @@ int todex_capture_window(uint32_t windowNumber, double timeoutSeconds, uint8_t *
 // alone in the picture; 0 captures everything shown there.
 int todex_capture_region(double x, double y, double width, double height, int32_t onlyPid,
                          double timeoutSeconds, uint8_t **outPixels, uint32_t *outWidth,
-                         uint32_t *outHeight) {
+                         uint32_t *outHeight, char *outError, size_t outErrorLen) {
     @try {
-        todex_reset(outPixels, outWidth, outHeight);
+        todex_reset(outPixels, outWidth, outHeight, outError, outErrorLen);
         if (width <= 0.0 || height <= 0.0) {
             return TODEX_CAPTURE_BAD_SIZE;
         }
         int status = TODEX_CAPTURE_OK;
-        SCShareableContent *content = todex_content(timeoutSeconds, &status);
+        SCShareableContent *content =
+            todex_content(timeoutSeconds, &status, outError, outErrorLen);
         if (content == nil) {
             return status;
         }
@@ -217,6 +259,11 @@ int todex_capture_region(double x, double y, double width, double height, int32_
                     [windows addObject:window];
                 }
             }
+            // Desktop windows (the Finder's desktop) are not listed, so an
+            // app showing only those leaves nothing to draw.
+            if (windows.count == 0) {
+                return TODEX_CAPTURE_NO_WINDOWS;
+            }
             filter = [[SCContentFilter alloc] initWithDisplay:display includingWindows:windows];
         } else {
             filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
@@ -237,7 +284,8 @@ int todex_capture_region(double x, double y, double width, double height, int32_
         config.sourceRect = CGRectMake(x - display.frame.origin.x, y - display.frame.origin.y,
                                        width, height);
         config.destinationRect = CGRectMake(0, 0, (CGFloat)pixelWidth, (CGFloat)pixelHeight);
-        CGImageRef image = todex_shoot(filter, config, timeoutSeconds, &status);
+        CGImageRef image =
+            todex_shoot(filter, config, timeoutSeconds, &status, outError, outErrorLen);
         if (image == NULL) {
             return status;
         }
@@ -245,7 +293,8 @@ int todex_capture_region(double x, double y, double width, double height, int32_
         CGImageRelease(image);
         return status;
     } @catch (NSException *e) {
-        todex_reset(outPixels, outWidth, outHeight);
+        todex_reset(outPixels, outWidth, outHeight, outError, outErrorLen);
+        todex_note_exception(e, outError, outErrorLen);
         return TODEX_CAPTURE_EXCEPTION;
     }
 }
