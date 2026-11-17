@@ -270,13 +270,22 @@ async fn worker(binary: String, pinned: bool, mut commands: mpsc::Receiver<Comma
                                     continue;
                                 }
                             }
-                            if message.get("id").is_some() && message.get("method").is_some() {
+                            let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+                            if let (Some(id), Some(result)) = (message.get("id"), codex_builtin_request_result(method)) {
+                                let _ = process.send(&json!({"id":id,"result":result})).await;
+                            } else if message.get("id").is_some() && message.get("method").is_some() {
                                 // No active user turn exists to own a new permission dialog.
                                 let _ = process.send(&json!({"id":message["id"],"error":{"code":-32000,"message":"TodeX session is idle"}})).await;
                             } else if let Some(goal) = codex_goal_event(&message) {
                                 if let Some(sink) = goal_sink.as_ref().or(last_sink.as_ref()) {
                                     let _ = sink.emit("goal.updated", goal).await;
                                 }
+                            } else if let Some(notice) = codex_notice_event(method, message.get("params").unwrap_or(&Value::Null)) {
+                                if let Some(sink) = &last_sink {
+                                    let _ = sink.emit("provider.event", notice).await;
+                                }
+                            } else if method == "item/autoApprovalReview/started" {
+                                // Only the review's outcome is shown.
                             } else if let Some(sink) = &last_sink {
                                 let _ = sink.emit("provider.event", json!({"provider":"codex", "providerMethod":message.get("method"), "metadata":message.get("params")})).await;
                             }
@@ -886,7 +895,7 @@ async fn active_turn(
                                 codex_permission_kind(&method,&params),codex_permission_title(&method,&params),codex_permission_details(&method,&params),codex_permission_options(&method,&params),&mut cancel).await;
                             (request_id, method, params, decision)
                         });
-                    } else { process.send(&json!({"id":request_id,"error":{"code":-32601,"message":"request is not supported by TodeX"}})).await?; }
+                    } else { process.send(&codex_unhandled_request_reply(request_id, method)).await?; }
                     continue;
                 }
                 if let Some(goal) = codex_goal_event(&message) {
@@ -1204,11 +1213,16 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$dir/wire.jsonl"
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   case "$line" in
-    *'"method":"initialize"'*) printf '{"id":"%s","result":{}}\n' "$id" ;;
+    *'"method":"initialize"'*)
+      printf '{"id":"%s","result":{"userAgent":"todex-agentd/0.169.0"}}\n' "$id"
+      printf '{"method":"configWarning","params":{"summary":"`mcp_servers.x.type` is ignored.","details":null},"emittedAtMs":1}\n' ;;
     *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"native"},"model":"fixture-model"}}\n' "$id" ;;
     *'"method":"turn/start"'*)
       printf '{"id":"%s","result":{"turn":{"id":"active","status":"inProgress"}}}\n' "$id"
       printf '{"method":"turn/started","params":{"threadId":"native","turn":{"id":"active","status":"inProgress"}}}\n'
+      printf '{"method":"item/autoApprovalReview/completed","params":{"threadId":"native","turnId":"active","reviewId":"r","targetItemId":"exec-1","startedAtMs":1,"completedAtMs":2,"decisionSource":"agent","action":{"type":"command","command":"ls","cwd":"/","source":"shell"},"review":{"status":"approved","riskLevel":"low"}}}\n'
+      printf '{"method":"currentTime/read","id":0,"params":{"threadId":"native"}}\n' ;;
+    *'"currentTimeAt"'*)
       printf '{"method":"turn/completed","params":{"threadId":"native","turn":{"id":"active","status":"completed"}}}\n' ;;
   esac
 done
@@ -1261,10 +1275,11 @@ done
         };
         let binary = script.display().to_string();
         let sessions = Sessions::new();
+        let warm_sink = sink("prewarm").muted();
         let warm = Warm {
             context: context(),
             settings: prompt("prewarm", ""),
-            sink: sink("prewarm").muted(),
+            sink: warm_sink.clone(),
         };
         assert_eq!(
             sessions.prewarm(&binary, warm).await.unwrap(),
@@ -1279,6 +1294,9 @@ done
             .unwrap()
             .native_session_id
             .is_none());
+        // As the supervisor does, the turn takes the prewarm's events over.
+        let turn_sink = sink("turn-1");
+        warm_sink.hand_over(&turn_sink).await;
         let (_cancel, cancel) = watch::channel(false);
         let result = tokio::time::timeout(
             Duration::from_secs(10),
@@ -1290,7 +1308,7 @@ done
                         model: turn_model.map(str::to_owned),
                         ..prompt("turn-1", "hello")
                     },
-                    sink: sink("turn-1"),
+                    sink: turn_sink,
                     cancel,
                 },
             ),
@@ -1304,6 +1322,9 @@ done
         assert_eq!(wire().matches(r#""method":"initialize""#).count(), 1);
         assert_eq!(wire().matches(r#""method":"thread/start""#).count(), 1);
         assert_eq!(wire().matches(r#""method":"turn/start""#).count(), 1);
+        assert!(wire().contains(r#""optOutNotificationMethods":["thread/started""#));
+        // Codex's `currentTime/read` is answered without the user.
+        assert!(wire().contains(r#"{"id":0,"result":{"currentTimeAt":"#));
         // The thread the prewarm started is saved with the turn.
         assert_eq!(
             store
@@ -1343,6 +1364,38 @@ done
             configurations[0]["effective"]["source"],
             "provider-confirmed"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_warnings_and_auto_reviews_reach_the_conversation() {
+        let history = prewarm_then_turn(None).await;
+        let notices: Vec<&Value> = history
+            .iter()
+            .filter(|event| event.event_type == "provider.event")
+            .map(|event| &event.payload)
+            .collect();
+        // Sent during the prewarm's handshake: journalled once, with the turn.
+        let warnings: Vec<_> = notices
+            .iter()
+            .filter(|notice| notice["providerMethod"] == "provider_warning")
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["metadata"]["kind"], "config");
+        assert_eq!(
+            warnings[0]["metadata"]["reason"],
+            "`mcp_servers.x.type` is ignored."
+        );
+        let reviews: Vec<_> = notices
+            .iter()
+            .filter(|notice| notice["providerMethod"] == "auto_review")
+            .collect();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["metadata"]["status"], "approved");
+        assert_eq!(reviews[0]["metadata"]["reason"], "ls");
+        assert!(!notices
+            .iter()
+            .any(|notice| notice["providerMethod"] == "configWarning"));
     }
 
     #[cfg(unix)]

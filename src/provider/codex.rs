@@ -210,8 +210,8 @@ impl ProviderDriver for CodexDriver {
         let mut process = JsonLineProcess::spawn(&spec).await?;
         let result = async {
             if *cancel.borrow() { return Err(AppError::TurnCancelled); }
-            process.send(&json!({ "id": "initialize", "method": "initialize", "params": { "clientInfo": { "name": "todex-agentd", "version": crate::version::APP_VERSION }, "capabilities": { "experimentalApi": true } } })).await?;
-            read_rpc_response_cancellable(&mut process, "initialize", &mut cancel).await?;
+            process.send(&codex_initialize_request()).await?;
+            log_codex_server(&read_rpc_response_cancellable(&mut process, "initialize", &mut cancel).await?);
             process.send(&json!({ "method": "initialized" })).await?;
             process.send(&json!({ "id": "resume", "method": "thread/resume", "params": { "threadId": native, "cwd": context.manifest.workspace } })).await?;
             read_rpc_response_cancellable(&mut process, "resume", &mut cancel).await?;
@@ -305,8 +305,8 @@ impl ProviderDriver for CodexDriver {
                 "stdio://".to_owned(),
             ];
             let mut process = JsonLineProcess::spawn(&spec).await?;
-            process.send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":crate::version::APP_VERSION}}})).await?;
-            let _ = read_rpc_response(&mut process, "initialize").await?;
+            process.send(&codex_initialize_request()).await?;
+            log_codex_server(&read_rpc_response(&mut process, "initialize").await?);
             process.send(&json!({ "method": "initialized" })).await?;
             let result = async {
                 let mut items = Vec::new();
@@ -529,8 +529,8 @@ async fn codex_fork_thread(
     ];
     let mut process = JsonLineProcess::spawn(&spec).await?;
     let result = async {
-        process.send(&json!({ "id": "initialize", "method": "initialize", "params": { "clientInfo": { "name": "todex-agentd", "version": crate::version::APP_VERSION }, "capabilities": { "experimentalApi": true } } })).await?;
-        read_rpc_response(&mut process, "initialize").await?;
+        process.send(&codex_initialize_request()).await?;
+        log_codex_server(&read_rpc_response(&mut process, "initialize").await?);
         process.send(&json!({ "method": "initialized" })).await?;
         process.send(&json!({ "id": "fork", "method": "thread/fork", "params": { "threadId": original, "cwd": context.manifest.workspace, "excludeTurns": true, "ephemeral": false, "lastTurnId": last_turn } })).await?;
         let response = read_rpc_response(&mut process, "fork").await?;
@@ -543,6 +543,190 @@ async fn codex_fork_thread(
     }.await;
     process.terminate().await;
     result
+}
+
+/// Notifications TodeX neither journals nor shows, so the app-server does
+/// not send them at all (`initialize.capabilities.optOutNotificationMethods`).
+/// Only methods no TodeX code or client consumes belong here; unknown names
+/// are accepted by every supported Codex.
+const CODEX_OPT_OUT_NOTIFICATIONS: &[&str] = &[
+    "thread/started",
+    "serverRequest/resolved",
+    "turn/moderationMetadata",
+    "model/safetyBuffering/updated",
+    "remoteControl/status/changed",
+    "account/updated",
+    "app/list/updated",
+    "skills/changed",
+    "fuzzyFileSearch/sessionUpdated",
+    "fuzzyFileSearch/sessionCompleted",
+    "thread/realtime/started",
+    "thread/realtime/itemAdded",
+    "thread/realtime/item/started",
+    "thread/realtime/item/transcript/delta",
+    "thread/realtime/item/completed",
+    "thread/realtime/transcript/delta",
+    "thread/realtime/transcript/done",
+    "thread/realtime/outputAudio/delta",
+    "thread/realtime/sdp",
+    "thread/realtime/error",
+    "thread/realtime/closed",
+    "windows/worldWritableWarning",
+    "windowsSandbox/setupCompleted",
+];
+
+/// The `initialize` request every TodeX app-server connection sends.
+fn codex_initialize_request() -> Value {
+    json!({
+        "id": "initialize",
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "todex-agentd",
+                "title": "TodeX 2.0",
+                "version": crate::version::APP_VERSION
+            },
+            "capabilities": {
+                "experimentalApi": true,
+                "optOutNotificationMethods": CODEX_OPT_OUT_NOTIFICATIONS
+            }
+        }
+    })
+}
+
+/// Logs the server that answered `initialize`: its `userAgent` names the
+/// Codex version, which tells protocol differences apart.
+fn log_codex_server(response: &Value) {
+    if let Some(user_agent) = response.get("userAgent").and_then(Value::as_str) {
+        tracing::debug!(user_agent, "Codex app-server initialized");
+    }
+}
+
+/// The reply to a server request no user answers: the result of one TodeX
+/// answers itself, otherwise "not supported".
+fn codex_unhandled_request_reply(id: Value, method: &str) -> Value {
+    match codex_builtin_request_result(method) {
+        Some(result) => json!({ "id": id, "result": result }),
+        None => json!({
+            "id": id,
+            "error": { "code": -32601, "message": "request is not supported by TodeX" }
+        }),
+    }
+}
+
+/// Server requests TodeX answers itself, without the user.
+fn codex_builtin_request_result(method: &str) -> Option<Value> {
+    match method {
+        "currentTime/read" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default();
+            Some(json!({ "currentTimeAt": now }))
+        }
+        _ => None,
+    }
+}
+
+/// A Codex warning or auto-review outcome as the `provider.event` notice
+/// clients show (`providerMethod` `provider_warning` or `auto_review`).
+/// `None` for other methods, and for auto-review progress (`started`).
+fn codex_notice_event(method: &str, params: &Value) -> Option<Value> {
+    let text = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let (notice, metadata) = match method {
+        "configWarning" | "deprecationNotice" | "warning" | "guardianWarning" => {
+            let kind = match method {
+                "configWarning" => "config",
+                "deprecationNotice" => "deprecation",
+                "guardianWarning" => "guardian",
+                _ => "warning",
+            };
+            let summary = text("summary").or_else(|| text("message"))?;
+            let mut metadata = json!({ "kind": kind, "reason": summary });
+            if let Some(details) = text("details") {
+                metadata["details"] = json!(details);
+            }
+            if let Some(path) = text("path") {
+                metadata["path"] = json!(path);
+            }
+            ("provider_warning", metadata)
+        }
+        "item/autoApprovalReview/completed" => {
+            let review = params.get("review")?;
+            let status = review.get("status").and_then(Value::as_str)?;
+            let mut metadata = json!({ "status": status });
+            if let Some(subject) = codex_review_subject(params.get("action")) {
+                metadata["reason"] = json!(subject);
+            }
+            for key in ["riskLevel", "rationale"] {
+                if let Some(value) = review.get(key).and_then(Value::as_str) {
+                    metadata[key] = json!(value);
+                }
+            }
+            if let Some(item) = params.get("targetItemId").and_then(Value::as_str) {
+                metadata["targetItemId"] = json!(item);
+            }
+            ("auto_review", metadata)
+        }
+        "autoApprovalReview/strictReviewRequired" => {
+            ("auto_review", json!({ "status": "strictReviewRequired" }))
+        }
+        _ => return None,
+    };
+    Some(json!({
+        "provider": "codex",
+        "providerMethod": notice,
+        "metadata": metadata,
+        "nativeMethod": method,
+        "nativeTurnId": params.get("turnId").cloned().unwrap_or(Value::Null),
+        "nativeSessionId": params.get("threadId").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+/// What an auto-review looked at, in one line: the command, program,
+/// stdin, patched files, network target, MCP tool or permission reason
+/// (`GuardianApprovalReviewAction`).
+fn codex_review_subject(action: Option<&Value>) -> Option<String> {
+    let action = action?;
+    let field = |key: &str| action.get(key).and_then(Value::as_str);
+    let strings = |key: &str| {
+        action
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let subject = match action.get("type").and_then(Value::as_str)? {
+        "command" => field("command")?.to_owned(),
+        "execve" => {
+            let argv = strings("argv");
+            if argv.is_empty() {
+                field("program")?.to_owned()
+            } else {
+                argv.join(" ")
+            }
+        }
+        "writeStdin" => field("stdin")?.to_owned(),
+        "applyPatch" => strings("files").join(", "),
+        "networkAccess" => field("target").or_else(|| field("host"))?.to_owned(),
+        "mcpToolCall" => {
+            let tool = field("toolTitle").or_else(|| field("toolName"))?;
+            match field("connectorName").or_else(|| field("server")) {
+                Some(server) => format!("{server}: {tool}"),
+                None => tool.to_owned(),
+            }
+        }
+        "requestPermissions" => field("reason")?.to_owned(),
+        _ => return None,
+    };
+    let subject = subject.trim();
+    (!subject.is_empty()).then(|| subject.chars().take(200).collect())
 }
 
 async fn read_rpc_response_cancellable(
@@ -605,24 +789,8 @@ async fn prepare_codex_thread(
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<PreparedThread, AppError> {
-    process
-        .send(&json!({
-            "id": "initialize",
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "todex-agentd",
-                    "title": "TodeX 2.0",
-                    "version": crate::version::APP_VERSION
-                },
-                "capabilities": {
-                    "experimentalApi": true,
-                    "optOutNotificationMethods": null
-                }
-            }
-        }))
-        .await?;
-    wait_for_response(process, "initialize", sink, cancel).await?;
+    process.send(&codex_initialize_request()).await?;
+    log_codex_server(&wait_for_response(process, "initialize", sink, cancel).await?);
     process.send(&json!({ "method": "initialized" })).await?;
 
     let controls = resolve_execution_config(
@@ -1000,11 +1168,17 @@ async fn handle_codex_message(
         }
 
         process
-            .send(&json!({
-                "id": request_id,
-                "error": { "code": -32601, "message": "request is not supported by TodeX" }
-            }))
+            .send(&codex_unhandled_request_reply(request_id, method))
             .await?;
+        return Ok(());
+    }
+
+    if let Some(notice) = codex_notice_event(method, &params) {
+        sink.emit("provider.event", notice).await?;
+        return Ok(());
+    }
+    if method == "item/autoApprovalReview/started" {
+        // Its outcome (`completed`) is the notice; progress is not shown.
         return Ok(());
     }
 
@@ -1207,10 +1381,8 @@ pub(crate) async fn fetch_codex_quota(binary: &str, workspace: &Path) -> Result<
     ];
     let mut process = JsonLineProcess::spawn(&spec).await?;
     let result = async {
-        process
-            .send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":crate::version::APP_VERSION},"capabilities":{"experimentalApi":true}}}))
-            .await?;
-        read_rpc_response(&mut process, "initialize").await?;
+        process.send(&codex_initialize_request()).await?;
+        log_codex_server(&read_rpc_response(&mut process, "initialize").await?);
         process.send(&json!({"method":"initialized"})).await?;
         process
             .send(&json!({"id":"account","method":"account/read","params":{}}))
@@ -1521,6 +1693,9 @@ fn codex_permission_options(method: &str, params: &Value) -> Value {
     if method == "item/tool/requestUserInput" {
         return json!([{ "id": "answer", "kind": "answer", "name": "Answer" }]);
     }
+    if let Some(options) = codex_offered_options(params) {
+        return Value::Array(options);
+    }
     let mut options = json!([
         { "id": "allow_once", "kind": "allow_once", "name": "Allow once" },
         { "id": "allow_always", "kind": "allow_always", "name": "Allow for session" },
@@ -1538,6 +1713,70 @@ fn codex_permission_options(method: &str, params: &Value) -> Value {
             );
     }
     options
+}
+
+/// The options for the decisions an approval request offers
+/// (`availableDecisions`, in Codex's order). Amendment decisions, which
+/// write lasting rules into the user's Codex config, are not offered.
+/// `None` (the fixed options apply) when the request lists none, lists one
+/// TodeX does not know, or leaves no way to refuse.
+fn codex_offered_options(params: &Value) -> Option<Vec<Value>> {
+    let decisions = params.get("availableDecisions")?.as_array()?;
+    let mut options = Vec::new();
+    for decision in decisions {
+        let option = match decision {
+            Value::String(name) => match name.as_str() {
+                "accept" => {
+                    json!({ "id": "allow_once", "kind": "allow_once", "name": "Allow once" })
+                }
+                "acceptForSession" => {
+                    json!({ "id": "allow_always", "kind": "allow_always", "name": "Allow for session" })
+                }
+                "decline" => {
+                    json!({ "id": "reject_once", "kind": "reject_once", "name": "Reject" })
+                }
+                "cancel" => {
+                    json!({ "id": "abort_turn", "kind": "abort_turn", "name": "Reject and stop turn" })
+                }
+                _ => return codex_unknown_decisions(decisions),
+            },
+            Value::Object(amendment)
+                if amendment.len() == 1
+                    && (amendment.contains_key("acceptWithExecpolicyAmendment")
+                        || amendment.contains_key("applyNetworkPolicyAmendment")) =>
+            {
+                continue
+            }
+            _ => return codex_unknown_decisions(decisions),
+        };
+        if !options.contains(&option) {
+            options.push(option);
+        }
+    }
+    let refusable = options
+        .iter()
+        .any(|option| matches!(option["kind"].as_str(), Some("reject_once" | "abort_turn")));
+    refusable.then_some(options)
+}
+
+fn codex_unknown_decisions(decisions: &[Value]) -> Option<Vec<Value>> {
+    tracing::warn!(
+        count = decisions.len(),
+        "Codex offered approval decisions TodeX does not know; showing the default options"
+    );
+    None
+}
+
+/// Whether the request lets the user decline and continue the turn. A
+/// request that offers only `cancel` must not be answered `decline`.
+fn codex_declines_continue(params: &Value) -> bool {
+    params
+        .get("availableDecisions")
+        .and_then(Value::as_array)
+        .is_none_or(|decisions| {
+            decisions.iter().any(|decision| decision == "decline")
+                || !decisions.iter().any(|decision| decision == "cancel")
+        })
 }
 
 fn codex_permission_response(
@@ -1596,7 +1835,12 @@ fn codex_permission_response(
         PermissionOutcome::AllowOnce => "accept",
         PermissionOutcome::Answer => "decline",
         PermissionOutcome::AbortTurn => "cancel",
-        PermissionOutcome::RejectOnce | PermissionOutcome::RejectAlways => "decline",
+        PermissionOutcome::RejectOnce | PermissionOutcome::RejectAlways
+            if codex_declines_continue(params) =>
+        {
+            "decline"
+        }
+        PermissionOutcome::RejectOnce | PermissionOutcome::RejectAlways => "cancel",
     };
     json!({ "decision": decision })
 }
@@ -2368,5 +2612,197 @@ done
                 .iter()
                 .any(|option| option["kind"] == "abort_turn")
         );
+    }
+
+    fn option_kinds(params: &Value) -> Vec<String> {
+        codex_permission_options("item/commandExecution/requestApproval", params)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["kind"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn reject(params: &Value) -> Value {
+        codex_permission_response(
+            "item/commandExecution/requestApproval",
+            params,
+            crate::provider::types::PermissionDecision {
+                outcome: PermissionOutcome::RejectOnce,
+                option_id: None,
+                data: None,
+            },
+        )["decision"]
+            .clone()
+    }
+
+    #[test]
+    fn command_approval_offers_only_the_decisions_codex_lists() {
+        // Recorded from codex-cli 0.169 with a read-only sandbox.
+        let params = json!({"availableDecisions": [
+            "accept",
+            {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["/bin/zsh", "-lc", "echo hi"]}},
+            "cancel"
+        ]});
+        assert_eq!(option_kinds(&params), ["allow_once", "abort_turn"]);
+        // A request that cannot be declined is refused by cancelling the turn.
+        assert_eq!(reject(&params), "cancel");
+
+        let params =
+            json!({"availableDecisions": ["accept", "acceptForSession", "decline", "cancel"]});
+        assert_eq!(
+            option_kinds(&params),
+            ["allow_once", "allow_always", "reject_once", "abort_turn"]
+        );
+        assert_eq!(reject(&params), "decline");
+    }
+
+    #[test]
+    fn command_approval_keeps_default_options_without_usable_decisions() {
+        let defaults = ["allow_once", "allow_always", "reject_once", "abort_turn"];
+        for params in [
+            json!({}),
+            json!({"availableDecisions": null}),
+            json!({"availableDecisions": []}),
+            json!({"availableDecisions": ["accept", "approveSomehow", "decline"]}),
+            json!({"availableDecisions": ["accept", {"somethingNew": {}}]}),
+            // Nothing left to refuse with.
+            json!({"availableDecisions": ["accept", "acceptForSession"]}),
+        ] {
+            assert_eq!(option_kinds(&params), defaults, "{params}");
+            assert_eq!(reject(&params), "decline", "{params}");
+        }
+    }
+
+    #[test]
+    fn warnings_and_auto_reviews_become_provider_notices() {
+        let notice = codex_notice_event(
+            "configWarning",
+            &json!({"summary": "Codex is ignoring 1 unrecognized configuration setting.",
+                "details": null, "path": "/home/u/.codex/config.toml"}),
+        )
+        .unwrap();
+        assert_eq!(notice["providerMethod"], "provider_warning");
+        assert_eq!(notice["nativeMethod"], "configWarning");
+        assert_eq!(
+            notice["metadata"],
+            json!({"kind": "config", "path": "/home/u/.codex/config.toml",
+                "reason": "Codex is ignoring 1 unrecognized configuration setting."})
+        );
+        for (method, kind, key) in [
+            ("deprecationNotice", "deprecation", "summary"),
+            ("warning", "warning", "message"),
+            ("guardianWarning", "guardian", "message"),
+        ] {
+            let notice =
+                codex_notice_event(method, &json!({ key: "careful", "threadId": "t" })).unwrap();
+            assert_eq!(notice["metadata"]["kind"], kind);
+            assert_eq!(notice["metadata"]["reason"], "careful");
+            assert_eq!(notice["nativeSessionId"], "t");
+        }
+        assert!(codex_notice_event("warning", &json!({"message": "  "})).is_none());
+
+        let review = codex_notice_event(
+            "item/autoApprovalReview/completed",
+            &json!({"threadId": "t", "turnId": "u", "reviewId": "r", "targetItemId": "exec-1",
+                "startedAtMs": 1, "completedAtMs": 2, "decisionSource": "agent",
+                "action": {"type": "command", "command": "rm -rf build", "cwd": "/w", "source": "shell"},
+                "review": {"status": "denied", "riskLevel": "high", "rationale": "deletes files"}}),
+        )
+        .unwrap();
+        assert_eq!(review["providerMethod"], "auto_review");
+        assert_eq!(review["nativeTurnId"], "u");
+        assert_eq!(
+            review["metadata"],
+            json!({"status": "denied", "reason": "rm -rf build", "riskLevel": "high",
+                "rationale": "deletes files", "targetItemId": "exec-1"})
+        );
+        let strict = codex_notice_event(
+            "autoApprovalReview/strictReviewRequired",
+            &json!({"threadId": "t", "turnId": "u", "startedAtMs": 1}),
+        )
+        .unwrap();
+        assert_eq!(
+            strict["metadata"],
+            json!({"status": "strictReviewRequired"})
+        );
+        assert!(codex_notice_event("item/autoApprovalReview/started", &json!({})).is_none());
+    }
+
+    #[test]
+    fn auto_review_subjects_name_what_was_reviewed() {
+        for (action, subject) in [
+            (
+                json!({"type": "execve", "program": "git", "argv": ["git", "push"]}),
+                "git push",
+            ),
+            (
+                json!({"type": "applyPatch", "files": ["/w/a.rs", "/w/b.rs"]}),
+                "/w/a.rs, /w/b.rs",
+            ),
+            (
+                json!({"type": "networkAccess", "target": "example.com:443", "host": "example.com"}),
+                "example.com:443",
+            ),
+            (
+                json!({"type": "mcpToolCall", "server": "fs", "toolName": "write"}),
+                "fs: write",
+            ),
+            (
+                json!({"type": "requestPermissions", "reason": "needs network"}),
+                "needs network",
+            ),
+        ] {
+            assert_eq!(
+                codex_review_subject(Some(&action)).as_deref(),
+                Some(subject)
+            );
+        }
+        assert_eq!(codex_review_subject(Some(&json!({"type": "future"}))), None);
+    }
+
+    #[test]
+    fn initialize_opts_out_of_unused_notifications_only() {
+        let request = codex_initialize_request();
+        assert_eq!(request["params"]["capabilities"]["experimentalApi"], true);
+        let opted_out = request["params"]["capabilities"]["optOutNotificationMethods"]
+            .as_array()
+            .unwrap();
+        assert!(!opted_out.is_empty());
+        for consumed in [
+            "error",
+            "turn/started",
+            "turn/completed",
+            "turn/plan/updated",
+            "item/started",
+            "item/completed",
+            "item/agentMessage/delta",
+            "item/reasoning/textDelta",
+            "item/reasoning/summaryTextDelta",
+            "thread/tokenUsage/updated",
+            "thread/settings/updated",
+            "thread/goal/updated",
+            "thread/goal/cleared",
+            "account/rateLimits/updated",
+            "model/rerouted",
+            "mcpServer/startupStatus/updated",
+            "configWarning",
+            "warning",
+            "deprecationNotice",
+            "guardianWarning",
+            "item/autoApprovalReview/completed",
+            "autoApprovalReview/strictReviewRequired",
+        ] {
+            assert!(!opted_out.contains(&json!(consumed)), "{consumed}");
+        }
+    }
+
+    #[test]
+    fn current_time_requests_are_answered_and_others_refused() {
+        let reply = codex_unhandled_request_reply(json!(3), "currentTime/read");
+        assert_eq!(reply["id"], 3);
+        assert!(reply["result"]["currentTimeAt"].as_u64().unwrap() > 1_700_000_000);
+        let reply = codex_unhandled_request_reply(json!(4), "item/tool/call");
+        assert_eq!(reply["error"]["code"], -32601);
     }
 }
