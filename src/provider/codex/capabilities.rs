@@ -5,6 +5,7 @@ use std::time::Duration;
 pub(super) struct ControlProbe {
     pub live: bool,
     pub queue: bool,
+    pub verified: bool,
     pub diagnostic: Value,
 }
 
@@ -21,10 +22,10 @@ pub(super) async fn probe(binary: &str) -> ControlProbe {
         if tokio::fs::metadata(&path).await?.len() > 16 * 1024 * 1024 { return Err(AppError::Unsupported("Codex schema exceeded the inspection size limit".to_owned())); }
         let schema: Value = serde_json::from_slice(&tokio::fs::read(path).await?)?;
         let (live,queue) = parse(&schema);
-        Ok::<_,AppError>(ControlProbe {live,queue,diagnostic:json!({"status":"verified","source":"installed-schema","experimental":true,"liveControls":live,"nativeQueue":queue})})
+        Ok::<_,AppError>(ControlProbe {live,queue,verified:true,diagnostic:json!({"status":"verified","source":"installed-schema","experimental":true,"liveControls":live,"nativeQueue":queue})})
     }.await;
     let _ = tokio::fs::remove_dir_all(&directory).await;
-    result.unwrap_or_else(|_|ControlProbe {live:false,queue:false,diagnostic:json!({"status":"unavailable","source":"installed-schema","reason":"The installed CLI schema could not be verified; experimental controls are disabled. Restart the backend after updating the CLI to probe again."})})
+    result.unwrap_or_else(|_|ControlProbe {live:false,queue:false,verified:false,diagnostic:json!({"status":"unavailable","source":"installed-schema","reason":"The installed CLI schema could not be verified; experimental controls are disabled temporarily and will be retried automatically."})})
 }
 
 fn parse(schema: &Value) -> (bool, bool) {

@@ -1387,16 +1387,42 @@ impl DriverEventSink {
         options: Value,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<PermissionDecision, AppError> {
+        self.request_permission_with_provider_cancel(
+            provider_request_id,
+            kind,
+            title,
+            details,
+            options,
+            None,
+            cancel,
+        )
+        .await
+    }
+
+    /// Lets a provider retire one native approval without cancelling the whole turn.
+    /// The broker still journals the resolution and removes the pending prompt.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_permission_with_provider_cancel(
+        &self,
+        provider_request_id: String,
+        kind: impl Into<String>,
+        title: impl Into<String>,
+        details: Value,
+        options: Value,
+        provider_cancel: Option<&mut watch::Receiver<bool>>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<PermissionDecision, AppError> {
         match self.muted_route().await {
             MutedRoute::Unmuted => {}
             MutedRoute::Held => return Err(Self::muted_permission_refused()),
             MutedRoute::To(target) => {
-                return Box::pin(target.request_permission(
+                return Box::pin(target.request_permission_with_provider_cancel(
                     provider_request_id,
                     kind,
                     title,
                     details,
                     options,
+                    provider_cancel,
                     cancel,
                 ))
                 .await
@@ -1411,6 +1437,7 @@ impl DriverEventSink {
                 details,
                 options,
                 None,
+                provider_cancel,
                 cancel,
             )
             .await
@@ -1451,6 +1478,7 @@ impl DriverEventSink {
                 title.into(),
                 details,
                 options,
+                None,
                 None,
                 cancel,
             )
@@ -1496,6 +1524,7 @@ impl DriverEventSink {
                 details,
                 options,
                 Some(allowed_devices),
+                None,
                 cancel,
             )
             .await
@@ -1842,6 +1871,7 @@ impl PermissionBroker {
         details: Value,
         options: Value,
         allowed_devices: Option<Vec<String>>,
+        mut provider_cancel: Option<&mut watch::Receiver<bool>>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<(PermissionDecision, String), AppError> {
         let options = normalize_permission_options(options)?;
@@ -1889,16 +1919,19 @@ impl PermissionBroker {
             }
         }
 
-        // No deadline: the request waits until the user answers, the turn is
-        // cancelled, or the broker drops it (daemon shutdown or restart). A
-        // user who steps away comes back to the same prompt.
-        let decision = tokio::select! {
-            result = receiver => {
-                result.map_err(|_| AppError::InvalidRequest("permission request was closed".to_owned()))
+        // No deadline: the request waits until the user answers, the provider
+        // retires it, the turn is cancelled, or the broker drops it (shutdown).
+        // A user who steps away comes back to the same prompt.
+        let decision = if let Some(provider_cancel) = provider_cancel.as_mut() {
+            tokio::select! {
+                result = receiver => result.map_err(|_| AppError::InvalidRequest("permission request was closed".to_owned())),
+                changed = cancel.changed() => { let _ = changed; Err(AppError::TurnCancelled) },
+                changed = provider_cancel.changed() => { let _ = changed; Err(AppError::TurnCancelled) },
             }
-            changed = cancel.changed() => {
-                let _ = changed;
-                Err(AppError::TurnCancelled)
+        } else {
+            tokio::select! {
+                result = receiver => result.map_err(|_| AppError::InvalidRequest("permission request was closed".to_owned())),
+                changed = cancel.changed() => { let _ = changed; Err(AppError::TurnCancelled) },
             }
         };
         let (decision, device_id) = match decision {
@@ -2330,6 +2363,7 @@ mod tests {
                 "Allow tool?".to_owned(),
                 Value::Null,
                 Value::Null,
+                None,
                 None,
                 &mut cancel_rx,
             )

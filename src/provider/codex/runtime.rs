@@ -655,6 +655,7 @@ async fn active_turn(
         tokio::time::Instant::now() + super::super::process::control_timeout()?;
     let mut native_turn: Option<String> = None;
     let mut terminal: Option<String> = None;
+    let mut terminal_error: Option<AppError> = None;
     let mut pending = HashMap::<String, Pending>::new();
     // Goal commands sent during the turn, by request id.
     let mut goals =
@@ -662,7 +663,9 @@ async fn active_turn(
     let mut queue = VecDeque::<Value>::new();
     let mut control_ordinal = 0_u64;
     let mut queue_order = HashMap::<String, u64>::new();
-    let mut permission_requests = HashMap::<String, (Value, String, Value)>::new();
+    let mut permission_requests =
+        HashMap::<String, (Value, String, Value, watch::Sender<bool>)>::new();
+    let mut resolved_permission_requests = std::collections::HashSet::<String>::new();
     let mut permissions = tokio::task::JoinSet::<(
         Value,
         String,
@@ -680,13 +683,12 @@ async fn active_turn(
             && terminal.is_some()
             && pending.is_empty()
             && goals.is_empty()
+            && permissions.is_empty()
             && (!interrupted || interrupt_ack)
         {
             let status = terminal.take().unwrap();
-            permissions.abort_all();
-            for (_, (wire_id, method, params)) in permission_requests.drain() {
-                let result = cancelled_permission(&method, &params);
-                process.send(&json!({"id":wire_id,"result":result})).await?;
+            if status == "failed" {
+                return Err(terminal_error.take().unwrap_or_else(unavailable));
             }
             if status == "completed" && !interrupted && !queue.is_empty() {
                 let queued = queue.pop_front().unwrap();
@@ -769,13 +771,17 @@ async fn active_turn(
             },
             result = permissions.join_next(), if !permissions.is_empty() => {
                 if let Some(Ok((request_id, method, params, decision))) = result {
-                    permission_requests.remove(&request_id.to_string());
+                    let key = super::jsonrpc_id_key(&request_id)?;
+                    permission_requests.remove(&key);
+                    let already_resolved = resolved_permission_requests.remove(&key);
                     let result = match decision {
                         Ok(decision) => codex_permission_response(&method, &params, decision),
                         Err(_) if method == "mcpServer/elicitation/request" => json!({"action":"cancel","content":null,"_meta":null}),
                         Err(_) => codex_permission_response(&method, &params, super::super::types::PermissionDecision { outcome:PermissionOutcome::RejectOnce,option_id:None,data:None }),
                     };
-                    process.send(&json!({"id":request_id,"result":result})).await?;
+                    if !already_resolved {
+                        process.send(&json!({"id":request_id,"result":result})).await?;
+                    }
                     if start_request.is_some() { start_deadline = tokio::time::Instant::now() + super::super::process::control_timeout()?; }
                 }
             }
@@ -863,7 +869,8 @@ async fn active_turn(
                             if let ProviderControl::Configure {model, reasoning_effort} = &p.control.control {
                                 if result.get("status").and_then(Value::as_str) == Some("applied") {
                                     let mut effective = json!({"source":"provider-confirmed","scope":"active-turn","effectiveFrom":"subsequent-captures"});
-                                    if let Some(model) = model { effective["model"] = json!(model); *native_model = Some(model.clone()); }
+                                    // Native settings updates apply only to this turn, not the thread default.
+                                    if let Some(model) = model { effective["model"] = json!(model); }
                                     if let Some(effort) = reasoning_effort { effective["reasoningEffort"] = json!(effort); }
                                     sink.emit("turn.configuration", json!({"provider":"codex", "requestId":p.control.request_id, "requested":{"model":model,"reasoningEffort":reasoning_effort}, "effective":effective})).await?;
                                 }
@@ -883,19 +890,42 @@ async fn active_turn(
                     if let Some(id) = params.pointer("/turn/id").and_then(Value::as_str) { native_turn = Some(id.to_owned()); }
                 }
                 if let Some(status) = turn_completion_status(&message, native_turn.as_deref())? {
-                    if status == "failed" { return Err(codex_turn_failure(&message)); }
-                    terminal = Some(status.to_owned()); continue;
+                    if status == "failed" {
+                        terminal_error = Some(codex_turn_failure(&message));
+                    }
+                    terminal = Some(status.to_owned());
+                    for (key, (wire_id, method, params, provider_cancel)) in &permission_requests {
+                        if resolved_permission_requests.insert(key.clone()) {
+                            provider_cancel.send_replace(true);
+                            process
+                                .send(&json!({"id":wire_id,"result":super::cancelled_permission(method, params)}))
+                                .await?;
+                        }
+                    }
+                    continue;
                 }
                 if let Some(request_id) = message.get("id").cloned() {
                     if is_codex_permission_method(method) {
-                        permission_requests.insert(request_id.to_string(),(request_id.clone(),method.to_owned(),params.clone()));
+                        let key = super::jsonrpc_id_key(&request_id)?;
+                        let (provider_cancel, mut provider_cancel_rx) = watch::channel(false);
+                        permission_requests.insert(key, (request_id.clone(), method.to_owned(), params.clone(), provider_cancel));
                         let sink = sink.clone(); let mut cancel = cancel.clone(); let method = method.to_owned();
                         permissions.spawn(async move {
-                            let decision = sink.request_permission(jsonrpc_id_text(&request_id).unwrap_or_default(),
-                                codex_permission_kind(&method,&params),codex_permission_title(&method,&params),codex_permission_details(&method,&params),codex_permission_options(&method,&params),&mut cancel).await;
+                            let decision = sink.request_permission_with_provider_cancel(jsonrpc_id_text(&request_id).unwrap_or_default(),
+                                codex_permission_kind(&method,&params),codex_permission_title(&method,&params),codex_permission_details(&method,&params),codex_permission_options(&method,&params),Some(&mut provider_cancel_rx),&mut cancel).await;
                             (request_id, method, params, decision)
                         });
                     } else { process.send(&codex_unhandled_request_reply(request_id, method)).await?; }
+                    continue;
+                }
+                if method == "serverRequest/resolved" {
+                    if let Some(request_id) = params.get("requestId") {
+                        let key = super::jsonrpc_id_key(request_id)?;
+                        if let Some((_, _, _, provider_cancel)) = permission_requests.get(&key) {
+                            resolved_permission_requests.insert(key);
+                            provider_cancel.send_replace(true);
+                        }
+                    }
                     continue;
                 }
                 if let Some(goal) = codex_goal_event(&message) {
@@ -1039,22 +1069,6 @@ async fn codex_goal(
     };
     process.unread(held);
     result
-}
-
-fn cancelled_permission(method: &str, params: &Value) -> Value {
-    if method == "mcpServer/elicitation/request" {
-        json!({"action":"cancel","content":null,"_meta":null})
-    } else {
-        codex_permission_response(
-            method,
-            params,
-            super::super::types::PermissionDecision {
-                outcome: PermissionOutcome::RejectOnce,
-                option_id: None,
-                data: None,
-            },
-        )
-    }
 }
 
 fn queue_items(queue: &VecDeque<Value>) -> Value {
@@ -1476,9 +1490,15 @@ while IFS= read -r line; do
       printf '{"method":"item/started","params":{"threadId":"native","turnId":"active","item":{"id":"commentary","type":"agentMessage","phase":"commentary","text":""}}}\n'
       printf '{"method":"item/agentMessage/delta","params":{"threadId":"native","turnId":"active","itemId":"commentary","delta":"working"}}\n'
       printf '{"method":"item/completed","params":{"threadId":"native","turnId":"active","item":{"id":"commentary","type":"agentMessage","phase":"commentary","text":"working"}}}\n'
-      printf '{"id":42,"method":"mcpServer/elicitation/request","params":{"threadId":"native","turnId":"active","serverName":"fixture","mode":"form","message":"Your name","requestedSchema":{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}}}\n'
+      request_id=42
+      if [ "$turns" -eq 2 ]; then request_id=43; fi
+      if [ "$turns" -eq 3 ]; then request_id=44; fi
+      printf '{"id":%s,"method":"mcpServer/elicitation/request","params":{"threadId":"native","turnId":"active","serverName":"fixture","mode":"form","message":"Your name","requestedSchema":{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}}}\n' "$request_id"
       : > ready
-      if [ "$turns" -eq 2 ]; then printf '{"method":"turn/completed","params":{"threadId":"native","turn":{"id":"active","status":"completed"}}}\n'; fi ;;
+      if [ "$turns" -eq 2 ]; then
+        printf '{"method":"serverRequest/resolved","params":{"threadId":"native","requestId":43}}\n'
+        printf '{"method":"turn/completed","params":{"threadId":"native","turn":{"id":"active","status":"completed"}}}\n'
+      fi ;;
     *'"method":"turn/settings/update"'*)
       printf '{"method":"item/agentMessage/delta","params":{"threadId":"native","turnId":"active","itemId":"final","delta":"before config ack"}}\n'
       printf '{"id":"%s","result":{"status":"applied"}}\n' "$id" ;;
@@ -1679,7 +1699,16 @@ done
             .unwrap();
         assert_eq!(result.stop_reason, "completed");
         driver
-            .run_turn(context.clone(), prompt.clone(), sink.clone(), cancel)
+            .run_turn(
+                context.clone(),
+                DriverPrompt {
+                    model: None,
+                    work_mode: Some("plan".into()),
+                    ..prompt.clone()
+                },
+                sink.clone(),
+                cancel.clone(),
+            )
             .await
             .unwrap();
         tokio::fs::remove_file(root.join("ready")).await.unwrap();
@@ -1720,6 +1749,22 @@ done
         assert!(events
             .iter()
             .any(|event| event.payload["queueItemId"] == "local-q"));
+        for provider_request_id in ["43", "44"] {
+            let permission_id = events
+                .iter()
+                .find(|event| {
+                    event.event_type == "permission.requested"
+                        && event.payload["providerRequestId"] == provider_request_id
+                })
+                .unwrap()
+                .payload["permissionId"]
+                .clone();
+            assert!(events.iter().any(|event| {
+                event.event_type == "permission.resolved"
+                    && event.payload["permissionId"] == permission_id
+                    && event.payload["outcome"] == "cancelled"
+            }));
+        }
         assert!(events
             .iter()
             .any(|event| event.event_type == "turn.configuration"
@@ -1756,6 +1801,22 @@ done
         assert!(frames.iter().any(|frame| frame["id"] == 42
             && frame["result"]["action"] == "accept"
             && frame["result"]["content"]["name"] == "Ada"));
+        assert!(!frames.iter().any(|frame| frame["id"] == 43));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["id"] == 44 && frame["result"]["action"] == "cancel")
+                .count(),
+            1
+        );
+        let turn_starts: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame["method"] == "turn/start")
+            .collect();
+        assert_eq!(
+            turn_starts[1]["params"]["collaborationMode"]["settings"]["model"],
+            "fixture-model"
+        );
         assert!(frames
             .iter()
             .any(|frame| frame["method"] == "turn/interrupt"));

@@ -85,11 +85,17 @@ pub struct CodexDriver {
 }
 
 /// The live-control probe of the installed CLI, repeated when the executable
-/// changes (an upgrade), one probe at a time.
+/// changes (an upgrade) or after a short cooldown following a failed probe.
 #[derive(Default)]
 struct ControlProbeCache {
-    current: std::sync::Mutex<Option<(Option<ExecutableStamp>, capabilities::ControlProbe)>>,
+    current: std::sync::Mutex<Option<CachedControlProbe>>,
     refresh: tokio::sync::Mutex<()>,
+}
+
+struct CachedControlProbe {
+    stamp: Option<ExecutableStamp>,
+    probe: capabilities::ControlProbe,
+    retry_at: Option<std::time::Instant>,
 }
 
 impl ControlProbeCache {
@@ -98,7 +104,7 @@ impl ControlProbeCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .map(|(_, probe)| probe.clone())
+            .map(|cached| cached.probe.clone())
     }
 
     fn probed(&self, stamp: &Option<ExecutableStamp>) -> bool {
@@ -106,7 +112,13 @@ impl ControlProbeCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .is_some_and(|(probed, _)| probed == stamp)
+            .is_some_and(|cached| {
+                cached.stamp == *stamp
+                    && (cached.probe.verified
+                        || cached
+                            .retry_at
+                            .is_some_and(|deadline| std::time::Instant::now() < deadline))
+            })
     }
 
     async fn refresh(&self, binary: &str) {
@@ -119,10 +131,16 @@ impl ControlProbeCache {
             return;
         }
         let probe = capabilities::probe(binary).await;
+        let retry_at = (!probe.verified)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_secs(15));
         *self
             .current
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((stamp, probe));
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedControlProbe {
+            stamp,
+            probe,
+            retry_at,
+        });
     }
 }
 
@@ -553,7 +571,6 @@ async fn codex_fork_thread(
 /// are accepted by every supported Codex.
 const CODEX_OPT_OUT_NOTIFICATIONS: &[&str] = &[
     "thread/started",
-    "serverRequest/resolved",
     "turn/moderationMetadata",
     "model/safetyBuffering/updated",
     "remoteControl/status/changed",
@@ -1103,6 +1120,10 @@ async fn wait_for_response(
 ) -> Result<Value, AppError> {
     let mut deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
     let mut response = None;
+    let mut cancelled = false;
+    let mut permission_requests =
+        std::collections::HashMap::<String, (Value, String, Value, watch::Sender<bool>)>::new();
+    let mut resolved_requests = std::collections::HashSet::<String>::new();
     let mut permissions = tokio::task::JoinSet::<(
         Value,
         String,
@@ -1111,20 +1132,35 @@ async fn wait_for_response(
     )>::new();
     loop {
         if permissions.is_empty() {
+            if cancelled {
+                return Err(AppError::TurnCancelled);
+            }
             if let Some(response) = response.take() {
                 return Ok(response);
             }
         }
         tokio::select! {
-            _ = cancel.changed() => return Err(AppError::TurnCancelled),
-            _ = tokio::time::sleep_until(deadline), if permissions.is_empty() => {
+            _ = cancel.changed(), if !cancelled => {
+                cancelled = true;
+                for (key, (id, method, params, provider_cancel)) in &permission_requests {
+                    resolved_requests.insert(key.clone());
+                    provider_cancel.send_replace(true);
+                    process.send(&json!({"id":id,"result":cancelled_permission(method, params)})).await?;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline), if permissions.is_empty() && !cancelled => {
                 return Err(AppError::ProviderUnavailable(format!("Codex request {request_id} timed out")));
             }
             answer = permissions.join_next(), if !permissions.is_empty() => {
                 if let Some(Ok((id, method, params, decision))) = answer {
-                    let result = codex_permission_response(&method, &params, decision?);
-                    process.send(&json!({"id":id,"result":result})).await?;
-                    deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
+                    let key = jsonrpc_id_key(&id)?;
+                    permission_requests.remove(&key);
+                    if !resolved_requests.remove(&key) {
+                        let decision = decision?;
+                        let result = codex_permission_response(&method, &params, decision);
+                        process.send(&json!({"id":id,"result":result})).await?;
+                        deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
+                    }
                 }
             }
             message = process.read_frame() => {
@@ -1134,13 +1170,26 @@ async fn wait_for_response(
                     response = Some(outcome?);
                     continue;
                 }
+                if message.get("method").and_then(Value::as_str) == Some("serverRequest/resolved") {
+                    if let Some(id) = message.pointer("/params/requestId") {
+                        let key = jsonrpc_id_key(id)?;
+                        if let Some((_, _, _, provider_cancel)) = permission_requests.get(&key) {
+                            resolved_requests.insert(key);
+                            provider_cancel.send_replace(true);
+                        }
+                    }
+                    continue;
+                }
                 if let (Some(id),Some(method)) = (message.get("id"),message.get("method").and_then(Value::as_str)) {
                     if is_codex_permission_method(method) {
                         let id = id.clone(); let method = method.to_owned(); let params = message.get("params").cloned().unwrap_or(Value::Null);
+                        let key = jsonrpc_id_key(&id)?;
+                        let (provider_cancel, mut provider_cancel_rx) = watch::channel(false);
+                        permission_requests.insert(key, (id.clone(), method.clone(), params.clone(), provider_cancel));
                         let sink = sink.clone(); let mut cancel = cancel.clone();
                         permissions.spawn(async move {
-                            let decision = sink.request_permission(jsonrpc_id_text(&id).unwrap_or_default(), codex_permission_kind(&method,&params),
-                                codex_permission_title(&method,&params),codex_permission_details(&method,&params),codex_permission_options(&method,&params),&mut cancel).await;
+                            let decision = sink.request_permission_with_provider_cancel(jsonrpc_id_text(&id).unwrap_or_default(), codex_permission_kind(&method,&params),
+                                codex_permission_title(&method,&params),codex_permission_details(&method,&params),codex_permission_options(&method,&params),Some(&mut provider_cancel_rx),&mut cancel).await;
                             (id,method,params,decision)
                         });
                         continue;
@@ -1149,6 +1198,22 @@ async fn wait_for_response(
                 handle_codex_message(process, message, sink, cancel, request_id).await?;
             }
         }
+    }
+}
+
+pub(super) fn cancelled_permission(method: &str, params: &Value) -> Value {
+    if method == "mcpServer/elicitation/request" {
+        json!({"action":"cancel","content":null,"_meta":null})
+    } else {
+        codex_permission_response(
+            method,
+            params,
+            super::types::PermissionDecision {
+                outcome: PermissionOutcome::RejectOnce,
+                option_id: None,
+                data: None,
+            },
+        )
     }
 }
 
@@ -1895,6 +1960,15 @@ fn codex_turn_failure(message: &Value) -> AppError {
         .map(safe_error_text)
         .unwrap_or_else(|| "Codex turn failed".to_owned());
     AppError::ProviderUnavailable(detail)
+}
+
+fn jsonrpc_id_key(id: &Value) -> Result<String, AppError> {
+    match id {
+        Value::String(_) | Value::Number(_) => Ok(id.to_string()),
+        _ => Err(AppError::InvalidRequest(
+            "Codex request id must be a string or number".to_owned(),
+        )),
+    }
 }
 
 fn jsonrpc_id_text(id: &Value) -> Result<String, AppError> {
@@ -2777,6 +2851,43 @@ done
     }
 
     #[test]
+    fn failed_control_probe_retries_after_its_cooldown() {
+        let cache = ControlProbeCache::default();
+        let stamp = None;
+        let failed = capabilities::ControlProbe {
+            live: false,
+            queue: false,
+            verified: false,
+            diagnostic: json!({"status":"unavailable"}),
+        };
+        *cache.current.lock().unwrap() = Some(CachedControlProbe {
+            stamp: stamp.clone(),
+            probe: failed,
+            retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(15)),
+        });
+        assert!(cache.probed(&stamp));
+        cache.current.lock().unwrap().as_mut().unwrap().retry_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        assert!(!cache.probed(&stamp));
+        {
+            let cached = cache.current.lock().unwrap();
+            let cached = cached.as_ref().unwrap();
+            assert!(!cached.probe.verified);
+            assert!(cached.retry_at.is_some());
+        }
+        cache
+            .current
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .probe
+            .verified = true;
+        cache.current.lock().unwrap().as_mut().unwrap().retry_at = None;
+        assert!(cache.probed(&stamp));
+    }
+
+    #[test]
     fn initialize_opts_out_of_unused_notifications_only() {
         let request = codex_initialize_request();
         assert_eq!(request["params"]["capabilities"]["experimentalApi"], true);
@@ -2796,6 +2907,7 @@ done
             "item/reasoning/summaryTextDelta",
             "thread/tokenUsage/updated",
             "thread/settings/updated",
+            "serverRequest/resolved",
             "thread/goal/updated",
             "thread/goal/cleared",
             "account/rateLimits/updated",
@@ -2810,6 +2922,12 @@ done
         ] {
             assert!(!opted_out.contains(&json!(consumed)), "{consumed}");
         }
+    }
+
+    #[test]
+    fn request_id_key_preserves_json_type() {
+        assert_eq!(jsonrpc_id_key(&json!(42)).unwrap(), "42");
+        assert_eq!(jsonrpc_id_key(&json!("42")).unwrap(), "\"42\"");
     }
 
     #[test]
