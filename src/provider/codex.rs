@@ -1348,10 +1348,7 @@ async fn handle_codex_message(
                 "model":params.get("toModel"),"source":"provider-confirmed","scope":"active-turn"
             }}),
         ),
-        "turn/plan/updated" => (
-            "plan.updated",
-            json!({ "provider": "codex", "plan": params.get("plan") }),
-        ),
+        "turn/plan/updated" => ("plan.updated", super::plan::codex_plan_payload(&params)),
         "error" => (
             "provider.error",
             json!({ "provider": "codex", "error": params }),

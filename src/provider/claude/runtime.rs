@@ -1648,6 +1648,12 @@ while IFS= read -r line; do
       ;;
   esac
   case "$line" in
+    *todo-write*)
+      printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-todo","name":"TodoWrite","input":{"todos":[{"content":"Read","status":"completed","activeForm":"Reading"},{"content":"Fix","status":"in_progress","activeForm":"Fixing"}]}}]}}\n'
+      printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-todo","content":"Todos updated"}]}}\n'
+      ;;
+  esac
+  case "$line" in
     *enter-plan*)
       # Claude enters Plan mode on its own and answers the switch to the
       # plan model (set_model, apply_flag_settings).
@@ -1947,6 +1953,36 @@ done
             .await
             .expect("prewarm finishes")
         }
+    }
+
+    /// Claude's todo list is the turn's plan; the tool card stays as it was.
+    #[tokio::test]
+    async fn a_todo_write_call_also_updates_the_plan() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        fixture.turn(&sessions, &manifest, "todo-write").await;
+        let history = fixture.store.complete_history(&manifest.id).await.unwrap();
+        let plans: Vec<_> = history
+            .iter()
+            .filter(|event| event.event_type == "plan.updated")
+            .collect();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].payload["provider"], "claude-code");
+        assert_eq!(
+            plans[0].payload["steps"],
+            json!([
+                { "text": "Read", "status": "completed" },
+                { "text": "Fix", "status": "in_progress" },
+            ])
+        );
+        assert!(plans[0].payload["turnId"].is_string());
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "tool.completed"
+                && event.payload["toolName"] == "TodoWrite"));
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
     }
 
     #[tokio::test]

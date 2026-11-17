@@ -14,6 +14,7 @@ pub(crate) mod mcp_injection;
 mod omp;
 mod opencode;
 mod pi;
+mod plan;
 pub(crate) mod process;
 pub(crate) mod process_registry;
 pub(crate) mod profile;

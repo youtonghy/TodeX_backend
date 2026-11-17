@@ -2562,7 +2562,7 @@ pub(super) async fn handle_acp_message(
             }
             "plan" => (
                 "plan.updated",
-                json!({ "provider": provider_id, "plan": update }),
+                super::plan::acp_plan_payload(provider_id, &update),
             ),
             "config_option_update" => (
                 "turn.configuration",

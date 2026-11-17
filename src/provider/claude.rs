@@ -3603,6 +3603,15 @@ async fn read_claude_turn(
                         sink.emit("tool.updated", tools.payload(&id, &prompt.turn_id, "delta"))
                             .await?;
                     }
+                    // A main-thread todo list is also the turn's plan.
+                    if subagent.is_none() {
+                        if let Some(plan) = super::plan::claude_todo_plan_payload(
+                            block.get("name"),
+                            block.get("input").unwrap_or(&Value::Null),
+                        ) {
+                            sink.emit("plan.updated", plan).await?;
+                        }
+                    }
                 }
             }
             Some("user") => {
