@@ -1,12 +1,13 @@
+use crate::time::TimestampExt;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use chrono::{DateTime, Utc};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use jiff::Timestamp;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -977,7 +978,7 @@ impl ConversationSupervisor {
             manifest.provider,
             ProviderKind::ClaudeCode | ProviderKind::Pi
         ) || manifest.updated_at
-            < Utc::now() - chrono::Duration::hours(BACKGROUND_WORK_HORIZON_HOURS)
+            < Timestamp::now() - jiff::SignedDuration::from_hours(BACKGROUND_WORK_HORIZON_HOURS)
         {
             return;
         }
@@ -1220,14 +1221,14 @@ impl ConversationSupervisor {
                     "provider": manifest.provider, "conversationId": manifest.id,
                     "runtimeId": catalog.runtime_id, "commands": catalog.commands,
                     "catalogSource": "session", "source": "provider-session",
-                    "fetchedAt": chrono::Utc::now().to_rfc3339(),
+                    "fetchedAt": jiff::Timestamp::now().to_rfc3339(),
                 }))
             } else {
                 let commands = driver.discover_commands(&manifest.workspace).await?;
                 Ok(json!({
                     "provider": manifest.provider, "conversationId": manifest.id,
                     "commands": commands, "catalogSource": "discovery",
-                    "source": "provider-discovery", "fetchedAt": chrono::Utc::now().to_rfc3339(),
+                    "source": "provider-discovery", "fetchedAt": jiff::Timestamp::now().to_rfc3339(),
                 }))
             }
         })
@@ -1595,7 +1596,7 @@ impl ConversationSupervisor {
 
     pub async fn cleanup_expired(
         &self,
-        cutoff: DateTime<Utc>,
+        cutoff: Timestamp,
     ) -> Result<Vec<ConversationManifest>, AppError> {
         let expired = |manifest: &ConversationManifest| {
             // Private conversations leave with the daemon; retention, which
@@ -5154,7 +5155,7 @@ mod tests {
             supervisor.delete_owned("local", &manifest.id).await,
             Err(AppError::Conflict(_))
         ));
-        let cutoff = Utc::now() + chrono::Duration::hours(1);
+        let cutoff = Timestamp::now() + jiff::SignedDuration::from_hours(1);
         assert!(supervisor.cleanup_expired(cutoff).await.unwrap().is_empty());
         assert!(store.get(&manifest.id).await.is_ok());
         supervisor.active.remove(&manifest.id);
@@ -5176,14 +5177,14 @@ mod tests {
             .unwrap();
         // A prompt that is starting holds the gate for reading.
         let starting = supervisor.cli_execution_gate.clone().read_owned().await;
-        let past = Utc::now() - chrono::Duration::hours(1);
+        let past = Timestamp::now() - jiff::SignedDuration::from_hours(1);
         let nothing =
             tokio::time::timeout(Duration::from_secs(5), supervisor.cleanup_expired(past))
                 .await
                 .expect("a pass that removes nothing does not wait for the gate");
         assert!(nothing.unwrap().is_empty());
 
-        let future = Utc::now() + chrono::Duration::hours(1);
+        let future = Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let cleanup = tokio::spawn({
             let supervisor = supervisor.clone();
             async move { supervisor.cleanup_expired(future).await }

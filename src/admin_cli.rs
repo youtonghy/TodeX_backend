@@ -324,8 +324,8 @@ fn fingerprint(summary: &DevicePairingRequestSummary) -> &str {
 }
 
 fn print_request(request: &DevicePairingRequestSummary) {
-    let remaining =
-        (request.expires_at / 1000).saturating_sub(chrono::Utc::now().timestamp().max(0) as u64);
+    let remaining = (request.expires_at / 1000)
+        .saturating_sub(jiff::Timestamp::now().as_second().max(0) as u64);
     println!(
         "{}  {:?}  from {}  expires in {}m{:02}s",
         request.verification_code,
@@ -475,10 +475,10 @@ pub fn mesh(command: MeshCommand) -> CommandResult {
 fn format_ms(value: Option<u64>) -> String {
     value
         .and_then(|ms| i64::try_from(ms).ok())
-        .and_then(chrono::DateTime::from_timestamp_millis)
+        .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
         .map_or_else(
             || "never".to_owned(),
-            |time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            |time| time.strftime("%Y-%m-%d %H:%M:%S UTC").to_string(),
         )
 }
 
@@ -589,7 +589,7 @@ mod tests {
     }
 
     fn now_ms() -> u64 {
-        chrono::Utc::now().timestamp_millis() as u64
+        jiff::Timestamp::now().as_millisecond() as u64
     }
 
     fn never(_: &DevicePairingRequestSummary, _: bool) -> CommandResult<bool> {

@@ -12,8 +12,7 @@ arboard = { version = "3", default-features = false }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
+jiff = { version = "0.2.39", features = ["serde"] }
 iana-time-zone = "0.1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
@@ -68,7 +67,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 x-wing = { version = "0.1.1", features = ["getrandom", "zeroize"] }
 ed25519-dalek = "2"
 russh-sftp = "3.0.1"
-suppaftp = { version = "12", features = ["tokio-rustls-ring"] }
+suppaftp = { version = "13", features = ["tokio-rustls-ring"] }
 webpki-roots = "1"
 # Computer Use: accessibility trees, input and screenshots on every desktop.
 # Pinned exactly: a 0.x API behind our own `computer` module.
@@ -136,3 +135,7 @@ xkbcommon = { path = "crates/xkbcommon" }
 # Windows in other desktop Spaces and window numbers for Computer Use (see
 # crates/xa11y-macos/Cargo.toml).
 xa11y-macos = { path = "crates/xa11y-macos" }
+# Keep chrono out of the graph until upstream no longer needs it.
+# See each crate's PATCHES.md for provenance and patch scope.
+rmcp = { path = "crates/rmcp" }
+russh-sftp = { path = "crates/russh-sftp" }

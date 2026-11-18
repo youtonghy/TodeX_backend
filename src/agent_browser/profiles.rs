@@ -171,7 +171,7 @@ fn new_record(name: &str) -> ProfileRecord {
         // Hex only: safe as a directory name.
         id: Uuid::new_v4().simple().to_string(),
         name: clean_name(name),
-        created_at: chrono::Utc::now().timestamp_millis(),
+        created_at: jiff::Timestamp::now().as_millisecond(),
     }
 }
 

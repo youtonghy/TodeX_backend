@@ -17,6 +17,7 @@
 //! child's `stats`. Its child session writes nothing to stdout, so there is
 //! no progress in between.
 
+use crate::time::TimestampExt;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::time::Instant;
@@ -367,7 +368,7 @@ impl PiSubagents {
             .or_insert_with(|| BackgroundRun {
                 title,
                 tool_call_id: tool_call_id.to_owned(),
-                started_at: chrono::Utc::now().to_rfc3339(),
+                started_at: jiff::Timestamp::now().to_rfc3339(),
             });
     }
 

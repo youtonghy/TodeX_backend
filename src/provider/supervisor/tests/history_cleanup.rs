@@ -12,11 +12,14 @@ async fn conversation(
     let mut manifest =
         ConversationManifest::new(ProviderKind::Codex, workspace.to_path_buf(), None, None);
     manifest.owner_id = owner_id.to_owned();
-    manifest.created_at = Utc::now() - chrono::Duration::days(age_days);
+    manifest.created_at = Timestamp::now() - jiff::SignedDuration::from_hours(24 * age_days);
     manifest.updated_at = manifest.created_at;
     let created = store.create(manifest).await.unwrap();
     assert_eq!(
-        (Utc::now() - created.updated_at).num_days(),
+        Timestamp::now()
+            .duration_since(created.updated_at)
+            .as_hours()
+            / 24,
         age_days,
         "the fixture keeps the given updated_at"
     );
@@ -168,7 +171,7 @@ async fn policy_age_rule_keeps_active_and_other_tenants() {
                 max_age_days: Some(30),
                 max_total_bytes: None,
             },
-            Utc::now(),
+            Timestamp::now(),
         )
         .await
         .unwrap();
@@ -211,7 +214,7 @@ async fn policy_capacity_rule_removes_oldest_idle_first() {
                 max_age_days: None,
                 max_total_bytes: Some(total - 150_000),
             },
-            Utc::now(),
+            Timestamp::now(),
         )
         .await
         .unwrap();
@@ -230,7 +233,7 @@ async fn policy_capacity_rule_removes_oldest_idle_first() {
                 max_age_days: None,
                 max_total_bytes: Some(1),
             },
-            Utc::now(),
+            Timestamp::now(),
         )
         .await
         .unwrap();

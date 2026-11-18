@@ -31,7 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::watch;
@@ -295,7 +295,8 @@ struct RunningCall {
     child_conversation_id: String,
     child_turn_id: String,
     agent: ProviderKind,
-    started_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    started_at: Timestamp,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -510,7 +511,7 @@ impl AgentCalls {
             state,
             started: Instant::now(),
         });
-        let started_at = Utc::now();
+        let started_at = Timestamp::now();
         let stopped = {
             let mut state = self.inner.lock();
             let starting = state.starting.remove(&reservation.id);

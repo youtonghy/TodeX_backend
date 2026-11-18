@@ -5,7 +5,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use jiff::{
+    civil::DateTime,
+    tz::{AmbiguousOffset, TimeZone},
+    SignedDuration, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -145,7 +149,7 @@ pub struct DueKanbanSchedule {
     pub tenant_id: String,
     pub task_id: String,
     pub schedule_id: String,
-    pub due_at: DateTime<Utc>,
+    pub due_at: Timestamp,
 }
 
 #[derive(Clone)]
@@ -232,7 +236,7 @@ impl KanbanTaskStore {
     }
 
     /// Pending schedules of live tasks whose time is at or before `now`.
-    pub async fn due_schedules(&self, now: DateTime<Utc>) -> Vec<DueKanbanSchedule> {
+    pub async fn due_schedules(&self, now: Timestamp) -> Vec<DueKanbanSchedule> {
         let snapshot = self.inner.read().await;
         snapshot
             .tasks
@@ -313,14 +317,22 @@ impl KanbanTaskStore {
 
 /// The instant `at` (backend local wall time) names. A time skipped by a DST
 /// jump runs an hour later; an ambiguous one at its first occurrence.
-pub fn schedule_instant(at: &str) -> Option<DateTime<Utc>> {
-    let naive = NaiveDateTime::parse_from_str(at, KANBAN_SCHEDULE_TIME_FORMAT).ok()?;
-    let local = Local.from_local_datetime(&naive).earliest().or_else(|| {
-        Local
-            .from_local_datetime(&(naive + chrono::Duration::hours(1)))
-            .earliest()
-    })?;
-    Some(local.with_timezone(&Utc))
+pub fn schedule_instant(at: &str) -> Option<Timestamp> {
+    let naive = DateTime::strptime(KANBAN_SCHEDULE_TIME_FORMAT, at).ok()?;
+    schedule_in_zone(naive, &TimeZone::system())
+}
+
+fn schedule_in_zone(at: DateTime, zone: &TimeZone) -> Option<Timestamp> {
+    let local = zone.to_ambiguous_timestamp(at);
+    if matches!(local.offset(), AmbiguousOffset::Gap { .. }) {
+        let shifted = at.checked_add(SignedDuration::from_hours(1)).ok()?;
+        let local = zone.to_ambiguous_timestamp(shifted);
+        if matches!(local.offset(), AmbiguousOffset::Gap { .. }) {
+            return None;
+        }
+        return local.earlier().ok();
+    }
+    local.earlier().ok()
 }
 
 /// Merges a client write that won on `updatedAt` into the stored record.
@@ -540,7 +552,7 @@ fn normalize_schedule(schedule: &mut KanbanTaskSchedule) -> Result<(), AppError>
         return invalid("id must be 1-128 characters of [A-Za-z0-9_-]");
     }
     schedule.at = schedule.at.trim().to_owned();
-    if NaiveDateTime::parse_from_str(&schedule.at, KANBAN_SCHEDULE_TIME_FORMAT).is_err() {
+    if DateTime::strptime(KANBAN_SCHEDULE_TIME_FORMAT, &schedule.at).is_err() {
         return invalid("at must be YYYY-MM-DDTHH:MM");
     }
     schedule.text = schedule.text.trim().to_owned();
@@ -931,6 +943,35 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn schedule_preserves_gap_retry_and_earliest_fold() {
+        for (zone, wall, expected) in [
+            (
+                "America/New_York",
+                "2026-03-08T02:30",
+                Some("2026-03-08T07:30:00Z"),
+            ),
+            (
+                "America/New_York",
+                "2026-11-01T01:30",
+                Some("2026-11-01T05:30:00Z"),
+            ),
+            (
+                "Australia/Lord_Howe",
+                "2026-10-04T02:15",
+                Some("2026-10-03T16:15:00Z"),
+            ),
+            ("Pacific/Apia", "2011-12-30T10:00", None),
+        ] {
+            let zone = TimeZone::get(zone).unwrap();
+            let wall = DateTime::strptime(KANBAN_SCHEDULE_TIME_FORMAT, wall).unwrap();
+            assert_eq!(
+                schedule_in_zone(wall, &zone),
+                expected.map(|at| at.parse().unwrap())
+            );
+        }
+    }
+
     #[tokio::test]
     async fn kanban_store_reports_due_schedules_and_validates_them() {
         let root = make_temp_dir("todex-kanban-due");
@@ -947,7 +988,7 @@ mod tests {
             .merge_owned("local", vec![past, future, cancelled])
             .await
             .unwrap();
-        let due = store.due_schedules(Utc::now()).await;
+        let due = store.due_schedules(Timestamp::now()).await;
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].schedule_id, "s-past");
 

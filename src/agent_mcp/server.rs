@@ -7,6 +7,7 @@
 //! connection to each host of a conversation, or before every command,
 //! whatever the permission mode; otherwise the permission mode decides.
 
+use crate::time::TimestampExt;
 use std::{
     net::SocketAddr,
     sync::Arc,
@@ -737,8 +738,8 @@ impl SshTools {
             LoginAsk::Joined(waiter) => waiter.wait().await,
             LoginAsk::New(request) => {
                 let request_id = request.id().to_owned();
-                let expires_at = chrono::Utc::now()
-                    + chrono::Duration::from_std(LOGIN_TIMEOUT).unwrap_or_default();
+                let expires_at = jiff::Timestamp::now()
+                    + jiff::SignedDuration::try_from(LOGIN_TIMEOUT).unwrap_or_default();
                 if let Err(error) = self
                     .conversations
                     .append_agent_event(
@@ -748,7 +749,7 @@ impl SshTools {
                             "requestId": request_id,
                             "host": host,
                             "execId": exec_id,
-                            "expiresAt": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            "expiresAt": expires_at.to_rfc3339_millis(),
                         }),
                     )
                     .await

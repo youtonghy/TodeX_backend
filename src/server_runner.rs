@@ -337,7 +337,7 @@ pub enum ProviderProcessTracking {
 
 impl ManagedServer {
     pub async fn start(config: Config, tracking: ProviderProcessTracking) -> Result<Self> {
-        let started_at = chrono::Utc::now();
+        let started_at = jiff::Timestamp::now();
         if config.security.enable_tls {
             anyhow::bail!(
                 "TLS is configured but this build has no certificate/key listener; terminate TLS at a trusted reverse proxy or disable enable_tls"
@@ -384,7 +384,8 @@ impl ManagedServer {
             tokio::spawn(async move {
                 let mut ticker = interval(std::time::Duration::from_secs(24 * 60 * 60));
                 loop {
-                    let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+                    let cutoff =
+                        jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * days as i64);
                     match state.conversations.cleanup_expired(cutoff).await {
                         Ok(removed) if !removed.is_empty() => tracing::info!(
                             removed = removed.len(),

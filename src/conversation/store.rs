@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use jiff::Timestamp;
 use lru::LruCache;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -1065,7 +1065,7 @@ impl ConversationStore {
             None
         };
         if encrypting {
-            manifest.history_encrypted_at = Some(Utc::now());
+            manifest.history_encrypted_at = Some(Timestamp::now());
             manifest.legacy_plaintext = false;
         }
         let ConversationDraft {
@@ -1199,9 +1199,9 @@ impl ConversationStore {
             self.apply_title(&mut manifest, title).await?;
         }
         if let Some(archived) = archived {
-            manifest.archived_at = archived.then(Utc::now);
+            manifest.archived_at = archived.then(Timestamp::now);
         }
-        manifest.updated_at = Utc::now();
+        manifest.updated_at = Timestamp::now();
         self.persist_manifest_locked(&manifest).await?;
         Ok(manifest)
     }
@@ -1221,7 +1221,7 @@ impl ConversationStore {
             return Ok(manifest);
         }
         manifest.status = status;
-        manifest.updated_at = Utc::now();
+        manifest.updated_at = Timestamp::now();
         self.persist_manifest_locked(&manifest).await?;
         Ok(manifest)
     }
@@ -2989,7 +2989,7 @@ impl ConversationStore {
                 "provider state does not match conversation provider".to_owned(),
             ));
         }
-        state.updated_at = Utc::now();
+        state.updated_at = Timestamp::now();
         if manifest.ephemeral {
             return self.ephemeral_save_provider_state(conversation_id, state);
         }
@@ -3353,7 +3353,7 @@ impl ConversationStore {
                                     }),
                                 );
                                 placeholder.time =
-                                    time.unwrap_or_else(|| truncate_to_micros(Utc::now()));
+                                    time.unwrap_or_else(|| truncate_to_micros(Timestamp::now()));
                                 placeholder.provider = *provider;
                                 lines.push(encode_record(&placeholder)?);
                             }
@@ -4145,8 +4145,10 @@ pub fn seal_request_snapshot(request: &mut Value, key: &FingerprintKey) {
 }
 
 /// Drop the sub-microsecond part v3 records do not store.
-pub(super) fn truncate_to_micros(time: DateTime<Utc>) -> DateTime<Utc> {
-    DateTime::from_timestamp_micros(time.timestamp_micros()).unwrap_or(time)
+pub(super) fn truncate_to_micros(time: Timestamp) -> Timestamp {
+    Timestamp::from_microsecond(crate::time::unix_micros(time))
+        .ok()
+        .unwrap_or(time)
 }
 
 async fn remove_if_exists(path: &Path) -> Result<(), AppError> {
@@ -4909,7 +4911,7 @@ async fn quarantine_tail(
 fn corrupt_copy_path(path: &Path, extension: &str) -> PathBuf {
     path.with_file_name(format!(
         "events.corrupt.{}.{extension}",
-        Utc::now().format("%Y%m%dT%H%M%S%.6fZ")
+        Timestamp::now().strftime("%Y%m%dT%H%M%S%.6fZ")
     ))
 }
 
@@ -4930,7 +4932,7 @@ enum SalvagedEntry {
         file: usize,
         run_start: u64,
         run_length: u64,
-        time: Option<DateTime<Utc>>,
+        time: Option<Timestamp>,
         provider: Option<super::ProviderKind>,
     },
 }

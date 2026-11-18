@@ -7,14 +7,15 @@ pub use bus::EventBus;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventRecord {
-    pub time: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub time: Timestamp,
     pub event_id: String,
     #[serde(rename = "type")]
     pub event_type: String,
@@ -33,7 +34,7 @@ impl EventRecord {
         payload: Value,
     ) -> Self {
         Self {
-            time: Utc::now(),
+            time: Timestamp::now(),
             event_id: format!("evt_{}", Uuid::new_v4().simple()),
             event_type: event_type.into(),
             workspace_id,

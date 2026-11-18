@@ -31,7 +31,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+
+use crate::time::TimestampExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -350,8 +352,10 @@ struct SessionView<'a> {
     id: &'a str,
     title: Option<&'a str>,
     cwd: Option<&'a str>,
-    created_at: Option<DateTime<Utc>>,
-    updated_at: DateTime<Utc>,
+    #[serde(serialize_with = "crate::time::serde_optional_timestamp::serialize")]
+    created_at: Option<Timestamp>,
+    #[serde(serialize_with = "crate::time::serde_timestamp::serialize")]
+    updated_at: Timestamp,
     bytes: Option<u64>,
     referenced_by: Vec<&'a str>,
     running: bool,
@@ -544,7 +548,7 @@ impl NativeHistory {
                 "root": root,
                 "sessionCount": listing.sessions.len(),
                 "totalBytes": listing.total_bytes(provider),
-                "measuredAt": Utc::now(),
+                "measuredAt": Timestamp::now().to_rfc3339_z(),
                 "capabilities": provider.capabilities(),
                 "native": native,
             }));
@@ -573,7 +577,7 @@ impl NativeHistory {
                 title: session.meta.title.as_deref(),
                 cwd: session.meta.cwd.as_deref(),
                 created_at: session.meta.created_at,
-                updated_at: DateTime::<Utc>::from(session.modified),
+                updated_at: Timestamp::try_from(session.modified).unwrap_or(Timestamp::UNIX_EPOCH),
                 bytes: session.bytes,
                 referenced_by: protection
                     .refs
@@ -591,7 +595,7 @@ impl NativeHistory {
             "root": roots.sessions_root(provider),
             "totalBytes": total_bytes,
             "count": sessions.len(),
-            "measuredAt": Utc::now(),
+            "measuredAt": Timestamp::now().to_rfc3339_z(),
             "sessions": views,
         }))
     }
@@ -686,7 +690,7 @@ impl NativeHistory {
         conversations: &ConversationSupervisor,
         provider: NativeProvider,
         thresholds: CleanupThresholds,
-        now: DateTime<Utc>,
+        now: Timestamp,
         trigger: CleanupTrigger,
     ) -> Result<CleanupReport, AppError> {
         let _guard = self.provider_lock(provider).lock().await;
@@ -702,14 +706,14 @@ impl NativeHistory {
             .iter()
             .map(|session| PolicyCandidate {
                 id: session.id.clone(),
-                updated_at: DateTime::<Utc>::from(session.modified),
+                updated_at: Timestamp::try_from(session.modified).unwrap_or(Timestamp::UNIX_EPOCH),
                 bytes: session.bytes.unwrap_or(0),
                 protected: protection.skip(session).is_some(),
             })
             .collect();
         let age_cutoff = thresholds
             .max_age_days
-            .map(|days| now - chrono::Duration::days(i64::from(days)));
+            .map(|days| now - jiff::SignedDuration::from_hours(24 * i64::from(days)));
         let trigger = match trigger {
             CleanupTrigger::Auto => "policy-auto",
             CleanupTrigger::Manual => "policy-manual",
@@ -728,9 +732,9 @@ impl NativeHistory {
             };
             let unchanged = current.is_some_and(|current| current <= session.modified);
             let still_old = match (rule, age_cutoff) {
-                (PolicyRule::Age, Some(cutoff)) => {
-                    current.is_some_and(|current| DateTime::<Utc>::from(current) < cutoff)
-                }
+                (PolicyRule::Age, Some(cutoff)) => current.is_some_and(|current| {
+                    Timestamp::try_from(current).is_ok_and(|modified| modified < cutoff)
+                }),
                 _ => true,
             };
             if !unchanged || !still_old {
@@ -852,7 +856,7 @@ pub async fn run_policy(
     policy: CleanupPolicy,
     trigger: CleanupTrigger,
 ) -> Result<(CleanupReport, CleanupRun), AppError> {
-    let at = Utc::now();
+    let at = Timestamp::now();
     let outcome = native
         .apply_policy(conversations, provider, policy.thresholds(), at, trigger)
         .await;
@@ -1249,8 +1253,7 @@ fn devin_session(item: &Value) -> Option<NativeSession> {
     let time = |value: Option<&Value>| {
         value
             .and_then(Value::as_str)
-            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-            .map(|at| at.with_timezone(&Utc))
+            .and_then(|text| text.parse::<Timestamp>().ok())
     };
     let modified = time(item.get("updatedAt"))
         .map(SystemTime::from)

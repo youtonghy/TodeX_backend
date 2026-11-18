@@ -1,3 +1,4 @@
+use crate::time::TimestampExt;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::FileType;
@@ -2363,7 +2364,7 @@ async fn provider_models(
         .models_live(query.provider, &workspace)
         .await?;
     Ok(Json(
-        json!({ "provider": query.provider, "models": models, "source": "provider-discovery", "fetchedAt": chrono::Utc::now().to_rfc3339() }),
+        json!({ "provider": query.provider, "models": models, "source": "provider-discovery", "fetchedAt": jiff::Timestamp::now().to_rfc3339() }),
     ))
 }
 
@@ -2398,7 +2399,7 @@ async fn provider_commands(
         "commands": commands,
         "source": "provider-discovery",
         "catalogSource": "discovery",
-        "fetchedAt": chrono::Utc::now().to_rfc3339(),
+        "fetchedAt": jiff::Timestamp::now().to_rfc3339(),
     })))
 }
 
@@ -4878,7 +4879,7 @@ struct UnsubscribeRequest {
 #[serde(rename_all = "camelCase")]
 struct ScheduleRequest {
     conversation_id: String,
-    at: Option<chrono::DateTime<chrono::Utc>>,
+    at: Option<jiff::Timestamp>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6974,7 +6975,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(taken_again.code(), "NOT_FOUND");
 
-        let at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let at = (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_rfc3339();
         let scheduled = run!(
             "schedule",
             "conversation.schedule",

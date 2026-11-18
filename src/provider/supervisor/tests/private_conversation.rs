@@ -196,14 +196,14 @@ async fn private_conversations_refuse_what_would_outlive_them() {
             .schedule_owned(
                 "local",
                 &manifest.id,
-                Some(Utc::now() + chrono::Duration::hours(1)),
+                Some(Timestamp::now() + jiff::SignedDuration::from_hours(1)),
             )
             .await
             .unwrap_err(),
     );
     // Retention and cleanup policies never pick it.
     assert!(supervisor
-        .cleanup_expired(Utc::now() + chrono::Duration::days(1))
+        .cleanup_expired(Timestamp::now() + jiff::SignedDuration::from_hours(24))
         .await
         .unwrap()
         .is_empty());
@@ -214,7 +214,7 @@ async fn private_conversations_refuse_what_would_outlive_them() {
                 max_age_days: Some(0),
                 max_total_bytes: Some(0),
             },
-            Utc::now() + chrono::Duration::days(2),
+            Timestamp::now() + jiff::SignedDuration::from_hours(24 * 2),
         )
         .await
         .unwrap();

@@ -1,3 +1,4 @@
+use crate::time::TimestampExt;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -1001,7 +1002,7 @@ async fn devin_sessions_are_listed_and_deleted_through_the_cli() {
         }
         entry
     };
-    let now = Utc::now().to_rfc3339();
+    let now = Timestamp::now().to_rfc3339();
     let page1 = json!({"jsonrpc": "2.0", "id": 1, "result": {
         "sessions": [entry(&old, "2026-08-01T10:00:00+00:00", false, Some("Devin  one")),
                      entry(&locked, "2026-08-01T10:00:00+00:00", true, None)],

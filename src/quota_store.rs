@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, TimeZone, Utc};
 use dashmap::DashMap;
+use jiff::Timestamp;
 use serde_json::{json, Value};
 
 /// Milliseconds since epoch; matches the timestamp style used elsewhere in
@@ -27,7 +27,7 @@ pub struct QuotaStore {
     /// per turn rather than read from `entries`: conversations sharing the
     /// account hit the limit together, and each overwrites the provider's
     /// latest snapshot. The turn's end takes its entry.
-    exhausted_turns: Arc<DashMap<String, DateTime<Utc>>>,
+    exhausted_turns: Arc<DashMap<String, Timestamp>>,
 }
 
 impl QuotaStore {
@@ -77,7 +77,7 @@ impl QuotaStore {
 
     /// Removes and returns when the plan window that `turn_id` last saw
     /// exhausted resets; `None` when the turn's latest snapshot had room left.
-    pub fn take_turn_exhaustion(&self, turn_id: &str) -> Option<DateTime<Utc>> {
+    pub fn take_turn_exhaustion(&self, turn_id: &str) -> Option<Timestamp> {
         self.exhausted_turns.remove(turn_id).map(|(_, until)| until)
     }
 }
@@ -90,7 +90,7 @@ impl QuotaStore {
 /// among the full windows decides; a rejection without one falls back to the
 /// top-level `resetsAt`. `None` when nothing is exhausted or no reset time is
 /// known.
-fn exhausted_until(payload: &Value) -> Option<DateTime<Utc>> {
+fn exhausted_until(payload: &Value) -> Option<Timestamp> {
     let windows = payload
         .get("windows")
         .and_then(Value::as_array)
@@ -117,14 +117,14 @@ fn exhausted_until(payload: &Value) -> Option<DateTime<Utc>> {
 }
 
 /// Providers report epoch seconds; accept milliseconds as well.
-fn reset_instant(value: &Value) -> Option<DateTime<Utc>> {
+fn reset_instant(value: &Value) -> Option<Timestamp> {
     let raw = value.as_i64()?;
     let millis = if raw > 100_000_000_000 {
         raw
     } else {
         raw.checked_mul(1000)?
     };
-    Utc.timestamp_millis_opt(millis).single()
+    Timestamp::from_millisecond(millis).ok()
 }
 
 #[cfg(test)]
@@ -192,7 +192,7 @@ mod tests {
         // not turn-a's exhaustion.
         store.record(&snapshot("turn-b", "rejected", 101.0));
         store.record(&snapshot("turn-c", "allowed_warning", 99.0));
-        let reset = Utc.timestamp_opt(1791279000, 0).single();
+        let reset = Timestamp::new(1791279000, 0).ok();
         assert_eq!(store.take_turn_exhaustion("turn-a"), reset);
         assert_eq!(store.take_turn_exhaustion("turn-a"), None);
         assert_eq!(store.take_turn_exhaustion("turn-c"), None);
@@ -208,7 +208,7 @@ mod tests {
         });
         assert_eq!(
             exhausted_until(&full_codex),
-            Utc.timestamp_opt(1792694011, 0).single()
+            Timestamp::new(1792694011, 0).ok()
         );
         let bare_rejection = json!({
             "status": "rejected",
@@ -217,7 +217,7 @@ mod tests {
         });
         assert_eq!(
             exhausted_until(&bare_rejection),
-            Utc.timestamp_opt(1791279000, 0).single()
+            Timestamp::new(1791279000, 0).ok()
         );
         assert_eq!(
             exhausted_until(&json!({ "status": "rejected", "windows": [] })),
@@ -247,7 +247,7 @@ mod tests {
             exhausted_until(&json!({ "isUsingOverage": true, "windows": full })),
             None
         );
-        let reset = Utc.timestamp_opt(1791279000, 0).single();
+        let reset = Timestamp::new(1791279000, 0).ok();
         for payload in [
             json!({ "isUsingOverage": false, "windows": full }),
             json!({ "status": null, "isUsingOverage": null, "windows": full }),
@@ -255,6 +255,20 @@ mod tests {
             json!({ "status": "rejected", "isUsingOverage": true, "windows": full }),
         ] {
             assert_eq!(exhausted_until(&payload), reset, "{payload}");
+        }
+    }
+
+    #[test]
+    fn reset_units_preserve_seconds_milliseconds_and_negative_seconds() {
+        for (raw, millis) in [
+            (1_791_279_000_i64, 1_791_279_000_000),
+            (1_791_279_000_123, 1_791_279_000_123),
+            (-1, -1000),
+        ] {
+            assert_eq!(
+                reset_instant(&json!(raw)),
+                Timestamp::from_millisecond(millis).ok()
+            );
         }
     }
 

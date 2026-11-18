@@ -1,9 +1,10 @@
+use crate::time::TimestampExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
@@ -407,7 +408,7 @@ struct UpgradeState {
 
 struct LatestRelease {
     at: Instant,
-    checked_at: DateTime<Utc>,
+    checked_at: Timestamp,
     /// A user-facing error when the release source could not be read.
     version: Result<Option<String>, String>,
 }
@@ -465,7 +466,7 @@ impl CliManager {
                 .iter()
                 .filter_map(|cli| cache.latest.get(cli).map(|latest| latest.checked_at))
                 .min()
-                .unwrap_or_else(Utc::now)
+                .unwrap_or_else(Timestamp::now)
         };
         let mut clis = rows;
         clis.extend(config.agent.acp_profiles.keys().map(|name| CliVersionInfo {
@@ -552,7 +553,7 @@ impl CliManager {
             cli,
             LatestRelease {
                 at: Instant::now(),
-                checked_at: Utc::now(),
+                checked_at: Timestamp::now(),
                 version: version.clone(),
             },
         );
@@ -633,7 +634,7 @@ impl CliManager {
             provider,
             action,
             status: "running".to_owned(),
-            started_at: Utc::now().to_rfc3339(),
+            started_at: Timestamp::now().to_rfc3339(),
             finished_at: None,
             previous_version,
             current_version: None,
@@ -666,7 +667,7 @@ impl CliManager {
     ) -> Option<CliUpgradeOperation> {
         let mut state = self.upgrades.lock().await;
         let operation = state.operations.get_mut(operation_id)?;
-        operation.finished_at = Some(Utc::now().to_rfc3339());
+        operation.finished_at = Some(Timestamp::now().to_rfc3339());
         match result {
             Ok(version) => {
                 operation.status = "succeeded".to_owned();
@@ -1196,7 +1197,7 @@ fn user_facing_error(error: &AppError) -> String {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     use super::{
         compare_versions, extract_version, npm_install_args, strip_ansi, CliLocks, CliManager,
@@ -1316,7 +1317,7 @@ mod tests {
                 cli,
                 LatestRelease {
                     at: Instant::now(),
-                    checked_at: Utc::now(),
+                    checked_at: Timestamp::now(),
                     version: Ok(Some("2.0.0".to_owned())),
                 },
             );

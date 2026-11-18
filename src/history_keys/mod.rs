@@ -25,7 +25,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::{
     devices::DeviceRegistry,
@@ -49,10 +49,10 @@ pub(crate) const HISTORY_DIR: &str = "history";
 pub(crate) const MAX_BATCH: usize = 500;
 
 /// Time source; tests inject a fixed clock to exercise DEK rotation.
-pub(crate) type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+pub(crate) type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 pub(crate) fn system_clock() -> Clock {
-    Arc::new(Utc::now)
+    Arc::new(Timestamp::now)
 }
 
 /// The daemon's history key state, shared by every connection.

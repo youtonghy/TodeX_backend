@@ -6,7 +6,9 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use jiff::Timestamp;
+
+use crate::time::TimestampExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -43,7 +45,7 @@ async fn history_storage(
     Ok(Json(json!({
         "totalBytes": total_bytes,
         "count": conversations.len(),
-        "measuredAt": Utc::now(),
+        "measuredAt": Timestamp::now().to_rfc3339_z(),
         "conversations": conversations,
     })))
 }

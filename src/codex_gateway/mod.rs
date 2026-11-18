@@ -9,8 +9,8 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -391,7 +391,8 @@ pub struct CodexCloudTaskSummary {
     pub id: String,
     pub title: String,
     pub status: CodexCloudTaskStatus,
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub updated_at: Timestamp,
     pub environment_id: Option<String>,
     pub environment_label: Option<String>,
     pub summary: CodexCloudTaskDiffSummary,
@@ -406,7 +407,8 @@ pub struct CodexCloudTaskSummary {
 pub struct CodexCloudTaskTurnAttempt {
     pub turn_id: String,
     pub attempt_placement: Option<i64>,
-    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "crate::time::serde_optional_timestamp")]
+    pub created_at: Option<Timestamp>,
     pub status: CodexCloudTaskAttemptStatus,
     pub diff: Option<String>,
     pub messages: Vec<String>,
@@ -3377,7 +3379,8 @@ pub struct CodexGatewayEventRecord {
     pub session_id: CodexGatewaySessionId,
     pub event_id: CodexGatewayEventId,
     pub cursor: CodexGatewayCursor,
-    pub time: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub time: Timestamp,
     #[serde(rename = "type")]
     pub event_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3529,7 +3532,7 @@ impl CodexGatewayEventRecord {
             session_id: session_id.into(),
             event_id: format!("evt_{}", Uuid::new_v4().simple()),
             cursor,
-            time: Utc::now(),
+            time: Timestamp::now(),
             event_type: event.event_type,
             codex_thread_id: payload_string(&payload, &["threadId", "thread_id", "codexThreadId"]),
             codex_turn_id: payload_string(&payload, &["turnId", "turn_id", "codexTurnId"]),

@@ -3,6 +3,7 @@
 //! they run as the daemon's user and could edit the data directory directly;
 //! these routes take no device signature and do what the TUI and the `pair` /
 //! `devices` commands do with those files.
+use crate::time::TimestampExt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -26,7 +27,7 @@ use crate::error::AppError;
 
 /// What the running server knows beyond its configuration.
 pub(crate) struct LocalAdminInfo {
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// The bound main port (the configured one may be `0`).
     pub port: u16,
     /// The bound API listener, when `[api]` is enabled.

@@ -10,7 +10,7 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use chrono::{DateTime, Local, Utc};
+use jiff::{tz::TimeZone, SignedDuration, Timestamp};
 use serde::Serialize;
 use tokio::task::JoinHandle;
 
@@ -32,7 +32,7 @@ use crate::{
 const TICK: Duration = Duration::from_secs(15);
 /// A schedule the backend was not running for is skipped once it is this
 /// late rather than started long after the time the user picked.
-const MISSED_AFTER: chrono::Duration = chrono::Duration::hours(24);
+const MISSED_AFTER: SignedDuration = SignedDuration::from_hours(24);
 const TITLE_LIMIT: usize = 80;
 
 /// The backend's local time zone, the zone `KanbanTaskSchedule::at` is in.
@@ -49,7 +49,11 @@ pub struct BackendTimeZone {
 pub fn backend_time_zone() -> BackendTimeZone {
     BackendTimeZone {
         name: iana_time_zone::get_timezone().ok(),
-        offset_minutes: Local::now().offset().local_minus_utc() / 60,
+        offset_minutes: Timestamp::now()
+            .to_zoned(TimeZone::system())
+            .offset()
+            .seconds()
+            / 60,
     }
 }
 
@@ -57,15 +61,15 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
         recover_interrupted(&state).await;
         loop {
-            let now = Utc::now();
+            let now = Timestamp::now();
             run_due(&state, now).await;
             let upcoming = state
                 .kanban_tasks
-                .due_schedules(now + chrono::Duration::from_std(TICK).unwrap_or_default())
+                .due_schedules(now + SignedDuration::try_from(TICK).unwrap_or_default())
                 .await
                 .into_iter()
                 .map(|due| due.due_at);
-            tokio::time::sleep(next_wait(upcoming, now, Utc::now())).await;
+            tokio::time::sleep(next_wait(upcoming, now, Timestamp::now())).await;
         }
     })
 }
@@ -74,16 +78,18 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
 /// schedule that was not yet due then, at most `TICK`. Schedules due at the
 /// pass were already attempted and wait for the next regular pass.
 fn next_wait(
-    due_ats: impl IntoIterator<Item = DateTime<Utc>>,
-    checked_at: DateTime<Utc>,
-    now: DateTime<Utc>,
+    due_ats: impl IntoIterator<Item = Timestamp>,
+    checked_at: Timestamp,
+    now: Timestamp,
 ) -> Duration {
     due_ats
         .into_iter()
         .filter(|due_at| *due_at > checked_at)
         .min()
         .map_or(TICK, |due_at| {
-            (due_at - now).to_std().unwrap_or(Duration::ZERO).min(TICK)
+            Duration::try_from(due_at.duration_since(now))
+                .unwrap_or(Duration::ZERO)
+                .min(TICK)
         })
 }
 
@@ -124,7 +130,7 @@ async fn recover_interrupted(state: &AppState) {
     }
 }
 
-pub(crate) async fn run_due(state: &AppState, now: DateTime<Utc>) {
+pub(crate) async fn run_due(state: &AppState, now: Timestamp) {
     for due in state.kanban_tasks.due_schedules(now).await {
         if state.conversations.is_shutting_down() {
             return;
@@ -133,9 +139,9 @@ pub(crate) async fn run_due(state: &AppState, now: DateTime<Utc>) {
     }
 }
 
-async fn run_one(state: &AppState, due: &DueKanbanSchedule, now: DateTime<Utc>) {
-    let missed = now - due.due_at > MISSED_AFTER;
-    let fired_at = now.timestamp_millis().max(0) as u64;
+async fn run_one(state: &AppState, due: &DueKanbanSchedule, now: Timestamp) {
+    let missed = now.duration_since(due.due_at) > MISSED_AFTER;
+    let fired_at = now.as_millisecond().max(0) as u64;
     let claimed = state
         .kanban_tasks
         .update_schedule(&due.tenant_id, &due.task_id, &due.schedule_id, |task| {
@@ -354,8 +360,8 @@ mod tests {
 
     #[test]
     fn scheduler_sleeps_until_the_next_schedule_at_most_a_tick() {
-        let checked = Utc::now();
-        let seconds = chrono::Duration::seconds;
+        let checked = Timestamp::now();
+        let seconds = SignedDuration::from_secs;
         assert_eq!(next_wait([], checked, checked), TICK);
         // Due at or before the pass: attempted already, not a reason to spin.
         assert_eq!(
@@ -432,11 +438,7 @@ mod tests {
         }
     }
 
-    fn scheduled_task(
-        id: &str,
-        action: KanbanScheduleAction,
-        at: DateTime<Utc>,
-    ) -> KanbanTaskRecord {
+    fn scheduled_task(id: &str, action: KanbanScheduleAction, at: Timestamp) -> KanbanTaskRecord {
         KanbanTaskRecord {
             id: id.to_owned(),
             tenant_id: String::new(),
@@ -453,8 +455,8 @@ mod tests {
             schedule: Some(KanbanTaskSchedule {
                 id: format!("{id}-schedule"),
                 at: at
-                    .with_timezone(&Local)
-                    .format(KANBAN_SCHEDULE_TIME_FORMAT)
+                    .to_zoned(TimeZone::system())
+                    .strftime(KANBAN_SCHEDULE_TIME_FORMAT)
                     .to_string(),
                 action,
                 conversation_id: (action == KanbanScheduleAction::Send)
@@ -483,7 +485,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("todex-kanban-scheduler-{}", uuid::Uuid::new_v4()));
         let state = AppState::new_for_tests(config(&root)).await.unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         state
             .kanban_tasks
             .merge_owned(
@@ -492,22 +494,22 @@ mod tests {
                     scheduled_task(
                         "start",
                         KanbanScheduleAction::Start,
-                        now - chrono::Duration::minutes(1),
+                        now - SignedDuration::from_mins(1),
                     ),
                     scheduled_task(
                         "send",
                         KanbanScheduleAction::Send,
-                        now - chrono::Duration::minutes(1),
+                        now - SignedDuration::from_mins(1),
                     ),
                     scheduled_task(
                         "missed",
                         KanbanScheduleAction::Start,
-                        now - chrono::Duration::hours(25),
+                        now - SignedDuration::from_hours(25),
                     ),
                     scheduled_task(
                         "later",
                         KanbanScheduleAction::Start,
-                        now + chrono::Duration::hours(1),
+                        now + SignedDuration::from_hours(1),
                     ),
                 ],
             )

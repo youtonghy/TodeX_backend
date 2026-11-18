@@ -23,7 +23,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -74,9 +74,11 @@ pub(crate) struct RecipientRecord {
     pub device_id: Option<String>,
     /// X-Wing public key, base64url.
     pub public_key: String,
-    pub added_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub added_at: Timestamp,
     #[serde(default)]
-    pub revoked_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::serde_optional_timestamp")]
+    pub revoked_at: Option<Timestamp>,
 }
 
 impl RecipientRecord {
@@ -104,10 +106,12 @@ pub(crate) struct GrantRecord {
     pub grant_id: String,
     pub rid: String,
     pub device_id: String,
-    pub requested_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub requested_at: Timestamp,
     pub status: GrantStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::serde_optional_timestamp")]
+    pub updated_at: Option<Timestamp>,
 }
 
 /// A device that may no longer use `history.*` (except
@@ -116,7 +120,8 @@ pub(crate) struct GrantRecord {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RevokedDevice {
     pub device_id: String,
-    pub revoked_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub revoked_at: Timestamp,
     /// The revoking device id, `"tui"` or `"local"` (the daemon).
     pub revoked_by: String,
 }
@@ -532,7 +537,7 @@ impl RecipientRegistry {
 
     fn update<T>(
         &self,
-        operation: impl FnOnce(&mut RecipientsFile, DateTime<Utc>) -> Result<T>,
+        operation: impl FnOnce(&mut RecipientsFile, Timestamp) -> Result<T>,
     ) -> Result<T> {
         self.apply(operation).map(|applied| applied.value)
     }
@@ -542,7 +547,7 @@ impl RecipientRegistry {
     /// `written` reports whether the operation (or reconciliation) wrote.
     fn apply<T>(
         &self,
-        operation: impl FnOnce(&mut RecipientsFile, DateTime<Utc>) -> Result<T>,
+        operation: impl FnOnce(&mut RecipientsFile, Timestamp) -> Result<T>,
     ) -> Result<Applied<T>> {
         let mut inner = self.lock()?;
         inner.reload_if_changed()?;
@@ -565,11 +570,7 @@ impl RecipientRegistry {
     /// devices are revoked, and with device auth on, devices missing from
     /// `devices.json` lose their recipient and are blocked (the TUI hook did
     /// not run). Returns the devices this newly blocked.
-    fn reconcile_devices(
-        &self,
-        file: &mut RecipientsFile,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<String>> {
+    fn reconcile_devices(&self, file: &mut RecipientsFile, now: Timestamp) -> Result<Vec<String>> {
         let blocked_rids = file
             .recipients
             .iter()
@@ -696,7 +697,7 @@ impl RecipientsFile {
 
     /// Adds `device_id` to the block list; `false` when already blocked.
     /// Entries are never pruned (see [`MAX_PENDING_EXTERNAL`]).
-    fn block(&mut self, device_id: &str, revoked_by: &str, now: DateTime<Utc>) -> bool {
+    fn block(&mut self, device_id: &str, revoked_by: &str, now: Timestamp) -> bool {
         if self.is_blocked(device_id) {
             return false;
         }
@@ -729,7 +730,7 @@ impl RecipientsFile {
 
     /// Marks `rid` revoked, settles its pending grants and bumps the epoch.
     /// `false` when it was not active.
-    fn revoke(&mut self, rid: &str, now: DateTime<Utc>) -> bool {
+    fn revoke(&mut self, rid: &str, now: Timestamp) -> bool {
         let Some(record) = self
             .recipients
             .iter_mut()
@@ -861,7 +862,7 @@ pub(crate) fn revoke_device_recipients(
     let Some(mut file) = read_file(&path)? else {
         return Ok(0);
     };
-    let now = Utc::now();
+    let now = Timestamp::now();
     let selected = |device_id: &str| match devices {
         DeviceRevocation::One(target) => device_id == target,
         DeviceRevocation::All(_) => true,
@@ -1269,7 +1270,7 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         value["revokedDevices"] = serde_json::json!([
-            { "deviceId": "dev_a", "revokedAt": Utc::now(), "revokedBy": "dev_b" }
+            { "deviceId": "dev_a", "revokedAt": Timestamp::now(), "revokedBy": "dev_b" }
         ]);
         secure_fs::write_owner_only_atomic(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(!registry.is_active(&rid).unwrap());

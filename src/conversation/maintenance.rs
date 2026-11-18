@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -25,7 +25,7 @@ use super::store::{ConversationStore, IDLE_SEAL_AFTER};
 /// files from before migration.
 pub(super) const BACKUP_DIR: &str = "journal-v2-backup";
 const BACKUP_MARKER: &str = "backup.json";
-const BACKUP_RETENTION: chrono::TimeDelta = chrono::TimeDelta::days(7);
+const BACKUP_RETENTION: jiff::SignedDuration = jiff::SignedDuration::from_hours(24 * 7);
 /// Startup does not clean up; the first pass waits this long.
 const CLEANUP_FIRST_DELAY: Duration = Duration::from_secs(120);
 const BACKUP_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
@@ -86,7 +86,8 @@ impl MaintenanceQueue {
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BackupMarker {
-    created_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    created_at: Timestamp,
 }
 
 /// Bytes available to unprivileged writes on the filesystem holding
@@ -192,7 +193,7 @@ impl ConversationStore {
             // An unreadable marker is treated as expired: the backup is a
             // convenience copy, never the journal itself.
             let expired = serde_json::from_slice::<BackupMarker>(&raw).map_or(true, |marker| {
-                Utc::now() - marker.created_at >= BACKUP_RETENTION
+                Timestamp::now().duration_since(marker.created_at) >= BACKUP_RETENTION
             });
             if expired {
                 tokio::fs::remove_dir_all(&backup).await?;

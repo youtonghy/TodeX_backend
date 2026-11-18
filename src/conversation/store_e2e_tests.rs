@@ -1664,7 +1664,7 @@ async fn idle_pass_skips_a_conversation_whose_turn_is_still_open() {
 #[tokio::test]
 async fn an_expiring_key_is_sealed_out_with_its_records() {
     let root = temp_dir("todex-e2e-key-age");
-    let now = Arc::new(std::sync::Mutex::new(Utc::now()));
+    let now = Arc::new(std::sync::Mutex::new(Timestamp::now()));
     let clock_now = now.clone();
     let keys =
         HistoryKeys::load_with_clock(&root, None, Arc::new(move || *clock_now.lock().unwrap()))
@@ -1691,7 +1691,7 @@ async fn an_expiring_key_is_sealed_out_with_its_records() {
         }
     }
     let first_kid = keys.deks().current_key(&first).await.unwrap().0;
-    *now.lock().unwrap() += chrono::Duration::hours(24);
+    *now.lock().unwrap() += jiff::SignedDuration::from_hours(24);
     assert!(keys.deks().active_key_expired(&first).await);
 
     // Inside an append: the expiring key's file is sealed before the record
@@ -1737,7 +1737,7 @@ async fn an_expiring_key_is_sealed_out_with_its_records() {
 #[tokio::test]
 async fn saving_a_request_seals_an_expired_key_without_deadlocking() {
     let root = temp_dir("todex-e2e-key-age-request");
-    let now = Arc::new(std::sync::Mutex::new(Utc::now()));
+    let now = Arc::new(std::sync::Mutex::new(Timestamp::now()));
     let clock_now = now.clone();
     let keys =
         HistoryKeys::load_with_clock(&root, None, Arc::new(move || *clock_now.lock().unwrap()))
@@ -1761,7 +1761,7 @@ async fn saving_a_request_seals_an_expired_key_without_deadlocking() {
         store.append(&id, event_type, payload).await.unwrap();
     }
     let old_kid = keys.deks().current_key(&id).await.unwrap().0;
-    *now.lock().unwrap() += chrono::Duration::hours(24);
+    *now.lock().unwrap() += jiff::SignedDuration::from_hours(24);
     assert!(keys.deks().active_key_expired(&id).await);
 
     tokio::time::timeout(

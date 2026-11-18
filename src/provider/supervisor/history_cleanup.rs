@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 
 use super::ConversationSupervisor;
@@ -62,7 +62,7 @@ pub struct CleanupThresholds {
 #[derive(Clone, Debug)]
 pub(crate) struct PolicyCandidate {
     pub id: String,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     pub bytes: u64,
     /// Running, waiting for a permission, or reserved by a starting turn:
     /// counts toward the total, never deleted.
@@ -83,12 +83,12 @@ pub(crate) enum PolicyRule {
 pub(crate) fn plan_policy_deletions(
     candidates: &[PolicyCandidate],
     thresholds: CleanupThresholds,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<(String, PolicyRule)> {
     let mut plan = Vec::new();
     let mut removed = HashSet::new();
     if let Some(days) = thresholds.max_age_days {
-        let cutoff = now - chrono::Duration::days(i64::from(days));
+        let cutoff = now - jiff::SignedDuration::from_hours(24 * i64::from(days));
         for candidate in candidates {
             if !candidate.protected && candidate.updated_at < cutoff {
                 removed.insert(candidate.id.as_str());
@@ -266,7 +266,7 @@ impl ConversationSupervisor {
         &self,
         owner_id: &str,
         thresholds: CleanupThresholds,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<CleanupReport, AppError> {
         // Measure before taking the gate: walking every directory can take a
         // while, and the gate blocks turn starts and CLI discovery meanwhile.
@@ -306,7 +306,7 @@ impl ConversationSupervisor {
         };
         let age_cutoff = thresholds
             .max_age_days
-            .map(|days| now - chrono::Duration::days(i64::from(days)));
+            .map(|days| now - jiff::SignedDuration::from_hours(24 * i64::from(days)));
         let mut report = CleanupReport::default();
         for (conversation_id, rule) in plan_policy_deletions(&candidates, thresholds, now) {
             let still_eligible = |current: &ConversationManifest| {
@@ -351,13 +351,13 @@ mod tests {
     fn candidate(id: &str, age_days: i64, bytes: u64, protected: bool) -> PolicyCandidate {
         PolicyCandidate {
             id: id.to_owned(),
-            updated_at: now() - chrono::Duration::days(age_days),
+            updated_at: now() - jiff::SignedDuration::from_hours(24 * age_days),
             bytes,
             protected,
         }
     }
 
-    fn now() -> DateTime<Utc> {
+    fn now() -> Timestamp {
         "2026-10-11T08:00:00Z".parse().unwrap()
     }
 

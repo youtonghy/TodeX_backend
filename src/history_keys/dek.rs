@@ -16,8 +16,8 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
+use jiff::{SignedDuration, Timestamp};
 
 use super::{encode_id, keyring::KeyEntry, Clock, KeyringStore, RecipientRegistry};
 use crate::{
@@ -34,7 +34,7 @@ pub(crate) trait OwnerRecipients: Send + Sync {
 type Result<T> = std::result::Result<T, AppError>;
 
 /// A DEK older than this is replaced on the next write.
-pub(crate) const MAX_DEK_AGE: Duration = Duration::hours(24);
+pub(crate) const MAX_DEK_AGE: SignedDuration = SignedDuration::from_hours(24);
 
 struct ActiveKey {
     kid: String,
@@ -43,14 +43,14 @@ struct ActiveKey {
     /// The owner recipient the key was also wrapped for; a change (the API
     /// key was revoked) rotates the key like an epoch change.
     owner_rid: Option<[u8; RECIPIENT_ID_LEN]>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 impl ActiveKey {
     /// Due for replacement by age; a clock that moved backwards counts too.
-    fn expired(&self, now: DateTime<Utc>) -> bool {
-        let age = now.signed_duration_since(self.created_at);
-        age < Duration::zero() || age >= MAX_DEK_AGE
+    fn expired(&self, now: Timestamp) -> bool {
+        let age = now.duration_since(self.created_at);
+        age < SignedDuration::ZERO || age >= MAX_DEK_AGE
     }
 }
 
@@ -420,14 +420,14 @@ mod tests {
         recipients: RecipientRegistry,
         keyrings: KeyringStore,
         deks: DekManager,
-        now: Arc<Mutex<DateTime<Utc>>>,
+        now: Arc<Mutex<Timestamp>>,
     }
 
     impl Fixture {
         fn new() -> Self {
             let root = temp_dir("dek");
             let (conversation, _) = conversation_dir(&root);
-            let now = Arc::new(Mutex::new(Utc::now()));
+            let now = Arc::new(Mutex::new(Timestamp::now()));
             let clock_now = now.clone();
             let clock: Clock = Arc::new(move || *clock_now.lock().unwrap());
             let recipients = RecipientRegistry::load(&root, None, clock.clone()).unwrap();
@@ -443,7 +443,7 @@ mod tests {
             }
         }
 
-        fn advance(&self, by: Duration) {
+        fn advance(&self, by: SignedDuration) {
             *self.now.lock().unwrap() += by;
         }
 
@@ -649,9 +649,9 @@ mod tests {
         let (first, _) = fixture.current().await;
 
         // Age: still valid just before 24 h, rotated at 24 h.
-        fixture.advance(MAX_DEK_AGE - Duration::seconds(1));
+        fixture.advance(MAX_DEK_AGE - SignedDuration::from_secs(1));
         assert_eq!(fixture.current().await.0, first);
-        fixture.advance(Duration::seconds(1));
+        fixture.advance(SignedDuration::from_secs(1));
         let (second, _) = fixture.current().await;
         assert_ne!(second, first);
 
@@ -671,7 +671,7 @@ mod tests {
         assert_ne!(fourth, third);
 
         // Clock moving backwards rotates too.
-        fixture.advance(-Duration::hours(1));
+        fixture.advance(-SignedDuration::from_hours(1));
         let (fifth, _) = fixture.current().await;
         assert_ne!(fifth, fourth);
         assert_eq!(

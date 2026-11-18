@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{oneshot, Notify, Semaphore},
@@ -561,9 +561,11 @@ pub(crate) struct AssignmentView {
     pub state: AssignmentState,
     pub active_connections: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub connected_at: Option<DateTime<Utc>>,
+    #[serde(serialize_with = "crate::time::serde_optional_timestamp::serialize")]
+    pub connected_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_used_at: Option<DateTime<Utc>>,
+    #[serde(serialize_with = "crate::time::serde_optional_timestamp::serialize")]
+    pub last_used_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<SshFailureKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -651,8 +653,8 @@ struct Info {
     state: AssignmentState,
     failure: Option<SshFailureKind>,
     error: Option<String>,
-    connected_at: Option<DateTime<Utc>>,
-    last_used_at: Option<DateTime<Utc>>,
+    connected_at: Option<Timestamp>,
+    last_used_at: Option<Timestamp>,
     last_activity: Instant,
     last_auto_failure: Option<Instant>,
 }
@@ -1237,7 +1239,7 @@ impl Assignment {
                     info.state = AssignmentState::Connected;
                     info.failure = None;
                     info.error = None;
-                    info.connected_at = Some(Utc::now());
+                    info.connected_at = Some(Timestamp::now());
                     info.last_activity = Instant::now();
                     info.last_auto_failure = None;
                 }
@@ -1466,7 +1468,7 @@ impl Assignment {
         {
             let mut info = self.info.lock().unwrap();
             info.last_activity = Instant::now();
-            info.last_used_at = Some(Utc::now());
+            info.last_used_at = Some(Timestamp::now());
         }
         self.activity.notify_one();
     }

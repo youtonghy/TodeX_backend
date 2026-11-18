@@ -23,7 +23,9 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+
+use crate::time::TimestampExt;
 use serde_json::{json, Value};
 
 use super::{prepare_prompt_content, ConversationPrompt, ConversationSupervisor};
@@ -87,7 +89,8 @@ pub(super) struct FollowUpQueue {
     /// for display only, when a continuation was queued under a pause the
     /// user holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    resume_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::serde_optional_timestamp")]
+    resume_at: Option<Timestamp>,
     /// Consecutive continuation turns that failed on an exhausted plan
     /// window; cleared when a turn completes.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -102,7 +105,8 @@ fn is_zero(value: &u32) -> bool {
 #[serde(rename_all = "camelCase")]
 struct FollowUpItem {
     id: String,
-    queued_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    queued_at: Timestamp,
     /// Carries `client_request_id == id`, so a start replayed after a crash
     /// is recognized by the prompt path instead of running twice.
     request: ConversationPrompt,
@@ -127,7 +131,7 @@ impl FollowUpQueue {
                     "id": item.id,
                     "text": item.request.text,
                     "status": "queued",
-                    "queuedAt": item.queued_at,
+                    "queuedAt": item.queued_at.to_rfc3339_z(),
                     "contentCount": item.request.content.len(),
                     "skills": item.request.skills.iter()
                         .map(|skill| skill.name.clone().unwrap_or_else(|| skill.resource_id.clone()))
@@ -140,7 +144,7 @@ impl FollowUpQueue {
             "paused": self.paused,
             "pauseReason": self.pause_reason,
             "pauseMessage": self.pause_message,
-            "resumeAt": self.resume_at,
+            "resumeAt": self.resume_at.map(TimestampExt::to_rfc3339_z),
         })
     }
 
@@ -197,20 +201,17 @@ impl FollowUpQueue {
 /// floor after `now`, doubled for every consecutive continuation beyond the
 /// first that failed on the limit.
 pub(super) fn rate_limit_resume_at(
-    reset: DateTime<Utc>,
-    now: DateTime<Utc>,
+    reset: Timestamp,
+    now: Timestamp,
     failures: u32,
     floor: Duration,
-) -> DateTime<Utc> {
+) -> Timestamp {
     let factor = 1u32
         .checked_shl(failures.saturating_sub(1))
         .unwrap_or(u32::MAX);
-    let wait =
-        chrono::Duration::from_std(floor.saturating_mul(factor)).unwrap_or(chrono::Duration::MAX);
-    reset.max(
-        now.checked_add_signed(wait)
-            .unwrap_or(DateTime::<Utc>::MAX_UTC),
-    )
+    let wait = jiff::SignedDuration::try_from(floor.saturating_mul(factor))
+        .unwrap_or(jiff::SignedDuration::MAX);
+    reset.max(now.checked_add(wait).unwrap_or(Timestamp::MAX))
 }
 
 fn validate_item_id(item_id: &str) -> Result<(), AppError> {
@@ -371,7 +372,7 @@ impl ConversationSupervisor {
         self.load_prompt_skills(&manifest, &prompt.skills).await?;
         let item = FollowUpItem {
             id: item_id.to_owned(),
-            queued_at: Utc::now(),
+            queued_at: Timestamp::now(),
             request: prompt,
         };
         if front {
@@ -520,7 +521,7 @@ impl ConversationSupervisor {
         &self,
         owner_id: &str,
         conversation_id: &str,
-        at: Option<DateTime<Utc>>,
+        at: Option<Timestamp>,
     ) -> Result<(Value, Option<ConversationSchedule>), AppError> {
         let Some(at) = at else {
             self.get_owned(owner_id, conversation_id).await?;
@@ -531,13 +532,13 @@ impl ConversationSupervisor {
         // A schedule outlives the client session that set it, which a
         // private conversation is not meant to.
         super::refuse_private(&manifest, "scheduled")?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         if at <= now {
             return Err(AppError::InvalidRequest(
                 "at must be in the future".to_owned(),
             ));
         }
-        if at > now + chrono::Duration::days(MAX_SCHEDULE_AHEAD_DAYS) {
+        if at > now + jiff::SignedDuration::from_hours(24 * MAX_SCHEDULE_AHEAD_DAYS) {
             return Err(AppError::InvalidRequest(format!(
                 "at must be at most {MAX_SCHEDULE_AHEAD_DAYS} days ahead"
             )));
@@ -785,7 +786,7 @@ impl ConversationSupervisor {
         &self,
         conversation_id: &str,
         turn_id: &str,
-        until: DateTime<Utc>,
+        until: Timestamp,
     ) {
         let result = async {
             let _request_guard = self.request_gate(conversation_id).lock_owned().await;
@@ -816,7 +817,7 @@ impl ConversationSupervisor {
             }
             let resume_at = rate_limit_resume_at(
                 until,
-                Utc::now(),
+                Timestamp::now(),
                 queue.rate_limit_failures,
                 self.rate_limit_retry_floor,
             );
@@ -833,7 +834,7 @@ impl ConversationSupervisor {
                     0,
                     FollowUpItem {
                         id: item_id,
-                        queued_at: Utc::now(),
+                        queued_at: Timestamp::now(),
                         request,
                     },
                 );
@@ -886,7 +887,7 @@ impl ConversationSupervisor {
             .store(shutting_down, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn spawn_rate_limit_timer(&self, conversation_id: &str, until: DateTime<Utc>) {
+    fn spawn_rate_limit_timer(&self, conversation_id: &str, until: Timestamp) {
         let supervisor = self.clone();
         let conversation_id = conversation_id.to_owned();
         tokio::spawn(async move {
@@ -899,7 +900,7 @@ impl ConversationSupervisor {
 
     /// Lifts the pause armed for `until`. A queue that was resumed, cleared or
     /// re-armed for a later reset in the meantime is left alone.
-    async fn resume_after_rate_limit(&self, conversation_id: &str, until: DateTime<Utc>) {
+    async fn resume_after_rate_limit(&self, conversation_id: &str, until: Timestamp) {
         // A shutdown ends the wait with the process: the queue is gone.
         if self.is_shutting_down() {
             return;
@@ -924,7 +925,7 @@ impl ConversationSupervisor {
         }
     }
 
-    fn spawn_schedule_timer(&self, conversation_id: &str, at: DateTime<Utc>) {
+    fn spawn_schedule_timer(&self, conversation_id: &str, at: Timestamp) {
         let supervisor = self.clone();
         let conversation_id = conversation_id.to_owned();
         tokio::spawn(async move {
@@ -936,7 +937,7 @@ impl ConversationSupervisor {
     /// The schedule for `at` is due: it ends and the queue is sent. A queue
     /// that was rescheduled, cancelled, sent early or deleted in the meantime
     /// is left alone.
-    async fn send_scheduled(&self, conversation_id: &str, at: DateTime<Utc>) {
+    async fn send_scheduled(&self, conversation_id: &str, at: Timestamp) {
         if self.is_shutting_down() {
             return;
         }
@@ -999,9 +1000,9 @@ impl ConversationSupervisor {
 /// Sleeps until the wall clock reaches `until`, re-reading it at least every
 /// [`RATE_LIMIT_RECHECK`] because monotonic timers stop while the machine
 /// sleeps.
-async fn sleep_until_wall_clock(until: DateTime<Utc>) {
+async fn sleep_until_wall_clock(until: Timestamp) {
     // `to_std` fails once `until` is in the past.
-    while let Ok(remaining) = (until - Utc::now()).to_std() {
+    while let Ok(remaining) = Duration::try_from(until.duration_since(Timestamp::now())) {
         if remaining.is_zero() {
             break;
         }

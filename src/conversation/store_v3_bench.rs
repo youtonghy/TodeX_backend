@@ -112,8 +112,9 @@ fn synthetic_event(id: &str, index: u64, text: &mut TextGenerator) -> Conversati
     }
     let mut event = ConversationEvent::new(id, index + 1, event_type, payload);
     event.provider = Some(ProviderKind::Codex);
-    event.time =
-        DateTime::from_timestamp_micros(1_700_000_000_000_000 + index as i64 * 1_000).unwrap();
+    event.time = Timestamp::from_microsecond(1_700_000_000_000_000 + index as i64 * 1_000)
+        .ok()
+        .unwrap();
     event
 }
 

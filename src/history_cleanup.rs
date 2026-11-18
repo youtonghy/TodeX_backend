@@ -14,7 +14,9 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+
+use crate::time::TimestampExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{sync::Notify, task::JoinHandle};
@@ -129,7 +131,8 @@ pub enum CleanupTrigger {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupRun {
-    pub at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub at: Timestamp,
     pub trigger: CleanupTrigger,
     pub deleted: usize,
     pub freed_bytes: u64,
@@ -158,7 +161,7 @@ pub struct HistoryCleanup {
     file: Arc<tokio::sync::Mutex<CleanupFile>>,
     wake: Arc<Notify>,
     /// The scheduler's next planned pass; `None` until it runs.
-    next_pass: Arc<std::sync::Mutex<Option<DateTime<Utc>>>>,
+    next_pass: Arc<std::sync::Mutex<Option<Timestamp>>>,
 }
 
 impl HistoryCleanup {
@@ -283,14 +286,14 @@ impl HistoryCleanup {
             .collect()
     }
 
-    pub fn next_pass_at(&self) -> Option<DateTime<Utc>> {
+    pub fn next_pass_at(&self) -> Option<Timestamp> {
         *self
             .next_pass
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn set_next_pass(&self, at: DateTime<Utc>) {
+    fn set_next_pass(&self, at: Timestamp) {
         *self
             .next_pass
             .lock()
@@ -305,7 +308,7 @@ impl HistoryCleanup {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if next.is_some() {
-            *next = Some(Utc::now());
+            *next = Some(Timestamp::now());
         }
         drop(next);
         self.wake.notify_one();
@@ -321,7 +324,7 @@ impl HistoryCleanup {
         json!({
             "policy": tenant.policy,
             "lastRun": tenant.last_run,
-            "nextRunAt": next_run_at,
+            "nextRunAt": next_run_at.map(TimestampExt::to_rfc3339_z),
         })
     }
 }
@@ -336,7 +339,7 @@ pub async fn run_policy(
     policy: CleanupPolicy,
     trigger: CleanupTrigger,
 ) -> Result<(CleanupReport, CleanupRun), AppError> {
-    let at = Utc::now();
+    let at = Timestamp::now();
     let outcome = conversations
         .apply_cleanup_policy(tenant_id, policy.thresholds(), at)
         .await;
@@ -371,22 +374,21 @@ pub async fn run_policy(
 pub fn spawn(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
         let cleanup = state.history_cleanup.clone();
-        let mut due = Utc::now() + FIRST_PASS_DELAY;
+        let mut due = Timestamp::now() + FIRST_PASS_DELAY;
         cleanup.set_next_pass(due);
         loop {
-            let wait = (due - Utc::now())
-                .to_std()
+            let wait = Duration::try_from(due.duration_since(Timestamp::now()))
                 .unwrap_or_default()
                 .min(CLOCK_CHECK);
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
-                _ = cleanup.wake.notified() => due = Utc::now(),
+                _ = cleanup.wake.notified() => due = Timestamp::now(),
             }
-            if Utc::now() < due {
+            if Timestamp::now() < due {
                 continue;
             }
             run_enabled(&state).await;
-            due = Utc::now() + PASS_INTERVAL;
+            due = Timestamp::now() + PASS_INTERVAL;
             cleanup.set_next_pass(due);
         }
     })
@@ -541,7 +543,7 @@ mod tests {
     async fn next_run_is_reported_only_for_enabled_policies() {
         let dir = temp_dir("history-cleanup-next");
         let cleanup = HistoryCleanup::load(&dir);
-        let planned = Utc::now() + chrono::Duration::days(1);
+        let planned = Timestamp::now() + jiff::SignedDuration::from_hours(24);
         cleanup.set_next_pass(planned);
         let disabled = cleanup.tenant("local").await;
         assert_eq!(cleanup.view(&disabled)["nextRunAt"], Value::Null);

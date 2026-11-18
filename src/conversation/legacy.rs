@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
@@ -37,7 +37,8 @@ pub(crate) const LEGACY_SCAN_MARKER: &str = "legacy-plaintext-scan.json";
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScanMarker {
-    completed_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    completed_at: Timestamp,
     conversations: usize,
     legacy: usize,
 }
@@ -103,7 +104,7 @@ impl ConversationStore {
                 "conversation holds legacy plaintext history; it is read-only"
             );
         } else {
-            manifest.history_encrypted_at = Some(Utc::now());
+            manifest.history_encrypted_at = Some(Timestamp::now());
         }
         self.persist_manifest_locked(&manifest).await?;
         Ok(legacy)
@@ -218,7 +219,7 @@ impl ConversationStore {
         );
         if scan.failed == 0 {
             let body = serde_json::to_vec_pretty(&ScanMarker {
-                completed_at: Utc::now(),
+                completed_at: Timestamp::now(),
                 conversations: scan.conversations,
                 legacy: legacy_total,
             })?;

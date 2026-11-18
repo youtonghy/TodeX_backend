@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -1926,7 +1926,7 @@ pub(super) fn salvage_segment(
     let policy = SealPolicy::default();
     let mut builder = SegmentBuilder::create(directory, conversation_id, number, &policy)?;
     let mut lost = 0u64;
-    let mut previous: Option<(DateTime<Utc>, Option<ProviderKind>)> = None;
+    let mut previous: Option<(Timestamp, Option<ProviderKind>)> = None;
     let mut sequence = first;
     let result = (|| -> Result<(), SegmentError> {
         while sequence <= last {

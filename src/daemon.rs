@@ -1,3 +1,4 @@
+use crate::time::TimestampExt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -6,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::{sleep, MissedTickBehavior};
@@ -47,7 +48,8 @@ pub struct DaemonProcess {
     pub data_dir: PathBuf,
     #[serde(default)]
     pub workspace_roots: Vec<PathBuf>,
-    pub started_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub started_at: Timestamp,
     pub executable: PathBuf,
     /// The external API listener (`host:port`), when enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -692,7 +694,7 @@ fn write_pid_file(
         network_enabled: config.network_enabled,
         data_dir: config.data_dir.clone(),
         workspace_roots: config.workspace_roots.clone(),
-        started_at: Utc::now(),
+        started_at: Timestamp::now(),
         executable: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("todex-agentd")),
         api_listen,
         ipc_path,
@@ -991,7 +993,7 @@ fn executable_is_outdated(process: &DaemonProcess) -> bool {
     }
     on_disk
         .modified()
-        .is_ok_and(|modified| DateTime::<Utc>::from(modified) > process.started_at)
+        .is_ok_and(|modified| Timestamp::try_from(modified).is_ok_and(|at| at > process.started_at))
 }
 
 #[cfg(target_os = "linux")]
@@ -1100,7 +1102,7 @@ fn daemon_record_from_args(
             .map(PathBuf::from)
             .unwrap_or_else(|| config.data_dir.clone()),
         workspace_roots,
-        started_at: Utc::now(),
+        started_at: Timestamp::now(),
         executable,
         api_listen,
         ipc_path: None,
@@ -1110,7 +1112,7 @@ fn daemon_record_from_args(
 
 /// Reads a process start time from `/proc/<pid>/stat` and the boot time.
 #[cfg(target_os = "linux")]
-fn process_started_at(pid: u32) -> Option<DateTime<Utc>> {
+fn process_started_at(pid: u32) -> Option<Timestamp> {
     let stat = fs::read_to_string(proc_path(pid).join("stat")).ok()?;
     // Field 22 (starttime); the fields after the parenthesized name start at 3.
     let start_ticks = stat
@@ -1132,7 +1134,7 @@ fn process_started_at(pid: u32) -> Option<DateTime<Utc>> {
         return None;
     }
     let millis = (start_ticks as i64).checked_mul(1000)? / ticks_per_second as i64;
-    DateTime::from_timestamp_millis(boot_time.checked_mul(1000)?.checked_add(millis)?)
+    Timestamp::from_millisecond(boot_time.checked_mul(1000)?.checked_add(millis)?).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -1355,7 +1357,7 @@ mod tests {
     #[cfg(unix)]
     use super::{process_liveness, ProcessLiveness};
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
-    use chrono::Utc;
+    use jiff::Timestamp;
     use std::time::{Duration, Instant};
 
     #[cfg(unix)]
@@ -1403,9 +1405,7 @@ mod tests {
             network_enabled: true,
             data_dir: std::path::PathBuf::from("/data"),
             workspace_roots: Vec::new(),
-            started_at: chrono::DateTime::parse_from_rfc3339("2026-10-01T08:00:00Z")
-                .unwrap()
-                .into(),
+            started_at: "2026-10-01T08:00:00Z".parse().unwrap(),
             executable: std::path::PathBuf::from("/bin/todex-agentd"),
             api_listen: None,
             ipc_path: Some(std::path::PathBuf::from("/data/agentd.sock")),
@@ -1494,7 +1494,7 @@ mod tests {
             network_enabled: true,
             data_dir: config.data_dir.clone(),
             workspace_roots: config.workspace_roots.clone(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             executable: env::current_exe().unwrap(),
             api_listen: None,
             ipc_path: None,
@@ -1525,7 +1525,7 @@ mod tests {
             network_enabled: true,
             data_dir: config.data_dir.clone(),
             workspace_roots: config.workspace_roots.clone(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             executable: env::current_exe().unwrap(),
             api_listen: None,
             ipc_path: None,
@@ -1551,7 +1551,7 @@ mod tests {
             network_enabled: true,
             data_dir: std::env::temp_dir(),
             workspace_roots: vec![std::env::temp_dir()],
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             executable: std::env::temp_dir().join("definitely-not-todex-agentd"),
             api_listen: None,
             ipc_path: None,
@@ -1605,7 +1605,7 @@ mod tests {
             network_enabled: true,
             data_dir: root.clone(),
             workspace_roots: Vec::new(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             executable: executable.clone(),
             api_listen: None,
             ipc_path: None,
@@ -1667,8 +1667,13 @@ mod tests {
         fs::copy("/bin/sleep", &executable).expect("replace executable");
         assert!(process_matches_record(&process));
         assert!(executable_is_outdated(&process));
-        assert!(process_started_at(process.pid)
-            .is_some_and(|started| (Utc::now() - started).num_seconds().abs() < 60));
+        assert!(
+            process_started_at(process.pid).is_some_and(|started| Timestamp::now()
+                .duration_since(started)
+                .as_secs()
+                .abs()
+                < 60)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1701,7 +1706,7 @@ mod tests {
             network_enabled: true,
             data_dir: config.data_dir.clone(),
             workspace_roots: config.workspace_roots.clone(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             executable: env::current_exe().unwrap(),
             api_listen: None,
             ipc_path: None,

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -115,17 +115,21 @@ pub struct ConversationManifest {
     pub provider_profile: Option<String>,
     pub status: ConversationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archived_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::serde_optional_timestamp")]
+    pub archived_at: Option<Timestamp>,
     pub last_sequence: u64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub created_at: Timestamp,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub updated_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_version: Option<u32>,
     /// Set when every record, the title and the request snapshot are stored
     /// encrypted (every conversation created since history encryption became
     /// mandatory; older ones may carry it from the retired migration).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub history_encrypted_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::serde_optional_timestamp")]
+    pub history_encrypted_at: Option<Timestamp>,
     /// Legacy unencrypted history (a plaintext record, title or request
     /// snapshot), found by the one-time startup scan or on first write
     /// (`docs/history-encryption.md` §8). Such a conversation is read-only:
@@ -157,7 +161,8 @@ pub struct ConversationManifest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationSchedule {
-    pub at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub at: Timestamp,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interrupted: bool,
 }
@@ -185,7 +190,7 @@ impl ConversationManifest {
         title: Option<String>,
         provider_profile: Option<String>,
     ) -> Self {
-        let now = Utc::now();
+        let now = Timestamp::now();
         Self {
             schema_version: CONVERSATION_SCHEMA_VERSION,
             id: Uuid::new_v4().to_string(),
@@ -223,7 +228,8 @@ pub struct ConversationEvent {
     pub sequence: u64,
     pub event_id: String,
     pub conversation_id: String,
-    pub time: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub time: Timestamp,
     #[serde(rename = "type")]
     pub event_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,7 +255,7 @@ impl ConversationEvent {
             sequence,
             event_id: format!("evt_{}", Uuid::new_v4().simple()),
             conversation_id: conversation_id.into(),
-            time: Utc::now(),
+            time: Timestamp::now(),
             raw_type: payload
                 .get("providerMethod")
                 .and_then(Value::as_str)
@@ -302,7 +308,8 @@ pub struct ConversationSnapshot {
     pub status: ConversationStatus,
     pub last_sequence: u64,
     pub event_count: u64,
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub updated_at: Timestamp,
 }
 
 impl ConversationSnapshot {
@@ -328,7 +335,8 @@ pub struct ProviderState {
     pub recoverable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub updated_at: Timestamp,
 }
 
 impl ProviderState {
@@ -339,7 +347,7 @@ impl ProviderState {
             native_session_id: None,
             recoverable: false,
             last_error: None,
-            updated_at: Utc::now(),
+            updated_at: Timestamp::now(),
         }
     }
 }

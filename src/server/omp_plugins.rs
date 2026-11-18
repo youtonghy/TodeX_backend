@@ -3,6 +3,7 @@
 //! `~/.omp/plugins`). Every write needs a signed device: plugins decide what
 //! code omp loads and what it may run on this host.
 
+use crate::time::TimestampExt;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::warn;
@@ -349,7 +350,7 @@ async fn start_operation(
                 action: request.action,
                 spec: spec.clone(),
                 status: "running",
-                started_at: Utc::now().to_rfc3339(),
+                started_at: Timestamp::now().to_rfc3339(),
                 finished_at: None,
                 error: None,
             };
@@ -437,7 +438,7 @@ fn finish(operation_id: &str, result: Result<(), String>) {
         .as_mut()
         .filter(|operation| operation.id == operation_id)
     {
-        operation.finished_at = Some(Utc::now().to_rfc3339());
+        operation.finished_at = Some(Timestamp::now().to_rfc3339());
         match result {
             Ok(()) => operation.status = "succeeded",
             Err(error) => {

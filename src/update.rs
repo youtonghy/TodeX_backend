@@ -298,7 +298,7 @@ async fn install(
     // date the copy by name; hard links and renames keep the old mtime.
     let backup = executable.with_extension(format!(
         "previous-{}-{}",
-        chrono::Utc::now().format("%Y%m%d%H%M%S"),
+        jiff::Timestamp::now().strftime("%Y%m%d%H%M%S"),
         uuid::Uuid::new_v4()
     ));
     #[cfg(unix)]
@@ -483,8 +483,11 @@ fn restore_backup(backup: &Path, executable: &Path) -> Result<()> {
 fn backup_created_at(suffix: &str, modified: Option<SystemTime>) -> Option<SystemTime> {
     if let Some((stamp, id)) = suffix.split_once('-') {
         if stamp.len() == 14 && !id.is_empty() && stamp.bytes().all(|c| c.is_ascii_digit()) {
-            let time = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d%H%M%S").ok()?;
-            return Some(time.and_utc().into());
+            let time = jiff::civil::DateTime::strptime("%Y%m%d%H%M%S", stamp).ok()?;
+            return jiff::tz::Offset::UTC
+                .to_timestamp(time)
+                .ok()
+                .map(SystemTime::from);
         }
     }
     uuid::Uuid::parse_str(suffix).ok().and(modified)

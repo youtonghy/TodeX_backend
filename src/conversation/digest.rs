@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -230,7 +230,8 @@ impl OpenTurnFold {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct JournalDigest {
     last_sequence: u64,
-    last_time: Option<DateTime<Utc>>,
+    #[serde(default, with = "crate::time::serde_optional_timestamp")]
+    last_time: Option<Timestamp>,
     /// Newest `message.created` with `role: "user"`.
     last_user_message: Option<u64>,
     client_requests: HashMap<String, ClientRequestFacts>,
@@ -432,7 +433,7 @@ impl JournalDigest {
     }
 
     /// Time of the newest event; `None` for an empty journal.
-    pub fn last_time(&self) -> Option<DateTime<Utc>> {
+    pub fn last_time(&self) -> Option<Timestamp> {
         self.last_time
     }
 

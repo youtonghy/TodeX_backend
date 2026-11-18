@@ -3,7 +3,7 @@
 //! Grok Build's `summary.json`; plus the mapping of records (and Grok's ACP
 //! update log) to transcript messages.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -24,14 +24,15 @@ pub(super) struct SessionMeta {
     pub id: Option<String>,
     pub title: Option<String>,
     pub cwd: Option<String>,
-    pub created_at: Option<DateTime<Utc>>,
+    pub created_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct TranscriptMessage {
     pub role: &'static str,
     pub text: String,
-    pub at: Option<DateTime<Utc>>,
+    #[serde(serialize_with = "crate::time::serde_optional_timestamp::serialize")]
+    pub at: Option<Timestamp>,
 }
 
 /// Listing metadata from the first and last lines of a session file (`tail`
@@ -469,7 +470,7 @@ pub(super) fn grok_summary(summary: &Value) -> Option<SessionMeta> {
 pub(super) struct GrokTranscript {
     role: Option<&'static str>,
     text: String,
-    at: Option<DateTime<Utc>>,
+    at: Option<Timestamp>,
     finished_tools: std::collections::HashSet<String>,
 }
 
@@ -488,7 +489,7 @@ impl GrokTranscript {
             .get("timestamp")
             .and_then(Value::as_i64)
             .filter(|seconds| *seconds > 0)
-            .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
+            .and_then(|seconds| Timestamp::new(seconds, 0).ok());
         match update.get("sessionUpdate").and_then(Value::as_str) {
             Some(kind @ ("user_message_chunk" | "agent_message_chunk")) => {
                 let role = if kind == "user_message_chunk" {
@@ -628,7 +629,7 @@ fn grok_chunk_text(content: &Value) -> String {
 fn content_messages(
     blocks: &[Value],
     role: &'static str,
-    at: Option<DateTime<Utc>>,
+    at: Option<Timestamp>,
     out: &mut Vec<TranscriptMessage>,
 ) {
     let mut text = String::new();
@@ -678,7 +679,7 @@ fn content_messages(
     flush(&mut text, out);
 }
 
-fn push_tool_result(out: &mut Vec<TranscriptMessage>, preview: &str, at: Option<DateTime<Utc>>) {
+fn push_tool_result(out: &mut Vec<TranscriptMessage>, preview: &str, at: Option<Timestamp>) {
     let preview = if preview.trim().is_empty() {
         "(no output)"
     } else {
@@ -692,7 +693,7 @@ fn push(
     role: &'static str,
     text: &str,
     max_chars: usize,
-    at: Option<DateTime<Utc>>,
+    at: Option<Timestamp>,
 ) {
     let text = text.trim();
     if text.is_empty() {
@@ -748,12 +749,10 @@ fn non_empty_str(value: Option<&Value>) -> Option<String> {
 }
 
 /// An RFC 3339 string or epoch milliseconds.
-fn timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
+fn timestamp(value: Option<&Value>) -> Option<Timestamp> {
     match value? {
-        Value::String(text) => DateTime::parse_from_rfc3339(text)
-            .ok()
-            .map(|at| at.with_timezone(&Utc)),
-        Value::Number(number) => DateTime::from_timestamp_millis(number.as_i64()?),
+        Value::String(text) => text.parse::<Timestamp>().ok(),
+        Value::Number(number) => Timestamp::from_millisecond(number.as_i64()?).ok(),
         _ => None,
     }
 }

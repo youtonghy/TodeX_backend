@@ -208,7 +208,9 @@ fn backup(path: &Path, bytes: &[u8]) -> Result<PathBuf, AppError> {
     let dir = path.parent().ok_or_else(|| {
         AppError::InvalidRequest(format!("config path has no parent: {}", path.display()))
     })?;
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+    let stamp = jiff::Timestamp::now()
+        .strftime("%Y%m%dT%H%M%S%.3fZ")
+        .to_string();
     let mut target = dir.join(format!("{BACKUP_PREFIX}{stamp}"));
     let mut suffix = 1;
     while target.exists() {

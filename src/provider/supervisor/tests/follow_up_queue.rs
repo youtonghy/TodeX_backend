@@ -1,6 +1,8 @@
 //! Backend follow-up queue: ordering, pausing, idempotency and restart.
 //! The queue is memory-only; a restart loses it.
 
+use crate::time::TimestampExt;
+use jiff::Timestamp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
 
@@ -18,7 +20,7 @@ struct GatedDriver {
     permits: Arc<Semaphore>,
     prompts: Arc<StdMutex<Vec<String>>>,
     fail_next: Arc<AtomicBool>,
-    limit_next: Arc<StdMutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    limit_next: Arc<StdMutex<Option<Timestamp>>>,
 }
 
 #[async_trait::async_trait]
@@ -47,7 +49,7 @@ impl ProviderDriver for GatedDriver {
                     "provider": "claude-code",
                     "scope": "account",
                     "status": "rejected",
-                    "windows": [{ "id": "five_hour", "usedPercent": 101.0, "resetsAt": reset.timestamp() }],
+                    "windows": [{ "id": "five_hour", "usedPercent": 101.0, "resetsAt": reset.as_second() }],
                 }),
             )
             .await?;
@@ -70,16 +72,15 @@ struct Gate {
     permits: Arc<Semaphore>,
     prompts: Arc<StdMutex<Vec<String>>>,
     fail_next: Arc<AtomicBool>,
-    limit_next: Arc<StdMutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    limit_next: Arc<StdMutex<Option<Timestamp>>>,
 }
 
 impl Gate {
     /// The next released turn fails on a plan window resetting `after` from
     /// now (whole seconds, as providers report it).
-    fn limit_next(&self, after: chrono::Duration) {
-        let reset = chrono::Utc::now() + after;
-        *self.limit_next.lock().unwrap() =
-            chrono::DateTime::from_timestamp(reset.timestamp() + 1, 0);
+    fn limit_next(&self, after: jiff::SignedDuration) {
+        let reset = jiff::Timestamp::now() + after;
+        *self.limit_next.lock().unwrap() = jiff::Timestamp::new(reset.as_second() + 1, 0).ok();
     }
 
     fn release(&self) {
@@ -580,7 +581,7 @@ async fn daemon_restart_loses_the_memory_only_queue() {
 }
 
 fn legacy_queue_json(paused_for_rate_limit: bool) -> String {
-    let reset = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let reset = (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_rfc3339();
     let state = if paused_for_rate_limit {
         format!(
             r#","paused":true,"pauseReason":"rate_limited","resumeAt":"{reset}","rateLimitFailures":2"#
@@ -748,7 +749,7 @@ async fn a_user_pause_outlasts_a_rate_limit_reset() {
         .queue_pause_owned("local", &manifest.id)
         .await
         .unwrap();
-    gate.limit_next(chrono::Duration::zero());
+    gate.limit_next(jiff::SignedDuration::ZERO);
     gate.release();
     let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| {
         q["items"].as_array().unwrap().len() == 2
@@ -907,7 +908,7 @@ async fn rate_limited_turn_continues_by_itself_after_the_reset() {
         .await
         .unwrap();
     gate.wait_for_prompts(1).await;
-    gate.limit_next(chrono::Duration::zero());
+    gate.limit_next(jiff::SignedDuration::ZERO);
     gate.release();
 
     // An empty queue still gets the continuation, waiting for the reset.
@@ -952,7 +953,7 @@ async fn rate_limit_continuation_goes_ahead_of_queued_items_once() {
         .unwrap();
     gate.wait_for_prompts(1).await;
     add(&supervisor, &manifest.id, "item-2", queued_prompt("second")).await;
-    gate.limit_next(chrono::Duration::zero());
+    gate.limit_next(jiff::SignedDuration::ZERO);
     gate.release();
 
     gate.wait_for_prompts(2).await;
@@ -960,7 +961,7 @@ async fn rate_limit_continuation_goes_ahead_of_queued_items_once() {
     assert_eq!(queue_ids(&supervisor, &manifest.id).await.0, ["item-2"]);
     // The continuation hits the limit again: one new continuation, still
     // ahead of the queued item.
-    gate.limit_next(chrono::Duration::zero());
+    gate.limit_next(jiff::SignedDuration::ZERO);
     gate.release();
     gate.wait_for_prompts(3).await;
     assert_eq!(gate.prompts()[2], CONTINUE_TEXT);
@@ -987,7 +988,7 @@ async fn a_turn_completed_during_the_wait_drops_the_continuation() {
         .unwrap();
     gate.wait_for_prompts(1).await;
     add(&supervisor, &manifest.id, "item-2", queued_prompt("second")).await;
-    gate.limit_next(chrono::Duration::hours(1));
+    gate.limit_next(jiff::SignedDuration::from_hours(1));
     gate.release();
     let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| q["paused"] == true).await;
     assert_eq!(snapshot["pauseReason"], "rate_limited");
@@ -1012,9 +1013,9 @@ async fn a_turn_completed_during_the_wait_drops_the_continuation() {
 
 #[test]
 fn continuations_wait_at_least_the_floor_and_back_off() {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let floor = Duration::from_secs(60);
-    let minutes = |n: i64| chrono::Duration::minutes(n);
+    let minutes = |n: i64| jiff::SignedDuration::from_mins(n);
     // A reset already in the past still waits a minute.
     assert_eq!(
         rate_limit_resume_at(now - minutes(5), now, 0, floor),
@@ -1050,12 +1051,12 @@ async fn continuations_stop_after_three_consecutive_limits() {
     gate.wait_for_prompts(1).await;
     // The original turn, then three continuations, all hit the limit.
     for started in 2..=4 {
-        gate.limit_next(chrono::Duration::zero());
+        gate.limit_next(jiff::SignedDuration::ZERO);
         gate.release();
         gate.wait_for_prompts(started).await;
         assert_eq!(gate.prompts()[started - 1], CONTINUE_TEXT);
     }
-    gate.limit_next(chrono::Duration::zero());
+    gate.limit_next(jiff::SignedDuration::ZERO);
     gate.release();
     let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| {
         q["pauseReason"] == "turn_failed"
@@ -1127,7 +1128,7 @@ async fn a_rate_limit_keeps_a_pause_the_user_holds() {
         .await
         .unwrap();
     gate.wait_for_prompts(2).await;
-    gate.limit_next(chrono::Duration::zero());
+    gate.limit_next(jiff::SignedDuration::ZERO);
     gate.release();
     let continue_id = format!("rate-limit-continue-{failed_turn}");
     let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| {
@@ -1140,10 +1141,13 @@ async fn a_rate_limit_keeps_a_pause_the_user_holds() {
     wait_until_idle(&supervisor).await;
 
     // No timer: the reset passes and nothing starts until the user resumes.
-    let resume_at =
-        chrono::DateTime::parse_from_rfc3339(snapshot["resumeAt"].as_str().unwrap()).unwrap();
-    let remaining = resume_at.signed_duration_since(chrono::Utc::now());
-    sleep(remaining.to_std().unwrap_or_default() + Duration::from_millis(300)).await;
+    let resume_at = snapshot["resumeAt"]
+        .as_str()
+        .unwrap()
+        .parse::<Timestamp>()
+        .unwrap();
+    let remaining = resume_at.duration_since(jiff::Timestamp::now());
+    sleep(Duration::try_from(remaining).unwrap_or_default() + Duration::from_millis(300)).await;
     assert_eq!(gate.prompts().len(), 2);
     assert_eq!(
         queue_ids(&supervisor, &manifest.id).await.1["pauseReason"],
@@ -1237,11 +1241,14 @@ async fn claude_session_limit_retries_after_the_reset() {
     })
     .await
     .expect("a session-limit failure should arm the rate-limit wait");
-    let resume_at = chrono::DateTime::parse_from_rfc3339(armed["resumeAt"].as_str().unwrap())
+    let resume_at = armed["resumeAt"]
+        .as_str()
+        .unwrap()
+        .parse::<Timestamp>()
         .expect("resumeAt");
-    let remaining = resume_at.signed_duration_since(chrono::Utc::now());
+    let remaining = resume_at.duration_since(jiff::Timestamp::now());
     assert!(
-        remaining.num_seconds() > 0 && remaining.num_seconds() < 120,
+        remaining.as_secs() > 0 && remaining.as_secs() < 120,
         "reset should be the upcoming minute, got {resume_at}"
     );
     assert_eq!(
@@ -1382,8 +1389,8 @@ async fn prompt_path_futures_stay_small() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn in_ms(ms: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() + chrono::Duration::milliseconds(ms)
+fn in_ms(ms: i64) -> Timestamp {
+    jiff::Timestamp::now() + jiff::SignedDuration::from_millis(ms)
 }
 
 async fn schedule_of(

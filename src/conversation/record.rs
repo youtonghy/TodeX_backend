@@ -31,7 +31,7 @@
 //! (`super::server_decrypt`).
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -371,10 +371,13 @@ impl RecordIn {
         conversation_id: &str,
         content: Option<Value>,
     ) -> Result<ConversationEvent, String> {
-        let mut time = DateTime::<Utc>::from_timestamp_micros(self.t)
+        let mut time = Timestamp::from_microsecond(self.t)
+            .ok()
             .ok_or_else(|| format!("record {} has an invalid time", self.s))?;
         if let Some(nanos) = self.tn.filter(|nanos| *nanos > 0 && *nanos < 1000) {
-            time += chrono::Duration::nanoseconds(i64::from(nanos));
+            time = time
+                .checked_add(jiff::SignedDuration::from_nanos(i64::from(nanos)))
+                .map_err(|_| format!("record {} has an invalid time", self.s))?;
         }
         let normalized_type = match self.n {
             None => Some(normalized_event_type(&self.y)),
@@ -414,11 +417,11 @@ fn record_out<'a>(
     content: Option<&'a Value>,
     encrypted: Option<&'a Value>,
 ) -> RecordOut<'a> {
-    let nanos = event.time.timestamp_subsec_nanos() % 1000;
+    let nanos = event.time.subsec_nanosecond().rem_euclid(1000) as u32;
     RecordOut {
         s: event.sequence,
         i: &event.event_id,
-        t: event.time.timestamp_micros(),
+        t: crate::time::unix_micros(event.time),
         y: &event.event_type,
         r: event.raw_type.as_deref(),
         p: event.provider,
@@ -526,8 +529,8 @@ pub(super) struct CompactedRecord {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompactedRun {
     event_id: String,
-    #[serde(with = "chrono::serde::ts_microseconds")]
-    time_us: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_unix_micros")]
+    time_us: Timestamp,
     original_type: String,
     run_start: u64,
     run_length: u64,
@@ -555,7 +558,6 @@ impl CompactedRecord {
 
 #[cfg(test)]
 mod tests {
-    use chrono::SubsecRound;
     use serde_json::json;
 
     use super::*;
@@ -583,7 +585,7 @@ mod tests {
         // Nanosecond time (Linux clocks), a raw type, a legacy normalized
         // value and a missing one must all survive.
         let mut legacy = plain.clone();
-        legacy.time = DateTime::from_timestamp(1_759_670_000, 123_456_789).unwrap();
+        legacy.time = Timestamp::new(1_759_670_000, 123_456_789).ok().unwrap();
         legacy.raw_type = Some("item/started".to_owned());
         legacy.normalized_type = Some("assistant.legacy".to_owned());
         cases.push(legacy.clone());
@@ -620,10 +622,40 @@ mod tests {
     }
 
     #[test]
+    fn pre_epoch_records_preserve_legacy_microseconds_and_nanos() {
+        let mut event = ConversationEvent::new("c", 3, "message.delta", json!({"x": 1}));
+        event.time = "1969-12-31T23:59:59.999998999Z".parse().unwrap();
+        let line = encode_record(&event).unwrap();
+        let fields: Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(fields["t"], -2);
+        assert_eq!(fields["tn"], 999);
+        assert_eq!(
+            parse_record(&line)
+                .unwrap()
+                .into_event("c", None)
+                .unwrap()
+                .time,
+            event.time
+        );
+
+        let compacted = CompactedRun {
+            event_id: event.event_id,
+            time_us: event.time,
+            original_type: event.event_type,
+            run_start: 1,
+            run_length: 3,
+        };
+        let fields = serde_json::to_value(compacted).unwrap();
+        assert_eq!(fields["timeUs"], -2);
+        let decoded: CompactedRun = serde_json::from_value(fields).unwrap();
+        assert_eq!(decoded.time_us, Timestamp::from_microsecond(-2).unwrap());
+    }
+
+    #[test]
     fn compacted_record_lines_still_decode() {
         let mut original = ConversationEvent::new("c", 3, "message.delta", json!({"x": 1}));
         // Markers store microseconds; Linux clocks carry nanoseconds.
-        original.time = original.time.trunc_subsecs(6);
+        original.time = Timestamp::from_microsecond(original.time.as_microsecond()).unwrap();
         let line = serde_json::to_vec(&CompactedRecord {
             sequence: 3,
             compacted: CompactedRun {

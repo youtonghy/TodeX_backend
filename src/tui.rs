@@ -1,3 +1,4 @@
+use crate::time::TimestampExt;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -7,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use arboard::Clipboard;
-use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use jiff::Timestamp;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -250,7 +251,7 @@ struct DevicePairingRequest {
     /// A loopback peer no proxy forwarded.
     from_this_machine: bool,
     /// When the device id is on the history block list (`revokedDevices`).
-    revoked_at: Option<chrono::DateTime<Utc>>,
+    revoked_at: Option<Timestamp>,
     expires_at: i64,
 }
 
@@ -944,7 +945,7 @@ impl TuiApp {
         let Some(request) = self.device_pairing.selected() else {
             return;
         };
-        if request.expires_at <= Utc::now().timestamp_millis() {
+        if request.expires_at <= Timestamp::now().as_millisecond() {
             return;
         }
         if approved
@@ -1153,7 +1154,7 @@ impl TuiApp {
             ));
         }
         if let Some(revoked_at) = request.revoked_at {
-            let when = revoked_at.format("%Y-%m-%d %H:%M UTC");
+            let when = revoked_at.strftime("%Y-%m-%d %H:%M UTC");
             lines.push(Line::styled(
                 match self.language {
                     TuiLanguage::English => format!(
@@ -1313,19 +1314,20 @@ impl TuiApp {
             self.device_pairing
                 .selected_device_record()
                 .map(|device| {
-                    let paired = chrono::DateTime::from_timestamp_millis(
-                        i64::try_from(device.paired_at).unwrap_or_default(),
+                    let paired = jiff::Timestamp::from_millisecond(
+                        i64::try_from(device.paired_at).ok().unwrap_or_default(),
                     )
-                    .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+                    .map(|time| time.strftime("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_default();
                     let seen = device
                         .last_seen_at
                         .and_then(|value| {
-                            chrono::DateTime::from_timestamp_millis(
-                                i64::try_from(value).unwrap_or_default(),
+                            jiff::Timestamp::from_millisecond(
+                                i64::try_from(value).ok().unwrap_or_default(),
                             )
+                            .ok()
                         })
-                        .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+                        .map(|time| time.strftime("%Y-%m-%d %H:%M").to_string())
                         .unwrap_or_else(|| "-".to_owned());
                     vec![
                         Line::from(format!(
@@ -1364,7 +1366,7 @@ impl TuiApp {
             )));
             let remaining = request
                 .expires_at
-                .saturating_sub(Utc::now().timestamp_millis())
+                .saturating_sub(Timestamp::now().as_millisecond())
                 .max(0)
                 / 1000;
             let mut lines = vec![
@@ -2536,7 +2538,7 @@ impl TuiApp {
         let dir = self.config.data_dir.join("tui-logs");
         crate::secure_fs::ensure_owner_only_dir(&dir)
             .with_context(|| format!("failed to create log directory {}", dir.display()))?;
-        let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+        let timestamp = Timestamp::now().strftime("%Y%m%d-%H%M%S");
         let text_path = dir.join(format!("{TUI_LOG_PREFIX}{timestamp}.log"));
         let jsonl_path = dir.join(format!("{TUI_LOG_PREFIX}{timestamp}.jsonl"));
 
@@ -2548,7 +2550,7 @@ impl TuiApp {
             .unwrap_or(self.config.port);
         let mut text = String::new();
         text.push_str("TodeX TUI log export\n");
-        text.push_str(&format!("exported_at={}\n", Utc::now().to_rfc3339()));
+        text.push_str(&format!("exported_at={}\n", Timestamp::now().to_rfc3339()));
         text.push_str(&format!("listen={listen_host}:{listen_port}\n"));
         if let Ok(addresses) = &self.connect_addresses {
             text.push_str(&format!(
@@ -2835,7 +2837,9 @@ impl TuiApp {
             )
         };
         let uptime = process
-            .and_then(|process| (Utc::now() - process.started_at).to_std().ok())
+            .and_then(|process| {
+                Duration::try_from(Timestamp::now().duration_since(process.started_at)).ok()
+            })
             .map(format_duration)
             .unwrap_or_else(|| "-".to_owned());
         let daemon_pid = process
@@ -3938,8 +3942,8 @@ impl ObserverState {
 struct ObservedSession {
     session_id: String,
     event_count: usize,
-    first_time: chrono::DateTime<Utc>,
-    last_time: chrono::DateTime<Utc>,
+    first_time: Timestamp,
+    last_time: Timestamp,
     adapter_state: Option<String>,
     in_flight_command_id: Option<String>,
     child_pid: Option<String>,
@@ -3954,7 +3958,7 @@ struct ObservedSession {
 
 impl ObservedSession {
     fn new(session_id: String) -> Self {
-        let now = Utc::now();
+        let now = Timestamp::now();
         Self {
             session_id,
             event_count: 0,
@@ -4168,14 +4172,14 @@ fn session_detail_lines(session: &ObservedSession, language: TuiLanguage) -> Vec
     lines.push(Line::from(match language {
         TuiLanguage::English => format!(
             "First event: {} | Last event: {} | Events: {}",
-            session.first_time.format("%H:%M:%S"),
-            session.last_time.format("%H:%M:%S"),
+            session.first_time.strftime("%H:%M:%S"),
+            session.last_time.strftime("%H:%M:%S"),
             session.event_count
         ),
         TuiLanguage::Chinese => format!(
             "首个事件：{} | 最近事件：{} | 事件数：{}",
-            session.first_time.format("%H:%M:%S"),
-            session.last_time.format("%H:%M:%S"),
+            session.first_time.strftime("%H:%M:%S"),
+            session.last_time.strftime("%H:%M:%S"),
             session.event_count
         ),
     }));
@@ -4500,7 +4504,7 @@ fn centered_area(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
 }
 
 fn summarize_event(event: &EventRecord) -> String {
-    let timestamp = event.time.format("%H:%M:%S");
+    let timestamp = event.time.strftime("%H:%M:%S");
     let detail = summarize_value(&event.payload);
     if detail.is_empty() {
         format!("[{timestamp}] {}", event.event_type)
@@ -5033,7 +5037,7 @@ mod tests {
             via_proxy: false,
             from_this_machine: false,
             revoked_at: None,
-            expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
+            expires_at: jiff::Timestamp::now().as_millisecond() + 60_000,
         }
     }
 
@@ -5389,7 +5393,8 @@ mod tests {
         // Same key already registered, and revoked from history earlier.
         request.peer_address = "192.0.2.4".to_owned();
         request.revoked_at = Some(
-            chrono::DateTime::parse_from_rfc3339("2026-09-01T08:30:00Z")
+            "2026-09-01T08:30:00Z"
+                .parse::<jiff::Timestamp>()
                 .unwrap()
                 .into(),
         );

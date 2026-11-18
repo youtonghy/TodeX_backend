@@ -479,7 +479,7 @@ async fn write_v2_conversation(root: &Path, count: u64, per_file: u64) -> String
     let store = ConversationStore::new(root.to_owned()).await.unwrap();
     let mut manifest =
         ConversationManifest::new(ProviderKind::ClaudeCode, root.to_owned(), None, None);
-    manifest.updated_at = Utc::now() - chrono::TimeDelta::hours(1);
+    manifest.updated_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
     let id = manifest.id.clone();
     let directory = root.join("conversations").join(&id);
     fs::create_dir_all(&directory).unwrap();
@@ -489,8 +489,9 @@ async fn write_v2_conversation(root: &Path, count: u64, per_file: u64) -> String
         let (event_type, payload) = mixed_payload(sequence - 1);
         let mut event = ConversationEvent::new(&id, sequence, event_type, payload);
         event.provider = Some(ProviderKind::ClaudeCode);
-        event.time =
-            DateTime::from_timestamp(1_700_000_000 + sequence as i64, 123_456_789).unwrap();
+        event.time = Timestamp::new(1_700_000_000 + sequence as i64, 123_456_789)
+            .ok()
+            .unwrap();
         lines.extend(serde_json::to_vec(&event).unwrap());
         lines.push(b'\n');
         if sequence % per_file == 0 && sequence < count {

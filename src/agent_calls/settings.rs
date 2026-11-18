@@ -518,7 +518,7 @@ async fn read_settings(path: &Path) -> Result<AgentCallingSettings, Unusable> {
 /// Moves an unusable settings file out of the way, keeping it.
 async fn set_aside_invalid(path: &Path) {
     let mut aside = path.as_os_str().to_owned();
-    aside.push(format!(".invalid-{}", chrono::Utc::now().timestamp()));
+    aside.push(format!(".invalid-{}", jiff::Timestamp::now().as_second()));
     let aside = PathBuf::from(aside);
     match tokio::fs::rename(path, &aside).await {
         Ok(()) => {

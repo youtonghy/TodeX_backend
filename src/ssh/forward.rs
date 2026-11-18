@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::{
     process::Command,
@@ -109,7 +109,8 @@ pub(crate) struct ForwardRunInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
+    #[serde(serialize_with = "crate::time::serde_optional_timestamp::serialize")]
+    pub started_at: Option<Timestamp>,
 }
 
 /// `SshForward` of the API.
@@ -670,7 +671,7 @@ async fn supervise(mut s: Supervision) {
     let mark_ready = |s: &mut Supervision| {
         s.runtime.update(&s.id, s.generation, |run| {
             run.status = ForwardStatus::Running;
-            run.started_at = Some(Utc::now());
+            run.started_at = Some(Timestamp::now());
         });
         s.secret = None;
         if let Some(ready) = s.ready.take() {

@@ -50,7 +50,7 @@ fn valid_shot_id(shot_id: &str) -> bool {
 
 fn next_micros() -> u64 {
     static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = u64::try_from(chrono::Utc::now().timestamp_micros()).unwrap_or(0);
+    let now = u64::try_from(jiff::Timestamp::now().as_microsecond()).unwrap_or(0);
     let mut last = LAST.load(Ordering::Relaxed);
     loop {
         let next = now.max(last + 1);

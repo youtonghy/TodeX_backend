@@ -51,6 +51,9 @@ mod shell_integration;
 mod ssh;
 mod terminal_mirror;
 mod transport_crypto;
+use crate::time::TimestampExt;
+
+mod time;
 mod tui;
 mod update;
 mod version;

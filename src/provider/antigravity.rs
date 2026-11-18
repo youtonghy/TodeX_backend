@@ -32,7 +32,7 @@ pub(super) mod native_idle;
 pub(crate) use integration::{config_dir as integration_dir, remove as remove_integration};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -587,8 +587,8 @@ pub(crate) fn quota_payload(usage: &Value) -> Value {
                 "resetsAt": bucket
                     .get("reset_time")
                     .and_then(Value::as_str)
-                    .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
-                    .map(|time| time.timestamp()),
+                    .and_then(|time| time.parse::<Timestamp>().ok())
+                    .map(|time| time.as_second()),
             })
         })
         .collect();
@@ -600,10 +600,10 @@ pub(crate) fn quota_payload(usage: &Value) -> Value {
     })
 }
 
-fn rejected_quota(usage: &Value, until: DateTime<Utc>) -> Value {
+fn rejected_quota(usage: &Value, until: Timestamp) -> Value {
     let mut payload = quota_payload(usage);
     payload["status"] = json!("rejected");
-    payload["raw"] = json!({ "resetsAt": until.timestamp(), "usage": usage });
+    payload["raw"] = json!({ "resetsAt": until.as_second(), "usage": usage });
     payload
 }
 
@@ -626,7 +626,7 @@ fn buckets(usage: &Value) -> impl Iterator<Item = (&Value, &Value)> {
 /// When the quota covering `model` frees up again: the latest reset among
 /// its group's exhausted buckets. `None` when nothing is exhausted, e.g. a
 /// credits balance that no window refills.
-fn exhausted_until(usage: &Value, model: Option<&str>) -> Option<DateTime<Utc>> {
+fn exhausted_until(usage: &Value, model: Option<&str>) -> Option<Timestamp> {
     let gemini = model.is_none_or(|model| model.starts_with("gemini"));
     buckets(usage)
         .filter(|(group, _)| {
@@ -647,8 +647,7 @@ fn exhausted_until(usage: &Value, model: Option<&str>) -> Option<DateTime<Utc>> 
             bucket
                 .get("reset_time")
                 .and_then(Value::as_str)
-                .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
-                .map(|time| time.with_timezone(&Utc))
+                .and_then(|time| time.parse::<Timestamp>().ok())
         })
         .max()
 }
@@ -834,22 +833,17 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
         assert_eq!(payload["windows"][1]["durationMins"], 300);
         assert_eq!(
             payload["windows"][0]["resetsAt"],
-            DateTime::parse_from_rfc3339("2026-10-15T06:45:48Z")
+            "2026-10-15T06:45:48Z"
+                .parse::<Timestamp>()
                 .unwrap()
-                .timestamp()
+                .as_second()
         );
         assert_eq!(payload["windows"].as_array().unwrap().len(), 3);
     }
 
     #[test]
     fn only_the_models_own_exhausted_group_blocks_it() {
-        let reset = |time: &str| {
-            Some(
-                DateTime::parse_from_rfc3339(time)
-                    .unwrap()
-                    .with_timezone(&Utc),
-            )
-        };
+        let reset = |time: &str| Some(time.parse::<Timestamp>().unwrap());
         assert_eq!(
             exhausted_until(&usage(0.25), Some("gemini-3.8-flash-high")),
             None

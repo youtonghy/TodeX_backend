@@ -1,3 +1,4 @@
+use crate::time::TimestampExt;
 use std::{path::Path, time::Instant};
 
 use serde::Serialize;
@@ -91,7 +92,7 @@ pub async fn inspect_providers(
     let success = providers.iter().all(|provider| provider.success);
     Ok(ProviderDoctorReport {
         schema_version: 1,
-        generated_at: chrono::Utc::now().to_rfc3339(),
+        generated_at: jiff::Timestamp::now().to_rfc3339(),
         backend_version: crate::version::APP_VERSION,
         billable: false,
         workspace_isolated: true,

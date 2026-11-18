@@ -13,8 +13,8 @@ use std::{
     sync::Arc,
 };
 
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -41,7 +41,8 @@ const MAX_WRAPS_PER_KEY: usize = 256;
 pub(crate) struct KeyEntry {
     /// 16 random bytes, base64url.
     pub kid: String,
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_timestamp")]
+    pub created_at: Timestamp,
     /// Recipient-set epoch the key was created under.
     pub epoch: u64,
     pub wraps: Vec<WrappedKey>,
@@ -356,7 +357,7 @@ mod tests {
     fn entry(key: &SegmentKey, recipients: &[u8]) -> KeyEntry {
         KeyEntry {
             kid: encode_id(&key.kid()),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             epoch: 1,
             wraps: recipients
                 .iter()

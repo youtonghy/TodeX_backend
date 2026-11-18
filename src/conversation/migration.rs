@@ -1,3 +1,4 @@
+use crate::time::TimestampExt;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -129,7 +130,7 @@ pub async fn migrate_legacy_codex_sessions(
             let mapping_path = data_dir.join("migrations/codex-gateway-v1.json");
             let mut mapping = load_mapping(&mapping_path).await?;
             if mapping.cutover_at.is_none() {
-                mapping.cutover_at = Some(chrono::Utc::now().to_rfc3339());
+                mapping.cutover_at = Some(jiff::Timestamp::now().to_rfc3339());
                 write_mapping(&mapping_path, &mapping).await?;
             }
             return Ok(LegacyMigrationReport::default());
@@ -150,7 +151,7 @@ pub async fn migrate_legacy_codex_sessions(
     if map_existed && mapping.cutover_at.is_none() {
         // Written by a daemon that imported every session directory on each
         // start: all history is already listed, so the cutover is now.
-        mapping.cutover_at = Some(chrono::Utc::now().to_rfc3339());
+        mapping.cutover_at = Some(jiff::Timestamp::now().to_rfc3339());
         write_mapping(&mapping_path, &mapping).await?;
     }
     let legacy_workspaces = load_legacy_workspaces(&data_dir.join("workspaces.json")).await;
@@ -287,7 +288,7 @@ pub async fn migrate_legacy_codex_sessions(
     }
     if mapping.cutover_at.is_none() {
         // Sources that failed above are already in the map and keep retrying.
-        mapping.cutover_at = Some(chrono::Utc::now().to_rfc3339());
+        mapping.cutover_at = Some(jiff::Timestamp::now().to_rfc3339());
         write_mapping(&mapping_path, &mapping).await?;
     }
     Ok(report)

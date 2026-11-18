@@ -1,6 +1,9 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Days, LocalResult, TimeZone, Utc, Weekday};
-use chrono_tz::Tz;
+use jiff::{
+    civil::{Time, Weekday},
+    tz::{AmbiguousOffset, TimeZone},
+    SignedDuration, Timestamp, ToSpan,
+};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,6 +16,7 @@ use tokio::time::Instant;
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
+use crate::time::TimestampExt;
 
 use super::discovery::CatalogCache;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
@@ -1285,6 +1289,7 @@ fn claude_user_content(prompt: &DriverPrompt) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use jiff::{tz::TimeZone, Timestamp};
     use serde_json::json;
     use std::path::Path;
 
@@ -2684,9 +2689,7 @@ done
 
     #[test]
     fn usage_limit_text_resolves_the_reported_zone_and_weekday() {
-        use chrono::{TimeZone, Utc};
-
-        let now = Utc.with_ymd_and_hms(2026, 10, 6, 8, 22, 17).unwrap();
+        let now = "2026-10-06T08:22:17Z".parse::<Timestamp>().unwrap();
         let session = usage_limit_reset(
             "You've hit your session limit · resets 5:30pm (Australia/Perth)",
             now,
@@ -2695,7 +2698,7 @@ done
         // Perth is UTC+8 with no daylight-saving; 5:30pm is 09:30 UTC the same day.
         assert_eq!(
             session,
-            Utc.with_ymd_and_hms(2026, 10, 6, 9, 30, 0).unwrap()
+            "2026-10-06T09:30:00Z".parse::<Timestamp>().unwrap()
         );
 
         // 2026-10-06 is a Tuesday, so Monday 12:00am is the following Monday.
@@ -2704,7 +2707,7 @@ done
             now,
         )
         .expect("weekly reset");
-        assert_eq!(weekly, Utc.with_ymd_and_hms(2026, 10, 12, 0, 0, 0).unwrap());
+        assert_eq!(weekly, "2026-10-12T00:00:00Z".parse::<Timestamp>().unwrap());
 
         assert!(usage_limit_reset("fixture failure", now).is_none());
         assert!(usage_limit_reset("You've hit your session limit", now).is_none());
@@ -2714,10 +2717,23 @@ done
     }
 
     #[test]
-    fn a_usage_limit_reset_that_just_passed_is_now() {
-        use chrono::{TimeZone, Utc};
+    fn quota_reset_skips_gap_and_uses_the_next_fold_instant() {
+        let zone = TimeZone::get("America/New_York").unwrap();
+        for (now, hour, expected) in [
+            ("2026-03-08T06:30:00Z", 2, "2026-03-09T06:30:00Z"),
+            ("2026-11-01T05:00:00Z", 1, "2026-11-01T05:30:00Z"),
+            ("2026-11-01T05:45:00Z", 1, "2026-11-01T06:30:00Z"),
+        ] {
+            assert_eq!(
+                super::next_zoned(&zone, now.parse().unwrap(), hour, 30, None),
+                Some(expected.parse().unwrap())
+            );
+        }
+    }
 
-        let now = Utc.with_ymd_and_hms(2026, 10, 6, 9, 35, 0).unwrap();
+    #[test]
+    fn a_usage_limit_reset_that_just_passed_is_now() {
+        let now = "2026-10-06T09:35:00Z".parse::<Timestamp>().unwrap();
         let text = |clock: &str| format!("You've hit your session limit · resets {clock} (UTC)");
         // Five minutes ago: the reset just passed, not tomorrow's.
         assert_eq!(usage_limit_reset(&text("9:30am"), now), Some(now));
@@ -2725,10 +2741,10 @@ done
         // Older than ten minutes: the next day's.
         assert_eq!(
             usage_limit_reset(&text("9:20am"), now),
-            Some(Utc.with_ymd_and_hms(2026, 10, 7, 9, 20, 0).unwrap())
+            Some("2026-10-07T09:20:00Z".parse::<Timestamp>().unwrap())
         );
         // Just before midnight, read just after it.
-        let after_midnight = Utc.with_ymd_and_hms(2026, 10, 7, 0, 3, 0).unwrap();
+        let after_midnight = "2026-10-07T00:03:00Z".parse::<Timestamp>().unwrap();
         assert_eq!(
             usage_limit_reset(&text("11:58pm"), after_midnight),
             Some(after_midnight)
@@ -2745,8 +2761,6 @@ done
 
     #[test]
     fn assistant_quota_limits_are_a_rejected_reset() {
-        use chrono::{TimeZone, Utc};
-
         let frame = json!({
             "type": "assistant",
             "error": "rate_limit",
@@ -2760,7 +2774,7 @@ done
         });
         assert_eq!(
             claude_frame_limit_reset(&frame),
-            Utc.timestamp_opt(1791279000, 0).single()
+            Timestamp::from_second(1791279000).ok()
         );
         let allowed = json!({
             "type": "rate_limit_event",
@@ -3273,7 +3287,7 @@ async fn read_claude_turn(
     let mut tools = ClaudeToolCalls::default();
     // Epoch from a rejected `rate_limit_event` or `quotaLimits`. Preferred
     // over the wall clock in the error text, which Claude rounds.
-    let mut rejected_reset: Option<DateTime<Utc>> = None;
+    let mut rejected_reset: Option<Timestamp> = None;
     // Text of an API-error assistant frame, used when the following `result`
     // has no usable message of its own.
     let mut limit_text: Option<String> = None;
@@ -3486,10 +3500,10 @@ async fn read_claude_turn(
                 if is_error {
                     let detail = claude_result_error(&message)
                         .unwrap_or_else(|| "Claude Code returned an error".to_owned());
-                    let parsed = usage_limit_reset(&detail, Utc::now()).or_else(|| {
+                    let parsed = usage_limit_reset(&detail, Timestamp::now()).or_else(|| {
                         limit_text
                             .as_deref()
-                            .and_then(|text| usage_limit_reset(text, Utc::now()))
+                            .and_then(|text| usage_limit_reset(text, Timestamp::now()))
                     });
                     // Re-emit at the end of the turn so a later non-exhausted
                     // snapshot cannot clear the wait before `after_turn`.
@@ -3954,8 +3968,8 @@ fn claude_quota_event(message: &Value) -> Option<Value> {
     }))
 }
 
-fn rejected_quota_payload(until: DateTime<Utc>) -> Value {
-    let resets_at = until.timestamp();
+fn rejected_quota_payload(until: Timestamp) -> Value {
+    let resets_at = until.as_second();
     json!({
         "provider": "claude-code",
         "scope": "account",
@@ -3974,7 +3988,7 @@ fn claude_frame_is_api_error(message: &Value) -> bool {
 /// Reset instant carried on a rejected quota snapshot. Claude Code 2.1 puts
 /// this on the assistant frame as `quotaLimits` (the stream-json serializer
 /// usually drops it) and on `rate_limit_event` / the normalized quota payload.
-fn claude_frame_limit_reset(message: &Value) -> Option<DateTime<Utc>> {
+fn claude_frame_limit_reset(message: &Value) -> Option<Timestamp> {
     let nested = message
         .get("quotaLimits")
         .or_else(|| message.get("quota_limits"))
@@ -4012,21 +4026,21 @@ fn claude_assistant_text(message: &Value) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
-fn epoch_to_utc(value: &Value) -> Option<DateTime<Utc>> {
+fn epoch_to_utc(value: &Value) -> Option<Timestamp> {
     let raw = value.as_i64()?;
     let seconds = if raw > 100_000_000_000 {
         raw.checked_div(1000)?
     } else {
         raw
     };
-    DateTime::from_timestamp(seconds, 0)
+    Timestamp::from_second(seconds).ok()
 }
 
 /// Wall-clock reset in a Claude usage-limit error, for example
 /// "You've hit your session limit · resets 5:30pm (Australia/Perth)" or
 /// "You've hit your weekly limit · resets Mon 12:00am (UTC)".
 /// `None` when the text is not a usage limit or the clock cannot be resolved.
-fn usage_limit_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+fn usage_limit_reset(text: &str, now: Timestamp) -> Option<Timestamp> {
     let lower = text.to_ascii_lowercase();
     if !lower.contains("reset")
         || !(lower.contains("limit") || lower.contains("out of extra usage"))
@@ -4047,13 +4061,11 @@ fn usage_limit_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     });
     let (hour, minute) = scan.eat_clock()?;
     let zone = scan.eat_zone();
-    match zone {
-        Some(name) => {
-            let tz: Tz = name.parse().ok()?;
-            next_zoned(&tz, now, hour, minute, weekday)
-        }
-        None => next_zoned(&chrono::Local, now, hour, minute, weekday),
-    }
+    let tz = match zone {
+        Some(name) => TimeZone::get(name).ok()?,
+        None => TimeZone::system(),
+    };
+    next_zoned(&tz, now, hour, minute, weekday)
 }
 
 /// How far in the past a parsed reset may lie and still mean "now": the
@@ -4065,43 +4077,42 @@ const RECENT_RESET_GRACE_MINUTES: i64 = 10;
 /// is after `now`. A time at most [`RECENT_RESET_GRACE_MINUTES`] ago — the
 /// reset just passed — is `now` instead of a day or week later; callers add
 /// their own minimum wait.
-fn next_zoned<T: TimeZone>(
-    tz: &T,
-    now: DateTime<Utc>,
+fn next_zoned(
+    tz: &TimeZone,
+    now: Timestamp,
     hour: u32,
     minute: u32,
     weekday: Option<Weekday>,
-) -> Option<DateTime<Utc>> {
-    let grace = chrono::Duration::minutes(RECENT_RESET_GRACE_MINUTES);
+) -> Option<Timestamp> {
+    let grace = SignedDuration::from_mins(RECENT_RESET_GRACE_MINUTES);
+    let time = Time::new(hour.try_into().ok()?, minute.try_into().ok()?, 0, 0).ok()?;
     // From yesterday, so a reset just before local midnight read just
     // after it still counts as recent.
-    let yesterday = now
-        .with_timezone(tz)
-        .date_naive()
-        .checked_sub_days(Days::new(1))?;
+    let yesterday = now.to_zoned(tz.clone()).date().checked_sub(1.day()).ok()?;
     let span = if weekday.is_some() { 9 } else { 3 };
     for day in 0..span {
-        let date = yesterday.checked_add_days(Days::new(day))?;
+        let date = yesterday.checked_add(day.days()).ok()?;
         if weekday.is_some_and(|weekday| date.weekday() != weekday) {
             continue;
         }
-        let naive = date.and_hms_opt(hour, minute, 0)?;
-        let utc = match tz.from_local_datetime(&naive) {
-            LocalResult::Single(local) => local.with_timezone(&Utc),
-            LocalResult::Ambiguous(early, late) => {
-                let early = early.with_timezone(&Utc);
+        let local = tz.to_ambiguous_timestamp(date.to_datetime(time));
+        let utc = match local.offset() {
+            AmbiguousOffset::Unambiguous { .. } => local.unambiguous().ok()?,
+            AmbiguousOffset::Fold { .. } => {
+                let early = local.earlier().ok()?;
                 if early > now {
                     early
                 } else {
-                    late.with_timezone(&Utc)
+                    local.later().ok()?
                 }
             }
-            LocalResult::None => continue,
+            // Claude's reported wall time does not occur on a gap day.
+            AmbiguousOffset::Gap { .. } => continue,
         };
         if utc > now {
             return Some(utc);
         }
-        if now - utc <= grace {
+        if now.duration_since(utc) <= grace {
             return Some(now);
         }
     }
@@ -4111,13 +4122,13 @@ fn next_zoned<T: TimeZone>(
 fn weekday_name(word: &str) -> Option<Weekday> {
     Some(
         match word.trim_end_matches(',').to_ascii_lowercase().as_str() {
-            "mon" | "monday" => Weekday::Mon,
-            "tue" | "tues" | "tuesday" => Weekday::Tue,
-            "wed" | "wednesday" => Weekday::Wed,
-            "thu" | "thur" | "thurs" | "thursday" => Weekday::Thu,
-            "fri" | "friday" => Weekday::Fri,
-            "sat" | "saturday" => Weekday::Sat,
-            "sun" | "sunday" => Weekday::Sun,
+            "mon" | "monday" => Weekday::Monday,
+            "tue" | "tues" | "tuesday" => Weekday::Tuesday,
+            "wed" | "wednesday" => Weekday::Wednesday,
+            "thu" | "thur" | "thurs" | "thursday" => Weekday::Thursday,
+            "fri" | "friday" => Weekday::Friday,
+            "sat" | "saturday" => Weekday::Saturday,
+            "sun" | "sunday" => Weekday::Sunday,
             _ => return None,
         },
     )
@@ -4414,7 +4425,8 @@ impl BackgroundTasks {
                         .get("parent_task_id")
                         .and_then(Value::as_str)
                         .is_some();
-                let info = BackgroundTaskInfo::from_frame(message, Some(Utc::now().to_rfc3339()));
+                let info =
+                    BackgroundTaskInfo::from_frame(message, Some(Timestamp::now().to_rfc3339()));
                 self.known
                     .entry(id.to_owned())
                     .or_default()

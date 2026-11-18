@@ -402,7 +402,7 @@ impl LocalTerminalManager {
                 .map(|command| command.ssh_host.clone())
                 .or_else(|| options.login_host.clone()),
             pid,
-            started_at: chrono::Utc::now().timestamp_millis(),
+            started_at: jiff::Timestamp::now().as_millisecond(),
             input_tx,
             killer,
             master,
