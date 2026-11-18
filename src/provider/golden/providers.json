@@ -108,7 +108,7 @@
       "controlProbe": {
         "status": "unavailable",
         "source": "installed-schema",
-        "reason": "The installed CLI schema could not be verified; experimental controls are disabled. Restart the backend after updating the CLI to probe again."
+        "reason": "The installed CLI schema could not be verified; experimental controls are disabled temporarily and will be retried automatically."
       },
       "steering": false,
       "liveConfiguration": false,
