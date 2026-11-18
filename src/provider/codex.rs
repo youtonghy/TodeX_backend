@@ -1143,9 +1143,10 @@ async fn wait_for_response(
             _ = cancel.changed(), if !cancelled => {
                 cancelled = true;
                 for (key, (id, method, params, provider_cancel)) in &permission_requests {
-                    resolved_requests.insert(key.clone());
-                    provider_cancel.send_replace(true);
-                    process.send(&json!({"id":id,"result":cancelled_permission(method, params)})).await?;
+                    if resolved_requests.insert(key.clone()) {
+                        provider_cancel.send_replace(true);
+                        process.send(&json!({"id":id,"result":cancelled_permission(method, params)})).await?;
+                    }
                 }
             }
             _ = tokio::time::sleep_until(deadline), if permissions.is_empty() && !cancelled => {
