@@ -1807,6 +1807,10 @@ async fn run_pi_turn(
     }
     sink.emit("turn.configuration", pi_configuration(&state, &prompt))
         .await?;
+    // Clients drop the plan when a turn starts; unfinished tasks carry over.
+    if rpc.tasks.has_open() {
+        sink.emit("plan.updated", rpc.tasks.plan_payload()).await?;
+    }
 
     let mut provider_state = context.provider_state;
     provider_state.native_session_id = Some(native_session_id.clone());
@@ -2489,6 +2493,9 @@ struct PiRpc<'a> {
     streamed_text_blocks: Vec<String>,
     /// `@tintinweb/pi-subagents` runs, mapped onto `subagent.*` events.
     subagents: subagents::PiSubagents,
+    /// `@tintinweb/pi-tasks` tasks, reported as `plan.updated`. They live as
+    /// long as the runtime, across turns.
+    tasks: super::plan::PiTasks,
 }
 
 /// Clients append `delta.delta` per block, so a merged fragment renders
@@ -2548,6 +2555,7 @@ impl<'a> PiRpc<'a> {
             tool_emitted_at: HashMap::new(),
             streamed_text_blocks: Vec::new(),
             subagents: subagents::PiSubagents::default(),
+            tasks: super::plan::PiTasks::default(),
         }
     }
 
@@ -2597,9 +2605,13 @@ impl<'a> PiRpc<'a> {
         payload: Value,
     ) -> Result<(), AppError> {
         let subagent = self.subagents.tool_event(kind, &payload);
+        let tasks_changed = kind == "tool.completed" && self.tasks.apply(&payload);
         sink.emit(kind, payload).await?;
         if let Some((kind, payload)) = subagent {
             sink.emit(kind, payload).await?;
+        }
+        if tasks_changed {
+            sink.emit("plan.updated", self.tasks.plan_payload()).await?;
         }
         Ok(())
     }
@@ -5522,6 +5534,95 @@ mod tests {
             })
             .count();
         assert_eq!(agent_cards, 2);
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn rpc_task_tools_report_the_plan_and_carry_open_tasks_into_the_next_turn() {
+        let fixture = Fixture::new().await;
+        fixture.run("tasks", "tasks-turn").await.unwrap();
+        fixture.run("normal", "open-turn").await.unwrap();
+        fixture.run("tasks-finish", "finish-turn").await.unwrap();
+        fixture.run("normal", "done-turn").await.unwrap();
+        let events = fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap();
+        let plans: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "plan.updated")
+            .map(|event| {
+                let steps: Vec<_> = event.payload["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|step| {
+                        format!(
+                            "{}={}",
+                            step["text"].as_str().unwrap(),
+                            step["status"].as_str().unwrap()
+                        )
+                    })
+                    .collect();
+                (
+                    event.payload["turnId"].as_str().unwrap_or("").to_owned(),
+                    steps.join(", "),
+                )
+            })
+            .collect();
+        let plan = |turn: &str, steps: &str| (turn.to_owned(), steps.to_owned());
+        // One snapshot per change (the refused update is none), the open
+        // list again when the next turn starts, and nothing once all are done.
+        assert_eq!(
+            plans,
+            [
+                plan("tasks-turn", "Start the server=pending"),
+                plan(
+                    "tasks-turn",
+                    "Start the server=pending, Run the matrix=pending"
+                ),
+                plan(
+                    "tasks-turn",
+                    "Start the server=in_progress, Run the matrix=pending"
+                ),
+                plan(
+                    "open-turn",
+                    "Start the server=in_progress, Run the matrix=pending"
+                ),
+                plan(
+                    "finish-turn",
+                    "Start the server=in_progress, Run the matrix=pending"
+                ),
+                plan(
+                    "finish-turn",
+                    "Start the server=completed, Run the matrix=pending"
+                ),
+                plan(
+                    "finish-turn",
+                    "Start the server=completed, Run the matrix=completed"
+                ),
+            ]
+        );
+        let first = events
+            .iter()
+            .find(|event| event.event_type == "plan.updated")
+            .unwrap();
+        assert_eq!(first.payload["provider"], "pi");
+        assert_eq!(
+            first.payload["plan"],
+            json!([{ "id": "1", "subject": "Start the server", "status": "pending" }])
+        );
+        // Each snapshot follows the tool card that caused it.
+        let position = |predicate: &dyn Fn(&crate::conversation::ConversationEvent) -> bool| {
+            events.iter().position(|event| predicate(event)).unwrap()
+        };
+        assert!(
+            position(&|event| event.event_type == "tool.completed"
+                && event.payload["toolName"] == "TaskCreate")
+                < position(&|event| event.event_type == "plan.updated")
+        );
         fixture.finish().await;
     }
 

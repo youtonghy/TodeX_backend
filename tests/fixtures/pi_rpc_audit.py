@@ -155,6 +155,15 @@ def spawn_runs():
             out({'type': 'tool_execution_end', 'toolCallId': call, 'toolName': 'spawn', 'isError': False,
                  'result': {'content': [{'type': 'text', 'text': 'child answer'}], 'details': details('success', stats=stats)}})
 
+def task_tools(calls):
+    # @tintinweb/pi-tasks: plain text results, the new id only in TaskCreate's.
+    for index, (name, args, text) in enumerate(calls):
+        call_id = 'task-%s-%d' % (scenario, index)
+        out({'type': 'tool_execution_start', 'toolCallId': call_id, 'toolName': name, 'args': args})
+        out({'type': 'tool_execution_end', 'toolCallId': call_id, 'toolName': name, 'isError': False,
+             'result': {'content': [{'type': 'text', 'text': text}]}})
+    finish()
+
 def background_subagent(settles):
     # pi-subagents' default: the Agent call returns at once, the run goes on in
     # the Pi process writing nothing but its status line, then settles through
@@ -237,6 +246,18 @@ for line in sys.stdin:
                 stream_with_tool()
             elif scenario == 'subagents':
                 subagent_runs()
+            elif scenario == 'tasks':
+                task_tools([
+                    ('TaskCreate', {'subject': 'Start the server', 'description': 'on 8300'}, 'Task #1 created successfully: Start the server'),
+                    ('TaskCreate', {'subject': 'Run the matrix', 'description': 'all configs'}, 'Task #2 created successfully: Run the matrix'),
+                    ('TaskUpdate', {'taskId': '1', 'status': 'in_progress'}, 'Updated task #1 status'),
+                    ('TaskUpdate', {'taskId': '9', 'status': 'completed'}, 'Task #9 not found'),
+                ])
+            elif scenario == 'tasks-finish':
+                task_tools([
+                    ('TaskUpdate', {'taskId': '1', 'status': 'completed'}, 'Updated task #1 status'),
+                    ('TaskUpdate', {'taskId': '2', 'status': 'completed'}, 'Updated task #2 status'),
+                ])
             elif scenario == 'dialog':
                 out({'type': 'extension_ui_request', 'id': 'dialog-a', 'method': 'confirm', 'title': 'Expires', 'timeout': 20})
                 out({'type': 'extension_ui_request', 'id': 'dialog-b', 'method': 'confirm', 'title': 'Concurrent', 'timeout': 30})
