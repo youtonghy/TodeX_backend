@@ -1,4 +1,3 @@
-use crate::time::TimestampExt;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -988,6 +987,8 @@ async fn grok_sessions_are_listed_viewed_and_deleted_through_the_cli() {
 #[cfg(unix)]
 #[tokio::test]
 async fn devin_sessions_are_listed_and_deleted_through_the_cli() {
+    use crate::time::TimestampExt;
+
     let mut fixture = fixture().await;
     let devin_dir = fixture.roots.devin_dir.clone();
     fs::create_dir_all(&devin_dir).unwrap();
