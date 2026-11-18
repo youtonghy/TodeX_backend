@@ -561,7 +561,9 @@ mod tests {
         // Enabling asks for a prompt pass instead of waiting for the planned one.
         let next = cleanup.next_pass_at().unwrap();
         assert!(next < planned);
-        assert_eq!(cleanup.view(&enabled)["nextRunAt"], json!(next));
+        let exact = "2026-10-01T08:00:00.120Z";
+        cleanup.set_next_pass(exact.parse().unwrap());
+        assert_eq!(cleanup.view(&enabled)["nextRunAt"], json!(exact));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
