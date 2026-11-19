@@ -1745,7 +1745,7 @@ TUI 配对二维码只携带后端地址（`{"kind":"todex-pairing-link","versio
 
 ## codex.local 请求
 
-以下命令在 `/v2/ws` 上发送，属于本地 Codex 控制面。
+以下命令在 `/v2/ws` 上发送，属于本地 Codex 控制面。旧网关把会话以明文 JSONL 写在数据目录中、不经端到端加密历史，因此默认关闭：`[agent] legacy_codex_gateway = false`（`TODEX_AGENTD_LEGACY_CODEX_GATEWAY`）时，`codex.local.*` 与 `codex.gateway.control` 一律返回 `UNSUPPORTED`，`session.resume` 不再补放网关会话；客户端应使用 `conversation.*`。
 
 ### `codex.local.start`
 

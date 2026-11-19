@@ -275,6 +275,11 @@ pub struct AgentConfig {
     /// Whether `conversation.warm` may start a conversation's provider
     /// process before its first prompt.
     pub provider_prewarm: bool,
+    /// Serves the legacy `codex.local.*` gateway (and `codex.gateway.control`),
+    /// which keeps its sessions as plain-text JSONL outside the encrypted
+    /// history. Off by default: the commands are refused, and the start-up
+    /// migration imports what the gateway left and then removes it.
+    pub legacy_codex_gateway: bool,
 }
 
 pub const DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES: u64 = 60;
@@ -454,6 +459,7 @@ struct PartialAgentConfig {
     provider_idle_timeout_minutes: Option<u64>,
     provider_keepalive_seconds: Option<u64>,
     provider_prewarm: Option<bool>,
+    legacy_codex_gateway: Option<bool>,
     image_cli_dirs: Option<Vec<PathBuf>>,
 }
 
@@ -789,6 +795,12 @@ impl Config {
                     agent_file.provider_prewarm,
                     defaults.agent.provider_prewarm,
                 ),
+                legacy_codex_gateway: coalesce(
+                    None,
+                    env_bool("TODEX_AGENTD_LEGACY_CODEX_GATEWAY"),
+                    agent_file.legacy_codex_gateway,
+                    defaults.agent.legacy_codex_gateway,
+                ),
             },
             security: SecurityConfig {
                 enable_auth,
@@ -1075,6 +1087,7 @@ impl Default for Config {
                 provider_idle_timeout_minutes: DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
                 provider_keepalive_seconds: DEFAULT_PROVIDER_KEEPALIVE_SECONDS,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -1217,6 +1230,10 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
             overlay_agent.provider_keepalive_seconds
         );
         replace_some!(base_agent.provider_prewarm, overlay_agent.provider_prewarm);
+        replace_some!(
+            base_agent.legacy_codex_gateway,
+            overlay_agent.legacy_codex_gateway
+        );
         replace_some!(base_agent.image_cli_dirs, overlay_agent.image_cli_dirs);
     }
     if let Some(overlay_security) = overlay.security {

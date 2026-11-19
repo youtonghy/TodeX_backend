@@ -1382,6 +1382,7 @@ mod tests {
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -1470,6 +1471,7 @@ mod tests {
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -1556,6 +1558,7 @@ mod tests {
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,

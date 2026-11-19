@@ -100,6 +100,7 @@ dsh --version
 | `TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES` | Provider 空闲超时分钟数（默认 60，`0` 关闭） |
 | `TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS` | 常驻 Provider 进程无 turn 时的保活秒数（默认 300，最小 30） |
 | `TODEX_AGENTD_PROVIDER_PREWARM` | 是否允许 `conversation.warm` 预先启动会话的 Provider 进程（默认 `true`） |
+| `TODEX_AGENTD_LEGACY_CODEX_GATEWAY` | 是否提供旧 `codex.local.*` 网关（默认 `false`）；它把会话以明文 JSONL 写在 `$DATA_DIR/codex_gateway/sessions`，不经端到端加密历史 |
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_TRUSTED_PROXIES` | 同机反向代理的 IP（逗号分隔），其 `X-Forwarded-For` 最右一项作为客户端地址；默认空 |
@@ -151,6 +152,7 @@ omp_env_allowlist = []                # omp 的凭据在 ~/.omp/agent/agent.db�
 provider_idle_timeout_minutes = 60   # Provider 连续无输出超过该分钟数时停止当前 turn（PROVIDER_IDLE_TIMEOUT）；0 关闭
 provider_keepalive_seconds = 300     # 常驻 Provider 进程（Codex/Pi/OpenCode/Grok/Devin/dsh/omp/ACP profile）无 turn 多久后停止；最小 30
 provider_prewarm = true              # 允许客户端经 conversation.warm 在提交 prompt 前预先启动会话的 Provider 进程
+legacy_codex_gateway = false         # 旧 codex.local.* 网关（明文 JSONL 落盘）；默认关闭，关闭时启动迁移导入其会话后删除明文原件
 
 [agent.acp_profiles.example]
 command = "example-acp-agent"
@@ -234,6 +236,8 @@ $TODEX_AGENTD_DATA_DIR/conversations/<conversation-id>/
 ```
 
 旧 `$DATA_DIR/codex_gateway/sessions` 会在 daemon 就绪后于后台复制迁移到该结构，源文件保持不变；迁移映射保存在 `$DATA_DIR/migrations/codex-gateway-v1.json`。首次迁移运行结束后映射写入 `cutoverAt`（RFC 3339；全新数据目录在首次启动时、旧版本写下的映射在本版本首次读取时立即写入），此后只更新映射中已有的来源，新出现的会话目录（旧 `codex.local` 网关仍会写入）不再导入；没有任何 Codex thread/turn（`state.json` 的 `threads`、`turns` 为空且事件不带 `codex_thread_id`/`codex_turn_id`，例如只用于 Git diff 的会话）的会话从不导入；已导入后被用户删除的会话在映射中标记 `deleted: true`，不再重建。映射的新字段对旧版 daemon 无害（它们忽略未知字段），但旧版 daemon 重写映射时会丢弃 `cutoverAt`/`deleted`，降级后被删除的导入会话可能重新出现。迁移失败会写入 daemon 日志并在下次启动时重试，不会阻止服务监听。
+
+以上是开启旧网关（`[agent] legacy_codex_gateway = true`）时的行为。旧网关默认关闭：此时没有任何东西再写入 `codex_gateway/sessions`，迁移不受 `cutoverAt` 限制，导入每个含对话的会话；一个会话目录在导入完成（或其导入会话已被用户删除、或它本不含对话）后即被删除，其中的明文正文不再留在数据目录里。读取或导入失败的目录保留，下次启动重试；映射照常保留，已删除的来源不会再次导入。
 
 ## 如何编译
 
@@ -353,7 +357,7 @@ macOS 可使用 launchd 的 `ProgramArguments` 指向同一 `serve` 命令；Win
 - 监控 `/health`、进程重启次数、数据目录剩余空间和 Provider CLI 退出率。
 - 备份前停止写入或使用文件系统快照，备份后做一次临时目录恢复和事件 replay 校验。
 
-升级前先停止 daemon，复制整个数据目录到带时间戳的备份目录，再升级 binary 并启动。后台迁移是幂等的：旧 `codex_gateway/sessions` 只读复制到 `conversations/`，不会删除或覆盖源文件。迁移只在首次运行时导入全部旧会话，之后只同步映射中已有的会话（见上文 `cutoverAt`）。升级失败时停止新 binary，恢复备份目录和旧 binary；不要手工编辑 `events.jsonl` 或 `provider-state.json`。
+升级前先停止 daemon，复制整个数据目录到带时间戳的备份目录，再升级 binary 并启动。后台迁移是幂等的：旧 `codex_gateway/sessions` 复制到 `conversations/`，不会覆盖源文件；旧网关关闭（默认）时，已导入的源目录随后删除，升级前备份的数据目录保留了原件。迁移只在首次运行时导入全部旧会话，之后只同步映射中已有的会话（见上文 `cutoverAt`）。升级失败时停止新 binary，恢复备份目录和旧 binary；不要手工编辑 `events.jsonl` 或 `provider-state.json`。
 
 ### 在容器中运行
 

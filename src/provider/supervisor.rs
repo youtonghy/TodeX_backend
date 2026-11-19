@@ -1429,7 +1429,6 @@ impl ConversationSupervisor {
         self.store.get(&manifest.id).await
     }
 
-    #[allow(dead_code)]
     pub async fn list(&self) -> Result<Vec<ConversationManifest>, AppError> {
         self.store.list().await
     }
@@ -4214,6 +4213,7 @@ mod tests {
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5330,6 +5330,7 @@ mod tests {
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -8045,6 +8046,7 @@ mod tests {
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -8321,6 +8323,7 @@ mod tests {
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -8524,6 +8527,7 @@ mod tests {
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -8598,6 +8602,7 @@ mod tests {
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -9467,6 +9472,7 @@ done
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                legacy_codex_gateway: false,
             },
             security: SecurityConfig {
                 enable_auth: true,

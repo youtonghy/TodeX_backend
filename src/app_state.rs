@@ -285,14 +285,25 @@ impl AppState {
         let data_dir = self.config.data_dir.clone();
         let workspace_roots = self.config.workspace_roots.clone();
         let store = self.conversation_store.clone();
+        let gateway_enabled = self.config.agent.legacy_codex_gateway;
         tokio::spawn(async move {
-            match migrate_legacy_codex_sessions(&data_dir, &workspace_roots, &store).await {
-                Ok(migration) if migration.imported > 0 || migration.skipped > 0 => {
+            match migrate_legacy_codex_sessions(
+                &data_dir,
+                &workspace_roots,
+                &store,
+                gateway_enabled,
+            )
+            .await
+            {
+                Ok(migration)
+                    if migration.imported > 0 || migration.skipped > 0 || migration.removed > 0 =>
+                {
                     tracing::info!(
                         imported = migration.imported,
                         already_imported = migration.already_imported,
                         skipped = migration.skipped,
                         ignored = migration.ignored,
+                        removed = migration.removed,
                         "legacy Codex conversation migration finished"
                     );
                 }

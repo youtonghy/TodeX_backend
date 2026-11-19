@@ -31,6 +31,9 @@ pub struct LegacyMigrationReport {
     /// Sources deliberately left alone: new after the cutover, without any
     /// Codex thread, or imported and later deleted by the user.
     pub ignored: usize,
+    /// Source directories removed after their history was safely imported
+    /// (or was not history at all): only when the legacy gateway is off.
+    pub removed: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -116,10 +119,21 @@ struct LegacySource {
     without_conversation: bool,
 }
 
+/// Imports the legacy `codex.local` gateway's sessions into the encrypted
+/// conversation store.
+///
+/// With `gateway_enabled` the gateway still writes sessions, so only those
+/// listed before the cutover are history; their plain-text sources stay.
+/// Without it nothing writes there any more: every session that holds a
+/// conversation is imported, and a source directory is removed once its
+/// import is complete (or the user deleted the imported conversation, or it
+/// holds no conversation at all). A source that fails to read or import is
+/// kept and retried on the next start.
 pub async fn migrate_legacy_codex_sessions(
     data_dir: &Path,
     workspace_roots: &[PathBuf],
     store: &ConversationStore,
+    gateway_enabled: bool,
 ) -> Result<LegacyMigrationReport, AppError> {
     let legacy_root = data_dir.join("codex_gateway/sessions");
     let metadata = match tokio::fs::symlink_metadata(&legacy_root).await {
@@ -173,7 +187,7 @@ pub async fn migrate_legacy_codex_sessions(
 
     let mut report = LegacyMigrationReport::default();
     for path in paths {
-        let source = match read_legacy_source(path).await {
+        let source = match read_legacy_source(path.clone()).await {
             Ok(Some(source)) => source,
             Ok(None) => {
                 report.skipped += 1;
@@ -190,6 +204,7 @@ pub async fn migrate_legacy_codex_sessions(
         match &existing {
             Some(entry) if entry.deleted => {
                 report.ignored += 1;
+                remove_source(&path, gateway_enabled, &mut report).await;
                 continue;
             }
             Some(entry) if entry.complete => {
@@ -204,11 +219,12 @@ pub async fn migrate_legacy_codex_sessions(
                     }
                     write_mapping(&mapping_path, &mapping).await?;
                     report.ignored += 1;
+                    remove_source(&path, gateway_enabled, &mut report).await;
                     continue;
                 }
             }
             Some(_) => {}
-            None if mapping.cutover_at.is_some() => {
+            None if gateway_enabled && mapping.cutover_at.is_some() => {
                 report.ignored += 1;
                 continue;
             }
@@ -219,6 +235,7 @@ pub async fn migrate_legacy_codex_sessions(
                 }) =>
             {
                 report.ignored += 1;
+                remove_source(&path, gateway_enabled, &mut report).await;
                 continue;
             }
             None => {}
@@ -230,6 +247,7 @@ pub async fn migrate_legacy_codex_sessions(
                     .await?
             {
                 report.already_imported += 1;
+                remove_source(&path, gateway_enabled, &mut report).await;
                 continue;
             }
         }
@@ -279,6 +297,7 @@ pub async fn migrate_legacy_codex_sessions(
                 }
                 write_mapping(&mapping_path, &mapping).await?;
                 report.imported += 1;
+                remove_source(&path, gateway_enabled, &mut report).await;
             }
             Err(error) => {
                 report.skipped += 1;
@@ -292,6 +311,22 @@ pub async fn migrate_legacy_codex_sessions(
         write_mapping(&mapping_path, &mapping).await?;
     }
     Ok(report)
+}
+
+/// Removes a legacy session directory whose content is no longer needed,
+/// unless the gateway (which may still use it) is on. The mapping keeps the
+/// entry, so a removed source is never imported again.
+async fn remove_source(path: &Path, gateway_enabled: bool, report: &mut LegacyMigrationReport) {
+    if gateway_enabled {
+        return;
+    }
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => report.removed += 1,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), error = %error, "could not remove an imported legacy Codex session");
+        }
+    }
 }
 
 async fn import_source(
@@ -759,7 +794,7 @@ mod tests {
         .unwrap();
 
         let store = ConversationStore::new(root.clone()).await.unwrap();
-        let first = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store)
+        let first = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store, true)
             .await
             .unwrap();
         assert_eq!(first.imported, 1);
@@ -791,7 +826,7 @@ mod tests {
         );
         assert!(provider_state.recoverable);
 
-        let second = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store)
+        let second = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store, true)
             .await
             .unwrap();
         assert_eq!(second.imported, 0);
@@ -812,7 +847,7 @@ mod tests {
             .unwrap()
             .write_all(format!("{}\n", appended).as_bytes())
             .unwrap();
-        let third = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store)
+        let third = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store, true)
             .await
             .unwrap();
         assert_eq!(third.imported, 1);
@@ -870,7 +905,7 @@ mod tests {
 
         let store = ConversationStore::new(root.clone()).await.unwrap();
         assert_eq!(
-            migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store)
+            migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store, true)
                 .await
                 .unwrap()
                 .imported,
@@ -904,7 +939,7 @@ mod tests {
             )
             .unwrap();
 
-        let report = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store)
+        let report = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store, true)
             .await
             .unwrap();
         assert_eq!(report.imported, 0);
@@ -955,18 +990,64 @@ mod tests {
         write_session(&root, "old", &[thread_event("old", 1)], None);
         let store = ConversationStore::new(root.clone()).await.unwrap();
         let roots = [workspace_root.clone()];
-        let first = migrate_legacy_codex_sessions(&root, &roots, &store)
+        let first = migrate_legacy_codex_sessions(&root, &roots, &store, true)
             .await
             .unwrap();
         assert_eq!(first.imported, 1);
         assert!(read_map(&root)["cutoverAt"].is_string());
 
         write_session(&root, "new", &[thread_event("new", 1)], None);
-        let second = migrate_legacy_codex_sessions(&root, &roots, &store)
+        let second = migrate_legacy_codex_sessions(&root, &roots, &store, true)
             .await
             .unwrap();
         assert_eq!((second.imported, second.ignored), (0, 1));
         assert_eq!(store.list().await.unwrap().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn without_the_gateway_every_conversation_is_imported_and_its_plain_text_removed() {
+        let root = temp_dir("todex-legacy-cleanup");
+        let workspace_root = root.join("workspaces");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let sessions = root.join("codex_gateway/sessions");
+        write_session(&root, "old", &[thread_event("old", 1)], None);
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let roots = [workspace_root.clone()];
+        let first = migrate_legacy_codex_sessions(&root, &roots, &store, false)
+            .await
+            .unwrap();
+        assert_eq!((first.imported, first.removed), (1, 1));
+        assert!(!sessions.join("old").exists());
+
+        // After the cutover: imported too, since nothing writes here any more.
+        write_session(&root, "new", &[thread_event("new", 1)], None);
+        // No Codex thread at all: not history, removed without importing.
+        write_session(
+            &root,
+            "diff-only",
+            &[
+                json!({ "session_id": "diff-only", "event_id": "d-1", "cursor": 1, "type": "codex.git.diff", "payload": { "diff": "+secret" } }),
+            ],
+            Some(json!({ "threads": {}, "turns": {} })),
+        );
+        // Unreadable: kept for the next start.
+        fs::create_dir_all(sessions.join("broken")).unwrap();
+        fs::write(sessions.join("broken/events.jsonl"), "{not json\n").unwrap();
+        let second = migrate_legacy_codex_sessions(&root, &roots, &store, false)
+            .await
+            .unwrap();
+        assert_eq!((second.imported, second.removed, second.skipped), (1, 2, 1));
+        assert!(!sessions.join("new").exists());
+        assert!(!sessions.join("diff-only").exists());
+        assert!(sessions.join("broken/events.jsonl").exists());
+        assert_eq!(store.list().await.unwrap().len(), 2);
+
+        // A third run neither imports nor removes anything again.
+        let third = migrate_legacy_codex_sessions(&root, &roots, &store, false)
+            .await
+            .unwrap();
+        assert_eq!((third.imported, third.removed), (0, 0));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -978,12 +1059,12 @@ mod tests {
         let store = ConversationStore::new(root.clone()).await.unwrap();
         let roots = [workspace_root.clone()];
         // No legacy sessions at all: later gateway sessions are never history.
-        migrate_legacy_codex_sessions(&root, &roots, &store)
+        migrate_legacy_codex_sessions(&root, &roots, &store, true)
             .await
             .unwrap();
         assert!(read_map(&root)["cutoverAt"].is_string());
         write_session(&root, "later", &[thread_event("later", 1)], None);
-        let report = migrate_legacy_codex_sessions(&root, &roots, &store)
+        let report = migrate_legacy_codex_sessions(&root, &roots, &store, true)
             .await
             .unwrap();
         assert_eq!((report.imported, report.ignored), (0, 1));
@@ -995,7 +1076,7 @@ mod tests {
             r#"{"schemaVersion":1,"entries":{}}"#,
         )
         .unwrap();
-        let report = migrate_legacy_codex_sessions(&root, &roots, &store)
+        let report = migrate_legacy_codex_sessions(&root, &roots, &store, true)
             .await
             .unwrap();
         assert_eq!((report.imported, report.ignored), (0, 1));
@@ -1022,10 +1103,14 @@ mod tests {
             Some(json!({ "session_id": "git-diff", "last_cursor": 1, "threads": {}, "turns": {} })),
         );
         let store = ConversationStore::new(root.clone()).await.unwrap();
-        let report =
-            migrate_legacy_codex_sessions(&root, std::slice::from_ref(&workspace_root), &store)
-                .await
-                .unwrap();
+        let report = migrate_legacy_codex_sessions(
+            &root,
+            std::slice::from_ref(&workspace_root),
+            &store,
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!((report.imported, report.ignored), (0, 1));
         assert!(store.list().await.unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
@@ -1039,13 +1124,13 @@ mod tests {
         write_session(&root, "old", &[thread_event("old", 1)], None);
         let store = ConversationStore::new(root.clone()).await.unwrap();
         let roots = [workspace_root.clone()];
-        migrate_legacy_codex_sessions(&root, &roots, &store)
+        migrate_legacy_codex_sessions(&root, &roots, &store, true)
             .await
             .unwrap();
         let id = store.list().await.unwrap()[0].id.clone();
         store.delete(&id).await.unwrap();
         for _ in 0..2 {
-            let report = migrate_legacy_codex_sessions(&root, &roots, &store)
+            let report = migrate_legacy_codex_sessions(&root, &roots, &store, true)
                 .await
                 .unwrap();
             assert_eq!((report.imported, report.ignored), (0, 1));

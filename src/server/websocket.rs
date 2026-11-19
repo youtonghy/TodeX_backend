@@ -393,6 +393,10 @@ pub(super) async fn resume_session_cursors(
     // Replay goes only to this sender, never back into the shared event bus.
     let mut scope = event_scope.write().await;
     let mut valid_sessions = Vec::new();
+    if !state.config.agent.legacy_codex_gateway {
+        // No gateway session is served (or kept) while it is off.
+        return Ok(valid_sessions);
+    }
     for (session_id, cursor) in cursors.iter().take(TRANSPORT_HELLO_MAX_SESSIONS) {
         if !scope.codex_sessions.contains(session_id)
             && scope.codex_sessions.len() >= MAX_CONNECTION_SCOPES
@@ -578,12 +582,46 @@ pub(super) fn legacy_event_is_visible(event: &PublishedEvent, scope: &LegacyEven
     true
 }
 
+/// The commands of the legacy `codex.local` gateway, whose sessions are kept
+/// as plain-text JSONL (`[agent] legacy_codex_gateway`).
+fn is_legacy_codex_gateway_message(kind: &ClientMessageKind) -> bool {
+    matches!(
+        kind,
+        ClientMessageKind::CodexGatewayControl(_)
+            | ClientMessageKind::CodexLocalStart(_)
+            | ClientMessageKind::CodexLocalStatus(_)
+            | ClientMessageKind::CodexLocalStop(_)
+            | ClientMessageKind::CodexLocalTurn(_)
+            | ClientMessageKind::CodexLocalInput(_)
+            | ClientMessageKind::CodexLocalSteer(_)
+            | ClientMessageKind::CodexLocalInterrupt(_)
+            | ClientMessageKind::CodexLocalApprovalRespond(_)
+            | ClientMessageKind::CodexLocalRequest(_)
+            | ClientMessageKind::CodexLocalReplay(_)
+            | ClientMessageKind::CodexLocalAttach(_)
+            | ClientMessageKind::CodexLocalSnapshot(_)
+            | ClientMessageKind::CodexLocalUnsupported(_)
+    )
+}
+
+fn legacy_codex_gateway_disabled() -> AppError {
+    AppError::Unsupported(
+        "the legacy codex.local gateway is disabled; use conversation.* commands \
+         (or set [agent] legacy_codex_gateway = true)"
+            .to_owned(),
+    )
+}
+
 async fn dispatch(
     message: ClientMessage,
     state: &AppState,
     auth: Option<&AuthContext>,
 ) -> Result<(), AppError> {
     debug!(message_id = %message.id, "client message received");
+
+    if !state.config.agent.legacy_codex_gateway && is_legacy_codex_gateway_message(&message.kind) {
+        return Err(legacy_codex_gateway_disabled());
+    }
 
     match message.kind {
         ClientMessageKind::CodexGatewayControl(payload) => {
@@ -2283,6 +2321,33 @@ mod tests {
         let candidate = legacy_scope_candidate(&terminal_message);
         assert_eq!(candidate.terminals.len(), 1);
         assert!(candidate.terminals[0].starts_with("term_"));
+    }
+
+    #[tokio::test]
+    async fn legacy_gateway_commands_are_refused_while_it_is_off() {
+        let mut state = test_state().await;
+        Arc::make_mut(&mut state.config).security.enable_auth = false;
+        Arc::make_mut(&mut state.config).agent.legacy_codex_gateway = false;
+        let error = dispatch(
+            ClientMessage {
+                id: "local-status-off".to_owned(),
+                kind: ClientMessageKind::CodexLocalStatus(CodexLocalSessionRequest {
+                    codex_session_id: "cdxs_off".to_owned(),
+                    tenant_id: "local".to_owned(),
+                }),
+            },
+            &state,
+            None,
+        )
+        .await
+        .expect_err("the gateway is off");
+        assert!(matches!(error, AppError::Unsupported(_)));
+        // Nothing was written for the session.
+        assert!(!state
+            .config
+            .data_dir
+            .join("codex_gateway/sessions/cdxs_off")
+            .exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4082,6 +4147,8 @@ mod tests {
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
                 provider_prewarm: true,
+                // These tests exercise the legacy gateway itself.
+                legacy_codex_gateway: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
