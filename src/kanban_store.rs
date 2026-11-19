@@ -304,6 +304,10 @@ impl KanbanTaskStore {
         if !update(&mut task) {
             return Ok(Some(task));
         }
+        // The loader validates every record; write nothing it would reject.
+        let mut task = normalize_tasks(vec![task], "")?
+            .pop()
+            .expect("one task in, one task out");
         let now = now_millis();
         task.updated_at = now.max(task.updated_at + 1);
         let mut next = current.clone();
@@ -333,6 +337,19 @@ fn schedule_in_zone(at: DateTime, zone: &TimeZone) -> Option<Timestamp> {
         return local.earlier().ok();
     }
     local.earlier().ok()
+}
+
+/// Keeps a task's conversation list within [`KANBAN_CONVERSATION_LIMIT`]
+/// by dropping the oldest links after the first (the task's main
+/// conversation, `conversationId`), so a task the scheduler keeps running
+/// stays valid instead of becoming a record the loader rejects. The
+/// conversations themselves are untouched. Returns how many were dropped.
+pub(crate) fn cap_conversation_ids(ids: &mut Vec<String>) -> usize {
+    let excess = ids.len().saturating_sub(KANBAN_CONVERSATION_LIMIT);
+    if excess > 0 {
+        ids.drain(1..1 + excess);
+    }
+    excess
 }
 
 /// Merges a client write that won on `updatedAt` into the stored record.
@@ -380,7 +397,9 @@ fn merge_incoming(existing: &KanbanTaskRecord, mut task: KanbanTaskRecord) -> Ka
         }
         _ => {}
     }
-    if let Some(ids) = &task.conversation_ids {
+    // Either addition above can take a full list past the limit.
+    if let Some(ids) = &mut task.conversation_ids {
+        cap_conversation_ids(ids);
         task.conversation_id = ids.first().cloned();
     }
     task
@@ -402,12 +421,25 @@ async fn load_snapshot(path: &Path) -> Result<KanbanTaskSnapshot, AppError> {
     let mut snapshot: KanbanTaskSnapshot = serde_json::from_str(&text)?;
     let now = now_millis();
     let mut tasks = Vec::with_capacity(snapshot.tasks.len());
-    for task in snapshot.tasks.drain(..) {
+    for mut task in snapshot.tasks.drain(..) {
+        // An older daemon's scheduler could link more conversations than the
+        // limit; keep the task and drop its oldest extra links.
+        if let Some(ids) = &mut task.conversation_ids {
+            let mut seen = std::collections::HashSet::new();
+            ids.retain(|id| seen.insert(id.trim().to_owned()));
+            let dropped = cap_conversation_ids(ids);
+            if dropped > 0 {
+                tracing::warn!(task = %task.id, dropped, "kanban task linked too many conversations; dropped the oldest links");
+            }
+        }
         // A record that fails validation is skipped rather than failing the
         // whole file, so one corrupt entry cannot wedge every client's sync.
+        let id = task.id.clone();
         match normalize_tasks(vec![task], "") {
             Ok(mut normalized) => tasks.append(&mut normalized),
-            Err(_) => continue,
+            Err(error) => {
+                tracing::warn!(task = %id, error = %error, "skipping an invalid stored kanban task");
+            }
         }
     }
     tasks.sort_by(|left, right| {
@@ -637,6 +669,7 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
     use std::fs;
 
     fn task(id: &str, title: &str, updated_at: u64) -> KanbanTaskRecord {
@@ -940,6 +973,68 @@ mod tests {
         next.schedule = Some(schedule("s2", KanbanScheduleStatus::Pending));
         let snapshot = store.merge_owned("local", vec![next]).await.unwrap();
         assert_eq!(snapshot.tasks[0].schedule.as_ref().unwrap().id, "s2");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A task linked to the limit of conversations keeps running on its
+    /// schedule: each run drops the oldest extra link (never the main
+    /// conversation), and the record survives a restart. A file an older
+    /// daemon wrote past the limit loads with its extra links dropped.
+    #[tokio::test]
+    async fn a_full_conversation_list_stays_loadable() {
+        let root = make_temp_dir("todex-kanban-conversation-cap");
+        let store = KanbanTaskStore::new(root.clone()).await.unwrap();
+        let ids = (0..KANBAN_CONVERSATION_LIMIT)
+            .map(|index| format!("conv_{index}"))
+            .collect::<Vec<_>>();
+        let mut full = task("task-1", "t", 10);
+        full.conversation_ids = Some(ids.clone());
+        full.schedule = Some(schedule("s1", KanbanScheduleStatus::Pending));
+        store.merge_owned("local", vec![full]).await.unwrap();
+        store
+            .update_schedule("local", "task-1", "s1", |task| {
+                crate::kanban_scheduler::tests::link(task, "conv_new");
+                true
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let reloaded = KanbanTaskStore::new(root.clone()).await.unwrap();
+        let tasks = reloaded.snapshot_owned("local").await.tasks;
+        assert_eq!(tasks.len(), 1);
+        let linked = tasks[0].conversation_ids.clone().unwrap();
+        assert_eq!(linked.len(), KANBAN_CONVERSATION_LIMIT);
+        assert_eq!(linked[0], "conv_0");
+        assert_eq!(linked[1], "conv_2");
+        assert_eq!(linked.last().map(String::as_str), Some("conv_new"));
+        assert_eq!(tasks[0].conversation_id.as_deref(), Some("conv_0"));
+
+        // An older client without the list adds one more conversation.
+        let mut legacy = tasks[0].clone();
+        legacy.conversation_ids = None;
+        legacy.conversation_id = Some("conv_legacy".to_owned());
+        legacy.updated_at = u64::MAX / 2;
+        let merged = reloaded.merge_owned("local", vec![legacy]).await.unwrap();
+        assert_eq!(
+            merged.tasks[0].conversation_ids.as_ref().unwrap().len(),
+            KANBAN_CONVERSATION_LIMIT
+        );
+
+        // A record written past the limit before this fix still loads.
+        let path = root.join(KANBAN_TASKS_FILE);
+        let mut raw: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let mut over = ids.clone();
+        over.push("conv_extra".to_owned());
+        raw["tasks"][0]["conversationIds"] = json!(over);
+        fs::write(&path, raw.to_string()).unwrap();
+        let reloaded = KanbanTaskStore::new(root.clone()).await.unwrap();
+        let tasks = reloaded.snapshot_owned("local").await.tasks;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "t");
+        assert_eq!(
+            tasks[0].conversation_ids.as_ref().unwrap().len(),
+            KANBAN_CONVERSATION_LIMIT
+        );
         let _ = fs::remove_dir_all(root);
     }
 

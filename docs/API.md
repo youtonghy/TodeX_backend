@@ -1068,7 +1068,7 @@ PUT /v2/kanban/tasks
 
 - `action: "start"`：在任务所在工作区用 `provider`/`providerProfile`（缺省为 `[agent] default_agent`）新建对话并发送 `text`；`"send"`：把 `text` 发到 `conversationId`（后端对话 ID），对话正在运行时进入后端追加队列。`model`、`reasoningEffort`、`permissionMode`、`workMode` 是设定时由客户端快照的发送参数。
 - `status`：客户端只写 `pending`（新建，`id` 由客户端生成）或 `cancelled`（取消，不得删除字段，缺失会被视为不认识该字段的旧客户端）。`running`、`done`、`failed` 只由后端写入，客户端以更新的 `updatedAt` 提交同一 `id` 的旧副本也不会回滚它们；后端写入时把 `updatedAt` 推到最新。
-- 调度器约每 15 秒按墙上时间检查一次（机器休眠后仍会补跑）。执行前先置 `running` 并持久化；新建的对话 ID 在发送前写入 `resultConversationId` 并追加到 `conversationIds`。prompt 以 `kanban-<scheduleId>` 作为幂等键，后端重启后重跑不会重复发送；若重启时尚未记录新建的对话，则置 `failed` 而不冒险重复建对话。
+- 调度器约每 15 秒按墙上时间检查一次（机器休眠后仍会补跑）。执行前先置 `running` 并持久化；新建的对话 ID 在发送前写入 `resultConversationId` 并追加到 `conversationIds`；列表已满 100 项时去掉第一项之后最旧的一项（第一项是任务的主对话，对话本身不删除），旧客户端推送带来的追加同样如此，加载时超限的旧记录也按此截断而不再整条丢弃。prompt 以 `kanban-<scheduleId>` 作为幂等键，后端重启后重跑不会重复发送；若重启时尚未记录新建的对话，则置 `failed` 而不冒险重复建对话。
 - 结果：`done` 带 `resultConversationId`，`turnId` 缺失表示已排在运行中的 turn 之后；`failed` 带 `error`。后端停机超过 24 小时才到点的计划不再执行，记为 `failed`（`missed: …`）。发送遵循普通 prompt 的前提：工作区目录仍可用、存在历史接收者（否则 `HISTORY_KEY_REQUIRED`）、对话不是只读的旧明文历史。
 
 `PUT` 请求体使用同样的 `tasks` 数组，是合并而非全量替换：后端按 `(tenantId, id)` upsert，`updatedAt` 较新的记录胜出，同毫秒时采用提交方记录。`tenantId` 一律由后端覆盖为当前认证 owner，客户端伪造无效。

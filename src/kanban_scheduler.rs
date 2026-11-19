@@ -348,15 +348,21 @@ fn add_conversation(task: &mut KanbanTaskRecord, conversation_id: &str) {
         .get_or_insert_with(|| task.conversation_id.iter().cloned().collect());
     if !ids.iter().any(|id| id == conversation_id) {
         ids.push(conversation_id.to_owned());
+        crate::kanban_store::cap_conversation_ids(ids);
     }
     task.conversation_id = ids.first().cloned();
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{collections::BTreeMap, fs, path::Path};
 
     use super::*;
+
+    /// What a schedule run does to its task's conversation list.
+    pub(crate) fn link(task: &mut KanbanTaskRecord, conversation_id: &str) {
+        add_conversation(task, conversation_id);
+    }
 
     #[test]
     fn scheduler_sleeps_until_the_next_schedule_at_most_a_tick() {
