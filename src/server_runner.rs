@@ -207,14 +207,18 @@ impl IpcServer {
 
 /// `<data_dir>/daemon.lock`, locked for a server's lifetime.
 const DATA_DIR_LOCK_FILE: &str = "daemon.lock";
+/// How long a starting server waits for the data directory lock.
+const DATA_DIR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Claims the data directory for this server. Two servers on one directory
 /// would both recover "interrupted" turns and append to the same journals,
 /// so a second one fails to start instead. The OS releases the lock when the
-/// process exits, however it exits.
+/// process exits, however it exits. A server stopped in this process released
+/// it, but a child forked meanwhile holds the lock (`flock` goes with the
+/// open file) until it execs, so a restart waits briefly before giving up.
 fn lock_data_dir(data_dir: &Path) -> Result<std::fs::File> {
     let path = data_dir.join(DATA_DIR_LOCK_FILE);
-    crate::secure_fs::lock_exclusive(&path, std::time::Duration::ZERO).map_err(|error| {
+    crate::secure_fs::lock_exclusive(&path, DATA_DIR_LOCK_WAIT).map_err(|error| {
         if error.kind() == std::io::ErrorKind::TimedOut {
             anyhow::anyhow!(
                 "another TodeX server is already using the data directory {}",
