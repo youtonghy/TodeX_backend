@@ -2889,28 +2889,15 @@ impl<'a> PiRpc<'a> {
             if !pi_frame_is_mergeable_delta(&message) {
                 self.flush_pending_delta().await?;
             }
-            if message.get("type").and_then(Value::as_str) == Some("message_end")
-                && message.pointer("/message/role").and_then(Value::as_str) == Some("custom")
-            {
-                if let Some(sink) = &self.sink {
-                    self.custom_sequence = self.custom_sequence.saturating_add(1);
-                    let message_id = pi_message_id(&message).unwrap_or_else(|| {
-                        format!(
-                            "{}-custom-{}",
-                            sink.runtime_id().unwrap_or("pi"),
-                            self.custom_sequence
-                        )
-                    });
-                    sink.emit("extension.message", json!({"provider":"pi","messageId":message_id,"message":message.get("message")})).await?;
-                    for (kind, payload) in self.subagents.notification(message.get("message")) {
-                        sink.emit(kind, payload).await?;
-                    }
+            if pi_is_custom_message(&message) {
+                // Frames held while a control answer was awaited came first:
+                // a custom message (a subagent's completion notice) joins them
+                // instead of overtaking, e.g., the session record it follows.
+                if !self.events.is_empty() {
+                    self.buffer_before_response(message)?;
+                } else {
+                    self.consume_custom_message(&message).await?;
                 }
-                continue;
-            }
-            if message.get("type").and_then(Value::as_str) == Some("message_start")
-                && message.pointer("/message/role").and_then(Value::as_str) == Some("custom")
-            {
                 continue;
             }
             if message.get("type").and_then(Value::as_str) != Some("extension_ui_request") {
@@ -3132,13 +3119,46 @@ impl<'a> PiRpc<'a> {
         if self.cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
             return Err(AppError::TurnCancelled);
         }
-        if let Some(event) = self.pop_buffered() {
+        while let Some(event) = self.pop_buffered() {
+            if pi_is_custom_message(&event) {
+                self.consume_custom_message(&event).await?;
+                continue;
+            }
             if !pi_frame_is_mergeable_delta(&event) {
                 self.flush_pending_delta().await?;
             }
             return Ok(event);
         }
         self.read_frame(None).await
+    }
+
+    /// A custom-role message (an extension's message, a subagent's completion
+    /// notice): `message_end` is journalled and settles the runs it reports;
+    /// `message_start` carries nothing more.
+    async fn consume_custom_message(&mut self, message: &Value) -> Result<(), AppError> {
+        if message.get("type").and_then(Value::as_str) != Some("message_end") {
+            return Ok(());
+        }
+        let Some(sink) = self.sink.clone() else {
+            return Ok(());
+        };
+        self.custom_sequence = self.custom_sequence.saturating_add(1);
+        let message_id = pi_message_id(message).unwrap_or_else(|| {
+            format!(
+                "{}-custom-{}",
+                sink.runtime_id().unwrap_or("pi"),
+                self.custom_sequence
+            )
+        });
+        sink.emit(
+            "extension.message",
+            json!({"provider":"pi","messageId":message_id,"message":message.get("message")}),
+        )
+        .await?;
+        for (kind, payload) in self.subagents.notification(message.get("message")) {
+            sink.emit(kind, payload).await?;
+        }
+        Ok(())
     }
 }
 
@@ -3335,9 +3355,22 @@ async fn wait_for_pi_abort(
     })?
 }
 
+/// A `message_start` / `message_end` of a custom-role message (extension
+/// output, subagent completion notices), handled by `consume_custom_message`.
+fn pi_is_custom_message(message: &Value) -> bool {
+    matches!(
+        message.get("type").and_then(Value::as_str),
+        Some("message_start" | "message_end")
+    ) && message.pointer("/message/role").and_then(Value::as_str) == Some("custom")
+}
+
 /// Between user turns an extension may still emit messages, tool progress or
 /// compaction events. They use the session sink, never a stale turn identifier.
 async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), AppError> {
+    // A custom message held in the buffer behind earlier frames.
+    if pi_is_custom_message(&message) {
+        return rpc.consume_custom_message(&message).await;
+    }
     let Some(sink) = rpc.sink.clone() else {
         return Ok(());
     };
@@ -4142,9 +4175,13 @@ mod tests {
                 .unwrap(),
             ProviderPrewarm::Warmed
         );
-        // The process records its launch once it runs.
+        // The process records its launch once it runs. The fixture opens the
+        // marker before it writes the line, so wait for the whole line.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !fixture.root.join("pi-launches").exists() {
+            while !tokio::fs::read_to_string(fixture.root.join("pi-launches"))
+                .await
+                .is_ok_and(|text| text.ends_with('\n'))
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -5452,6 +5489,33 @@ mod tests {
             .unwrap();
         assert_eq!(lost_work.reason, "stopped");
         fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_run_settling_while_the_turn_awaits_its_state_keeps_the_record_before_the_notice() {
+        // The record and the notification arrive while the turn waits for its
+        // settled-state answer: the record is held until then, and the
+        // notification must not overtake it with only its preview.
+        let fixture = Fixture::new().await;
+        fixture
+            .run("subagents-during-state", "settle-turn")
+            .await
+            .unwrap();
+        let background = fixture
+            .wait_event(|event| {
+                event.event_type == "subagent.completed" && event.payload["subagentId"] == "bg-call"
+            })
+            .await;
+        assert_eq!(background.payload["result"], "All tests found.");
+        let enriched = fixture
+            .wait_event(|event| {
+                event.event_type == "subagent.updated"
+                    && event.payload["subagentId"] == "bg-call"
+                    && event.payload.pointer("/usage/total_tokens").is_some()
+            })
+            .await;
+        assert!(enriched.payload.get("status").is_none());
     }
 
     #[tokio::test]

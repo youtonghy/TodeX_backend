@@ -125,17 +125,24 @@ def subagent_runs():
          'result': {'content': [{'type': 'text', 'text': 'Agent started in background.\nAgent ID: bg-agent\nOutput file: /tmp/bg-agent.output'}],
                     'details': details('background', agentId='bg-agent', description='Scan tests')}})
     finish()
+    if scenario == 'subagents-during-state':
+        # The run settles while the host waits for its settled-state answer.
+        return
     def settle():
         time.sleep(0.08)
-        out({'type': 'entry_appended', 'entry': {'type': 'custom', 'id': 'e1', 'customType': 'subagents:record',
-             'data': {'id': 'bg-agent', 'type': 'Explore', 'description': 'Scan tests', 'status': 'completed', 'result': 'All tests found.'}}})
-        message = {'role': 'custom', 'customType': 'subagent-notification', 'display': True,
-                   'content': '<task-notification>...</task-notification>',
-                   'details': {'id': 'bg-agent', 'description': 'Scan tests', 'status': 'completed', 'totalTokens': 4321,
-                               'outputFile': '/tmp/bg-agent.output', 'resultPreview': 'All tests'}}
-        out({'type': 'message_start', 'message': message})
-        out({'type': 'message_end', 'message': message})
+        settle_background()
     threading.Thread(target=settle, daemon=True).start()
+
+def settle_background():
+    # The background run's session record, then its completion notification.
+    out({'type': 'entry_appended', 'entry': {'type': 'custom', 'id': 'e1', 'customType': 'subagents:record',
+         'data': {'id': 'bg-agent', 'type': 'Explore', 'description': 'Scan tests', 'status': 'completed', 'result': 'All tests found.'}}})
+    message = {'role': 'custom', 'customType': 'subagent-notification', 'display': True,
+               'content': '<task-notification>...</task-notification>',
+               'details': {'id': 'bg-agent', 'description': 'Scan tests', 'status': 'completed', 'totalTokens': 4321,
+                           'outputFile': '/tmp/bg-agent.output', 'resultPreview': 'All tests'}}
+    out({'type': 'message_start', 'message': message})
+    out({'type': 'message_end', 'message': message})
 
 def spawn_runs():
     # pi-agenticoding: `spawn` runs a child session in the foreground with
@@ -226,6 +233,8 @@ for line in sys.stdin:
             continue
         ack(cmd, {'commands': [{'name': 'fixture-report', 'description': 'fixture command', 'source': 'extension', 'sourceInfo': {'path': os.path.join(os.getcwd(), 'pi.py'), 'origin': 'top-level', 'scope': 'user', 'source': 'npm:fixture-plugin'}}]})
     elif kind == 'get_state':
+        if cmd.get('id') == 'settled-state' and scenario == 'subagents-during-state':
+            settle_background()
         if cmd.get('id') == 'state' and scenario == 'buffer-idle':
             out({'type': 'message_start', 'message': {'role': 'assistant'}})
             out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop', 'content': [{'type': 'text', 'text': 'background before next prompt'}], 'usage': {'input': 1, 'output': 2}}})
@@ -244,7 +253,7 @@ for line in sys.stdin:
                 out({'type': 'agent_settled'})
             elif scenario == 'stream':
                 stream_with_tool()
-            elif scenario == 'subagents':
+            elif scenario in ['subagents', 'subagents-during-state']:
                 subagent_runs()
             elif scenario == 'tasks':
                 task_tools([
