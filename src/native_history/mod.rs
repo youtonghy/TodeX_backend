@@ -758,23 +758,41 @@ impl NativeHistory {
         trigger: &'static str,
         report: &mut CleanupReport,
     ) {
-        let outcome = if provider.cli_deletes() {
+        // The bytes actually freed. A CLI deletes the session itself, so its
+        // whole size as listed counts once the CLI reports success.
+        let (freed, outcome) = if provider.cli_deletes() {
             let spec = match provider {
                 NativeProvider::Codex => self.clis.codex_delete(&roots.codex_home, &session.id),
                 NativeProvider::GrokBuild => self.clis.grok_delete(&roots.grok_home, &session.id),
                 _ => self.clis.devin_delete(&roots.devin_dir, &session.id),
             };
-            cli::run_delete(provider, &spec).await
+            let outcome = cli::run_delete(provider, &spec).await;
+            let freed = if outcome.is_ok() {
+                session.bytes.unwrap_or(0)
+            } else {
+                0
+            };
+            (freed, outcome)
         } else {
             let sessions_root = roots.sessions_root(provider);
             let side_root = roots.side_root(provider).to_owned();
             let target = session.clone();
-            tokio::task::spawn_blocking(move || remove_session(&sessions_root, &side_root, &target))
-                .await
-                .map_err(|error| AppError::Anyhow(error.into()))
-                .and_then(|result| result.map_err(AppError::from))
+            match tokio::task::spawn_blocking(move || {
+                remove_session(&sessions_root, &side_root, &target)
+            })
+            .await
+            {
+                Ok(removal) => (
+                    removal.freed,
+                    removal
+                        .error
+                        .map_or(Ok(()), |error| Err(AppError::from(error))),
+                ),
+                Err(error) => (0, Err(AppError::Anyhow(error.into()))),
+            }
         };
-        let freed = session.bytes.unwrap_or(0);
+        // A partly removed session still freed what it removed.
+        report.freed_bytes = report.freed_bytes.saturating_add(freed);
         match outcome {
             Ok(()) => {
                 tracing::info!(
@@ -786,7 +804,6 @@ impl NativeHistory {
                     trigger,
                     "native history session deleted"
                 );
-                report.freed_bytes = report.freed_bytes.saturating_add(freed);
                 report.deleted.push(session.id.clone());
             }
             Err(error) => {
@@ -1494,39 +1511,68 @@ fn pid_alive(pid: i64) -> bool {
     }
 }
 
-/// Removes a session's transcript files, then its side data. Each path must
+/// What [`remove_session`] removed: the bytes actually freed, and the
+/// first failure, which stops the removal.
+struct Removal {
+    freed: u64,
+    error: Option<io::Error>,
+}
+
+/// Removes a session's side data, then its transcript files. Each path must
 /// resolve (through its canonical parent) inside its root; symlinks are
-/// refused.
-fn remove_session(
-    sessions_root: &Path,
-    side_root: &Path,
-    session: &NativeSession,
-) -> io::Result<()> {
-    let sessions_root = fs::canonicalize(sessions_root)?;
-    for path in &session.files {
-        remove_inside(&sessions_root, path)?;
-    }
-    if session.side.is_empty() {
-        return Ok(());
-    }
-    // The transcript is gone: side data is best effort from here on.
-    let side_root = match fs::canonicalize(side_root) {
-        Ok(root) => root,
-        Err(error) => {
-            tracing::warn!(%error, "could not resolve the native session side-data root");
-            return Ok(());
+/// refused. Side data goes first: scans find a session (and with it its
+/// side data) through its transcript, so a failure leaves the transcript in
+/// place and the session listed, and the next cleanup retries it instead of
+/// leaving unlisted leftovers.
+fn remove_session(sessions_root: &Path, side_root: &Path, session: &NativeSession) -> Removal {
+    let mut removal = Removal {
+        freed: 0,
+        error: None,
+    };
+    let mut remove = |root: &Path, path: &Path| {
+        let bytes = tree_bytes(path);
+        match remove_inside(root, path) {
+            Ok(()) => {
+                removal.freed = removal.freed.saturating_add(bytes);
+                true
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not remove native session data");
+                removal.error = Some(error);
+                false
+            }
         }
     };
-    for path in &session.side {
-        if let Err(error) = remove_inside(&side_root, path) {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "could not remove native session side data"
-            );
+    if !session.side.is_empty() {
+        match fs::canonicalize(side_root) {
+            Ok(side_root) => {
+                for path in &session.side {
+                    if !remove(&side_root, path) {
+                        return removal;
+                    }
+                }
+            }
+            // No side-data root: nothing of the session can be there.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                removal.error = Some(error);
+                return removal;
+            }
         }
     }
-    Ok(())
+    let sessions_root = match fs::canonicalize(sessions_root) {
+        Ok(root) => root,
+        Err(error) => {
+            removal.error = Some(error);
+            return removal;
+        }
+    };
+    for path in &session.files {
+        if !remove(&sessions_root, path) {
+            break;
+        }
+    }
+    removal
 }
 
 fn remove_inside(root: &Path, path: &Path) -> io::Result<()> {

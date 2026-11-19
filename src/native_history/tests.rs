@@ -1297,3 +1297,65 @@ async fn omp_sessions_are_listed_viewed_and_deleted_with_their_artifacts() {
     assert!(blobs.join("abc").exists());
     assert_eq!(list(&fixture, NativeProvider::Omp).await["count"], 2);
 }
+
+/// Side data that cannot be removed keeps the session: its transcript stays
+/// (so the next scan lists it and cleanup can retry), it is reported as
+/// skipped, and `freedBytes` counts only what was actually removed.
+#[cfg(unix)]
+#[tokio::test]
+async fn unremovable_side_data_keeps_the_session_listed_and_uncounted() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = fixture().await;
+    let claude_dir = fixture.roots.claude_dir.clone();
+    let id = new_id();
+    let path = claude_session(&fixture, "-work-a", &id, "p");
+    let todos = claude_dir.join("todos");
+    fs::create_dir_all(&todos).unwrap();
+    let todo = todos.join(format!("{id}-agent-{id}.json"));
+    fs::write(&todo, b"[1,2,3]").unwrap();
+    let env = claude_dir.join("session-env");
+    fs::create_dir_all(env.join(&id)).unwrap();
+    fs::write(env.join(&id).join("vars"), b"A=1").unwrap();
+    let listing = list(&fixture, NativeProvider::ClaudeCode).await;
+    let total = listing["sessions"][0]["bytes"].as_u64().unwrap();
+    assert!(total > fs::metadata(&path).unwrap().len());
+
+    // `session-env` cannot be written to: its entry cannot be removed.
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o500)).unwrap();
+    let report = fixture
+        .state
+        .native_history
+        .cleanup(
+            &fixture.state.conversations,
+            NativeProvider::ClaudeCode,
+            std::slice::from_ref(&id),
+        )
+        .await
+        .unwrap();
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(report.deleted.is_empty());
+    assert_eq!(report.skipped.len(), 1);
+    assert!(
+        path.exists(),
+        "the transcript stays so the session is found again"
+    );
+    assert!(report.freed_bytes < total);
+    let listing = list(&fixture, NativeProvider::ClaudeCode).await;
+    assert_eq!(listing["count"], 1);
+
+    // Once removable, the retry removes the rest and counts only that.
+    let remaining = listing["sessions"][0]["bytes"].as_u64().unwrap();
+    let report = fixture
+        .state
+        .native_history
+        .cleanup(
+            &fixture.state.conversations,
+            NativeProvider::ClaudeCode,
+            std::slice::from_ref(&id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, vec![id.clone()]);
+    assert_eq!(report.freed_bytes, remaining);
+    assert!(!path.exists() && !env.join(&id).exists() && !todo.exists());
+}
