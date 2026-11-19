@@ -173,9 +173,12 @@ impl WorkspaceStore {
     ) -> Result<WorkspaceMerge, AppError> {
         let normalized = normalize_workspaces(workspaces, &self.workspace_roots, Some(owner_id));
         let mut current = self.inner.write().await;
+        // Merge into a copy: a merge that is not written leaves the
+        // in-memory snapshot (every tenant's records and tombstones) as is.
         let mut by_id = current
             .workspaces
-            .drain(..)
+            .iter()
+            .cloned()
             .map(|workspace| {
                 (
                     (workspace.tenant_id.clone(), workspace.id.clone()),
@@ -183,7 +186,7 @@ impl WorkspaceStore {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let mut deleted = std::mem::take(&mut current.deleted);
+        let mut deleted = current.deleted.clone();
         for workspace in normalized.workspaces {
             let key = (workspace.tenant_id.clone(), workspace.id.clone());
             // A client pushing an older copy (it has not pulled the newer one
@@ -231,27 +234,29 @@ impl WorkspaceStore {
         else {
             return Ok(false);
         };
-        let removed = current.workspaces.remove(index);
+        // Changed on a copy and published only once written, so a failed
+        // write leaves the workspace in memory as it is on disk.
+        let mut next = current.clone();
+        let removed = next.workspaces.remove(index);
         let now = now_millis();
-        current
-            .deleted
+        next.deleted
             .retain(|tombstone| tombstone.tenant_id != owner_id || tombstone.id != workspace_id);
         // At least the record's own time, so a copy carrying it stays deleted
         // even when this clock runs behind the client's.
-        current.deleted.push(WorkspaceTombstone {
+        next.deleted.push(WorkspaceTombstone {
             id: removed.id,
             path: removed.path,
             tenant_id: removed.tenant_id,
             deleted_at: now.max(removed.updated_at),
         });
-        if current.deleted.len() > MAX_WORKSPACE_TOMBSTONES {
-            current
-                .deleted
+        if next.deleted.len() > MAX_WORKSPACE_TOMBSTONES {
+            next.deleted
                 .sort_by_key(|tombstone| std::cmp::Reverse(tombstone.deleted_at));
-            current.deleted.truncate(MAX_WORKSPACE_TOMBSTONES);
+            next.deleted.truncate(MAX_WORKSPACE_TOMBSTONES);
         }
-        current.updated_at = now;
-        write_snapshot(&self.path, &current).await?;
+        next.updated_at = now;
+        write_snapshot(&self.path, &next).await?;
+        *current = next;
         Ok(true)
     }
 }
@@ -818,6 +823,77 @@ mod tests {
         assert_eq!(snapshot.workspaces.len(), 1);
         assert_eq!(snapshot.workspaces[0].name, "App again");
         assert!(snapshot.deleted.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A merge or deletion whose write fails changes nothing in memory: not
+    /// the caller's records, not another tenant's, not the tombstones.
+    #[tokio::test]
+    async fn a_failed_write_leaves_the_snapshot_as_it_was() {
+        let root = make_temp_dir("todex-workspace-store-failed-write");
+        let workspace_root = root.join("workspaces");
+        let (app, docs, gone) = (
+            workspace_root.join("app"),
+            workspace_root.join("docs"),
+            workspace_root.join("gone"),
+        );
+        for path in [&app, &docs, &gone] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let store = WorkspaceStore::new(root.clone(), vec![workspace_root])
+            .await
+            .unwrap();
+        let ids = store
+            .merge_owned(
+                "local",
+                vec![record(&app, "App", 100), record(&gone, "Gone", 100)],
+            )
+            .await
+            .unwrap()
+            .snapshot
+            .workspaces
+            .into_iter()
+            .map(|workspace| (workspace.name, workspace.id))
+            .collect::<HashMap<_, _>>();
+        store
+            .merge_owned("other", vec![record(&docs, "Docs", 100)])
+            .await
+            .unwrap();
+        assert!(store.delete_owned("local", &ids["Gone"]).await.unwrap());
+        let before = (
+            store.snapshot_owned("local").await,
+            store.snapshot_owned("other").await,
+        );
+
+        // The snapshot file cannot be replaced: renaming onto a directory fails.
+        let file = root.join(WORKSPACES_FILE);
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        assert!(store
+            .merge_owned("local", vec![record(&app, "Renamed", 200)])
+            .await
+            .is_err());
+        assert!(store.delete_owned("local", &ids["App"]).await.is_err());
+        let after = (
+            store.snapshot_owned("local").await,
+            store.snapshot_owned("other").await,
+        );
+        assert_eq!(after, before);
+
+        // The next successful write still carries everything.
+        fs::remove_dir(&file).unwrap();
+        store
+            .merge_owned("local", vec![record(&app, "Renamed", 200)])
+            .await
+            .unwrap();
+        let reloaded = WorkspaceStore::new(root.clone(), vec![root.join("workspaces")])
+            .await
+            .unwrap();
+        let local = reloaded.snapshot_owned("local").await;
+        assert_eq!(local.workspaces.len(), 1);
+        assert_eq!(local.workspaces[0].name, "Renamed");
+        assert_eq!(local.deleted.len(), 1);
+        assert_eq!(reloaded.snapshot_owned("other").await.workspaces.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
