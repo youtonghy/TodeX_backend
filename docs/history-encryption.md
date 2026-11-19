@@ -59,7 +59,7 @@
 - 已轮换但所在分片尚未封存的 DEK 仍留在内存，供封存时重打包；分片封存完成后清零。daemon 崩溃后丢失的 DEK 只影响该分片不能重打包压缩，内容仍可被客户端读取。活动文件改名封存的同时轮换 DEK，所以一个 DEK 的记录通常只落在一个分片里；唯一的例外是下文无接收方时运行中的 turn 沿用最新 DEK 跨过封存边界，此时新活动文件仍用该 DEK，封存转换在之后仍有未封存记录时保留它，直到新活动文件也封存后才清零。改名失败（例如 Windows 上文件被安全软件占用）不影响追加：本条记录照常写入原活动文件、沿用原 DEK（没有改名就不轮换），下一次追加再尝试封存。
 - nonce 不复用：同一 sequence 只在同一 DEK 下加密一次。追加写入或 fsync 失败（`ENOSPC`、`EIO`）时，后端尽力把活动文件截回写入前的长度，无论截断是否成功都弃用当前 DEK 后才返回错误；尾部恢复截掉记录（损坏尾部隔离到 `events.corrupt.*`）或追加时发现 manifest 领先 journal，同样先弃用 DEK。被弃用的 DEK 不再作为下文无接收方时的回退密钥，此时若无法生成新 DEK，追加直接失败而不是用旧 DEK 重新加密同一 sequence。
 - 会话标题：`manifest.titleEnc = {"kid","ct"}`，以该 `kid` 的 stream 2、counter 0 加密，`kid` 同样登记在 `keyring.json`；省略 `manifest.title`（客户端视同空串）。每次设置标题都用一个只为它生成的新 `kid`（不进入活动 DEK、用后即弃），所以 counter 0 永不在同一 `kid` 下复用。
-- 一次性 DEK：标题，以及导入外部会话与 fork 时组装中的新会话（草稿目录）各自生成新 DEK，同样先对全部接收方封装并写入 keyring（草稿的 keyring 随目录一起发布）。草稿中的明文记录以该 DEK 按事件流加密（counter = 新会话中的 sequence）；fork 复制的密文保留原 `$enc`，来源的 keyring 先复制进草稿，草稿 DEK 追加其后。这样导入与 fork 得到的会话从第一条记录起完全加密，带 `historyEncryptedAt`。
+- 一次性 DEK：标题，以及导入外部会话与 fork 时组装中的新会话（草稿目录）各自生成新 DEK，同样先对全部接收方封装并写入 keyring（草稿的 keyring 随目录一起发布）。草稿中的明文记录以该 DEK 按事件流加密（counter = 新会话中的 sequence）；fork 复制的密文保留原 `$enc`，来源 keyring 中被复制记录（及其引用的帧）用到的 DEK 复制进草稿，草稿 DEK 并列其中；只被分叉点之后的历史或来源标题用到的 DEK 不复制。这样导入与 fork 得到的会话从第一条记录起完全加密，带 `historyEncryptedAt`。
 - 无接收方：若没有未吊销的接收方（或 keyring 无法写入），新 DEK 无法生成。此时新建会话（含导入与 fork）以及新 prompt（包括追加队列的投递与 `conversation.retry`，在保存请求快照时）被拒绝，返回 `HISTORY_KEY_REQUIRED`（HTTP 409，WS 错误码同名，提示在客户端登记设备密钥），不写任何内容；已在运行的 turn 继续用内存中最新的 DEK 加密写完。内存中没有任何 DEK（daemon 刚重启）时追加直接失败、记录错误日志，turn 以失败结束（终态事件同样写不进去时由重启恢复关闭），绝不回落为明文。
 
 ### 3.3 新设备与恢复
@@ -134,7 +134,7 @@ manifest.json  snapshot.json  provider-state.json  last-request.json
 
 ### 4.3 封存分片
 
-- 帧：按约 1 MiB 原始数据切分，帧不跨 `kid`。三条流：信封流（每行 `{"s","i","t","y","r","p","e"}`，raw DEFLATE，不加密）、摘要内容流、完整内容流（各为 payload 的 JSON 数组，raw DEFLATE（RFC 1951，无 zlib/gzip 头，浏览器可直接解压）后在 e2e 下以 stream 3/4、counter=帧序号加密）。
+- 帧：按约 1 MiB 原始数据切分，帧不跨 `kid`；`Sealed` 组的帧达到 64 KiB 后还会在下一条 turn 终态事件处结束（见 §5.3）。三条流：信封流（每行 `{"s","i","t","y","r","p","e"}`，raw DEFLATE，不加密）、摘要内容流、完整内容流（各为 payload 的 JSON 数组，raw DEFLATE（RFC 1951，无 zlib/gzip 头，浏览器可直接解压）后在 e2e 下以 stream 3/4、counter=帧序号加密）。
 - `.idx`：首尾 sequence、每帧（流、首 sequence、条数、压缩偏移与长度、原始长度、`kid`、帧序号）、§6 的分片摘要、SHA-256。
 - 封存时精简：已确认存在终态记录（`message.completed`、`tool.completed`、`subagent.completed` 等，按 block/tool id 匹配）的 `message.delta`、`tool.updated`、`subagent.updated` 换成 `journal.compacted` 标记；`thought.delta` 与以 toolUse 结束的旁白 delta 保留。
 - 内存：每个会话只常驻分片表；帧表按需加载；全局解压帧缓存 32 MiB、会话索引 64 个，均 LRU。
@@ -196,7 +196,7 @@ e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容�
 
 - 事件级（活动分片、passthrough 帧与实时推送）：`s`/`f` 为 base64url；摘要与完整相同则省略 `s`。`detail=summary` 下发 `s`（缺省时发 `f`），`detail=full` 下发 `f`，同一事件不会同时带两者。实时推送按 `full` 下发，与写入 journal 的密文逐字节相同。摘要在写入时由后端用明文算出，回放从不对密文运行摘要。
 - 帧级（`Sealed` 帧）：事件 `$enc` 为 `{v, kid, c, n, fr: {s, f, i}}`（`kid` 为帧的 `kid`，`c`/`n` 为本会话与该事件 sequence），`s`/`f` 是摘要帧与完整帧的 id（不透明字符串，`<分片 id>-<偏移>`，分片重建后不复用）。HTTP 分页响应顶层附 `frames: { "<帧 id>": {"kid","stream","counter","c","ct"} }`，只含所请求 detail 的那一种帧（summary 为 stream 3，full 为 stream 4），同一页内去重；帧在页字节预算中按 base64 长度计一次。WebSocket 每条 `conversation.event` 单独解密，所以凡引用帧的回放消息顶层都附带它所引用的帧（同一帧会在多条消息里重复出现）。一次订阅补放累计携带的帧超过 16 MiB 时补放提前结束，结果为 `hasMore: true`，其余由客户端按 `nextSequence` 走 HTTP 分页（每帧只发一次）。帧明文是 raw DEFLATE 压缩的 payload JSON 数组，`i` 为下标。
-- `c`/`n` 是 AAD 用的原会话与 sequence：fork 复制密文时保留来源值，新会话 sequence 可不同。fork 复制的帧级记录保留 `fr`，被引用的帧以线上形式存放在 fork 目录的 `frames/<帧 id>.json`，回放时同样放进 `frames`；fork 同时复制来源的 `keyring.json`，客户端用 fork 的会话 id 取封装。
+- `c`/`n` 是 AAD 用的原会话与 sequence：fork 复制密文时保留来源值，新会话 sequence 可不同。fork 复制的帧级记录保留 `fr`，被复制记录引用的完整流帧（`fr.f`；摘要回放回退到它）以线上形式存放在 fork 目录的 `frames/<帧 id>.json`，回放时同样放进 `frames`，只被分叉点之后记录引用的帧不复制；fork 同时复制这些记录与帧用到的 DEK（见 §3.2），客户端用 fork 的会话 id 取封装。按某条回复分叉时，跨越分叉点的那一帧只能整帧复制（daemon 已没有它的 DEK，无法重新分帧），所以 fork 可能带有分叉点之后的一小段密文，能解开它的仍是原本能读来源会话的接收方。为限制这段残留，封存时 `Sealed` 组的帧原始数据达到 64 KiB 后在下一条 turn 终态事件（`turn.completed`/`failed`/`cancelled`/`interrupted`）处结束；更小的帧继续累积（逐 turn 切帧会让短 turn 的历史压缩后大约多三分之一）。此前封存的分片帧不受影响，按 1 MiB 分帧。
 - 解密后的 payload 整体替换 `payload`（其中已含信封字段）。无法解密（无 DEK、授权未到、校验失败）时 `payload` = 信封字段 + `{"detailLocked": true}`，sequence 照常推进。其中密钥在手却未通过 AEAD 校验（或结构损坏）的事件另带 `"detailCorrupt": true`：信封字段未经认证，客户端不据此生成待审批项，并显示为“已损坏”而非“未授权”。
 
 ### 5.4 能力协商

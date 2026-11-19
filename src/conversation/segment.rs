@@ -57,6 +57,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
 use super::digest::JournalDigest;
+use super::digest::TURN_TERMINAL_EVENTS;
 use super::record::{
     compacted_marker, decode_journal_record, encode_envelope, encrypted_content, open_event,
     parse_record, record_bytes, ENCRYPTED_FIELD, JOURNAL_COMPACTED_EVENT,
@@ -74,6 +75,11 @@ const FLAG_PASSTHROUGH: u8 = 1;
 /// Raw bytes a frame collects before it is compressed. Reading one record
 /// decompresses at most this much per stream.
 pub(super) const FRAME_RAW_BYTES: usize = 1024 * 1024;
+/// A sealed frame holding at least this many raw bytes ends at the next
+/// turn-terminal record instead of running on to [`FRAME_RAW_BYTES`], which
+/// bounds what a fork from a reply carries past its fork point. Twice the
+/// DEFLATE window, so the cut costs little compression.
+pub(super) const FRAME_TURN_CUT_BYTES: usize = 64 * 1024;
 /// DEFLATE level. Frames are compressed once, in the background, and read
 /// many times: on real 64 MiB journals level 9 sealed to 4.0–5.9 MiB
 /// against 4.1–6.5 MiB at level 6, for about 1–2 s per segment.
@@ -1148,7 +1154,21 @@ impl SegmentBuilder {
         } else {
             full.clone()
         };
-        self.append_content(sequence, group, &summary, &full)
+        let sealed = matches!(group, FrameGroup::Sealed(_));
+        self.append_content(sequence, group, &summary, &full)?;
+        // A sealed frame that has grown past FRAME_TURN_CUT_BYTES ends with
+        // its turn: forking from a reply copies the frames of the records it
+        // keeps, and a frame reaching past the turn's terminal record carries
+        // later turns' content into the fork (§5.3). Smaller frames run on,
+        // as cutting every short turn costs about a third of the compression.
+        if sealed
+            && TURN_TERMINAL_EVENTS.contains(&stored.event_type.as_str())
+            && self.buffers[2].raw.len() >= FRAME_TURN_CUT_BYTES
+        {
+            self.flush(1)?;
+            self.flush(2)?;
+        }
+        Ok(())
     }
 
     /// Copy a sealed run's summary and full frames as they are (salvage,

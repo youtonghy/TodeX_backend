@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -915,18 +915,17 @@ impl ConversationStore {
         let mut draft = self.begin_conversation(&manifest).await?;
         let temporary = draft.temporary.clone();
         let filled = async {
-            // Copied ciphertext stays readable through the fork's own id:
-            // its keys are the source's. Copied first, so the draft's own key
-            // (see [`Self::draft_event`]) is added to it rather than replaced.
-            if let Some(keys) = &self.history {
-                keys.keyrings().copy_into(source_id, &temporary).await?;
-            }
+            // Only what the copied records use comes along: the frames they
+            // refer to and the keys they (and those frames) are sealed
+            // under, so history after the fork point stays with the source
+            // (a frame that straddles the fork point is the exception: it is
+            // copied whole, see docs/history-encryption.md §5.3).
+            let mut kids = HashSet::new();
             let mut after = 0u64;
             let mut copied = 0u64;
             while after < end {
-                let page = self.replay(source_id, after, MAX_REPLAY_LIMIT).await?;
-                // Copied sealed records keep referring to their frames.
-                write_copied_frames(&temporary, &page.frames).await?;
+                let mut page = self.replay(source_id, after, MAX_REPLAY_LIMIT).await?;
+                let mut frames = serde_json::Map::new();
                 for event in page.events {
                     if event.sequence > end {
                         break;
@@ -935,14 +934,40 @@ impl ConversationStore {
                     copied += 1;
                     let next = copy(event, copied);
                     validate_event(&next, &manifest.id, copied)?;
+                    if let Some(encrypted) = encrypted_content(&next.payload) {
+                        kids.extend(
+                            encrypted
+                                .get("kid")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                        );
+                        // Copied sealed records keep referring to their frames.
+                        for id in referenced_frames(encrypted) {
+                            if let Some(frame) = page.frames.remove(id) {
+                                frames.insert(id.to_owned(), frame);
+                            }
+                        }
+                    }
                     manifest.status = status_after_conversation_event(manifest.status, &next);
                     manifest.last_sequence = next.sequence;
                     let stored = self.draft_event(&mut draft, next, true).await?;
                     draft.writer.write(&stored).await?;
                 }
+                for frame in frames.values() {
+                    kids.extend(frame.get("kid").and_then(Value::as_str).map(str::to_owned));
+                }
+                write_copied_frames(&temporary, &frames).await?;
                 if !page.has_more {
                     break;
                 }
+            }
+            // Copied ciphertext stays readable through the fork's own id:
+            // its keys are the source's, added beside the draft's own key
+            // (see [`Self::draft_event`]).
+            if let Some(keys) = &self.history {
+                keys.keyrings()
+                    .copy_selected_into(source_id, &temporary, kids)
+                    .await?;
             }
             for next in trailer(copied) {
                 validate_event(&next, &manifest.id, manifest.last_sequence + 1)?;
@@ -4861,6 +4886,14 @@ async fn write_atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), A
 
 /// Keep the sealed frames a fork's copied records refer to in its
 /// [`COPIED_FRAMES_DIR`].
+/// The frame ids (`$enc.fr.s` and `.f`) a sealed record refers to.
+fn referenced_frames(encrypted: &serde_json::Map<String, Value>) -> impl Iterator<Item = &str> {
+    let reference = encrypted.get("fr");
+    ["s", "f"]
+        .into_iter()
+        .filter_map(move |field| reference?.get(field)?.as_str())
+}
+
 async fn write_copied_frames(
     directory: &Path,
     frames: &serde_json::Map<String, Value>,

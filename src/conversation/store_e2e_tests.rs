@@ -937,6 +937,149 @@ async fn forks_copy_ciphertext_frames_and_keys() {
     e2e.cleanup();
 }
 
+/// A sealed frame past `FRAME_TURN_CUT_BYTES` ends with its turn, so the
+/// next turn's records start a new frame.
+#[tokio::test]
+async fn large_turns_end_their_sealed_frames() {
+    let e2e = E2e::new("todex-e2e-turn-frames", true).await;
+    let id = e2e.create(None).await.id;
+    for turn in 0..6 {
+        let turn_id = format!("t{turn}");
+        let text = format!("turn {turn} says hello\n").repeat(4000);
+        for (event_type, payload) in [
+            ("turn.started", json!({"turnId": turn_id})),
+            (
+                "tool.completed",
+                json!({"turnId": turn_id, "itemId": format!("tool_{turn}"), "result": text}),
+            ),
+            ("turn.completed", json!({"turnId": turn_id})),
+        ] {
+            e2e.store.append(&id, event_type, payload).await.unwrap();
+        }
+    }
+    assert!(e2e.store.seal_active_if(&id, 1).await.unwrap());
+    while e2e.store.seal_next(&id).await.unwrap() {}
+    let (events, _) = history(&e2e.store, &id, ReplayDetail::Full).await;
+    let frame =
+        |event: &ConversationEvent| event.payload["$enc"]["fr"]["f"].as_str().map(str::to_owned);
+    // Where a turn's large output and its end share a frame, that frame is
+    // past the threshold and must end there. (A segment boundary can also
+    // leave a turn's end in a small frame of the next segment, which runs
+    // on.)
+    let mut checked = 0;
+    for window in events.windows(3) {
+        if window[1].event_type == "turn.completed"
+            && frame(&window[1]).is_some()
+            && frame(&window[0]) == frame(&window[1])
+        {
+            assert_ne!(
+                frame(&window[1]),
+                frame(&window[2]),
+                "a frame ran past turn.completed"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 2, "too few sealed turn ends to check: {checked}");
+    e2e.cleanup();
+}
+
+/// Forking through a reply copies only what the kept records use: the
+/// frames they refer to and the keys they are sealed under. Frames and keys
+/// only later turns used stay with the source.
+#[tokio::test]
+async fn forks_through_a_reply_copy_only_the_frames_and_keys_they_keep() {
+    let e2e = E2e::new("todex-e2e-fork-through", true).await;
+    let source = e2e.create(None).await.id;
+    for index in 0..900 {
+        let (event_type, payload) = mixed_payload(index);
+        e2e.store
+            .append(&source, event_type, payload)
+            .await
+            .unwrap();
+    }
+    while e2e.store.seal_next(&source).await.unwrap() {}
+    let keys = e2e.client_keys(&source).await;
+    let (source_events, source_frames) = history(&e2e.store, &source, ReplayDetail::Full).await;
+    let source_view = client_view(&keys, &source_events, &source_frames, false);
+    // The fork point: the end of the tenth turn (`mixed_payload` index 399).
+    let through = 400;
+    assert_eq!(
+        source_events[through as usize - 1].event_type,
+        "turn.completed"
+    );
+
+    let fork = ConversationManifest::new(ProviderKind::Codex, e2e.root.clone(), None, None);
+    let fork_id = fork.id.clone();
+    let copy_id = fork_id.clone();
+    e2e.store
+        .create_from_journal_through(
+            &source,
+            fork,
+            None,
+            None,
+            Some(through),
+            move |event, sequence| {
+                let mut next =
+                    ConversationEvent::new(&copy_id, sequence, event.event_type, event.payload);
+                next.time = event.time;
+                next
+            },
+            |_| Vec::new(),
+        )
+        .await
+        .unwrap();
+    let (fork_events, fork_frames) = history(&e2e.store, &fork_id, ReplayDetail::Full).await;
+    assert_eq!(fork_events.len() as u64, through);
+    let fork_keys = e2e.client_keys(&fork_id).await;
+    let fork_view = client_view(&fork_keys, &fork_events, &fork_frames, false);
+    for (copy, original) in fork_view.iter().zip(&source_view) {
+        assert_eq!(copy.payload, original.payload);
+    }
+
+    // Exactly the full frames the kept records refer to were copied (a
+    // summary replay falls back to them).
+    let referenced = fork_events
+        .iter()
+        .filter_map(|event| event.payload["$enc"].get("fr"))
+        .map(|reference| reference["f"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert!(!referenced.is_empty());
+    let copied = fs::read_dir(
+        e2e.store
+            .directory(&fork_id)
+            .unwrap()
+            .join(COPIED_FRAMES_DIR),
+    )
+    .unwrap()
+    .map(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .trim_end_matches(".json")
+            .to_owned()
+    })
+    .collect::<BTreeSet<_>>();
+    assert_eq!(copied, referenced);
+    let source_referenced = source_events
+        .iter()
+        .filter_map(|event| event.payload["$enc"].get("fr"))
+        .map(|reference| reference["f"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert!(copied.len() < source_referenced.len());
+
+    // Only the keys the kept records use; later turns' keys stay behind.
+    let used = fork_events
+        .iter()
+        .filter_map(|event| event.payload["$enc"]["kid"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let fork_kids = fork_keys.keys().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(fork_kids, used);
+    assert!(fork_kids.len() < keys.len());
+    e2e.cleanup();
+}
+
 #[tokio::test]
 async fn salvage_keeps_intact_sealed_runs_of_an_e2e_segment() {
     let e2e = E2e::new("todex-e2e-salvage", true).await;

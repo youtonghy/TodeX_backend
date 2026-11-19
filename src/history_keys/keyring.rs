@@ -245,21 +245,50 @@ impl KeyringStore {
         })
     }
 
-    /// Copies every key of `conversation_id` into `directory/keyring.json`
-    /// (a fork being assembled before it is published), so ciphertext the
-    /// fork copied stays readable through the fork's own id. Returns whether
-    /// the source had a keyring.
-    pub(crate) async fn copy_into(&self, conversation_id: &str, directory: &Path) -> Result<bool> {
+    /// Copies the keys `kids` of `conversation_id` into
+    /// `directory/keyring.json` (a fork being assembled before it is
+    /// published), so the ciphertext the fork copied stays readable through
+    /// the fork's own id while keys only later history used stay behind.
+    /// Keys the draft already holds (its own one-off key) are kept after the
+    /// copied ones. Returns how many keys were copied.
+    pub(crate) async fn copy_selected_into(
+        &self,
+        conversation_id: &str,
+        directory: &Path,
+        kids: HashSet<String>,
+    ) -> Result<usize> {
         let source = self.path(conversation_id)?;
         let target = directory.join(FILE_NAME);
         let lock = self.lock_for(conversation_id);
         let _guard = lock.lock().await;
-        blocking(move || match read_keyring(&source)? {
-            Some(file) if !file.keys.is_empty() => {
-                write_keyring(&target, &file)?;
-                Ok(true)
+        blocking(move || {
+            let Some(file) = read_keyring(&source)? else {
+                return Ok(0);
+            };
+            let mut keys = file
+                .keys
+                .into_iter()
+                .filter(|key| kids.contains(&key.kid))
+                .collect::<Vec<_>>();
+            let copied = keys.len();
+            if copied == 0 {
+                return Ok(0);
             }
-            _ => Ok(false),
+            if let Some(existing) = read_keyring(&target)? {
+                for key in existing.keys {
+                    if !keys.iter().any(|copied| copied.kid == key.kid) {
+                        keys.push(key);
+                    }
+                }
+            }
+            write_keyring(
+                &target,
+                &KeyringFile {
+                    version: FILE_VERSION,
+                    keys,
+                },
+            )?;
+            Ok(copied)
         })
         .await
     }

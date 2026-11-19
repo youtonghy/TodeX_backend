@@ -4702,11 +4702,25 @@ mod tests {
         for (copy, original) in forked.iter().zip(&source) {
             assert_eq!(copy.payload["$enc"], original.payload["$enc"]);
         }
-        // Plus the fork's own key, which encrypted its `conversation.forked`.
-        assert_eq!(
-            keys.keyrings().keys(&fork.id).await.unwrap().len(),
-            keys.keyrings().keys(&manifest.id).await.unwrap().len() + 1
-        );
+        // The keys the copies use (not the source's title key or keys no
+        // copied record uses), plus the fork's own key, which encrypted its
+        // `conversation.forked`.
+        let used = source
+            .iter()
+            .filter_map(|event| event.payload["$enc"]["kid"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let fork_kids = keys
+            .keyrings()
+            .keys(&fork.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|key| key.kid)
+            .collect::<Vec<_>>();
+        assert_eq!(fork_kids.len(), used.len() + 1);
+        assert!(used
+            .iter()
+            .all(|kid| fork_kids.iter().any(|fork_kid| fork_kid == kid)));
         assert!(encrypted_content(&forked.last().unwrap().payload).is_some());
         supervisor.delete_owned("local", &fork.id).await.unwrap();
         fs::remove_dir_all(root).unwrap();
