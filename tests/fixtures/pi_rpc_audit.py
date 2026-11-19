@@ -39,7 +39,13 @@ def ui(method, **fields):
     out({'type': 'extension_ui_request', 'id': fields.pop('id', 'ui-' + method), 'method': method, **fields})
 
 def idle_events():
-    time.sleep(0.08)
+    # Between turns: the test releases them once its turn has ended, since
+    # under load the host can take longer than any fixed delay to end it.
+    deadline = time.time() + 10
+    while not os.path.exists('idle-go') and time.time() < deadline:
+        time.sleep(0.01)
+    if os.path.exists('idle-go'):
+        os.remove('idle-go')
     ui('notify', message='idle notification', notifyType='info')
     custom('idle custom message')
     ui('confirm', id='idle-confirm', title='Background confirmation')
@@ -185,42 +191,59 @@ def background_subagent(settles):
     finish(text='launched')
     if not settles:
         return
+    if scenario == 'bg-subagent-at-settle':
+        # The run settles, and Pi starts its report, before Pi answers the
+        # host's settled-state query (see the get_state handler).
+        return
     def settle():
-        global streaming
         time.sleep(float(open('pi-bg-delay').read()) if os.path.exists('pi-bg-delay') else 0.8)
-        ui('setStatus', id='status-bg-done', statusKey='subagents')
-        out({'type': 'entry_appended', 'entry': {'type': 'custom', 'id': 'r1', 'customType': 'subagents:record',
-             'data': {'id': 'bg-1', 'type': 'general-purpose', 'description': 'Scan tests', 'status': 'completed', 'result': 'Tests scanned.'}}})
-        streaming = True
-        out({'type': 'agent_start'})
-        message = {'role': 'custom', 'customType': 'subagent-notification', 'display': True,
-                   'content': '<task-notification>...</task-notification>',
-                   'details': {'id': 'bg-1', 'description': 'Scan tests', 'status': 'completed', 'resultPreview': 'Tests scanned.'}}
-        out({'type': 'message_start', 'message': message})
-        out({'type': 'message_end', 'message': message})
-        if os.path.exists('pi-own-run-wait'):
-            # Holds the run until a prompt queued behind it arrives.
-            for _ in range(300):
-                if queue:
-                    break
-                time.sleep(0.01)
-        out({'type': 'message_start', 'message': {'role': 'assistant'}})
-        out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop', 'content': [{'type': 'text', 'text': 'report'}], 'usage': {'input': 1, 'output': 1}}})
-        while queue:
-            text = queue.pop(0)
-            out({'type': 'message_start', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': text}]}})
-            out({'type': 'message_start', 'message': {'role': 'assistant'}})
-            out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop', 'content': [{'type': 'text', 'text': 'after ' + text}], 'usage': {'input': 1, 'output': 1}}})
-        streaming = False
-        out({'type': 'agent_end'})
-        out({'type': 'agent_settled'})
+        start_own_report()
+        finish_own_report()
     threading.Thread(target=settle, daemon=True).start()
+
+def start_own_report():
+    # The background run settles and Pi starts a run of its own to report it.
+    # Like Pi's single event loop, agent_start is written before the state
+    # turns streaming, so a later get_state answer follows it.
+    global streaming
+    ui('setStatus', id='status-bg-done', statusKey='subagents')
+    out({'type': 'entry_appended', 'entry': {'type': 'custom', 'id': 'r1', 'customType': 'subagents:record',
+         'data': {'id': 'bg-1', 'type': 'general-purpose', 'description': 'Scan tests', 'status': 'completed', 'result': 'Tests scanned.'}}})
+    out({'type': 'agent_start'})
+    streaming = True
+    message = {'role': 'custom', 'customType': 'subagent-notification', 'display': True,
+               'content': '<task-notification>...</task-notification>',
+               'details': {'id': 'bg-1', 'description': 'Scan tests', 'status': 'completed', 'resultPreview': 'Tests scanned.'}}
+    out({'type': 'message_start', 'message': message})
+    out({'type': 'message_end', 'message': message})
+
+def finish_own_report():
+    global streaming
+    if os.path.exists('pi-own-run-wait'):
+        # Holds the run until a prompt queued behind it arrives; it breaks
+        # as soon as one does, so the bound only matters under heavy load.
+        for _ in range(3000):
+            if queue:
+                break
+            time.sleep(0.01)
+    out({'type': 'message_start', 'message': {'role': 'assistant'}})
+    out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop', 'content': [{'type': 'text', 'text': 'report'}], 'usage': {'input': 1, 'output': 1}}})
+    while queue:
+        text = queue.pop(0)
+        out({'type': 'message_start', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': text}]}})
+        out({'type': 'message_start', 'message': {'role': 'assistant'}})
+        out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop', 'content': [{'type': 'text', 'text': 'after ' + text}], 'usage': {'input': 1, 'output': 1}}})
+    streaming = False
+    out({'type': 'agent_end'})
+    out({'type': 'agent_settled'})
 
 def update_queue():
     out({'type': 'queue_update', 'steering': steering[:], 'followUp': queue[:]})
 
 # User messages on the branch, as (entryId, text), for get_fork_messages.
 user_entries = []
+# Background runs already reported (bg-subagent-at-settle reports once).
+reported = set()
 
 for line in sys.stdin:
     cmd = json.loads(line)
@@ -235,10 +258,16 @@ for line in sys.stdin:
     elif kind == 'get_state':
         if cmd.get('id') == 'settled-state' and scenario == 'subagents-during-state':
             settle_background()
+        own_report_at_settle = cmd.get('id') == 'settled-state' and scenario == 'bg-subagent-at-settle' and 'bg-1' not in reported
+        if own_report_at_settle:
+            reported.add('bg-1')
+            start_own_report()
         if cmd.get('id') == 'state' and scenario == 'buffer-idle':
             out({'type': 'message_start', 'message': {'role': 'assistant'}})
             out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop', 'content': [{'type': 'text', 'text': 'background before next prompt'}], 'usage': {'input': 1, 'output': 2}}})
         ack(cmd, state())
+        if own_report_at_settle:
+            threading.Thread(target=finish_own_report, daemon=True).start()
         if cmd.get('id') == 'accepted-state':
             if scenario == 'normal':
                 finish()
@@ -320,9 +349,9 @@ for line in sys.stdin:
             threading.Thread(target=idle_events, daemon=True).start()
         elif scenario == 'rejected':
             out({'type': 'response', 'id': cmd.get('id'), 'command': kind, 'success': False, 'error': 'fixture command rejected'})
-        elif scenario in ['bg-subagent', 'bg-forever']:
+        elif scenario in ['bg-subagent', 'bg-forever', 'bg-subagent-at-settle']:
             ack(cmd)
-            background_subagent(scenario == 'bg-subagent')
+            background_subagent(scenario != 'bg-forever')
         elif scenario == 'malformed':
             ack(cmd)
             print('not-json', flush=True)

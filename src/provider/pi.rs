@@ -1976,7 +1976,12 @@ async fn read_pi_turn(
                     .await?;
                 let state = rpc.wait_response("settled-state").await?;
                 save_pi_state(sink, &mut provider_state, &state, prompt).await?;
-                rpc.reusable = pi_is_idle(&state);
+                // Pi may already be on a run of its own (a background
+                // subagent settled right after the turn and Pi started its
+                // report): its `agent_start` is among the frames held for the
+                // answer, and the worker loop takes that run over between
+                // turns. Only a busy state nothing explains closes the runtime.
+                rpc.reusable = pi_is_idle(&state) || pi_started_own_run(&state, &rpc.events);
                 return pi_turn_result(
                     provider_state.native_session_id.clone(),
                     stop_reason.clone(),
@@ -3235,6 +3240,21 @@ async fn resolve_extension_ui(
     })
 }
 
+/// Whether Pi is busy only with a run it started itself after the turn
+/// settled: streaming, not compacting, nothing queued, and that run's
+/// `agent_start` among the frames read before `state` was answered.
+fn pi_started_own_run(state: &Value, held: &VecDeque<Value>) -> bool {
+    state.pointer("/data/isStreaming").and_then(Value::as_bool) == Some(true)
+        && state.pointer("/data/isCompacting").and_then(Value::as_bool) == Some(false)
+        && state
+            .pointer("/data/pendingMessageCount")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && held
+            .iter()
+            .any(|frame| frame.get("type").and_then(Value::as_str) == Some("agent_start"))
+}
+
 fn pi_is_idle(state: &Value) -> bool {
     state.pointer("/data/isStreaming").and_then(Value::as_bool) == Some(false)
         && state.pointer("/data/isCompacting").and_then(Value::as_bool) == Some(false)
@@ -4035,7 +4055,10 @@ mod tests {
             &self,
             matches: impl Fn(&crate::conversation::ConversationEvent) -> bool,
         ) -> crate::conversation::ConversationEvent {
-            for _ in 0..300 {
+            // A deadline, not a count of polls: under a loaded test run each
+            // history read takes longer too.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
                 if let Some(event) = self
                     .store
                     .complete_history(&self.manifest.id)
@@ -4048,7 +4071,32 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            panic!("fixture event did not arrive");
+            let seen = self
+                .store
+                .complete_history(&self.manifest.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|event| {
+                    let turn = event
+                        .payload
+                        .get("turnId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let status = event
+                        .payload
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let reason = event
+                        .payload
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    format!("{}@{turn}:{status}:{reason}", event.event_type)
+                })
+                .collect::<Vec<_>>();
+            panic!("fixture event did not arrive; journal: {seen:?}");
         }
 
         /// Runs `scenario` requesting `model` and `effort`.
@@ -4088,6 +4136,14 @@ mod tests {
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                 .filter(|command| command["type"] == kind || command["id"] == kind)
                 .count()
+        }
+
+        /// Lets the `schedule-idle` scenario send its between-turn events,
+        /// once the turn that started them has ended.
+        async fn release_idle_events(&self) {
+            tokio::fs::write(self.root.join("idle-go"), b"")
+                .await
+                .unwrap();
         }
 
         async fn launches(&self) -> usize {
@@ -5113,6 +5169,7 @@ mod tests {
         use crate::conversation::ConversationStatus;
         let fixture = Fixture::new().await;
         fixture.run("schedule-idle", "idle-start").await.unwrap();
+        fixture.release_idle_events().await;
         let request = fixture
             .wait_event(|event| event.event_type == "permission.requested")
             .await;
@@ -5177,6 +5234,7 @@ mod tests {
         assert_eq!(custom.payload.get("scope"), Some(&json!("session")));
 
         fixture.run("schedule-idle", "idle-again").await.unwrap();
+        fixture.release_idle_events().await;
         let pending = fixture
             .wait_event(|event| {
                 event.event_type == "permission.requested" && event.event_id != request.event_id
@@ -5398,6 +5456,38 @@ mod tests {
             .await;
         // Everything was reported: nothing lost with the process.
         assert!(lost.try_recv().is_err());
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pis_own_report_starting_before_the_settled_state_keeps_the_runtime() {
+        // The background run settles and Pi starts its report before it
+        // answers the turn's settled-state query, which then reads streaming:
+        // the runtime stays, and the report is journalled between turns.
+        let fixture = Fixture::new().await;
+        fixture
+            .run("bg-subagent-at-settle", "launch")
+            .await
+            .unwrap();
+        fixture
+            .wait_event(|event| {
+                event.event_type == "message.completed"
+                    && event.payload.get("turnId").is_none()
+                    && event.payload.to_string().contains("report")
+            })
+            .await;
+        let events = fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "provider.runtime"
+                && event.payload["status"] == "stopped"));
+        fixture.run("pure", "next").await.unwrap();
+        assert_eq!(fixture.launches().await, 1);
         fixture.finish().await;
     }
 
