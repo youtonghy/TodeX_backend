@@ -241,7 +241,7 @@ e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容�
 | `grant.progress` | `history.grant.fulfill` 写入了新封装（含不带 `grantId` 的恢复自授权） | `rid`（目标）、`grantId`（有则带）、`conversationIds`（本批实际新增封装的 v2 会话 id，去重） |
 | `grant.fulfilled` | `history.grant.fulfill` 带 `complete: true` 把授权标为 `fulfilled` | `grantId`、`rid`；同一批若也写入了封装，先推 `grant.progress` 再推本条 |
 
-TUI 在独立进程中改写 `recipients.json`，daemon 按文件戳（mtime + 长度）检测：每 2 秒轮询一次，且每条 `history.*` 命令执行前也检查一次；新出现在 `revokedDevices` 中的设备各推送一条 `device.revoked`。批量履约中途某个会话写入失败时，已写入的会话仍以 `grant.progress` 推送，随后返回错误。
+TUI 在独立进程中改写 `recipients.json`；daemon 与 TUI 的每次读—改—写都持有跨进程锁 `recipients.json.lock`（等待至多 2 秒），从重新读取一直持有到原子替换，双方的变更不会互相覆盖。daemon 按文件戳（mtime + 长度）检测外部改动：每 2 秒轮询一次，且每条 `history.*` 命令执行前也检查一次；新出现在 `revokedDevices` 中的设备各推送一条 `device.revoked`。批量履约中途某个会话写入失败时，已写入的会话仍以 `grant.progress` 推送，随后返回错误。
 
 `conversation.retry` 必须携带 `text` + `content`（客户端从 `retryRequest` 解密所得），或旧式的 `prompt`（解密后的原请求文本），否则 `INVALID_REQUEST`。`last-request.json` 不含提示原文：`request.text` 为空串、内联 `text`/`image` 内容项被移除，只保留 `textMac`（去掉首尾空白后的请求文本的 HMAC；prompt 执行前同样去掉首尾空白，`message.created` 的 `content` 即此形式）、`contentMac`（内联项 JSON 的 HMAC）与文件引用；去掉首尾空白后的 `prompt` 的 HMAC 必须等于 `textMac`（快照是明文时去掉首尾空白后必须等于原文；此前未去空白封存的快照也接受原样 `prompt`），否则 `CONFLICT`。为此用户 `message.created` 的加密 payload 另带 `retryRequest: {text, content}`：去掉首尾空白的原请求文本与原始 `content` 项（内联文本、图片与文件引用，按原顺序）；摘要流不含该字段。客户端重试时把它解密后作为 `{conversationId, text, content}` 发回：`text` 校验 `textMac`，`content` 中的内联项（`text`/`image`）序列化后校验 `contentMac`、文件引用须与快照保留的一致，全部通过后按原顺序重放，因此带内联文本、图片或只选 Skill 的请求同样可以重试。只带 `prompt`（旧客户端）的重试仅在原请求没有内联项时可用，否则返回 `CONFLICT`，提示需要原始内容项。旧版明文快照只存在于只读的 `legacyPlaintext` 会话中，重试会被 `HISTORY_READ_ONLY` 拒绝。
 

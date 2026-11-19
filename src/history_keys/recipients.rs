@@ -8,9 +8,13 @@
 //! with auth on a device's new key replaces its previous one.
 //!
 //! The TUI revokes devices from another process, so like `devices.json` the
-//! file is reloaded whenever its stamp changes. When device auth is on, a
-//! device recipient whose device is no longer in `devices.json` is revoked on
-//! the next access even if the TUI hook did not run.
+//! file is reloaded whenever its stamp changes, and every read-modify-write
+//! (the daemon's and [`revoke_device_recipients`]) holds the cross-process
+//! `recipients.json.lock` ([`secure_fs::lock_exclusive`]) from the reload
+//! to the replacement, so neither side overwrites the other's change. When
+//! device auth is on, a device recipient whose device is no longer in
+//! `devices.json` is revoked on the next access even if the TUI hook did not
+//! run.
 //!
 //! Revoked devices are also blocked (`revokedDevices`): a blocked device may
 //! only call `history.encryption.get` until another device restores it, so
@@ -550,6 +554,9 @@ impl RecipientRegistry {
         operation: impl FnOnce(&mut RecipientsFile, Timestamp) -> Result<T>,
     ) -> Result<Applied<T>> {
         let mut inner = self.lock()?;
+        // Held until the replacement below, so a writer in another process
+        // (the TUI hook) cannot change the file between reload and write.
+        let _file_lock = lock_file(&inner.path)?;
         inner.reload_if_changed()?;
         let now = (self.clock)();
         let mut file = inner.file.clone();
@@ -652,6 +659,8 @@ impl Inner {
         }
     }
 
+    /// Publishes `file`. Callers hold [`lock_file`] and reloaded under it,
+    /// so no external change is overwritten and the stamp is our own.
     fn write(&mut self, file: RecipientsFile) -> Result<()> {
         write_file(&self.path, &file)?;
         self.file = file;
@@ -836,7 +845,24 @@ fn write_file(path: &Path, file: &RecipientsFile) -> Result<()> {
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(invalid("history recipient registry file is too large"));
     }
-    write_private_file(path, &bytes)
+    write_private_file(path, &bytes)?;
+    #[cfg(test)]
+    tests::after_write();
+    Ok(())
+}
+
+/// Takes `recipients.json.lock`, the cross-process lock every
+/// read-modify-write of the registry file holds. Creates the owner-only
+/// history directory first, so the lock file never creates it with looser
+/// permissions.
+fn lock_file(path: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        secure_fs::ensure_owner_only_dir(parent)?;
+    }
+    Ok(secure_fs::lock_exclusive(
+        &secure_fs::lock_path(path),
+        secure_fs::STATE_LOCK_TIMEOUT,
+    )?)
 }
 
 /// Which devices [`revoke_device_recipients`] revokes.
@@ -853,12 +879,18 @@ pub(crate) enum DeviceRevocation<'a> {
 /// device recipients of the selected devices and blocks those devices
 /// (`revokedBy: "tui"`) in one atomic write. Returns how many recipients
 /// were revoked. A missing registry file changes nothing: no device has
-/// history keys yet. The daemon notices the change by the file stamp.
+/// history keys yet. The daemon notices the change by the file stamp. The
+/// read-modify-write holds [`lock_file`], so it neither loses nor undoes a
+/// concurrent daemon write.
 pub(crate) fn revoke_device_recipients(
     data_dir: &Path,
     devices: DeviceRevocation<'_>,
 ) -> Result<usize> {
     let path = data_dir.join(HISTORY_DIR).join(FILE_NAME);
+    if !path.exists() {
+        return Ok(0);
+    }
+    let _file_lock = lock_file(&path)?;
     let Some(mut file) = read_file(&path)? else {
         return Ok(0);
     };
@@ -925,6 +957,23 @@ fn not_registered() -> AppError {
 mod tests {
     use super::*;
     use crate::history_keys::{system_clock, test_support::*};
+    use std::{cell::RefCell, time::Duration};
+
+    thread_local! {
+        static AFTER_WRITE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs the hook [`on_next_write`] set on this thread, right after
+    /// [`write_file`] replaced the file.
+    pub(super) fn after_write() {
+        if let Some(hook) = AFTER_WRITE.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    fn on_next_write(hook: impl FnOnce() + 'static) {
+        AFTER_WRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
 
     /// Device auth off: every client is the `local` device.
     fn registry(root: &Path) -> RecipientRegistry {
@@ -1194,6 +1243,46 @@ mod tests {
             .unwrap()
             .device_id;
         (devices, device_id)
+    }
+
+    /// A TUI revocation started while the daemon is mid-write waits for the
+    /// daemon's lock, then applies on top of the daemon's change: neither
+    /// write is lost.
+    #[test]
+    fn a_tui_revocation_waits_for_the_daemon_write_and_both_survive() {
+        let root = temp_dir("concurrent");
+        let (devices, a) = paired(&root, 1);
+        let (_, b) = paired(&root, 2);
+        let registry = RecipientRegistry::load(&root, Some(devices), system_clock()).unwrap();
+        let rid_a = registry.register_device(&a, &recipient(1)).unwrap().value;
+        let revoker = std::sync::Arc::new(Mutex::new(None));
+        {
+            let (root, a, revoker) = (root.clone(), a.clone(), revoker.clone());
+            on_next_write(move || {
+                let handle = std::thread::spawn(move || {
+                    revoke_device_recipients(&root, DeviceRevocation::One(&a)).unwrap()
+                });
+                std::thread::sleep(Duration::from_millis(150));
+                assert!(
+                    !handle.is_finished(),
+                    "the TUI revocation must wait for the daemon's lock"
+                );
+                *revoker.lock().unwrap() = Some(handle);
+            });
+        }
+        let rid_b = registry.register_device(&b, &recipient(2)).unwrap().value;
+        let handle = revoker.lock().unwrap().take().expect("hook ran");
+        assert_eq!(handle.join().unwrap(), 1);
+
+        // The daemon reloads the TUI's write, which kept the daemon's change.
+        assert!(!registry.is_active(&rid_a).unwrap());
+        assert!(registry.is_active(&rid_b).unwrap());
+        let file = read_file(&root.join(HISTORY_DIR).join(FILE_NAME))
+            .unwrap()
+            .unwrap();
+        assert!(file.is_blocked(&a));
+        assert!(file.active(&rid_b).is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
