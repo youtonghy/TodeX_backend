@@ -45,7 +45,17 @@ pub fn containing_workspace_root<'a>(roots: &'a [PathBuf], path: &Path) -> Optio
 }
 
 pub fn validate_workspace_directory(roots: &[PathBuf], path: &Path) -> Result<PathBuf, AppError> {
-    let canonical_roots = canonical_workspace_roots(roots);
+    validate_workspace_directory_within(&canonical_workspace_roots(roots), path)
+}
+
+/// [`validate_workspace_directory`] against roots already resolved with
+/// [`canonical_workspace_roots`], so validating many paths resolves the
+/// roots once. Blocking filesystem calls: async callers validating a batch
+/// run it on the blocking pool.
+pub fn validate_workspace_directory_within(
+    canonical_roots: &[PathBuf],
+    path: &Path,
+) -> Result<PathBuf, AppError> {
     let path = expand_home(path);
     if !path.is_absolute() {
         return Err(AppError::InvalidRequest(
@@ -62,7 +72,7 @@ pub fn validate_workspace_directory(roots: &[PathBuf], path: &Path) -> Result<Pa
     }
 
     let canonical = fs::canonicalize(&path).map_err(AppError::Io)?;
-    if containing_workspace_root(&canonical_roots, &canonical).is_some() {
+    if containing_workspace_root(canonical_roots, &canonical).is_some() {
         return Ok(canonical);
     }
     Err(AppError::WorkspacePathOutsideRoot)
@@ -72,13 +82,26 @@ pub fn validate_workspace_directory_text(
     roots: &[PathBuf],
     path: &str,
 ) -> Result<PathBuf, AppError> {
+    validate_workspace_directory(roots, required_path(path)?)
+}
+
+/// [`validate_workspace_directory_text`] against already canonical roots
+/// (see [`validate_workspace_directory_within`]).
+pub fn validate_workspace_directory_text_within(
+    canonical_roots: &[PathBuf],
+    path: &str,
+) -> Result<PathBuf, AppError> {
+    validate_workspace_directory_within(canonical_roots, required_path(path)?)
+}
+
+fn required_path(path: &str) -> Result<&Path, AppError> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err(AppError::InvalidRequest(
             "workspace path is required".to_owned(),
         ));
     }
-    validate_workspace_directory(roots, Path::new(trimmed))
+    Ok(Path::new(trimmed))
 }
 
 pub fn expand_home(path: &Path) -> PathBuf {

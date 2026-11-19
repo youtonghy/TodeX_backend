@@ -574,7 +574,7 @@ pub(super) async fn workspaces(
     let auth = require_auth(&state, &headers)?;
     let snapshot = state.workspaces.snapshot_owned(&auth.tenant_id).await;
     let (workspaces, rejected) =
-        partition_available_workspaces(&state.config.workspace_roots, snapshot.workspaces);
+        partition_available_workspaces(&state.config.workspace_roots, snapshot.workspaces).await?;
     Ok(Json(WorkspacesResponse {
         workspaces,
         updated_at: snapshot.updated_at,
@@ -584,15 +584,31 @@ pub(super) async fn workspaces(
 }
 
 /// Revalidates stored workspace records against the filesystem so clients can
-/// grey out directories that were removed after they were synced.
-fn partition_available_workspaces(
+/// grey out directories that were removed after they were synced. The roots
+/// are resolved once per call, and the whole batch runs on the blocking
+/// pool: a slow mount must not stall the async workers.
+async fn partition_available_workspaces(
+    workspace_roots: &[PathBuf],
+    records: Vec<WorkspaceRecord>,
+) -> Result<(Vec<WorkspaceRecord>, Vec<RejectedWorkspace>), AppError> {
+    let roots = workspace_roots.to_vec();
+    tokio::task::spawn_blocking(move || partition_available_workspaces_blocking(&roots, records))
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))
+}
+
+fn partition_available_workspaces_blocking(
     workspace_roots: &[PathBuf],
     records: Vec<WorkspaceRecord>,
 ) -> (Vec<WorkspaceRecord>, Vec<RejectedWorkspace>) {
+    let canonical_roots = crate::workspace_paths::canonical_workspace_roots(workspace_roots);
     let mut workspaces = Vec::with_capacity(records.len());
     let mut rejected = Vec::new();
     for record in records {
-        match validate_workspace_directory_text(workspace_roots, &record.path) {
+        match crate::workspace_paths::validate_workspace_directory_text_within(
+            &canonical_roots,
+            &record.path,
+        ) {
             Ok(_) => workspaces.push(record),
             Err(error) => rejected.push(RejectedWorkspace {
                 id: record.id,
@@ -629,7 +645,7 @@ pub(super) async fn replace_workspaces(
     let snapshot = merged.snapshot;
     let deleted = deleted_workspaces(snapshot.deleted);
     let (workspaces, mut rejected) =
-        partition_available_workspaces(&state.config.workspace_roots, snapshot.workspaces);
+        partition_available_workspaces(&state.config.workspace_roots, snapshot.workspaces).await?;
     let mut seen_rejected = rejected
         .iter()
         .map(|item| (item.id.clone(), item.path.clone()))

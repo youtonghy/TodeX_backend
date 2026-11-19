@@ -10,7 +10,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::{error::AppError, workspace_paths::validate_workspace_directory_text};
+use crate::{
+    error::AppError,
+    workspace_paths::{canonical_workspace_roots, validate_workspace_directory_text_within},
+};
 
 const WORKSPACES_FILE: &str = "workspaces.json";
 /// Deleted workspaces remembered per store; the oldest are forgotten first.
@@ -171,7 +174,14 @@ impl WorkspaceStore {
         owner_id: &str,
         workspaces: Vec<WorkspaceRecord>,
     ) -> Result<WorkspaceMerge, AppError> {
-        let normalized = normalize_workspaces(workspaces, &self.workspace_roots, Some(owner_id));
+        // Every record is checked on disk: off the async workers.
+        let roots = self.workspace_roots.clone();
+        let owner = owner_id.to_owned();
+        let normalized = tokio::task::spawn_blocking(move || {
+            normalize_workspaces(workspaces, &roots, Some(&owner))
+        })
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))?;
         let mut current = self.inner.write().await;
         // Merge into a copy: a merge that is not written leaves the
         // in-memory snapshot (every tenant's records and tombstones) as is.
@@ -314,8 +324,9 @@ fn normalize_workspaces(
     let mut normalized: HashMap<(String, String), WorkspaceRecord> =
         HashMap::with_capacity(workspaces.len());
     let mut rejected = Vec::new();
+    let canonical_roots = canonical_workspace_roots(workspace_roots);
     for mut workspace in workspaces {
-        let path = match validate_workspace_record(workspace_roots, &workspace) {
+        let path = match validate_workspace_record(&canonical_roots, &workspace) {
             Ok(path) => path,
             Err(error) => {
                 rejected.push(RejectedWorkspace {
@@ -399,7 +410,7 @@ fn normalize_tags(values: Vec<String>) -> Vec<String> {
 }
 
 fn validate_workspace_record(
-    roots: &[PathBuf],
+    canonical_roots: &[PathBuf],
     workspace: &WorkspaceRecord,
 ) -> Result<PathBuf, AppError> {
     if workspace.name.trim().is_empty() {
@@ -407,7 +418,7 @@ fn validate_workspace_record(
             "workspace name is required".to_owned(),
         ));
     }
-    validate_workspace_directory_text(roots, &workspace.path)
+    validate_workspace_directory_text_within(canonical_roots, &workspace.path)
 }
 
 pub fn stable_workspace_id(path: &Path) -> String {
