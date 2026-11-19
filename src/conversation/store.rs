@@ -1727,10 +1727,14 @@ impl ConversationStore {
                     });
                     terminated = true;
                     self.maintenance.request(conversation_id);
-                    // Each DEK's records stay inside one sealed file, which
-                    // is what lets the seal converter repack them and then
-                    // drop the key. A key that expired was just replaced by
-                    // one that has sealed nothing yet.
+                    // Each DEK's records normally stay inside one sealed
+                    // file, which is what lets the seal converter repack
+                    // them and then drop the key. A key that expired was
+                    // just replaced by one that has sealed nothing yet. When
+                    // no new key can be had (every recipient revoked), the
+                    // running turn continues under the previous key in the
+                    // fresh file; the converter keeps that key until the
+                    // fresh file is sealed too (`release_repacked_locked`).
                     if let Some(keys) = self.history.as_ref().filter(|_| !key_expiring) {
                         keys.deks().rotate(conversation_id).await;
                         key = self.record_key(conversation_id).await?;
@@ -3640,15 +3644,6 @@ impl ConversationStore {
         if !matches!(committed, Ok(true)) {
             prepared.discard();
         }
-        if matches!(committed, Ok(true)) && !prepared.repacked.is_empty() {
-            // The repacked records now live in sealed frames: their DEKs
-            // are no longer needed and are zeroized (§3.2).
-            if let Some(keys) = &self.history {
-                keys.deks()
-                    .release_sealed(conversation_id, &prepared.repacked)
-                    .await;
-            }
-        }
         if committed.is_ok() && self.commit_stop().is_some() {
             // A simulated crash ends the caller like a killed process.
             return Err(AppError::Conflict(
@@ -3717,9 +3712,18 @@ impl ConversationStore {
             // A simulated crash: leave the directory as it is and forget
             // everything, like a restarted process would.
             self.forget_journal_caches_locked(conversation_id);
+            self.release_repacked_locked(conversation_id, prepared, false)
+                .await;
             return Ok(true);
         }
         let new_files = journal_files(directory).await?;
+        // Released under the conversation lock, so no append can pick up a
+        // key between deciding it is unused and dropping it.
+        let journal_continues = new_files
+            .iter()
+            .any(|file| !file.is_sealed_segment() && file.bytes > 0);
+        self.release_repacked_locked(conversation_id, prepared, journal_continues)
+            .await;
         let sealed = SealedSegment::from_body(number, &prepared.body)
             .map_err(|error| segment_error(conversation_id, number, error))?;
         let sealed = Arc::new(sealed);
@@ -3773,6 +3777,26 @@ impl ConversationStore {
             "sealed journal segment"
         );
         Ok(true)
+    }
+
+    /// The repacked records of a committed segment now live in sealed
+    /// frames: their DEKs are no longer needed and are zeroized (§3.2),
+    /// except the newest one while unsealed records may still use it (see
+    /// [`crate::history_keys::DekManager::release_sealed_keeping`]).
+    async fn release_repacked_locked(
+        &self,
+        conversation_id: &str,
+        prepared: &PreparedSegment,
+        journal_continues: bool,
+    ) {
+        if prepared.repacked.is_empty() {
+            return;
+        }
+        if let Some(keys) = &self.history {
+            keys.deks()
+                .release_sealed_keeping(conversation_id, &prepared.repacked, journal_continues)
+                .await;
+        }
     }
 
     /// The crash-injection point of segment commits (always `None` outside

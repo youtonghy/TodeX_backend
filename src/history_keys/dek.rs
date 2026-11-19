@@ -351,21 +351,41 @@ impl DekManager {
 
     /// Drops keys whose segments are sealed (including the active one if
     /// listed). Each key is zeroized once its last user lets go.
+    #[cfg(test)]
     pub(crate) async fn release_sealed(&self, conversation_id: &str, kids: &[String]) {
+        self.release_sealed_keeping(conversation_id, kids, false)
+            .await;
+    }
+
+    /// [`Self::release_sealed`] for a segment commit. `journal_continues`:
+    /// the conversation still has unsealed records after the segment. The
+    /// newest key then stays in memory even if the segment repacked it: a
+    /// running turn that could not get a new key (every recipient revoked)
+    /// kept encrypting under it in the next file (§3.2), and its records,
+    /// and the turn's remaining ones, still need it until that file is
+    /// sealed in turn.
+    pub(crate) async fn release_sealed_keeping(
+        &self,
+        conversation_id: &str,
+        kids: &[String],
+        journal_continues: bool,
+    ) {
         let Some(slot) = self.existing_slot(conversation_id) else {
             return;
         };
         let empty = {
             let mut keys = slot.lock().await;
+            let kept = keys.newest.clone().filter(|_| journal_continues);
+            let released = |kid: &String| kids.contains(kid) && kept.as_ref() != Some(kid);
             if keys
                 .active
                 .as_ref()
-                .is_some_and(|active| kids.contains(&active.kid))
+                .is_some_and(|active| released(&active.kid))
             {
                 keys.active = None;
             }
-            keys.retained.retain(|kid, _| !kids.contains(kid));
-            if keys.newest.as_ref().is_some_and(|kid| kids.contains(kid)) {
+            keys.retained.retain(|kid, _| !released(kid));
+            if keys.newest.as_ref().is_some_and(released) {
                 keys.newest = None;
             }
             keys.active.is_none() && keys.retained.is_empty()

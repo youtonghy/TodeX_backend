@@ -814,6 +814,61 @@ async fn running_turns_keep_their_key_when_recipients_disappear() {
     restarted.cleanup();
 }
 
+/// The running turn's key survives its first file being sealed: the turn
+/// crossed the segment size after the last recipient was revoked, so the
+/// fresh active file continues under the same key, and the seal converter
+/// must not drop it while that file still needs it (§3.2).
+#[tokio::test]
+async fn a_running_turn_keeps_its_key_across_a_segment_seal_after_revocation() {
+    let e2e = E2e::new("todex-e2e-revoked-seal", true).await;
+    let id = e2e.create(None).await.id;
+    let first = e2e
+        .store
+        .append(&id, "turn.started", json!({"turnId": "t"}))
+        .await
+        .unwrap();
+    let kid = first.payload["$enc"]["kid"].clone();
+    let rid = crate::history_keys::encode_id(&recipient(1).rid());
+    e2e.keys.recipients().revoke(&rid, "local").unwrap();
+    let directory = e2e.store.directory(&id).unwrap();
+    let text = "output ".repeat(600);
+    let mut rotated = false;
+    for _ in 0..400 {
+        let event = e2e
+            .store
+            .append(&id, "message.delta", json!({"turnId": "t", "text": text}))
+            .await
+            .unwrap();
+        assert_eq!(event.payload["$enc"]["kid"], kid);
+        if journal_files(&directory).await.unwrap().len() > 1 {
+            rotated = true;
+            break;
+        }
+    }
+    assert!(rotated, "the turn should outgrow one journal file");
+    // One more record lands in the fresh file under the same key, then the
+    // background converter seals the first file.
+    e2e.store
+        .append(&id, "message.delta", json!({"turnId": "t", "text": "more"}))
+        .await
+        .unwrap();
+    while e2e.store.seal_next(&id).await.unwrap() {}
+    let last = e2e
+        .store
+        .append(&id, "turn.completed", json!({"turnId": "t"}))
+        .await
+        .unwrap();
+    assert_eq!(last.payload["$enc"]["kid"], kid);
+    // Once the rest of the turn is sealed too, the key is released.
+    assert!(e2e.store.seal_active_if(&id, 1).await.unwrap());
+    while e2e.store.seal_next(&id).await.unwrap() {}
+    let deks = e2e.keys.deks();
+    assert!(deks.fallback_key(&id).await.is_none());
+    let (events, _) = history(&e2e.store, &id, ReplayDetail::Full).await;
+    assert_eq!(events.last().unwrap().event_type, "turn.completed");
+    e2e.cleanup();
+}
+
 #[tokio::test]
 async fn forks_copy_ciphertext_frames_and_keys() {
     let e2e = E2e::new("todex-e2e-fork", true).await;
