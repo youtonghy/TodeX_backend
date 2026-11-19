@@ -30,9 +30,12 @@ struct UploadQuery {
     upload_id: Option<String>,
     #[serde(default)]
     offset: u64,
-    /// A private conversation of the caller: the upload is stored in its
-    /// private folder and deleted with it. Any other conversation (or none)
-    /// uses the shared upload directory.
+    /// A conversation of the caller. A private one stores the upload in its
+    /// private folder, deleted with it; any other conversation (or none)
+    /// uses the shared upload directory. A conversation that does not exist
+    /// (or is not the caller's) is `NOT_FOUND`: a private conversation that
+    /// was already deleted leaves nothing to tell it apart, and its files
+    /// must not fall back to the shared directory and its retention.
     #[serde(default)]
     conversation_id: Option<String>,
 }
@@ -55,11 +58,7 @@ async fn upload(
 ) -> Result<Json<UploadResponse>, AppError> {
     let auth = require_auth(&state, &headers)?;
     let private = match query.conversation_id.as_deref() {
-        Some(id) => state
-            .conversations
-            .get_owned(&auth.tenant_id, id)
-            .await
-            .ok()
+        Some(id) => Some(state.conversations.get_owned(&auth.tenant_id, id).await?)
             .filter(|manifest| manifest.ephemeral)
             .map(|manifest| manifest.id),
         None => None,
@@ -255,6 +254,15 @@ mod tests {
             .await
             .unwrap();
         assert!(!private.exists());
+        assert!(!folder.exists());
+        // A first chunk that arrives after the deletion is refused instead
+        // of landing in the shared directory; so is an unknown conversation.
+        let unknown = uuid::Uuid::new_v4().to_string();
+        for id in [conversation.id.as_str(), unknown.as_str()] {
+            let uri = format!("/v2/uploads?name=late.txt&offset=0&conversationId={id}");
+            let response = app.clone().oneshot(put(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
         assert!(!folder.exists());
         let _ = std::fs::remove_dir_all(shared.parent().unwrap());
         let _ = std::fs::remove_dir_all(root);
