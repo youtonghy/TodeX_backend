@@ -13,12 +13,29 @@ use tracing::warn;
 use crate::{error::AppError, workspace_paths::validate_workspace_directory_text};
 
 const WORKSPACES_FILE: &str = "workspaces.json";
+/// Deleted workspaces remembered per store; the oldest are forgotten first.
+const MAX_WORKSPACE_TOMBSTONES: usize = 512;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSnapshot {
     pub workspaces: Vec<WorkspaceRecord>,
     pub updated_at: u64,
+    /// Workspaces deleted through `DELETE /v2/workspaces/{id}`. A client that
+    /// still holds one pushes it back with its old `updated_at`; the merge
+    /// skips it, and clients drop their local copy when they see it here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted: Vec<WorkspaceTombstone>,
+}
+
+/// A deleted workspace: records of it not updated after `deleted_at` stay deleted.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTombstone {
+    pub id: String,
+    pub path: String,
+    pub tenant_id: String,
+    pub deleted_at: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -125,6 +142,12 @@ impl WorkspaceStore {
                 .cloned()
                 .collect(),
             updated_at: snapshot.updated_at,
+            deleted: snapshot
+                .deleted
+                .iter()
+                .filter(|tombstone| tombstone.tenant_id == owner_id)
+                .cloned()
+                .collect(),
         }
     }
 
@@ -160,17 +183,35 @@ impl WorkspaceStore {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let mut deleted = std::mem::take(&mut current.deleted);
         for workspace in normalized.workspaces {
-            by_id.insert(
-                (workspace.tenant_id.clone(), workspace.id.clone()),
-                workspace,
-            );
+            let key = (workspace.tenant_id.clone(), workspace.id.clone());
+            // A client pushing an older copy (it has not pulled the newer one
+            // yet) does not undo the newer edit.
+            if by_id
+                .get(&key)
+                .is_some_and(|stored| stored.updated_at > workspace.updated_at)
+            {
+                continue;
+            }
+            // A copy of a deleted workspace not edited since stays deleted; a
+            // newer one (the workspace was added again) ends the tombstone.
+            if let Some(index) = deleted.iter().position(|tombstone| {
+                tombstone.tenant_id == workspace.tenant_id && tombstone.id == workspace.id
+            }) {
+                if workspace.updated_at <= deleted[index].deleted_at {
+                    continue;
+                }
+                deleted.remove(index);
+            }
+            by_id.insert(key, workspace);
         }
         let mut workspaces = by_id.into_values().collect::<Vec<_>>();
         workspaces.sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at));
         let snapshot = WorkspaceSnapshot {
             workspaces,
             updated_at: now_millis(),
+            deleted,
         };
         write_snapshot(&self.path, &snapshot).await?;
         *current = snapshot.clone();
@@ -183,14 +224,33 @@ impl WorkspaceStore {
 
     pub async fn delete_owned(&self, owner_id: &str, workspace_id: &str) -> Result<bool, AppError> {
         let mut current = self.inner.write().await;
-        let before = current.workspaces.len();
-        current
+        let Some(index) = current
             .workspaces
-            .retain(|workspace| workspace.tenant_id != owner_id || workspace.id != workspace_id);
-        if current.workspaces.len() == before {
+            .iter()
+            .position(|workspace| workspace.tenant_id == owner_id && workspace.id == workspace_id)
+        else {
             return Ok(false);
+        };
+        let removed = current.workspaces.remove(index);
+        let now = now_millis();
+        current
+            .deleted
+            .retain(|tombstone| tombstone.tenant_id != owner_id || tombstone.id != workspace_id);
+        // At least the record's own time, so a copy carrying it stays deleted
+        // even when this clock runs behind the client's.
+        current.deleted.push(WorkspaceTombstone {
+            id: removed.id,
+            path: removed.path,
+            tenant_id: removed.tenant_id,
+            deleted_at: now.max(removed.updated_at),
+        });
+        if current.deleted.len() > MAX_WORKSPACE_TOMBSTONES {
+            current
+                .deleted
+                .sort_by_key(|tombstone| std::cmp::Reverse(tombstone.deleted_at));
+            current.deleted.truncate(MAX_WORKSPACE_TOMBSTONES);
         }
-        current.updated_at = now_millis();
+        current.updated_at = now;
         write_snapshot(&self.path, &current).await?;
         Ok(true)
     }
@@ -649,6 +709,116 @@ mod tests {
             group_tags: Vec::new(),
             tags: Vec::new(),
         }
+    }
+
+    fn record(path: &Path, name: &str, updated_at: u64) -> WorkspaceRecord {
+        WorkspaceRecord {
+            id: String::new(),
+            name: name.to_owned(),
+            path: path.display().to_string(),
+            session_id: String::new(),
+            tenant_id: "local".to_owned(),
+            thread_id: String::new(),
+            model: String::new(),
+            reasoning_effort: None,
+            approval_policy: "on-request".to_owned(),
+            sandbox_mode: "workspace-write".to_owned(),
+            permission_profile: None,
+            approvals_reviewer: None,
+            service_tier: None,
+            local_adapter_state: None,
+            icon: None,
+            icon_color: None,
+            ring_style: None,
+            created_at: 1,
+            updated_at,
+            sort_order: None,
+            group_id: None,
+            group_name: None,
+            group_tags: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_copy_does_not_undo_a_newer_edit() {
+        let root = make_temp_dir("todex-workspace-store-newer");
+        let workspace_root = root.join("workspaces");
+        let path = workspace_root.join("app");
+        fs::create_dir_all(&path).unwrap();
+        let store = WorkspaceStore::new(root.clone(), vec![workspace_root])
+            .await
+            .unwrap();
+        store
+            .merge_owned("local", vec![record(&path, "Renamed on the phone", 200)])
+            .await
+            .unwrap();
+        // A desktop that has not pulled yet pushes its stale copy.
+        let snapshot = store
+            .merge_owned("local", vec![record(&path, "Old name", 100)])
+            .await
+            .unwrap()
+            .snapshot;
+        assert_eq!(snapshot.workspaces[0].name, "Renamed on the phone");
+        // An equal time is the same edit sent again; a newer one wins.
+        let snapshot = store
+            .merge_owned("local", vec![record(&path, "Newer", 300)])
+            .await
+            .unwrap()
+            .snapshot;
+        assert_eq!(snapshot.workspaces[0].name, "Newer");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_workspace_stays_deleted_until_added_again() {
+        let root = make_temp_dir("todex-workspace-store-tombstone");
+        let workspace_root = root.join("workspaces");
+        let path = workspace_root.join("app");
+        fs::create_dir_all(&path).unwrap();
+        let store = WorkspaceStore::new(root.clone(), vec![workspace_root.clone()])
+            .await
+            .unwrap();
+        let id = store
+            .merge_owned("local", vec![record(&path, "App", 100)])
+            .await
+            .unwrap()
+            .snapshot
+            .workspaces[0]
+            .id
+            .clone();
+        assert!(store.delete_owned("local", &id).await.unwrap());
+        let deleted = store.snapshot_owned("local").await.deleted;
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].id, id);
+        assert!(store.snapshot_owned("other").await.deleted.is_empty());
+
+        // A client still holding the old copy pushes it back: it stays deleted.
+        let snapshot = store
+            .merge_owned("local", vec![record(&path, "App", 100)])
+            .await
+            .unwrap()
+            .snapshot;
+        assert!(snapshot.workspaces.is_empty());
+        assert_eq!(snapshot.deleted.len(), 1);
+
+        // The tombstone survives a restart.
+        let reloaded = WorkspaceStore::new(root.clone(), vec![workspace_root])
+            .await
+            .unwrap();
+        assert_eq!(reloaded.snapshot_owned("local").await.deleted.len(), 1);
+
+        // Added again later: the newer record wins and the tombstone goes.
+        let later = deleted[0].deleted_at + 1;
+        let snapshot = reloaded
+            .merge_owned("local", vec![record(&path, "App again", later)])
+            .await
+            .unwrap()
+            .snapshot;
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].name, "App again");
+        assert!(snapshot.deleted.is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {

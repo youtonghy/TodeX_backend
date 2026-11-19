@@ -995,13 +995,15 @@ DELETE /v2/workspaces/{workspaceId}
 }
 ```
 
-`PUT` 请求体使用同样的 `workspaces` 数组。后端会校验 `name`、`path`、路径存在性和根目录边界，按当前认证身份和规范化路径合并记录，并返回后端生成的稳定 ID。它不会接受客户端伪造的租户，也不会持久化设备本地的 `threadId` 和 `localAdapterState`。可选的 `icon`、`iconColor`、`ringStyle` 是客户端的侧栏展示偏好（图标键名、`#rrggbb` 颜色与状态环样式键名），后端只做透传持久化，不校验取值。可选的 `groupId`、`groupName` 表示侧栏分组：共享同一 `groupId` 的工作区组成一组，`groupName` 是复制到每个成员上的组名；后端只做去首尾空白并截断到 64 个字符，空值视为不在分组中。分组没有独立存储，跟随工作区记录整体合并，因此成员离组时客户端直接省略这两个字段即可。可选的 `tags`（工作区自身标签）与 `groupTags`（分组标签，像 `groupName` 一样复制到每个成员上）是字符串数组：后端去掉控制字符和首尾空白、每个标签截断到 32 个字符、丢弃空值与不区分大小写的重复项（保留首次出现的写法），每个列表最多保留 16 个；空列表在响应中省略。它们同样随记录整体合并，省略即表示没有标签，因此不认识这两个字段的旧客户端保存工作区时会清空标签。
+`PUT` 请求体使用同样的 `workspaces` 数组。后端会校验 `name`、`path`、路径存在性和根目录边界，按当前认证身份和规范化路径合并记录，并返回后端生成的稳定 ID。合并按 `updatedAt` 取新：已存记录的 `updatedAt` 比提交的新时保留已存记录（尚未拉取最新快照的客户端推送旧副本不会撤销别处较新的修改），相等或更新时用提交的记录替换。它不会接受客户端伪造的租户，也不会持久化设备本地的 `threadId` 和 `localAdapterState`。可选的 `icon`、`iconColor`、`ringStyle` 是客户端的侧栏展示偏好（图标键名、`#rrggbb` 颜色与状态环样式键名），后端只做透传持久化，不校验取值。可选的 `groupId`、`groupName` 表示侧栏分组：共享同一 `groupId` 的工作区组成一组，`groupName` 是复制到每个成员上的组名；后端只做去首尾空白并截断到 64 个字符，空值视为不在分组中。分组没有独立存储，跟随工作区记录整体合并，因此成员离组时客户端直接省略这两个字段即可。可选的 `tags`（工作区自身标签）与 `groupTags`（分组标签，像 `groupName` 一样复制到每个成员上）是字符串数组：后端去掉控制字符和首尾空白、每个标签截断到 32 个字符、丢弃空值与不区分大小写的重复项（保留首次出现的写法），每个列表最多保留 16 个；空列表在响应中省略。它们同样随记录整体合并，省略即表示没有标签，因此不认识这两个字段的旧客户端保存工作区时会清空标签。
 
 校验失败的记录（例如目录已被删除或位于 `workspace_roots` 之外）不再让整个请求报错：它们会被跳过并在响应的 `rejected` 数组中回报，每项包含客户端提交的 `id`、`name`、`path`、错误 `code`（如 `WORKSPACE_PATH_NOT_FOUND`）和 `message`；即使请求中所有记录都被拒绝也按同样方式返回 200。`GET` 和 `PUT` 响应都会重新校验已持久化的记录：目录后来被删除的存量记录同样只出现在 `rejected` 中，不再阻塞同步；客户端可据此把失效工作区灰显并在路径恢复后自动复原。加载已持久化的快照时同样跳过失效路径并记录告警，因此目录被删除后 daemon 仍可正常启动。要彻底移除一条失效工作区记录，需要显式调用 `DELETE /v2/workspaces/{workspaceId}`；该操作允许目录已不存在的记录被删除。
 
 工作区没有单独的信任状态：`workspace_roots` 就是执行边界。位于根目录（或 scratch 根）内的已有目录可以直接用于 Provider 模型/命令发现、prompt、MCP 调用、Git 写操作、本地终端和本地 Codex 启动，无需先做信任决定；每次启动前后端都会重新校验目录仍存在且未逃出根目录。因此 `workspace_roots` 应只包含允许 Agent 以 daemon 用户权限运行的目录。
 
 `DELETE /v2/workspaces/{workspaceId}` 取消当前 owner 在该工作区内的活动 turn，并从目录中移除该工作区，但不会删除已有对话历史；响应为 `{ "workspaceId", "deleted", "cancelledTurns" }`。
+
+删除会留下墓碑（`id`、`path`、`deletedAt`；`deletedAt` 不早于被删记录的 `updatedAt`，每个 daemon 最多保留 512 条，最早的先丢弃），保存在 `workspaces.json` 中：之后 `PUT` 提交的同一工作区（按稳定 ID）若 `updatedAt` 不晚于 `deletedAt` 会被静默跳过（不进入 `rejected`），使仍持有旧副本的客户端无法把它推回来；`updatedAt` 更晚的提交（工作区被重新添加）照常写入并清除该墓碑。`GET` 与 `PUT` 响应始终带 `deleted: [{ "id", "path", "deletedAt" }]`（当前 owner 的墓碑，可能为空）；客户端应据此删除本地仍保留的同一工作区，而不是在下次同步时再推送它。旧版 daemon 的响应没有该字段，客户端可据此判断后端是否支持删除同步。
 
 早期版本按 owner 与路径记录工作区信任（`GET`/`PUT /v2/workspaces/{workspaceId}/trust`，未信任时返回 403 `WORKSPACE_TRUST_REQUIRED`）。该机制已移除：这两个路由不再存在（返回 404），daemon 启动时删除遗留的 `$DATA_DIR/workspace-trust.json`。
 

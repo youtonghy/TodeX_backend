@@ -579,6 +579,7 @@ pub(super) async fn workspaces(
         workspaces,
         updated_at: snapshot.updated_at,
         rejected,
+        deleted: deleted_workspaces(snapshot.deleted),
     }))
 }
 
@@ -626,6 +627,7 @@ pub(super) async fn replace_workspaces(
         );
     }
     let snapshot = merged.snapshot;
+    let deleted = deleted_workspaces(snapshot.deleted);
     let (workspaces, mut rejected) =
         partition_available_workspaces(&state.config.workspace_roots, snapshot.workspaces);
     let mut seen_rejected = rejected
@@ -642,6 +644,7 @@ pub(super) async fn replace_workspaces(
         workspaces,
         updated_at: snapshot.updated_at,
         rejected,
+        deleted,
     }))
 }
 
@@ -4516,6 +4519,31 @@ pub(super) struct WorkspacesResponse {
     updated_at: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rejected: Vec<RejectedWorkspace>,
+    /// Workspaces deleted on this backend; always present (possibly empty) so
+    /// clients can tell a backend that reports deletions from an older one.
+    deleted: Vec<DeletedWorkspace>,
+}
+
+/// A deleted workspace as clients see it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DeletedWorkspace {
+    id: String,
+    path: String,
+    deleted_at: u64,
+}
+
+fn deleted_workspaces(
+    tombstones: Vec<crate::workspace_store::WorkspaceTombstone>,
+) -> Vec<DeletedWorkspace> {
+    tombstones
+        .into_iter()
+        .map(|tombstone| DeletedWorkspace {
+            id: tombstone.id,
+            path: tombstone.path,
+            deleted_at: tombstone.deleted_at,
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
