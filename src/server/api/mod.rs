@@ -134,19 +134,42 @@ pub(crate) async fn cancel_unauthorized_key_turns(state: &AppState) {
     let Ok(keys) = state.api_keys.list() else {
         return;
     };
+    if keys.is_empty() {
+        return;
+    }
+    // One listing per check, not one per key: the running conversations,
+    // grouped by owner.
+    let Ok(manifests) = state.conversations.list().await else {
+        return;
+    };
+    let mut running: std::collections::HashMap<
+        &str,
+        Vec<&crate::conversation::ConversationManifest>,
+    > = std::collections::HashMap::new();
+    for manifest in &manifests {
+        if matches!(
+            manifest.status,
+            crate::conversation::ConversationStatus::Running
+                | crate::conversation::ConversationStatus::WaitingPermission
+        ) {
+            running
+                .entry(manifest.owner_id.as_str())
+                .or_default()
+                .push(manifest);
+        }
+    }
+    if running.is_empty() {
+        return;
+    }
     let now = crate::api_keys::unix_ms();
     for key in &keys {
-        let active = key.is_active(now);
         let owner = key.owner_id();
-        let Ok(manifests) = state.conversations.list_owned(&owner).await else {
+        let Some(owned) = running.get(owner.as_str()) else {
             continue;
         };
-        for manifest in manifests.iter().filter(|manifest| {
-            matches!(
-                manifest.status,
-                crate::conversation::ConversationStatus::Running
-                    | crate::conversation::ConversationStatus::WaitingPermission
-            ) && !(active
+        let active = key.is_active(now);
+        for manifest in owned.iter().filter(|manifest| {
+            !(active
                 && key.scopes.allows_agent(manifest.provider)
                 && key.scopes.allows_workspace(&manifest.workspace))
         }) {
