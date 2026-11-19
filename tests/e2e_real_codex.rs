@@ -1054,6 +1054,8 @@ async fn spawn_daemon() -> Daemon {
         .arg(&workspace_root)
         // This fixture uses device-signed plaintext WebSockets.
         .env("TODEX_AGENTD_PAIRING_ENCRYPTION", "none")
+        // These tests drive the legacy codex.local gateway, off by default.
+        .env("TODEX_AGENTD_LEGACY_CODEX_GATEWAY", "true")
         .env("TODEX_AGENTD_CODEX_BIN", codex_binary())
         .env(
             "TODEX_AGENTD_PI_BIN",
@@ -1163,6 +1165,8 @@ async fn spawn_fake_history_daemon() -> Daemon {
         .arg(&workspace_root)
         // This fixture uses device-signed plaintext WebSockets.
         .env("TODEX_AGENTD_PAIRING_ENCRYPTION", "none")
+        // These tests drive the legacy codex.local gateway, off by default.
+        .env("TODEX_AGENTD_LEGACY_CODEX_GATEWAY", "true")
         .env("TODEX_AGENTD_CODEX_BIN", &fake_codex)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
