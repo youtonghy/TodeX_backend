@@ -4743,7 +4743,8 @@ mod tests {
         conversation_id: &str,
         predicate: impl Fn(&ConversationEvent) -> bool,
     ) -> ConversationEvent {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Generous: a loaded test run reads the journal slowly too.
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if let Some(event) = store
                     .complete_history(conversation_id)

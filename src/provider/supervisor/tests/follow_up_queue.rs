@@ -1574,12 +1574,14 @@ async fn resume_sends_a_scheduled_queue_now_and_clear_keeps_the_schedule() {
 #[tokio::test]
 async fn archiving_or_deleting_ends_a_schedule() {
     let (root, store, supervisor, workspace, gate) = gated_fixture("todex-schedule-archive").await;
+    // Both schedules are due soon enough to wait out, with room for a loaded
+    // test run to archive and delete first; then neither may send.
     let manifest = supervisor
         .create(ProviderKind::ClaudeCode, workspace.clone(), None, None)
         .await
         .unwrap();
     supervisor
-        .schedule_owned("local", &manifest.id, Some(in_ms(300)))
+        .schedule_owned("local", &manifest.id, Some(in_ms(2_000)))
         .await
         .unwrap();
     add(&supervisor, &manifest.id, "a", queued_prompt("a")).await;
@@ -1596,14 +1598,18 @@ async fn archiving_or_deleting_ends_a_schedule() {
         .create(ProviderKind::ClaudeCode, workspace, None, None)
         .await
         .unwrap();
+    // The later of the two schedules.
+    let due = tokio::time::Instant::now() + Duration::from_millis(2_000);
     supervisor
-        .schedule_owned("local", &deleted.id, Some(in_ms(300)))
+        .schedule_owned("local", &deleted.id, Some(in_ms(2_000)))
         .await
         .unwrap();
     add(&supervisor, &deleted.id, "b", queued_prompt("b")).await;
     supervisor.delete_owned("local", &deleted.id).await.unwrap();
-    sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep_until(due + Duration::from_millis(500)).await;
     assert!(gate.prompts().is_empty());
+    let (ids, _) = queue_ids(&supervisor, &manifest.id).await;
+    assert_eq!(ids, ["a"]);
     assert!(store.get(&deleted.id).await.is_err());
     fs::remove_dir_all(root).unwrap();
 }

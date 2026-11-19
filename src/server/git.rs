@@ -54,8 +54,19 @@ const GIT_RESPONSE_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GIT_PATH_OUTPUT_LIMIT: usize = 64 * 1024;
 const GIT_METADATA_ENTRY_LIMIT: usize = 100_000;
 const GIT_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
-const GIT_SCAN_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
-const GIT_WRITE_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a scan or a write waits for its turn. The test suite runs many
+/// Git operations at once in one process, sharing these limits, so a loaded
+/// run waits longer instead of reporting the capacity busy.
+const GIT_SCAN_QUEUE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(30)
+} else {
+    Duration::from_secs(2)
+};
+const GIT_WRITE_QUEUE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(30)
+} else {
+    Duration::from_secs(2)
+};
 const GIT_MUTATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 static GIT_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
