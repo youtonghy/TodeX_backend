@@ -111,6 +111,8 @@ DeepSeek Harness 通过 `dsh --profile acp` 接入（`npm install -g @deepseek-a
 
 ```http
 GET /v2/providers
+GET /v2/providers/quota
+GET /v2/providers/claude-code/quota
 GET /v2/providers/versions
 POST /v2/providers/{provider}/upgrade
 POST /v2/providers/{provider}/install
@@ -574,6 +576,12 @@ Pi 本身没有后台工作的概念；`@tintinweb/pi-subagents` 的后台子代
 `conversation.runtime.stop` 的 payload 为 `{ "conversationId": "..." }`，与 HTTP `/runtime/stop` 等价，关闭 Pi 进程及待答表单，保留会话日志与原生 session 信息。`conversation.cancel` / `conversation.stop` 仅取消当前回合（可带 `turnId`，见上文「取消」）。删除工作区或会话、会话过期与 daemon 关闭也会停止对应 runtime。daemon 重启时补记旧 runtime 的停止事件，并将未答表单标记为取消；session 表单不会把空闲会话改成运行中。
 
 停止后台任务：`conversation.backgroundTasks.stop`（payload `{ "conversationId": "..." }`）与 HTTP `POST /v2/conversations/{conversationId}/background-tasks/stop` 等价，停止会话在回合之间仍在运行的后台任务（Claude Code 的后台命令、后台子代理及子代理留下的后台命令；不含 `ScheduleWakeup` / Cron 定时唤醒）。只有能力 `backgroundTaskStop: true` 的 provider（目前仅 Claude Code）支持，其余返回 `UNSUPPORTED`；有回合正在运行时返回 `CONFLICT`，应先用 `conversation.cancel` 停止回合。daemon 向 Claude 进程逐个发送 `stop_task` 控制请求，结果为 `{ "conversationId", "stoppedTaskIds": [...] }`（没有进程或没有后台任务时为空数组）；Claude 一个都没停下时返回错误。停下的任务会追加一条 `provider.event`，`providerMethod: "background_tasks_ended"`、`metadata: { "taskIds", "reason": "user_stopped" }`，客户端据此结束「等待后台任务」状态。
+
+### Claude Code 地区预检
+
+`capabilities.claudeRegionPreflight: true` 表示 daemon 会在启动受管 Claude Code、发送 prompt 或重发、以及直接请求官方模型目录之前检查出口地区。daemon 从目标域名的 `/cdn-cgi/trace` 获取出口 IP，用 `ipx.al` 查询该 IP 的归属地，并应用 [Anthropic 的地区政策](https://www.anthropic.com/legal/supported-regions)。`ipx.al` 只收到出口 IP。无法核实地区的自定义上游会被拦截。
+
+`GET /v2/providers/claude-code/quota` 先运行预检，随后返回最近一次 `quota.updated` 记录的 Claude 快照。`GET /v2/providers/quota` 中的 Claude 数据依旧是只读快照。确认地区不受支持时返回 HTTP `403`，错误码 `CLAUDE_REGION_UNSUPPORTED`，并附 `region`（两位地区码）。无法验证时返回 `503 CLAUDE_REGION_UNVERIFIED`。WebSocket 使用 `server.error`，已开始的 turn 使用 `turn.failed`。排队消息被拦截后保留在暂停的队列中。
 
 ### 预热（conversation.warm）
 

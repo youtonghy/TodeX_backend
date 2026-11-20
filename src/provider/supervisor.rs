@@ -477,6 +477,7 @@ struct SpawnTurn {
     cancel: watch::Receiver<bool>,
     /// See [`TurnHandles::adopt`].
     adopt: Option<String>,
+    queued: Option<follow_ups::FollowUpItem>,
 }
 
 struct ActiveTurn {
@@ -2220,6 +2221,11 @@ impl ConversationSupervisor {
         }
         Ok(match warmed {
             Ok(Ok(outcome)) => outcome.reason(),
+            Ok(Err(
+                error @ (AppError::ClaudeRegionUnverified | AppError::ClaudeRegionUnsupported(_)),
+            )) => {
+                return Err(error);
+            }
             Ok(Err(error)) => {
                 tracing::warn!(conversation_id, error = %error, "provider prewarm failed");
                 Some("failed")
@@ -2478,6 +2484,17 @@ impl ConversationSupervisor {
         owner_id: &str,
         conversation_id: &str,
         prompt: ConversationPrompt,
+    ) -> Result<String, AppError> {
+        self.prompt_with_queue_item(owner_id, conversation_id, prompt, None)
+            .await
+    }
+
+    async fn prompt_with_queue_item(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        prompt: ConversationPrompt,
+        queued: Option<follow_ups::FollowUpItem>,
     ) -> Result<String, AppError> {
         // Every prompt path (direct, retry, queue delivery) passes here;
         // `save_request` checks again under the conversation lock.
@@ -2778,6 +2795,7 @@ impl ConversationSupervisor {
             },
             cancel: cancel_rx,
             adopt: None,
+            queued,
         });
         Ok(turn_id)
     }
@@ -2833,6 +2851,7 @@ impl ConversationSupervisor {
             prompt: driver_prompt,
             cancel: cancel_rx,
             adopt,
+            queued,
         } = turn;
         let conversation_id = manifest.id.clone();
         // The turn has started: TodeX's own MCP tools follow its permission
@@ -2904,6 +2923,15 @@ impl ConversationSupervisor {
                     }
                 },
             };
+            let preflight_error = match &outcome {
+                Ok(Err(error)) if error.is_claude_region_error() => Some(error.to_string()),
+                _ => None,
+            };
+            if let (Some(item), Some(message)) = (queued, preflight_error) {
+                supervisor
+                    .restore_region_blocked_follow_up(&conversation_id, item, message)
+                    .await;
+            }
             let terminal = supervisor
                 .finish_turn(
                     &conversation_id,
@@ -3096,6 +3124,7 @@ impl ConversationSupervisor {
             },
             cancel: cancel_rx,
             adopt: Some(adoption),
+            queued: None,
         });
         Ok(())
     }
@@ -3164,15 +3193,16 @@ impl ConversationSupervisor {
                 let message = error.to_string();
                 self.record_provider_error(conversation_id, provider_state, &message)
                     .await;
-                (
-                    "turn.failed",
-                    json!({
-                        "turnId": turn_id,
-                        "clientRequestId": client_request_id,
-                        "code": error.code(),
-                        "message": message,
-                    }),
-                )
+                let mut payload = json!({
+                    "turnId": turn_id,
+                    "clientRequestId": client_request_id,
+                    "code": error.code(),
+                    "message": message,
+                });
+                if let Some(region) = error.claude_region() {
+                    payload["region"] = json!(region);
+                }
+                ("turn.failed", payload)
             }
             (Err(error), None) => {
                 let (code, message) = driver_task_failure(error);

@@ -544,6 +544,8 @@ pub(in crate::provider) struct LaunchKey {
     /// Digest of the user `settings.json`, which carries the active provider
     /// profile's environment (API key, base URL) and is read at start-up.
     settings: Option<[u8; 32]>,
+    /// A network-setting change must not reuse the older process.
+    egress: crate::provider::claude_region::CliEgress,
     /// A private conversation's process (`--no-session-persistence`).
     ephemeral: bool,
 }
@@ -580,6 +582,10 @@ impl LaunchKey {
                 .map(|launch| Sha256::digest(format!("{launch:?}")).into()),
             config_dir,
             settings,
+            egress: crate::provider::claude_region::CliEgress::read(Some(
+                &context.manifest.workspace,
+            ))
+            .await?,
             ephemeral: context.manifest.ephemeral,
         })
     }
@@ -943,7 +949,7 @@ async fn worker(
                     started = async {
                         let key = LaunchKey::new(&launcher.binary, &context, &settings).await?;
                         let (process, runtime_id) =
-                            super::spawn_claude(&launcher.binary, &context, &settings)
+                            super::spawn_claude(&launcher.binary, &context, &settings, &key.egress)
                                 .await?;
                         // Held before `initialize`: a failed process is
                         // stopped by this worker, which stays in the table
@@ -1056,7 +1062,7 @@ async fn worker(
             outcome = async {
                 if live.is_none() {
                     let (process, runtime_id) =
-                        super::spawn_claude(&launcher.binary, &context, &prompt).await?;
+                        super::spawn_claude(&launcher.binary, &context, &prompt, &key.egress).await?;
                     let started = live.insert(Live::new(process, key, runtime_id.clone()));
                     started.context_lost = super::super::types::private_context_lost(&context);
                     let expected = started.key.permission_mode.clone();
@@ -1088,6 +1094,7 @@ async fn worker(
                 let mut handoff = None;
                 let outcome = super::run_claude_turn(
                     &mut started.process,
+                    &started.key.egress,
                     &mut started.usage,
                     &mut started.mode,
                     context,
@@ -1421,8 +1428,10 @@ async fn run_once(
         prompt.approval_policy.as_deref(),
     )?
     .provider_mode;
+    let egress =
+        crate::provider::claude_region::CliEgress::read(Some(&context.manifest.workspace)).await?;
     let (mut process, runtime_id) =
-        super::spawn_claude(&launcher.binary, &context, &prompt).await?;
+        super::spawn_claude(&launcher.binary, &context, &prompt, &egress).await?;
     let result = async {
         let mut mode = super::initialize_session(
             &mut process,
@@ -1439,6 +1448,7 @@ async fn run_once(
         // The process ends with the turn, and its background work with it.
         super::run_claude_turn(
             &mut process,
+            &egress,
             &mut super::ClaudeUsageLedger::default(),
             &mut mode,
             context,
@@ -1883,6 +1893,37 @@ done
 
     fn cleanup(root: &Path) {
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn region_preflight_stops_spawn_and_rechecks_a_warm_process() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let region = manifest.workspace.join("mock-claude-region");
+        tokio::fs::write(&region, "CN").await.unwrap();
+        let error = fixture.prewarm(&sessions, &manifest).await.unwrap_err();
+        assert_eq!(error.code(), "CLAUDE_REGION_UNSUPPORTED");
+        assert!(fixture.launches().is_empty());
+        assert!(fixture.wire().is_empty());
+
+        tokio::fs::write(&region, "US").await.unwrap();
+        fixture.turn(&sessions, &manifest, "allowed").await;
+        assert_eq!(fixture.launches().len(), 1);
+        assert_eq!(fixture.wire().matches(r#""type":"user""#).count(), 1);
+
+        tokio::fs::write(&region, "UA").await.unwrap();
+        let (_cancel, cancel) = watch::channel(false);
+        let error = fixture
+            .run(&sessions, &manifest, "blocked", None, cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "CLAUDE_REGION_UNVERIFIED");
+        assert_eq!(fixture.launches().len(), 1);
+        assert_eq!(fixture.wire().matches(r#""type":"user""#).count(), 1);
+        assert!(!fixture.wire().contains("blocked"));
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
     }
 
     #[tokio::test]

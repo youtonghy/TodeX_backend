@@ -41,6 +41,8 @@ pub struct ProviderCapabilities {
     pub native_mcp: bool,
     pub managed_mcp: bool,
     pub model_selection: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub claude_region_preflight: bool,
     pub image_input: bool,
     pub image_input_mode: ImageInputMode,
 }

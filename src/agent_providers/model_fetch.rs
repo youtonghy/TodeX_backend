@@ -75,7 +75,12 @@ pub async fn fetch_models(agent: ProviderKind, settings: &Value) -> Result<Value
     let anthropic = anthropic_style(agent, settings);
     let url = models_url(anthropic, &base_url);
 
-    let mut request = http_client()?.get(&url);
+    let client = http_client()?;
+    if agent == ProviderKind::ClaudeCode {
+        let target = reqwest::Url::parse(&url).map_err(|_| AppError::ClaudeRegionUnverified)?;
+        crate::provider::claude_region::check_http(client, &target).await?;
+    }
+    let mut request = client.get(&url);
     if let Some(key) = api_key.filter(|key| !key.is_empty()) {
         request = request
             .header("authorization", format!("Bearer {key}"))

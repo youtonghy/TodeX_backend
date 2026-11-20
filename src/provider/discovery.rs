@@ -289,6 +289,10 @@ async fn store_fetched<V: Clone>(
 fn shared_error(error: &AppError) -> AppError {
     match error {
         AppError::ProviderUnavailable(detail) => AppError::ProviderUnavailable(detail.clone()),
+        AppError::ClaudeRegionUnsupported(region) => {
+            AppError::ClaudeRegionUnsupported(region.clone())
+        }
+        AppError::ClaudeRegionUnverified => AppError::ClaudeRegionUnverified,
         AppError::Unsupported(detail) => AppError::Unsupported(detail.clone()),
         AppError::InvalidRequest(detail) => AppError::InvalidRequest(detail.clone()),
         AppError::Conflict(detail) => AppError::Conflict(detail.clone()),

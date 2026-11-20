@@ -117,6 +117,10 @@ pub enum AppError {
     StorageLow(String),
     #[error("provider unavailable: {0}")]
     ProviderUnavailable(String),
+    #[error("Claude Code is not available in the detected region ({0})")]
+    ClaudeRegionUnsupported(String),
+    #[error("Could not verify that the Claude Code egress is in a supported region")]
+    ClaudeRegionUnverified,
     /// The CLI ships with the container image (`managedBy: "image"`); TodeX
     /// neither installs nor upgrades it. Update the image instead.
     #[error("CLI is managed by the container image: {0}")]
@@ -150,6 +154,20 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub(crate) fn is_claude_region_error(&self) -> bool {
+        matches!(
+            self,
+            Self::ClaudeRegionUnsupported(_) | Self::ClaudeRegionUnverified
+        )
+    }
+
+    pub(crate) fn claude_region(&self) -> Option<&str> {
+        match self {
+            Self::ClaudeRegionUnsupported(region) => Some(region),
+            _ => None,
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidRequest(_) => "INVALID_REQUEST",
@@ -186,6 +204,8 @@ impl AppError {
             Self::HistoryReadOnly => "HISTORY_READ_ONLY",
             Self::StorageLow(_) => "STORAGE_LOW",
             Self::ProviderUnavailable(_) => "PROVIDER_UNAVAILABLE",
+            Self::ClaudeRegionUnsupported(_) => "CLAUDE_REGION_UNSUPPORTED",
+            Self::ClaudeRegionUnverified => "CLAUDE_REGION_UNVERIFIED",
             Self::CliManagedByImage(_) => "CLI_MANAGED_BY_IMAGE",
             Self::RemoteAuthFailed(_) => "REMOTE_AUTH_FAILED",
             Self::RemoteHostKeyUnverified(_) => "REMOTE_HOST_KEY_UNVERIFIED",
@@ -236,7 +256,10 @@ impl IntoResponse for AppError {
             Self::HistoryKeyRequired | Self::HistoryReadOnly | Self::CliManagedByImage(_) => {
                 StatusCode::CONFLICT
             }
-            Self::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ProviderUnavailable(_) | Self::ClaudeRegionUnverified => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::ClaudeRegionUnsupported(_) => StatusCode::FORBIDDEN,
             // Not 401: clients treat that as a failed device signature.
             Self::RemoteAuthFailed(_) | Self::RemoteHostKeyUnverified(_) => StatusCode::FORBIDDEN,
             Self::RemoteUnreachable(_) | Self::BrowserTargetUnreachable(_) => {
@@ -252,6 +275,9 @@ impl IntoResponse for AppError {
             "code": self.code(),
             "message": self.to_string(),
         });
+        if let Some(region) = self.claude_region() {
+            body["region"] = json!(region);
+        }
         if let Self::AuthTimestampRejected { server_time } = self {
             body["serverTime"] = json!(server_time);
         }

@@ -103,7 +103,7 @@ fn is_zero(value: &u32) -> bool {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FollowUpItem {
+pub(super) struct FollowUpItem {
     id: String,
     #[serde(with = "crate::time::serde_timestamp")]
     queued_at: Timestamp,
@@ -320,8 +320,16 @@ impl ConversationSupervisor {
         }
         let busy = self.active.contains_key(conversation_id);
         if !busy && !paused && queue.items.is_empty() && !queue.scheduled() {
+            let queued =
+                (manifest.provider == crate::conversation::ProviderKind::ClaudeCode).then(|| {
+                    FollowUpItem {
+                        id: item_id.to_owned(),
+                        queued_at: Timestamp::now(),
+                        request: prompt.clone(),
+                    }
+                });
             return self
-                .prompt_inner(owner_id, conversation_id, prompt)
+                .prompt_with_queue_item(owner_id, conversation_id, prompt, queued)
                 .await
                 .map(FollowUpAddOutcome::Started);
         }
@@ -717,8 +725,9 @@ impl ConversationSupervisor {
                 return Ok(());
             }
             let manifest = self.store.get(conversation_id).await?;
+            let queued = (manifest.provider == crate::conversation::ProviderKind::ClaudeCode).then(|| head.clone());
             match self
-                .prompt_inner(&manifest.owner_id, conversation_id, head.request)
+                .prompt_with_queue_item(&manifest.owner_id, conversation_id, head.request, queued)
                 .await
             {
                 Ok(_) => {
@@ -735,6 +744,29 @@ impl ConversationSupervisor {
         .await;
         if let Err(error) = result {
             tracing::error!(conversation_id, error = %error, "failed to advance follow-up queue");
+        }
+    }
+
+    /// The journal already reserved the first request id. Explicitly resuming
+    /// the paused item needs a fresh id, or deduplication would skip the retry.
+    pub(super) async fn restore_region_blocked_follow_up(
+        &self,
+        conversation_id: &str,
+        mut item: FollowUpItem,
+        message: String,
+    ) {
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        let mut queue = self.load_follow_ups(conversation_id);
+        queue.items.retain(|queued| queued.id != item.id);
+        item.id = format!("claude-region-retry-{}", uuid::Uuid::new_v4().simple());
+        item.request.client_request_id = Some(item.id.clone());
+        queue.items.insert(0, item);
+        if !queue.held_by_user() {
+            queue.pause("turn_failed", Some(message));
+            queue.resume_at = None;
+        }
+        if let Err(error) = self.save_follow_ups(conversation_id, &queue).await {
+            tracing::error!(conversation_id, error = %error, "failed to keep the Claude follow-up that region preflight blocked");
         }
     }
 

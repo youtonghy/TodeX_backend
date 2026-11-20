@@ -183,6 +183,7 @@ impl ProviderProfile {
             native_mcp: self.native_mcp,
             managed_mcp: self.managed_mcp(),
             model_selection: self.model_selection,
+            claude_region_preflight: self.kind == ProviderKind::ClaudeCode,
             image_input: self.image_input,
             image_input_mode: self.image_input_mode,
         }

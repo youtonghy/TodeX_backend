@@ -17,7 +17,24 @@ use crate::quota_store::now_ms;
 use super::v2::require_auth;
 
 pub(super) fn routes() -> Router<AppState> {
-    Router::new().route("/v2/providers/quota", get(provider_quota))
+    Router::new()
+        .route("/v2/providers/quota", get(provider_quota))
+        .route("/v2/providers/claude-code/quota", get(claude_quota))
+}
+
+async fn claude_quota(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    crate::provider::claude_region::check_quota().await?;
+    Ok(Json(claude_snapshot(&state)))
+}
+
+fn claude_snapshot(state: &AppState) -> Value {
+    state.quota.get("claude-code").unwrap_or_else(|| {
+        json!({"provider":"claude-code","scope":"account","state":"idle","reason":"Claude Code reports plan limits during a turn; run a session first."})
+    })
 }
 
 async fn provider_quota(
@@ -48,10 +65,7 @@ async fn provider_quota(
     providers.insert("codex".to_owned(), codex);
     providers.insert("antigravity".to_owned(), antigravity);
 
-    let claude = state.quota.get("claude-code").unwrap_or_else(|| {
-        json!({"provider":"claude-code","scope":"account","state":"idle","reason":"Claude Code reports plan limits during a turn; run a session first."})
-    });
-    providers.insert("claude-code".to_owned(), claude);
+    providers.insert("claude-code".to_owned(), claude_snapshot(&state));
 
     // Devin's ACP server advertises no plan-quota surface today (verified
     // against devin 3000.11.3: no `billingInformation` push on initialize,

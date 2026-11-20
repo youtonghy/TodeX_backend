@@ -3,6 +3,7 @@
 mod acp;
 pub(crate) mod antigravity;
 mod claude;
+pub(crate) mod claude_region;
 mod cli_manager;
 pub(crate) mod codex;
 pub(crate) mod deepseek_harness;

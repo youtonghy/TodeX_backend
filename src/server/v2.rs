@@ -4471,11 +4471,11 @@ fn truncate_git_error(text: String, max_bytes: usize) -> String {
 }
 
 fn error_response(id: Option<String>, error: AppError) -> Value {
-    json!({
-        "id": id,
-        "type": "server.error",
-        "payload": { "code": error.code(), "message": error.to_string() },
-    })
+    let mut payload = json!({ "code": error.code(), "message": error.to_string() });
+    if let Some(region) = error.claude_region() {
+        payload["region"] = json!(region);
+    }
+    json!({ "id": id, "type": "server.error", "payload": payload })
 }
 
 #[derive(Debug, Serialize)]

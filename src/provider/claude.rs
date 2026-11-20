@@ -657,9 +657,15 @@ impl ClaudeDriver {
 
     /// The CLI's own model list, or the built-in catalog when the probe
     /// fails, runs too long or reports no models.
-    async fn cli_models(&self, workspace: &Path) -> Vec<super::types::ProviderModelDescriptor> {
+    async fn cli_models(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
         match tokio::time::timeout(CLAUDE_CLI_MODELS_TIMEOUT, self.probe(workspace)).await {
-            Ok(Ok(probe)) if !probe.models.is_empty() => return probe.models,
+            Ok(Ok(probe)) if !probe.models.is_empty() => return Ok(probe.models),
+            Ok(Err(
+                error @ (AppError::ClaudeRegionUnverified | AppError::ClaudeRegionUnsupported(_)),
+            )) => return Err(error),
             Ok(Ok(_)) => {
                 tracing::warn!("Claude Code reported no model list; using the built-in catalog")
             }
@@ -671,7 +677,7 @@ impl ClaudeDriver {
                 tracing::warn!("Claude Code model probe timed out; using the built-in catalog")
             }
         }
-        claude_model_aliases()
+        Ok(claude_model_aliases())
     }
 }
 
@@ -700,6 +706,10 @@ async fn probe_claude(binary: &str, workspace: &Path) -> Result<ClaudeProbe, App
         "--permission-mode".to_owned(),
         "default".to_owned(),
     ];
+    super::claude_region::CliEgress::read(Some(workspace))
+        .await?
+        .check()
+        .await?;
     let mut process = JsonLineProcess::spawn(&spec).await?;
     // The sender must outlive initialize: `cancel.changed()` resolves as
     // soon as every sender drops and would masquerade as a cancellation.
@@ -744,15 +754,15 @@ impl ProviderDriver for ClaudeDriver {
         // CLI upgrades and the account's entitlements without TodeX handling
         // any credential.
         let Some(base) = claude_discovery_env("ANTHROPIC_BASE_URL") else {
-            return Ok(self.cli_models(workspace).await);
+            return self.cli_models(workspace).await;
         };
         let fetch = async {
             let Some(url) = claude_discovery_url(&base) else {
                 return Ok(claude_model_aliases());
             };
-            let request = crate::agent_providers::http_client()?
-                .get(url)
-                .timeout(CLAUDE_DISCOVERY_TIMEOUT);
+            let client = crate::agent_providers::http_client()?;
+            super::claude_region::check_http(client, &url).await?;
+            let request = client.get(url).timeout(CLAUDE_DISCOVERY_TIMEOUT);
             // Same headers Claude Code itself sends: ANTHROPIC_AUTH_TOKEN as a
             // bearer token, taking precedence over ANTHROPIC_API_KEY (x-api-key).
             let request = if let Some(token) = claude_discovery_env("ANTHROPIC_AUTH_TOKEN") {
@@ -1102,7 +1112,9 @@ async fn spawn_claude(
     binary: &str,
     context: &DriverContext,
     prompt: &DriverPrompt,
+    egress: &super::claude_region::CliEgress,
 ) -> Result<(JsonLineProcess, String), AppError> {
+    egress.check().await?;
     let (spec, session_id) = claude_launch_spec(binary, context, prompt).await?;
     let process = JsonLineProcess::spawn(&spec).await?;
     Ok((process, session_id))
@@ -2436,7 +2448,7 @@ while IFS= read -r line; do
 done
 "#,
         );
-        let models = driver.cli_models(&root).await;
+        let models = driver.cli_models(&root).await.unwrap();
         let ids = models
             .iter()
             .map(|model| model.id.as_str())
@@ -2459,7 +2471,7 @@ done
             "#!/bin/sh\nwhile IFS= read -r line; do printf '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"todex-initialize\",\"response\":{\"commands\":[]}}}\\n'; done\n",
         ] {
             let (driver, root) = driver_with_fake_claude(script);
-            let models = driver.cli_models(&root).await;
+            let models = driver.cli_models(&root).await.unwrap();
             assert_eq!(
                 models.iter().map(|model| &model.id).collect::<Vec<_>>(),
                 claude_model_aliases()
@@ -3156,6 +3168,7 @@ enum TurnStart {
 #[allow(clippy::too_many_arguments)]
 async fn run_claude_turn(
     process: &mut JsonLineProcess,
+    egress: &super::claude_region::CliEgress,
     usage_ledger: &mut ClaudeUsageLedger,
     mode: &mut permission_mode::ModeReport,
     context: DriverContext,
@@ -3171,6 +3184,7 @@ async fn run_claude_turn(
 ) -> Result<DriverTurnResult, AppError> {
     let outcome = read_claude_turn(
         process,
+        egress,
         usage_ledger,
         mode,
         context,
@@ -3207,6 +3221,7 @@ async fn run_claude_turn(
 #[allow(clippy::too_many_arguments)]
 async fn read_claude_turn(
     process: &mut JsonLineProcess,
+    egress: &super::claude_region::CliEgress,
     usage_ledger: &mut ClaudeUsageLedger,
     mode: &mut permission_mode::ModeReport,
     context: DriverContext,
@@ -3262,6 +3277,10 @@ async fn read_claude_turn(
         }
     });
     if !adopt {
+        egress.check().await?;
+        if *cancel.borrow() {
+            return Err(AppError::TurnCancelled);
+        }
         process.send(&user_message).await?;
     }
     // A replay over MAX_PROTOCOL_LINE_BYTES (a prompt with large images) is
@@ -3434,6 +3453,8 @@ async fn read_claude_turn(
                     // than ending a turn that shows an answer to it. It stays
                     // unreplayed until Claude replays it, so the resends add up.
                     prompt_resends += 1;
+                    egress.check().await?;
+                    if *cancel.borrow() { return Err(AppError::TurnCancelled); }
                     process.send(&user_message).await?;
                     wait = Some(IdleWait::start(after_idle, &work.tasks));
                     continue;
@@ -3520,6 +3541,10 @@ async fn read_claude_turn(
                     && empty_results < MAX_EMPTY_RESULT_RESENDS
                 {
                     empty_results += 1;
+                    egress.check().await?;
+                    if *cancel.borrow() {
+                        return Err(AppError::TurnCancelled);
+                    }
                     process.send(&user_message).await?;
                     continue;
                 }
