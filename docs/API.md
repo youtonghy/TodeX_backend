@@ -1480,7 +1480,7 @@ Content-Type: application/json
 
 ### SSH 密钥
 
-管理后端用户 `~/.ssh` 下的密钥。密钥解析、生成与加密均在进程内完成（不调用 `ssh-keygen`，口令不会出现在进程参数中）。
+管理后端用户 `~/.ssh` 下的密钥。列出与生成在进程内完成；导入由系统 `ssh-keygen` 校验。口令不会出现在进程参数或环境变量中。
 
 - `GET /v2/ssh/keys` → `{ sshDirectory, agentAvailable, keys: SshKey[] }`
   - 按内容识别私钥（OpenSSH / PEM），`<name>` 与 `<name>.pub` 配对；跳过 `config`、`known_hosts*`、`authorized_keys*`、目录、socket、超过 64 KiB 的文件及指向 `~/.ssh` 之外的符号链接。
@@ -1489,6 +1489,12 @@ Content-Type: application/json
 - `POST /v2/ssh/keys/import` `{ name, privateKey, publicKey?, passphrase? }` → `{ key }`。由系统 `ssh-keygen -y` 校验（系统 ssh 能加载的格式都可导入，含 OpenSSH 与传统 PEM），私钥按提交内容（CRLF 转为 LF）写入，公钥取 `ssh-keygen` 推导结果；`publicKey` 若提供必须匹配。加密私钥需提供 `passphrase`，或提供 `publicKey`（以 `ssh-keygen -l` 指纹比对）。`passphrase` 经 askpass 一次性 owner-only 文件传给 `ssh-keygen`，不进入 argv/环境变量，也不会保存；系统找不到 `ssh-keygen` 时返回 `UNSUPPORTED`。
 - `POST /v2/ssh/keys/generate` `{ name, algorithm?, comment?, passphrase? }` → `{ key }`。`algorithm`：`ed25519`（默认）、`rsa`（4096 位）、`ecdsa`（P-256）。
 - 名称为 `[A-Za-z0-9._-]{1,64}`，不得以 `.`/`-` 开头、以 `.pub` 结尾或与 OpenSSH 文件同名。写入 `~/.ssh/<name>`（0600）与 `<name>.pub`（0644），`~/.ssh` 不存在时以 0700 创建；任一文件已存在返回 409，从不覆盖。请求体上限 64 KiB。
+- `POST /v2/ssh/keys/{name}/deploy` `{ alias, password?, disablePasswordLogin? }` → `KeyDeployResult`。把密钥部署到一台**受管**主机（`~/.ssh/config` 中的主机返回 400，未知主机或密钥返回 404；密钥须有私钥文件和已知公钥）。一次请求处理一台主机，按顺序：
+  1. 用主机当前的登录方式连接（有 `password` 时与 `test` 相同：askpass、不复用共享连接），把公钥经 stdin 交给固定 `sh` 脚本，追加到远端 `~/.ssh/authorized_keys`（`~/.ssh` 0700、文件 0600；类型与密钥体已存在时不重复添加）。
+  2. 把主机改为 `authMethod: key`、`identityFile` 指向该私钥（已是密钥登录的主机即被覆盖），再只用该密钥（`IdentitiesOnly=yes`、`PreferredAuthentications=publickey`、独立连接）执行 `exit 0`。失败时主机恢复原样，远端公钥保留。加密且不在 ssh-agent 中的密钥无法自动验证：照常切换，`verified: false`。
+  3. `disablePasswordLogin: true` 且已验证时，用该密钥登录并以 root、免密 sudo 或 `sudo -S`（密码即 `password`，经 stdin）执行：备份 `/etc/ssh/sshd_config` 为 `sshd_config.todex-<时间>`，在文件开头写入带标记的 `PasswordAuthentication no` / `KbdInteractiveAuthentication no`（重复执行只保留一段），`sshd -t` 通过后依次尝试 `systemctl` / `service` / `rc-service` 重启 sshd，以 `sshd -T` 确认，之后再用密钥登录一次。`sshd -t` 失败或无法重启时恢复原文件。仅支持 Linux。
+  - `KeyDeployResult`：`ok`、`durationMs`、`stage?`（`install` / `verify`，失败时）、`failure?`（同 `SshFailureKind`；远端脚本自身失败为 `other`）、`detail?`、`alreadyInstalled`、`verified`、`host?`（结果对应的主机）、`passwordLogin?`（`{ status: disabled | skipped | failed, reason?, detail? }`，`reason`：`notVerified`、`unsupportedOs`、`noSshd`、`configInvalid`、`restartFailed`、`stillEnabled`、`needsRoot`、`connection`、`other`）。关闭密码登录失败不影响 `ok`：此时密钥已部署、主机已切换。
+  - 远端需有 POSIX `sh`，登录 shell 需能解析单引号（sh、bash、zsh、fish）。经 ProxyJump/ProxyCommand 的主机不接受 `password`（与 `test` 相同）。
 
 ### SSH 终端
 

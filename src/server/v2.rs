@@ -5667,6 +5667,7 @@ mod tests {
         for (method, uri) in [
             ("GET", "/v2/ssh/hosts"),
             ("POST", "/v2/ssh/hosts/web/test"),
+            ("POST", "/v2/ssh/keys/id_ed25519/deploy"),
             ("PUT", "/v2/ssh/hosts/web/agent-access"),
             ("GET", "/v2/ssh/settings"),
             ("PUT", "/v2/ssh/settings"),

@@ -413,7 +413,7 @@ impl SshService {
         self.key_view(&name).await
     }
 
-    async fn key_view(&self, name: &str) -> Result<SshKeyView, AppError> {
+    pub(super) async fn key_view(&self, name: &str) -> Result<SshKeyView, AppError> {
         self.list_keys()
             .await?
             .keys
@@ -423,7 +423,7 @@ impl SshService {
     }
 }
 
-fn valid_key_name(name: &str) -> Result<(), AppError> {
+pub(super) fn valid_key_name(name: &str) -> Result<(), AppError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_NAME_LEN
         && !name.starts_with(['.', '-'])

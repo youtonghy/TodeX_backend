@@ -9,6 +9,7 @@
 //! a one-shot file (see [`askpass`]).
 
 pub(crate) mod config_file;
+pub(crate) mod deploy;
 pub(crate) mod forward;
 pub(crate) mod ip_pool;
 pub(crate) mod keys;

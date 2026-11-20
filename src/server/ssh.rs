@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 use crate::app_state::AppState;
 use crate::error::AppError;
 use crate::privacy_filter::{AgentOutputFilter, AgentOutputFilterUpdate};
+use crate::ssh::deploy::KeyDeployRequest;
 use crate::ssh::forward::ForwardInput;
 use crate::ssh::ip_pool::{AssignmentInput, AssignmentUpdate, PoolConfigInput};
 use crate::ssh::keys::{KeyGenerateRequest, KeyImportRequest};
@@ -101,6 +102,10 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/v2/ssh/keys/generate",
             post(generate_key).layer(DefaultBodyLimit::max(MAX_KEY_BODY_BYTES)),
+        )
+        .route(
+            "/v2/ssh/keys/{name}/deploy",
+            post(deploy_key).layer(DefaultBodyLimit::max(MAX_KEY_BODY_BYTES)),
         )
         .route("/v2/ssh/forwards", get(list_forwards).post(create_forward))
         .route(
@@ -245,6 +250,33 @@ fn optional_password(body: &[u8]) -> Result<Option<Zeroizing<String>>, AppError>
         .password
         .map(Zeroizing::new)
         .filter(|password| !password.is_empty()))
+}
+
+/// Deploys key `name` to a managed host. Parse errors never quote the body,
+/// which carries a password.
+async fn deploy_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let request: KeyDeployRequest = serde_json::from_slice(&body).map_err(|error| {
+        let problem = match error.classify() {
+            serde_json::error::Category::Data => {
+                "expected { alias: string, password?: string, disablePasswordLogin?: boolean }"
+            }
+            _ => "not valid JSON",
+        };
+        AppError::InvalidRequest(format!(
+            "invalid request body at line {} column {}: {problem}",
+            error.line(),
+            error.column()
+        ))
+    })?;
+    Ok(Json(serde_json::to_value(
+        state.ssh.deploy_key(&name, request).await?,
+    )?))
 }
 
 async fn list_forwards(
