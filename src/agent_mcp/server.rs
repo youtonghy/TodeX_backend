@@ -1688,7 +1688,7 @@ exit 3
             .lines()
             .find(|line| line.ends_with("|| exit 1"))
             .unwrap();
-        assert!(line.contains("-o BatchMode=yes -o StrictHostKeyChecking=yes"));
+        assert!(line.contains("-o BatchMode=yes -o StrictHostKeyChecking=accept-new"));
         assert!(log.contains("-- web cd '/srv/a b' || exit 1\nuname -a"));
 
         let big = call(

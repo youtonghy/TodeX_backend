@@ -23,7 +23,10 @@ use std::{
     ffi::OsString,
     net::Ipv4Addr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -507,6 +510,9 @@ pub(crate) struct Launcher {
     wrapper: PathBuf,
     /// Long-running children, recorded so a later daemon can end orphans.
     children: Arc<tunnel::ChildRegistry>,
+    /// [`ConnectionSettings::accept_new_host_keys`], shared by every clone so
+    /// forwards and pool masters started later follow the setting.
+    accept_new_host_keys: Arc<AtomicBool>,
 }
 
 impl Launcher {
@@ -532,10 +538,19 @@ impl Launcher {
             SshMode::Interactive => return args,
         };
         args.extend(mode_options.iter().map(OsString::from));
-        args.extend(
-            ["-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15"].map(OsString::from),
-        );
+        args.extend(["-o".into(), self.host_key_checking().into()]);
+        args.extend(["-o", "ConnectTimeout=15"].map(OsString::from));
         args
+    }
+
+    /// `StrictHostKeyChecking=accept-new` (unknown keys are recorded, changed
+    /// keys refused) or `=yes` (both refused), per the connection settings.
+    pub(crate) fn host_key_checking(&self) -> &'static str {
+        if self.accept_new_host_keys.load(Ordering::Relaxed) {
+            "StrictHostKeyChecking=accept-new"
+        } else {
+            "StrictHostKeyChecking=yes"
+        }
     }
 }
 
@@ -584,6 +599,7 @@ impl SshService {
             children: Arc::new(tunnel::ChildRegistry::new(
                 cfg!(unix).then(|| dir.join(CHILDREN_FILE)),
             )),
+            accept_new_host_keys: Arc::new(AtomicBool::new(store.connection.accept_new_host_keys)),
         };
         let pool = {
             let launcher = launcher.clone();
@@ -722,8 +738,9 @@ impl SshService {
     /// [`Self::command`]. Host-key and password prompts reach the user.
     ///
     /// With `password`, the askpass helper answers the one password prompt
-    /// instead. Unknown host keys are then rejected rather than asked about,
-    /// so the client can retry without a password to confirm them. Hosts
+    /// instead. Unknown host keys are accepted on first contact when the
+    /// connection settings allow it, otherwise rejected rather than asked
+    /// about, so the client can retry without a password to confirm them. Hosts
     /// behind ProxyJump/ProxyCommand ignore the password and prompt as usual.
     /// The caller keeps the returned secret until ssh started, then hands it
     /// to [`AskpassSecret::expire_after`] with [`TERMINAL_ASKPASS_DEADLINE`].
@@ -754,17 +771,20 @@ impl SshService {
         let secret = askpass.map(|(vars, secret)| {
             env.extend(vars.map(|(key, value)| (key.to_owned(), value)));
             env.push(("SSH_ASKPASS_REQUIRE".to_owned(), "force".into()));
-            args.extend(
-                [
-                    "-o",
-                    "NumberOfPasswordPrompts=1",
-                    "-o",
-                    "StrictHostKeyChecking=yes",
-                ]
-                .map(OsString::from),
-            );
+            args.extend(["-o".into(), "NumberOfPasswordPrompts=1".into()]);
             secret
         });
+        // The terminal asks about unknown host keys itself unless they are
+        // accepted on first contact; with a password nobody can answer.
+        if secret.is_some()
+            || self
+                .inner
+                .launcher
+                .accept_new_host_keys
+                .load(Ordering::Relaxed)
+        {
+            args.extend(["-o".into(), self.inner.launcher.host_key_checking().into()]);
+        }
         args.extend(["-tt".into(), "--".into(), alias.into()]);
         let command = TerminalCommand {
             program: self.inner.ssh_bin.clone(),
@@ -1269,6 +1289,10 @@ impl SshService {
                 ..store.clone()
             };
             self.save(&mut store, next).await?;
+            self.inner
+                .launcher
+                .accept_new_host_keys
+                .store(store.connection.accept_new_host_keys, Ordering::Relaxed);
         }
         Ok(store.connection.clone())
     }
@@ -2318,7 +2342,7 @@ exit 0
             .lines()
             .find(|line| line.ends_with("good exit 0"))
             .unwrap();
-        assert!(test_line.contains("-o BatchMode=yes -o StrictHostKeyChecking=yes"));
+        assert!(test_line.contains("-o BatchMode=yes -o StrictHostKeyChecking=accept-new"));
         assert!(test_line.contains("-F "));
         assert!(test_line.contains("-- good exit 0"));
     }
@@ -2372,9 +2396,9 @@ exit 0
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         let args = args.join(" ");
-        assert!(
-            args.contains("-o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=yes -tt -- good")
-        );
+        assert!(args.contains(
+            "-o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=accept-new -tt -- good"
+        ));
         assert!(!args.contains("hunter2"));
 
         // The terminal deadline deletes a file ssh never asked for.
@@ -2646,8 +2670,9 @@ exit 0
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         let args = args.join(" ");
-        assert!(args
-            .contains("-o BatchMode=no -o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=yes"));
+        assert!(args.contains(
+            "-o BatchMode=no -o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=accept-new"
+        ));
         assert!(!args.contains("ControlMaster=auto"));
         assert!(command
             .as_std()
@@ -2718,6 +2743,87 @@ exit 0
         assert!(!store.connection.server_alive_enabled);
     }
 
+    /// Unknown host keys are accepted on first contact unless switched off;
+    /// the switch reaches batch, askpass and terminal commands, including
+    /// ones started after it changed.
+    #[tokio::test]
+    async fn host_keys_are_accepted_on_first_contact_until_switched_off() {
+        let fixture = fixture("Host good\n").await;
+        assert!(
+            fixture
+                .service
+                .connection_settings()
+                .await
+                .accept_new_host_keys
+        );
+        let (plain, _) = fixture
+            .service
+            .terminal_command("good", None)
+            .await
+            .unwrap();
+        let joined = |args: &[OsString]| {
+            args.iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(joined(&plain.args).contains("-o StrictHostKeyChecking=accept-new -tt -- good"));
+
+        let off = ConnectionSettings {
+            accept_new_host_keys: false,
+            ..ConnectionSettings::default()
+        };
+        fixture.service.set_connection_settings(off).await.unwrap();
+        fixture.service.test_connection("good", None).await.unwrap();
+        fixture
+            .service
+            .test_connection("good", Some("pw"))
+            .await
+            .unwrap();
+        let log = std::fs::read_to_string(fixture.root.join("ssh.log")).unwrap();
+        let runs: Vec<&str> = log.lines().filter(|l| l.ends_with("good exit 0")).collect();
+        assert_eq!(runs.len(), 2, "{log}");
+        for line in runs {
+            assert!(line.contains("StrictHostKeyChecking=yes"), "{line}");
+            assert!(!line.contains("accept-new"), "{line}");
+        }
+        // The interactive terminal asks again, as plain ssh does.
+        let (plain, _) = fixture
+            .service
+            .terminal_command("good", None)
+            .await
+            .unwrap();
+        assert!(
+            !joined(&plain.args).contains("StrictHostKeyChecking"),
+            "{:?}",
+            plain.args
+        );
+        let (with_password, _) = fixture
+            .service
+            .terminal_command("good", Some("pw"))
+            .await
+            .unwrap();
+        assert!(joined(&with_password.args).contains("StrictHostKeyChecking=yes"));
+
+        // A daemon restart keeps the choice.
+        let reloaded =
+            SshStore::from_json(&std::fs::read(fixture.root.join("data/ssh/store.json")).unwrap())
+                .unwrap();
+        assert!(!reloaded.connection.accept_new_host_keys);
+    }
+
+    /// Stores and API bodies from before the setting existed keep it on.
+    #[test]
+    fn missing_host_key_setting_means_accept_new() {
+        let store = SshStore::from_json(br#"{"connection":{"serverAliveEnabled":true}}"#).unwrap();
+        assert!(store.connection.accept_new_host_keys);
+        let body: ConnectionSettings = serde_json::from_str(
+            r#"{"serverAliveEnabled":false,"serverAliveInterval":15,"serverAliveCountMax":3}"#,
+        )
+        .unwrap();
+        assert!(body.accept_new_host_keys);
+    }
+
     /// The store as another daemon version wrote it: partial, out of range
     /// or with fields this version does not know.
     #[test]
@@ -2739,6 +2845,7 @@ exit 0
                 server_alive_enabled: true,
                 server_alive_interval: 5,
                 server_alive_count_max: 10,
+                accept_new_host_keys: true,
             }
         );
         assert_eq!(
@@ -2747,6 +2854,7 @@ exit 0
                 server_alive_enabled: false,
                 server_alive_interval: 600,
                 server_alive_count_max: 1,
+                accept_new_host_keys: true,
             }
         );
         assert_eq!(load(r#"{"connection":{}}"#), ConnectionSettings::default());
@@ -2938,6 +3046,7 @@ exit 0
                 server_alive_enabled: true,
                 server_alive_interval: 20,
                 server_alive_count_max: 4,
+                accept_new_host_keys: true,
             })
             .await
             .unwrap();

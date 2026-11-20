@@ -5702,8 +5702,14 @@ mod tests {
         let settings_body = to_bytes(settings.into_body(), 1024).await.unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&settings_body).unwrap(),
-            json!({ "serverAliveEnabled": false, "serverAliveInterval": 15, "serverAliveCountMax": 3 })
+            json!({
+                "serverAliveEnabled": false,
+                "serverAliveInterval": 15,
+                "serverAliveCountMax": 3,
+                "acceptNewHostKeys": true,
+            })
         );
+        // A body from a client without the host key setting keeps it on.
         let enabled =
             r#"{"serverAliveEnabled":true,"serverAliveInterval":20,"serverAliveCountMax":4}"#;
         let saved = app

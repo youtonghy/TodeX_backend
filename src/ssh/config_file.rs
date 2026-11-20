@@ -172,6 +172,16 @@ pub(crate) struct ConnectionSettings {
     pub server_alive_interval: u32,
     /// Unanswered probes before ssh closes the connection.
     pub server_alive_count_max: u32,
+    /// Trust an unknown host key on first contact and record it in
+    /// `known_hosts` (`StrictHostKeyChecking=accept-new`); a changed key is
+    /// still refused. Off means unknown keys are refused too. Older clients
+    /// leave it out of their body, which keeps the default.
+    #[serde(default = "default_accept_new_host_keys")]
+    pub accept_new_host_keys: bool,
+}
+
+fn default_accept_new_host_keys() -> bool {
+    true
 }
 
 impl Default for ConnectionSettings {
@@ -180,6 +190,7 @@ impl Default for ConnectionSettings {
             server_alive_enabled: false,
             server_alive_interval: 15,
             server_alive_count_max: 3,
+            accept_new_host_keys: default_accept_new_host_keys(),
         }
     }
 }
@@ -215,6 +226,7 @@ impl ConnectionSettings {
                 self.server_alive_count_max,
                 SERVER_ALIVE_COUNT_MAX_RANGE,
             ),
+            accept_new_host_keys: self.accept_new_host_keys,
         }
     }
 }
@@ -228,6 +240,7 @@ pub(crate) struct StoredConnection {
     server_alive_enabled: bool,
     server_alive_interval: u32,
     server_alive_count_max: u32,
+    accept_new_host_keys: bool,
 }
 
 impl Default for StoredConnection {
@@ -237,6 +250,7 @@ impl Default for StoredConnection {
             server_alive_enabled: defaults.server_alive_enabled,
             server_alive_interval: defaults.server_alive_interval,
             server_alive_count_max: defaults.server_alive_count_max,
+            accept_new_host_keys: defaults.accept_new_host_keys,
         }
     }
 }
@@ -247,6 +261,7 @@ impl From<StoredConnection> for ConnectionSettings {
             server_alive_enabled: stored.server_alive_enabled,
             server_alive_interval: stored.server_alive_interval,
             server_alive_count_max: stored.server_alive_count_max,
+            accept_new_host_keys: stored.accept_new_host_keys,
         }
         .clamped()
     }

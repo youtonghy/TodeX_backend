@@ -120,7 +120,7 @@ async fn forwards_run_a_dedicated_ssh_and_stop_it() {
     assert!(
         rest.starts_with(
             "-o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o \
-             StrictHostKeyChecking=yes -o ConnectTimeout=15 -N -o ExitOnForwardFailure=yes \
+             StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -N -o ExitOnForwardFailure=yes \
              -o LogLevel=DEBUG1 -L "
         ),
         "{line}"
