@@ -233,6 +233,7 @@
       "nativeMcp": true,
       "managedMcp": true,
       "modelSelection": true,
+      "claudeRegionPreflight": true,
       "imageInput": true,
       "imageInputMode": "always",
       "controlActions": [
