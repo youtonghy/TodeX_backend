@@ -1,230 +1,160 @@
 # TodeX Backend (`todex-agentd`)
 
 <p align="center">
-  <strong>Unified backend daemon and orchestration engine for TodeX 2.0 AI coding agents.</strong>
+  <strong>The TodeX backend: runs your coding agents on your own machine and serves them, securely, to the TodeX desktop, web and mobile apps.</strong>
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> •
-  <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
----
+![A conversation served by todex-agentd, in TodeX Desktop](docs/screenshots/conversation-en.png)
 
-## Overview
+`todex-agentd` runs on the machine where your code lives: a laptop, a workstation, a server or a container. It starts and drives the agent CLIs installed there, keeps every conversation, and lets any paired TodeX client follow and control them. Conversations keep running when clients disconnect, and every client sees the same state.
 
-`todex-agentd` is the core backend service of the TodeX ecosystem. Built with Rust, Tokio, and Axum, it orchestrates multiple AI coding assistants—including **Codex app-server**, **Agent Client Protocol (ACP 2.0)**, **Pi RPC**, **Claude Code stream-json**, **Grok Build**, **Devin** (`devin acp`), **OpenCode** (`opencode acp`), the **Antigravity CLI** (`agy acp`), **DeepSeek Harness** (`dsh --profile acp`), and **omp** (oh-my-pi, `omp acp`)—behind a unified, secure, and persistent API.
+The screenshots below are from [TodeX Desktop](https://github.com/youtonghy/TodeX_desktop), showing what each backend feature looks like to a user.
 
-In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST endpoints and a unified `/v2/ws` WebSocket). Conversation folders serve as the single source of truth for message histories, journals, snapshots, and native provider sessions.
+## Contents
 
----
+- [Features](#features)
+- [Install](#install)
+- [Run](#run)
+- [Pair devices](#pair-devices)
+- [Configuration](#configuration)
+- [API](#api)
+- [Development](#development)
 
-## Key Features
+## Features
 
-- **Multi-Agent Orchestration**:
-  - **Codex**: Native JSON-RPC app-server integration (`start`, `turn`, `status`, `stop`, `attach`, `replay`, `interrupt`).
-  - **ACP (Agent Client Protocol 2.0)**: Supports pre-configured profiles defined in `config.toml` with strict boundary constraints.
-  - **Pi**: Native RPC integration with command discovery (`get_commands`), dynamic models, and interactive tool approval handling.
-  - **Claude Code**: Stream-JSON driver integrating directly with the Claude CLI, with built-in model aliases when no custom Anthropic gateway is configured.
-- **Conversation Folder Persistence**:
-  - Structured storage under `$DATA_DIR/conversations/<uuid>/`:
-    - `manifest.json`: Metadata, active provider profile, workspace path, and timestamps.
-    - `events.jsonl`: Append-only event journal enabling resilient resumption.
-    - `snapshot.json`: Compact conversation state snapshots.
-    - `provider-state.json`: Native agent engine state for turn resumption across restarts.
-  - Optimistic turn concurrency protection (returns `409 Conflict` on concurrent mutations; no arbitrary prompt queueing).
-- **Read-Only Capability Catalogs**:
-  - Real-time introspection of native Skills, MCP servers, Slash Commands, and Model catalogs directly from installed providers.
-  - Applies project-over-user precedence hierarchy without mutating local provider configurations.
-  - Native Skill injection into agent prompts via `resourceId` (no client file uploads required).
-- **Agent Provider Accounts (cc-switch model)**:
-  - `/v2/agent-providers` stores multiple provider/account profiles per agent (Codex, Claude Code, Grok Build, Pi, OpenCode) and activates one by rewriting the agent's native global config (`settings.json`, `config.toml`/`auth.json` for Codex and Grok Build, `models.json`, `opencode.json`) so both TodeX-launched and manually started CLI sessions pick it up.
-  - Exclusive agents backfill the current live config into the outgoing profile before switching; additive agents merge managed nodes while leaving external provider entries untouched.
-  - Secret values are masked in API responses and preserved on write-back; model lists are proxied server-side; additive edits carry a content-revision conflict check.
-  - `GET /v2/agent-providers/{agent}/export` and `POST /v2/agent-providers/{agent}/import` move one agent's profiles between hosts as a JSON file (secrets in clear, device-signed and audited); import upserts by id and keeps the current selection.
-- **Unified Multiplexed WebSocket (`/v2/ws`)**:
-  - Single connection handling conversation streams, turn events, interactive permission requests, local terminal/PTY sessions, and runtime controls.
-  - Heartbeat detection, sequence-based reconnection (`afterSequence`), and UTF-8 frame length enforcement.
-- **Post-Quantum Transport Encryption**:
-  - Configurable end-to-end transport layer encryption:
-    - **Plaintext** (`none`)
-    - **X25519-ChaCha20Poly1305** (`x25519`)
-    - **ML-KEM-768** (`ml-kem-768`, NIST Post-Quantum standard)
-  - The transport public key is delivered by [device verification](docs/device-verification.md) and authenticated by its verification code; the TUI pairing QR carries only the server address.
-- **Security & Sandboxing**:
-  - Fail-closed device authentication: every request carries an Ed25519 signature from a registered device (unauthorized requests are rejected with `401 Unauthorized`). Devices are enrolled via [device verification](docs/device-verification.md) and can be revoked individually in the TUI.
-  - Tenant isolation (`tenant_id`) enforced across all conversation queries, event journals, and subscriptions.
-  - Workspace root boundary enforcement (`workspace_roots`) restricting client access to authorized filesystem scopes.
-  - Sanitized subprocess environments preventing leak of administrative environment variables.
-- **SSH Hosts & Remote Files**:
-  - Discovers `Host` aliases from the backend user's `~/.ssh/config` (following `Include`) and runs the system OpenSSH client, so keys, ssh-agent, ProxyJump and `known_hosts` behave as in the user's shell. Extra hosts and FTP sites are managed in `$DATA_DIR/ssh`; `~/.ssh/config` is never written and passwords are never stored.
-  - SSH key listing, import and in-process generation; interactive SSH terminals over `/v2/ws`; SFTP/FTP(S) file sessions under `/v2/remote/*`.
-  - Opt-in per host "Agent access" exposes a `todex_ssh` MCP server (`ssh_list_hosts`, `ssh_exec`) to Codex, Claude Code and ACP agents. See [API docs](docs/API.md#ssh-主机与远程连接).
-- **Agent browser on the host**:
-  - Agents drive a browser tab (`browser_*` tools of `todex_desktop`) in a headed Chrome for Testing the daemon pins, downloads and verifies (`todex-agentd browser install`, or `install.sh --with-browser`); `localhost` is the daemon's host. Each workspace browses in its own profile; clients watch the tab live over `/v2/ws` and any paired device approves a conversation's first use, and each host beyond this computer (a public site or the local network: once for the conversation, or always).
-- **Computer Use on the host**:
-  - Agents observe and act on the computer the daemon runs on (`computer_*` tools of `todex_desktop`), in process through [xa11y](https://github.com/xa11y/xa11y) (macOS AX, Windows UI Automation, Linux AT-SPI). Clients only preview it (live frames, screenshots) and answer prompts.
-  - Each conversation's first use is confirmed by someone at the host; a pill with Stop and a global shortcut end it; TodeX, credential stores and system settings are never controlled. On macOS grant `todex-agentd` Screen Recording and Accessibility; see `docs/API.md`.
-- **Interactive TUI & Daemon Management**:
-  - Interactive Terminal UI (`cargo run -- tui`) built with Ratatui to monitor status, inspect logs, control daemon lifecycle, and generate pairing QR codes with automatic LAN IP resolution.
-  - Background daemon management (`start`, `stop`, `restart`, `status`) backed by a persistent PID file.
+### Every agent behind one backend
 
----
+Codex, Claude Code, Pi, Grok Build, Devin, OpenCode, Antigravity, DeepSeek Harness, omp (oh-my-pi) and any agent that speaks the Agent Client Protocol (ACP), behind one consistent experience:
 
-## Architecture
+- Streamed answers, tool calls, file edits and commands, with approval requests sent to every paired device.
+- Models, reasoning effort, slash commands, skills and MCP servers read live from each installed agent.
+- Conversations that survive restarts and resume where they left off; forks, queued messages, plans, goals and background tasks.
+- Work modes including Plan and Smart (plan with one model, then execute the approved plan with another).
+- **Private conversations** that live only in memory and are never written to history, and **scheduled conversations** that start at a time you choose.
+- A per-workspace task board, pinned to the conversations that work on each task.
 
-```
-                      +---------------------------------------+
-                      |   TodeX Desktop / TodeX Mobile App    |
-                      +-------------------+-------------------+
-                                          |
-                        HTTP /v2/*        |   WebSocket /v2/ws
-                       (Auth / REST)      |   (Events, Streams, PTY)
-                                          v
-+---------------------------------------------------------------------------------+
-|                                  todex-agentd                                   |
-|                                                                                 |
-|  +---------------------+  +----------------------+  +------------------------+  |
-|  |   Auth & Security   |  |   Transport Crypto   |  |     Workspace Store    |  |
-|  | (Devices / Tenants) |  | (X25519 / ML-KEM)    |  | (Sandbox Root Bounds)  |  |
-|  +---------------------+  +----------------------+  +------------------------+  |
-|                                                                                 |
-|  +---------------------------------------------------------------------------+  |
-|  |                          Conversation Engine / Hub                        |  |
-|  |     (Manifests, Events Journal, Snapshots, Turn Concurrency Control)      |  |
-|  +---------------------------------------------------------------------------+  |
-|                                                                                 |
-|  +---------------------------------------------------------------------------+  |
-|  |                             Provider Drivers                              |  |
-|  |  +----------------+  +----------------+  +--------------+  +-----------+  |  |
-|  |  | Codex Gateway  |  |ACP 2.0 & Devin|  |    Pi RPC    |  |Claude Code|  |  |
-|  |  +----------------+  +----------------+  +--------------+  +-----------+  |  |
-|  +---------------------------------------------------------------------------+  |
-+---------------------------------------------------------------------------------+
-                                          |
-                      +-------------------+-------------------+
-                      | Native Agent CLI Processes / Subtools |
-                      | (codex, acp, pi, claude, devin, opencode, agy, omp)    |
-                      +---------------------------------------+
-```
+![Private conversation](docs/screenshots/private-conversation-en.png)
 
----
+### Agent CLIs and accounts
 
-## Quick Start
+See every agent CLI's installed and latest version, install missing CLIs with the vendor's official installer, and upgrade them while no agent is running. Keep several provider accounts per agent and switch between them: the backend writes the agent's own config, so CLI sessions you start by hand use the same account. Accounts can be exported and imported as a file to move them between hosts, and **config sync** copies accounts, settings, MCP servers and skills from one backend to another.
 
-### Prerequisites
+| CLI management | Config sync |
+| :---: | :---: |
+| ![CLI management](docs/screenshots/settings-cli-en.png) | ![Config sync](docs/screenshots/config-sync-en.png) |
 
-- Rust toolchain (MSRV 1.80+ recommended; not needed when using the install script below)
-- At least one AI agent CLI installed and authenticated on the machine (`codex`, `pi`, `claude`, etc.)
+### Terminals, SSH and remote files
 
-### Install Script (macOS / Linux / WSL)
+Terminals on the backend machine; SSH hosts read from `~/.ssh/config` (with `Include`) using the system OpenSSH client, so keys, ssh-agent, ProxyJump and `known_hosts` behave as in your shell; SSH key import and generation; FTP sites; SFTP/FTP file browsing; and port forwarding. `~/.ssh/config` is never written and passwords are never stored. Turn on **Agent access** for a host and agents can run commands there, with approval per conversation or per command.
 
-Download and manage a prebuilt release without a Rust toolchain:
+![SSH hosts](docs/screenshots/terminal-hosts-en.png)
+
+### Agent browser and Computer Use
+
+Agents can work on the backend's computer through two desktop tools:
+
+- **Agent browser**: a real browser window on the host (so `localhost` is that machine), with a separate profile per workspace. The backend downloads and verifies the browser itself (`todex-agentd browser install`). Clients watch the tab live; a paired device approves each conversation's first use, and sites beyond the local machine need approval.
+- **Computer Use**: the agent sees and operates the host's apps (macOS, Windows and Linux). Someone at the host confirms each conversation's first use, a Stop control and a global shortcut end it, and TodeX itself, credential stores and system settings are never controlled. On macOS, grant `todex-agentd` Screen Recording and Accessibility.
+
+![Computer Use live view](docs/screenshots/computer-live-en.png)
+
+### Agent Calling and the external API
+
+Agents can call other agents: a task is handed to another agent and model in a child conversation of the same workspace, within the agents and models you allow. Scripts and services can do the same through an optional external API (REST and server-sent events on its own port) with API keys, each limited to its own conversations, agents, models and workspaces. Results come back decrypted for the key while history on disk stays end-to-end encrypted.
+
+![Agent Calling](docs/screenshots/settings-agent-calling-en.png)
+
+### Multiple backends and backend groups
+
+A client can stay connected to many backends at once. **Backend groups** link devices and backends into one group with a signed member list: devices join with an invite (QR code) and an approved code, a device that joins once can use every backend of the group, and when a backend's own address doesn't answer, traffic can be relayed through another member, still end-to-end encrypted.
+
+| Backend connections | Backend groups |
+| :---: | :---: |
+| ![Backend connections](docs/screenshots/settings-backends-en.png) | ![Backend groups](docs/screenshots/settings-mesh-en.png) |
+
+### Security
+
+- **Device verification**: a client gets access only by pairing. You compare a code on the client with the one in the backend's console (or approve with `todex-agentd pair approve`), and the device's key is enrolled. Every request is signed by a registered device; devices can be revoked individually. See [device verification](docs/device-verification.md).
+- **Encrypted transport**: traffic between clients and the backend is encrypted with X25519 or post-quantum ML-KEM-768; the backend's key is authenticated by the pairing code. Plaintext is allowed only for clients on the same machine, and only when you choose it. See [transport v2](docs/transport-v2.md).
+- **End-to-end encrypted history**: conversation history is always encrypted with keys held by your devices, with a recovery key. See [history encryption](docs/history-encryption.md).
+- **Boundaries**: agents work only inside the configured workspace roots, and agent processes don't inherit the backend's administrative environment.
+
+### Runs itself
+
+An interactive console (TUI) shows status and logs, starts and stops the background daemon, shows the pairing QR code and lists, approves and revokes devices. The daemon can start at login, and installed releases update themselves: a running daemon restarts into a new release once no agent has worked for 5 minutes.
+
+## Install
+
+macOS, Linux and WSL, no Rust toolchain needed:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/youtonghy/TodeX_backend/main/install.sh | bash
 ```
 
-The script installs `todex-agentd` to `~/.local/bin` (override with `--prefix DIR` or `TODEX_INSTALL_DIR`), verifies the release `SHA256SUMS`, keeps one rollback copy beside the binary, and restarts a running managed daemon. It picks the `linux-x64-gnu` or `linux-arm64-gnu` build by CPU architecture, including under WSL. The Linux builds need glibc 2.28 or newer (Debian 10, Ubuntu 20.04, RHEL 8, or later); musl distributions such as Alpine must build from source.
+The script installs `todex-agentd` to `~/.local/bin` (change with `--prefix DIR` or `TODEX_INSTALL_DIR`), verifies the release checksums, keeps one rollback copy, and restarts a running managed daemon. Linux builds need glibc 2.28+ (Debian 10, Ubuntu 20.04, RHEL 8 or later); musl distributions such as Alpine must build from source. Windows builds are attached to each [release](https://github.com/youtonghy/TodeX_backend/releases).
 
 ```bash
 ./install.sh install                 # install or update to the latest release
-./install.sh update                  # update an existing install
-./install.sh install --version 2.0.2 # pin a specific release
-./install.sh status                  # installed/latest versions and daemon state
-./install.sh uninstall               # stop the daemon and remove the binary
-./install.sh uninstall --purge       # also remove the ~/.todex-agent data directory
+./install.sh install --version 2.0.2 # a specific release
+./install.sh status                  # installed and latest versions, daemon state
+./install.sh uninstall [--purge]     # remove the binary (and the ~/.todex-agent data)
 ```
 
-When piping from `curl`, pass arguments through `bash -s --`, for example `... | bash -s -- uninstall --purge --yes` (`--purge` needs `--yes` when there is no terminal to confirm). A pinned `--version` stays in place only with `TODEX_AUTO_UPDATE=0`; otherwise `serve`, `tui`, and `daemon start` update to the latest release on launch, and a running daemon restarts into a new release once no Agent has run for 5 minutes. Rollback copies older than 30 days are removed automatically.
+When piping from `curl`, pass arguments with `bash -s --`, for example `... | bash -s -- uninstall --purge --yes`. Set `TODEX_AUTO_UPDATE=0` to stay on a pinned version. To run agents in Docker instead, use [TodeX Container](https://github.com/youtonghy/TodeX_container); TodeX Desktop can also deploy a backend on its own computer from **Settings › Local backend**.
 
-### 1. Build the Binary
+Install and sign in to at least one agent CLI (`codex`, `claude`, `pi`, …) on the machine, or install them later from a client's CLI management page.
+
+## Run
 
 ```bash
-cargo build --release
+todex-agentd tui                      # interactive console (recommended)
+todex-agentd serve --host 127.0.0.1 --port 7345   # foreground server
+todex-agentd daemon start|stop|restart|status     # background daemon
+todex-agentd daemon autostart enable  # start at login (status / disable)
 ```
 
-### 2. Running the Server
+Quitting the console leaves the daemon running. To accept clients from other machines, listen on the network (`--host 0.0.0.0`) or set `advertise_url`; for TLS, put a reverse proxy (Caddy, nginx, Cloudflare Tunnel) in front.
 
-#### Option A: Interactive TUI Controller (Recommended for local dev)
+## Pair devices
 
-```bash
-cargo run -- tui
-```
+In the console, press `d` to see pairing requests, compare the full code (and the key fingerprint next to it) with the client, then press `a` to approve or `r` to reject; the same panel lists devices, and `x` revokes one. The pairing QR code holds only the server address; if it doesn't fit the terminal, press `b` to open it in a browser.
 
-The TUI allows starting and stopping the background daemon, viewing live server logs, and displaying QR codes for mobile client pairing. [Device verification](docs/device-verification.md) is the only way clients gain access: press `d` in the TUI, compare the full code, then use `a` to approve or `r` to reject; the same panel lists registered devices (`x` revokes the selected one). The verification code also authenticates the backend's transport key, whose fingerprint is shown next to it; clients pin the key only from pairing, never by manual import. Quitting the TUI keeps the daemon running in the background.
-
-Pairing QR codes use solid terminal cell backgrounds to avoid gaps caused by terminal fonts. If the code does not fit, press `b` in the QR popup to view it in your default browser. The QR holds only the server address, so it is a single code for every encryption mode. The browser page renders it as a square SVG and loads no external resources; its private temporary file is removed when the TUI exits.
-
-#### Option B: Foreground Server
+Without the console (servers, containers), run these as the daemon's user (in a container: `docker exec -u todex <container> todex-agentd ...`):
 
 ```bash
-cargo run -- serve --host 127.0.0.1 --port 7345
-```
-
-#### Option C: Background Daemon Mode
-
-```bash
-# Start detached daemon
-cargo run -- daemon start
-
-# Check status
-cargo run -- daemon status
-
-# Restart daemon
-cargo run -- daemon restart
-
-# Stop daemon
-cargo run -- daemon stop
-
-# Start automatically at login (launchd/systemd user service/registry Run key)
-cargo run -- daemon autostart enable   # status / disable to query or remove
-```
-
-#### Headless administration (containers, servers without the TUI)
-
-Run these as the daemon's user (in a container: `docker exec -u todex <container> todex-agentd ...`); each accepts `--data-dir`. See [docs/BUILD_RUN.md](docs/BUILD_RUN.md) ("在容器中运行") for exit codes and details.
-
-```bash
-todex-agentd pair list [--format text|json]           # pairing requests waiting for a decision
+todex-agentd pair list [--format text|json]           # pending pairing requests
 todex-agentd pair approve <CODE|REQUEST_ID> [--yes]   # also: pair reject
 todex-agentd devices list [--format text|json]        # also: devices revoke <deviceId>
-todex-agentd providers install <id>... [--if-missing] # same installers as the app
+todex-agentd providers install <id>... [--if-missing] # install agent CLIs
 ```
 
----
+See [docs/BUILD_RUN.md](docs/BUILD_RUN.md) for exit codes and container details.
 
 ## Configuration
 
-Configuration values are resolved using the following precedence:
-1. **Command-Line Arguments**
-2. **Environment Variables**
-3. **Configuration File** (`$TODEX_AGENTD_DATA_DIR/config.toml`)
-4. **Built-in Defaults**
+Settings come from, in order: command-line flags, environment variables, `~/.todex-agent/config.toml`, built-in defaults.
 
-### Configuration Options
-
-| Option | CLI Flag | Environment Variable | Default Value | Description |
+| Option | Flag | Environment variable | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| **Host** | `--host` | `TODEX_AGENTD_HOST` | `127.0.0.1` | Binding network interface address. |
-| **Port** | `--port` | `TODEX_AGENTD_PORT` | `7345` | TCP port for HTTP and WebSocket. |
-| **Data Dir** | `--data-dir` | `TODEX_AGENTD_DATA_DIR` | `~/.todex-agent` | Storage directory for configs, manifests, and logs. |
-| **Workspace Root** | `--workspace-root` (repeatable) | `TODEX_AGENTD_WORKSPACE_ROOT`, `TODEX_AGENTD_WORKSPACE_ROOTS` (path-list) | `~/projects` | Root boundaries for authorized project directories; the first is the primary root. |
-| **Default Agent** | — | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` | Default provider (`codex`, `acp`, `pi`, `claude-code`, `grok-build`, `devin`, `opencode`, `antigravity`, `deepseek-harness`, `omp`). |
-| **Codex Binary** | — | `TODEX_AGENTD_CODEX_BIN` | `codex` | Path or executable name for Codex CLI. |
-| **Claude Binary** | — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Path or executable name for Claude Code CLI. |
-| **Pi Binary** | — | `TODEX_AGENTD_PI_BIN` | `pi` | Path or executable name for Pi CLI. |
-| **Enable Auth** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | Enables fail-closed device-signature authentication. |
-| **Advertise URL** | — | `TODEX_AGENTD_ADVERTISE_URL` (`server.advertise_url`) | unset | `http(s)` URL clients should use (no credentials, query, or fragment); shown first in the startup log and used by the TUI pairing link/QR. |
-| **Deployment** | — | `TODEX_AGENTD_DEPLOYMENT` (`server.deployment`) | `host` | `host` or `container`. Reported by `/v2/version`; `container` turns self-update off and makes `update` a no-op. |
-| **Image CLI Dirs** | — | `TODEX_AGENTD_IMAGE_CLI_DIR` (path-list; `agent.image_cli_dirs`) | unset | CLIs resolving under these directories ship with the container image (`managedBy: "image"`) and are not installed or upgraded by TodeX. |
-| **Path Mappings** | — | `TODEX_AGENTD_PATH_MAPPINGS` (JSON; `[[workspace.path_mappings]]`) | unset | `[{"hostPath","backendPath"}]` published to paired clients by `/v2/version`; each `backendPath` must lie inside a workspace root. |
-| **Pairing Encryption** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | Required WebSocket encryption (`x25519` or `ml-kem-768`); `none` permits plaintext from loopback clients and is refused on a non-loopback listener (remote clients must use encrypted transport v2). Clients receive the matching public key during device verification. |
-| **History Encryption** | — | `TODEX_AGENTD_HISTORY_ENCRYPTION` | always `e2e` | Retired: conversation history is always end-to-end encrypted (see [docs/history-encryption.md](docs/history-encryption.md)). Any value of this variable or of `history_encryption` in `config.toml` is ignored with a warning. Writes need at least one client device key; conversations written in plaintext by older versions stay readable but are read-only. |
+| Host | `--host` | `TODEX_AGENTD_HOST` | `127.0.0.1` | Address to listen on. |
+| Port | `--port` | `TODEX_AGENTD_PORT` | `7345` | Port for HTTP and WebSocket. |
+| Data directory | `--data-dir` | `TODEX_AGENTD_DATA_DIR` | `~/.todex-agent` | Config, conversations, keys and logs. |
+| Workspace roots | `--workspace-root` (repeatable) | `TODEX_AGENTD_WORKSPACE_ROOT`, `TODEX_AGENTD_WORKSPACE_ROOTS` | `~/projects` | Directories agents may work in; the first is the primary root. |
+| Default agent | — | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` | `codex`, `acp`, `pi`, `claude-code`, `grok-build`, `devin`, `opencode`, `antigravity`, `deepseek-harness` or `omp`. |
+| Agent binaries | — | `TODEX_AGENTD_CODEX_BIN`, `TODEX_AGENTD_CLAUDE_BIN`, `TODEX_AGENTD_PI_BIN` | `codex`, `claude`, `pi` | Path or command name of each CLI. |
+| Device authentication | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | Require a signature from a paired device on every request. |
+| Advertised URL | — | `TODEX_AGENTD_ADVERTISE_URL` (`server.advertise_url`) | unset | The `http(s)` URL clients should use; shown first in the log and used for the pairing QR code. |
+| Pairing encryption | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | `x25519` or `ml-kem-768`; `none` allows plaintext from loopback clients only and is refused on a network listener. |
+| Deployment | — | `TODEX_AGENTD_DEPLOYMENT` (`server.deployment`) | `host` | `container` turns self-update off. |
+| Image CLI directories | — | `TODEX_AGENTD_IMAGE_CLI_DIR` (`agent.image_cli_dirs`) | unset | CLIs under these directories ship with a container image and are not installed or upgraded by TodeX. |
+| Path mappings | — | `TODEX_AGENTD_PATH_MAPPINGS` (`[[workspace.path_mappings]]`) | unset | `[{"hostPath","backendPath"}]` pairs that tell clients how host folders map to backend paths. |
+| Browser origins | — | `TODEX_AGENTD_CORS_ORIGINS` (`security.cors_origins`) | unset | Extra web origins (for example a self-hosted TodeX Web) allowed to connect. |
 
-### Example `config.toml`
-
-Located at `~/.todex-agent/config.toml`:
+Example `~/.todex-agent/config.toml`:
 
 ```toml
 host = "127.0.0.1"
@@ -232,19 +162,15 @@ port = 7345
 pairing_encryption = "ml-kem-768"
 data_dir = "~/.todex-agent"
 workspace_root = "~/projects"
-# Multiple roots:
 # workspace_roots = ["~/projects", "/srv/repos"]
 
 [agent]
 default_agent = "codex"
-codex_bin = "codex"
-claude_bin = "claude"
-pi_bin = "pi"
-# Stop a turn whose provider produces no output for this many minutes (0 disables).
+# Stop a turn whose agent produces no output for this many minutes (0 disables).
 provider_idle_timeout_minutes = 60
-# Stop a resident provider process after this many seconds without a turn (clamped to 30–604800).
+# Stop an idle agent process after this many seconds (30–604800).
 provider_keepalive_seconds = 300
-# Let clients start a conversation's provider process before its next prompt (conversation.warm).
+# Let clients start a conversation's agent before the next prompt.
 provider_prewarm = true
 
 [agent.acp_profiles.default]
@@ -253,102 +179,47 @@ args = ["--stdio"]
 
 [security]
 enable_auth = true
-enable_tls = false
 
-# External API for scripts and services, authenticated with API keys; off by
-# default. Keys and this listener are managed in Desktop/Web Settings ->
-# "Agent 调用" (Agent Calling). See docs/API.md.
+# External API for scripts and services (API keys); off by default.
+# Usually managed from a client: Settings › Agent Calling.
 [api]
 enabled = false
 host = "127.0.0.1"
 port = 7346
 ```
 
-> [!NOTE]
-> `enable_tls = true` is intentionally blocked on the native listener to prevent false security assumptions. For remote or production access, terminate TLS using a trusted reverse proxy (e.g., Nginx, Caddy, Cloudflare Tunnel).
+`enable_tls = true` is refused on the built-in listener on purpose; terminate TLS in a reverse proxy.
 
----
+## API
 
-## API & WebSocket Reference
+Clients talk to the backend over the `/v2` REST API and one multiplexed WebSocket (`/v2/ws`), both carried over the encrypted transport. The optional external API serves `/api/v1` with API keys. The full contract is in [docs/API.md](docs/API.md); conversation runtime rules are in [docs/conversation-runtime.md](docs/conversation-runtime.md), and backend groups in [docs/mesh-v1.md](docs/mesh-v1.md).
 
-### External API (`/api/v1`, API keys)
-
-When the external API listener is enabled, the daemon also serves REST + SSE on port `7346`, authenticated with `Authorization: Bearer tdx_…` keys. API keys and the listener (on/off and port) are managed in the Desktop or Web client under Settings → "Agent 调用" (Agent Calling); the TUI only shows the listener status. `[api] enabled = true` (or `--enable-api`) still turns the listener on from the config file. Each key reaches only its own conversations, and only the agents, models and workspaces both its own scope and the global Agent Calling scope allow; `POST /api/v1/runs` runs one prompt end to end. Events come back decrypted for the key while history on disk stays end-to-end encrypted. See the "外部 API（API Key）" chapter of [docs/API.md](docs/API.md).
-
-### HTTP Endpoints (`/v2`)
-
-- `GET /health`: Health status probe.
-- `GET /v2/version`: Returns daemon version and capabilities; signed requests also get the data directory and workspace roots.
-- `GET /v2/workspaces`: List cached workspaces for current tenant.
-- `PUT /v2/workspaces`: Merge workspace caches and return canonical workspace IDs. Any directory inside the backend workspace roots can run agents; there is no separate trust step.
-- `DELETE /v2/workspaces/{workspaceId}`: Cancel active turns and remove one workspace from the current tenant's catalog without deleting its conversations.
-- `GET /v2/workspace/entries?workspace=...&query=...`: Workspace file and folder suggestions for `@` picker.
-- `GET /v2/workspace/directories?path=...`: Directory tree explorer.
-- `GET /v2/workspace/file?path=...`: Read file contents within sandbox root.
-- `GET /v2/browser/fetch?url=...`: Proxy web resource fetching.
-- `GET /v2/providers`: List available agent providers and their active states.
-- `GET /v2/providers/versions`: Inspect the configured backend host's Codex, Pi, Claude Code, Grok Build, Devin, OpenCode, Antigravity, DeepSeek Harness, omp, and external ACP CLI versions.
-- `POST /v2/providers/{provider}/upgrade`: Start a single-flight self-update for a managed CLI; active Agent work blocks upgrades.
-- `POST /v2/providers/{provider}/install`: Install a missing managed CLI with the vendor's official install script (Unix); shares the upgrade operation, gate and audit trail.
-- `GET /v2/providers/upgrades/{operationId}`: Read asynchronous CLI install/upgrade progress and the verified resulting version.
-- `GET /v2/providers/models?provider=...&workspace=...`: Discover supported models for a provider.
-- `GET /v2/providers/commands?provider=...&workspace=...`: Query slash commands and extensions.
-- `GET /v2/conversations`: List persisted conversations for tenant.
-- `POST /v2/conversations`: Create a new conversation folder with selected agent provider.
-- `GET /v2/conversations/{id}`: Fetch conversation manifest and details.
-- `GET /v2/conversations/{id}/events?afterSequence=0&limit=200`: Paginated event journal query. `beforeSequence=N` pages backwards (`sequence <= N`, `hasMore` = earlier events remain) for lazy history loading.
-- `POST /v2/conversations/{id}/prompt`: Dispatch a prompt turn with text, typed content, model, reasoning effort, and skill resource IDs. Local files remain confined to the conversation workspace.
-- `POST /v2/conversations/{id}/cancel`: Cancel active running turn.
-- `POST /v2/conversations/{id}/permissions/{permissionId}`: Resolve interactive approval request.
-- `/v2/ssh/hosts*`, `/v2/ssh/keys*`, `/v2/ftp/sites*`, `/v2/remote/connections*`: SSH hosts, keys, FTP sites and SFTP/FTP file sessions on the backend host.
-
-### WebSocket Endpoint (`/v2/ws`)
-
-The single endpoint `/v2/ws` handles:
-1. Subscription to real-time conversation event journals (`conversation.subscribe`).
-2. Dispatching prompt turns and cancellations.
-3. Interactive permission decisions.
-4. Interactive PTY terminal sessions (`terminal.open`, `terminal.input`, `terminal.resize`, `terminal.close`).
-5. Local Codex engine process control.
-
----
-
-## Development & Verification
-
-Run the standard check suite before committing:
+## Development
 
 ```bash
-# Check compilation
-cargo check
-
-# Check formatting
+cargo build --release
 cargo fmt --all --check
-
-# Run linter
 cargo clippy --locked --all-targets --all-features
-
-# Run unit tests
 cargo test
 
-# Read-only Codex/Pi/OpenCode/omp installation, login, and RPC discovery
+# Read-only check of installed agents, logins and discovery
 cargo run -- doctor providers --provider codex,pi,opencode,omp --format json
 
-# Run the billable Codex/Pi smoke explicitly
+# Billable end-to-end smoke test against real Codex/Pi (opt in explicitly)
 TODEX_REAL_E2E=1 TODEX_REAL_ALLOW_BILLABLE=1 TODEX_REAL_PROVIDERS=codex,pi \
-  cargo test --test e2e_real_codex real_v2_provider_http_ws_roundtrip \
-  -- --ignored --test-threads=1
+  cargo test --test e2e_real_codex real_v2_provider_http_ws_roundtrip -- --ignored --test-threads=1
 ```
 
----
+Releases: [docs/RELEASING.md](docs/RELEASING.md). Security review: [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md).
 
-## Related Repositories
+## Related repositories
 
-- **[TodeX Desktop](../TodeX_desktop)**: macOS desktop client built with Electron, React 19, and HeroUI Pro.
-- **[TodeX Protocol](../TodeX_protocol)**: Shared `@todex/protocol` sources consumed by the desktop and web clients.
-- **[Todex Mobile](../Todex_mobile)**: Mobile client built with Swift.
-
----
+- [TodeX Desktop](https://github.com/youtonghy/TodeX_desktop): the desktop app
+- [TodeX Web](https://github.com/youtonghy/TodeX_web): the website and browser workbench
+- [TodeX Native](https://github.com/youtonghy/TodeX_native): the mobile app
+- [TodeX Container](https://github.com/youtonghy/TodeX_container): this backend and agent CLIs in a Docker image
+- [TodeX Protocol](https://github.com/youtonghy/TodeX_protocol): the client protocol library
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT. See [LICENSE](LICENSE).

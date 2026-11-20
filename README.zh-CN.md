@@ -1,223 +1,160 @@
-# TodeX 后端服务 (`todex-agentd`)
+# TodeX 后端（`todex-agentd`）
 
 <p align="center">
-  <strong>统一的 TodeX 2.0 AI 编程 Agent 后端守护进程与编排引擎。</strong>
+  <strong>TodeX 后端：在你自己的机器上运行编程 Agent，并安全地提供给 TodeX 桌面端、Web 端和移动端使用。</strong>
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> •
-  <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
----
+![TodeX 桌面端中由 todex-agentd 提供的对话](docs/screenshots/conversation-zh.png)
 
-## 概述
+`todex-agentd` 运行在代码所在的机器上：笔记本、工作站、服务器或容器都可以。它启动并驱动这台机器上安装的 Agent CLI，保存所有对话，并让任何已配对的 TodeX 客户端跟进和控制它们。客户端断开后对话照常运行，所有客户端看到的状态一致。
 
-`todex-agentd` 是 TodeX 生态的核心后端服务。基于 Rust、Tokio 和 Axum 构建，它为多种 AI 编程助手（包括 **Codex app-server**、**Agent Client Protocol (ACP 2.0)**、**Pi RPC** 和 **Claude Code stream-json**）提供统一、安全且持久化的编排与控制接口。
+下面的截图来自 [TodeX 桌面端](https://github.com/youtonghy/TodeX_desktop)，展示了各项后端功能在用户眼中的样子。
 
-在 TodeX 2.0 中，所有对外交互均收敛至 `/v2` 控制面（REST 接口与统一的 `/v2/ws` WebSocket）。基于会话目录（Conversation Folder）的持久化设计构成了消息历史、事件日志、状态快照与原生 Provider 会话的核心存储机制。
+## 目录
 
----
+- [功能](#功能)
+- [安装](#安装)
+- [运行](#运行)
+- [配对设备](#配对设备)
+- [配置](#配置)
+- [API](#api)
+- [开发](#开发)
 
-## 核心特性
+## 功能
 
-- **多 Agent 统一编排**：
-  - **Codex**：原生 JSON-RPC app-server 驱动（支持 `start`、`turn`、`status`、`stop`、`attach`、`replay`、`interrupt` 等控制）。
-  - **ACP (Agent Client Protocol 2.0)**：支持 `config.toml` 中预配置的受控 profile，防止任意命令注入。
-  - **Pi**：原生 RPC 驱动，支持命令目录发现（`get_commands`）、动态模型查询与交互式工具审批。
-  - **Claude Code**：基于 `stream-json` 协议直接对接 Claude CLI；未配置自定义 Anthropic 网关时使用 CLI 内置模型别名。
-- **会话目录持久化体系**：
-  - 会话数据独立保存于 `$DATA_DIR/conversations/<uuid>/` 目录下：
-    - `manifest.json`：存储元数据、选定 Provider Profile、工作区路径及时间戳。
-    - `events.jsonl`：仅追加的事件日志，支持按序列号断点续传。
-    - `snapshot.json`：压缩后的快速会话状态快照。
-    - `provider-state.json`：原生 Agent 引擎状态，支持重启后无缝 resume 会话。
-  - 乐观并发控制（并发发起变更 turn 时返回 `409 Conflict`，避免未知的盲目排队）。
-- **只读能力目录（Capability Catalogs）**：
-  - 实时读取原生已安装 Agent 的 Skills、MCP Servers、斜杠命令与模型目录。
-  - 应用“项目级优先于用户级”的配置优先级规则，绝不擅自篡改本地 Provider 配置文件。
-  - 支持后端按 `resourceId` 注入 Skill 内容（前端无需上传完整 Skill 文本）。
-- **统一多路复用 WebSocket (`/v2/ws`)**：
-  - 单一 WebSocket 连接承载会话事件流、实时推理流、交互式权限审批、本地终端 PTY 会话以及运行控制指令。
-  - 具备心跳保活检测、基于序列号的断线重连（`afterSequence`）及 UTF-8 帧大小保护。
-- **后量子传输加密**：
-  - 支持端到端传输层加密：
-    - **明文** (`none`)
-    - **X25519-ChaCha20Poly1305** (`x25519`)
-    - **ML-KEM-768** (`ml-kem-768`，NIST 后量子密码学标准)
-  - 传输公钥由[设备验证](docs/device-verification.md)交付并由验证码认证；TUI 配对二维码只包含服务器地址。
-- **安全与沙箱边界**：
-  - Fail-Closed 设备签名认证：每个请求携带已注册设备的 Ed25519 签名，未授权请求直接返回 `401 Unauthorized`；设备经[设备验证](docs/device-verification.md)登记，可在 TUI 单独吊销。
-  - 租户隔离（`tenant_id`），严格校验所有会话读取、订阅与变更入口。
-  - 工作区根目录约束（`workspace_root`），强力防御未经授权的路径穿越。
-  - 净化的子进程环境，只继承基础系统变量，避免泄露主机敏感凭据。
-- **SSH 主机与远程文件**：
-  - 自动读取后端用户 `~/.ssh/config` 中的 `Host`（跟随 `Include`），并调用系统 OpenSSH，密钥、ssh-agent、ProxyJump 与 `known_hosts` 的行为与用户终端一致；额外主机与 FTP 站点保存在 `$DATA_DIR/ssh`，从不写入 `~/.ssh/config`，也从不保存密码。
-  - SSH 密钥查看、导入与进程内生成；通过 `/v2/ws` 的交互式 SSH 终端；`/v2/remote/*` 下的 SFTP/FTP(S) 文件会话。
-  - 按主机手动开启的“Agent 访问”会向 Codex、Claude Code 与 ACP 类 Agent 暴露 `todex_ssh` MCP 服务器（`ssh_list_hosts`、`ssh_exec`）。详见 [API 文档](docs/API.md#ssh-主机与远程连接)。
-- **主机上的 Agent 浏览器**：
-  - Agent 驱动浏览器标签（`todex_desktop` 的 `browser_*` 工具），使用 daemon 固定版本、自动下载并校验的有界面 Chrome for Testing（也可用 `todex-agentd browser install` 或 `install.sh --with-browser` 提前下载）；`localhost` 指 daemon 所在主机。每个工作区使用独立的浏览器资料；客户端通过 `/v2/ws` 实时观看，会话首次使用、以及打开本机以外的每个主机（公网站点或局域网地址：允许一次或始终允许）都可由任意已配对设备确认。
-- **主机上的 Computer Use**：
-  - Agent 观察并操作 daemon 所在的电脑（`todex_desktop` 的 `computer_*` 工具），在进程内通过 [xa11y](https://github.com/xa11y/xa11y)（macOS AX、Windows UI Automation、Linux AT-SPI）完成；客户端只负责预览（实时画面、截图）和审批。
-  - 每个会话首次使用需由主机前的人确认；浮条“停止”和全局快捷键可随时结束；TodeX、凭据存储和系统设置永远不会被操作。macOS 上需为 `todex-agentd` 授予屏幕录制和辅助功能权限，详见 `docs/API.md`。
-- **交互式 TUI 与守护进程管理**：
-  - 基于 Ratatui 构建的交互式 TUI（`cargo run -- tui`）：查看运行状态、实时日志、启停守护进程，并自动探测局域网 IP 生成只含服务器地址的配对二维码。
-  - 基于 PID 文件管理的后台守护进程模式（`start`、`stop`、`restart`、`status`）。
+### 一个后端，接入所有 Agent
 
----
+Codex、Claude Code、Pi、Grok Build、Devin、OpenCode、Antigravity、DeepSeek Harness、omp（oh-my-pi），以及任何支持 Agent Client Protocol（ACP）的 Agent，统一的使用体验：
 
-## 系统架构
+- 流式回答、工具调用、文件修改和命令执行，授权请求会发送到所有已配对设备。
+- 模型、思考强度、斜杠命令、Skill 和 MCP 服务器，实时从已安装的 Agent 读取。
+- 对话在重启后依然保留，并从中断处继续；支持分叉、消息排队、计划、目标和后台任务。
+- 多种工作模式，包括计划模式和智能模式（先用一个模型规划，批准后由另一个模型执行）。
+- **隐私对话** 只存在内存中，从不写入历史；**定时对话** 在你选定的时间启动。
+- 按工作区划分的任务看板，任务可固定到处理它的对话上。
 
-```
-                      +---------------------------------------+
-                      |   TodeX Desktop / TodeX Mobile App    |
-                      +-------------------+-------------------+
-                                          |
-                        HTTP /v2/*        |   WebSocket /v2/ws
-                       (Auth / REST)      |   (事件流, 交互, PTY)
-                                          v
-+---------------------------------------------------------------------------------+
-|                                  todex-agentd                                   |
-|                                                                                 |
-|  +---------------------+  +----------------------+  +------------------------+  |
-|  |     认证与安全      |  |       传输加密       |  |       工作区存储       |  |
-|  | (设备签名/租户隔离)|  | (X25519 / ML-KEM)    |  |  (沙箱 workspace_root) |  |
-|  +---------------------+  +----------------------+  +------------------------+  |
-|                                                                                 |
-|  +---------------------------------------------------------------------------+  |
-|  |                           会话引擎 / 调度中心                             |  |
-|  |          (Manifests, 事件日志, 快照, Turn 乐观并发控制)                   |  |
-|  +---------------------------------------------------------------------------+  |
-|                                                                                 |
-|  +---------------------------------------------------------------------------+  |
-|  |                             Provider 适配器                               |  |
-|  |  +----------------+  +----------------+  +--------------+  +-----------+  |  |
-|  |  | Codex Gateway  |  |   ACP 2.0      |  |    Pi RPC    |  |Claude Code|  |  |
-|  |  +----------------+  +----------------+  +--------------+  +-----------+  |  |
-|  +---------------------------------------------------------------------------+  |
-+---------------------------------------------------------------------------------+
-                                          |
-                      +-------------------+-------------------+
-                      |       原生 Agent CLI 进程与子工具     |
-                      |    (codex, acp profile, pi, claude)   |
-                      +---------------------------------------+
-```
+![隐私对话](docs/screenshots/private-conversation-zh.png)
 
----
+### Agent CLI 与账号
 
-## 快速开始
+查看每个 Agent CLI 的已装版本和最新版本，用厂商官方安装脚本安装缺少的 CLI，并在没有 Agent 运行时升级。每个 Agent 可保存多个服务商账号并随时切换：后端会改写 Agent 自己的配置，所以你手动启动的 CLI 会话也使用同一个账号。账号可以导出、导入为文件，在主机之间迁移；**配置同步** 可以把账号、设置、MCP 服务器和 Skill 从一个后端复制到另一个后端。
 
-### 前置要求
+| CLI 管理 | 配置同步 |
+| :---: | :---: |
+| ![CLI 管理](docs/screenshots/settings-cli-zh.png) | ![配置同步](docs/screenshots/config-sync-zh.png) |
 
-- Rust 工具链（推荐 MSRV 1.80+；使用下方安装脚本时不需要）
-- 本机已安装并完成登录认证的 AI Agent CLI（如 `codex`、`pi`、`claude` 等）
+### 终端、SSH 与远程文件
 
-### 安装脚本（macOS / Linux / WSL）
+后端机器上的终端；从 `~/.ssh/config`（含 `Include`）读取 SSH 主机，并使用系统自带的 OpenSSH 客户端，因此密钥、ssh-agent、ProxyJump 和 `known_hosts` 的行为与你的 shell 一致；SSH 密钥的导入与生成；FTP 站点；SFTP/FTP 文件浏览；端口转发。后端从不改写 `~/.ssh/config`，也从不保存密码。为主机打开 **Agent 访问** 后，Agent 就能在上面执行命令，可按对话或逐条命令审批。
 
-无需 Rust 工具链，一键下载并管理预编译版本：
+![SSH 主机](docs/screenshots/terminal-hosts-zh.png)
+
+### Agent 浏览器与 Computer Use
+
+Agent 可以通过两种桌面工具在后端所在的电脑上工作：
+
+- **Agent 浏览器**：主机上一个真实的浏览器窗口（所以 `localhost` 就是那台机器），每个工作区有独立的配置。浏览器由后端自行下载并校验（`todex-agentd browser install`）。客户端可以实时观看；每个对话首次使用时需要已配对设备批准，访问本机以外的站点也需要批准。
+- **Computer Use**：Agent 查看并操作主机上的应用（macOS、Windows、Linux）。每个对话首次使用都需要主机前的人确认，可以用停止按钮或全局快捷键结束；TodeX 本身、凭据存储和系统设置永远不会被控制。macOS 上需要为 `todex-agentd` 授予“屏幕录制”和“辅助功能”权限。
+
+![Computer Use 实时画面](docs/screenshots/computer-live-zh.png)
+
+### Agent 调用与外部 API
+
+Agent 可以调用其他 Agent：任务会在同一工作区的子对话中交给另一个 Agent 和模型完成，范围限定在你允许的 Agent 和模型内。脚本和服务也可以通过可选的外部 API（独立端口上的 REST 与 SSE）用 API Key 做同样的事，每个 Key 只能访问自己的对话以及限定的 Agent、模型和工作区。结果以解密后的形式返回给该 Key，而磁盘上的历史依然端到端加密。
+
+![Agent 调用](docs/screenshots/settings-agent-calling-zh.png)
+
+### 多后端与后端组
+
+一个客户端可以同时连接多个后端。**后端组** 用签名的成员名单把设备和后端连成一组：设备通过邀请（二维码）和核对验证码加入，加入一次即可使用组内所有后端；某个后端自己的地址连不上时，流量可以经组内其他成员中转，依然端到端加密。
+
+| 后端连接 | 后端组 |
+| :---: | :---: |
+| ![后端连接](docs/screenshots/settings-backends-zh.png) | ![后端组](docs/screenshots/settings-mesh-zh.png) |
+
+### 安全
+
+- **设备验证**：客户端只能通过配对获得访问权限。把客户端上的验证码与后端控制台中的核对一致后批准（或用 `todex-agentd pair approve`），该设备的密钥即被登记。每个请求都必须由已登记设备签名，设备可以单独撤销。详见 [设备验证](docs/device-verification.md)。
+- **传输加密**：客户端与后端之间的通信使用 X25519 或抗量子的 ML-KEM-768 加密，后端密钥由配对验证码认证。只有同一台机器上的客户端、且在你明确选择时，才允许明文。详见 [transport v2](docs/transport-v2.md)。
+- **端到端加密的历史记录**：对话历史始终由你的设备持有的密钥加密，并支持恢复密钥。详见 [历史加密](docs/history-encryption.md)。
+- **边界**：Agent 只能在配置的工作区根目录内工作，Agent 进程不会继承后端的管理类环境变量。
+
+### 省心运行
+
+交互式控制台（TUI）可以查看状态和日志、启停后台守护进程、显示配对二维码，并列出、批准和撤销设备。守护进程可以随登录启动，已安装的发行版会自动更新：没有 Agent 工作满 5 分钟后，运行中的守护进程会重启到新版本。
+
+## 安装
+
+macOS、Linux 和 WSL，无需 Rust 工具链：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/youtonghy/TodeX_backend/main/install.sh | bash
 ```
 
-脚本将 `todex-agentd` 安装到 `~/.local/bin`（可用 `--prefix DIR` 或 `TODEX_INSTALL_DIR` 覆盖），校验 release 的 `SHA256SUMS`，在二进制旁保留一份回滚副本，并重启正在运行的托管 daemon。按 CPU 架构自动选择 `linux-x64-gnu` 或 `linux-arm64-gnu` 构建（WSL 同样适用）。Linux 构建需要 glibc 2.28 及以上（Debian 10、Ubuntu 20.04、RHEL 8 或更新版本）；Alpine 等 musl 发行版需从源码编译。
+脚本把 `todex-agentd` 安装到 `~/.local/bin`（可用 `--prefix DIR` 或 `TODEX_INSTALL_DIR` 修改），校验发行版的校验和，保留一份回滚副本，并重启正在运行的托管守护进程。Linux 版本需要 glibc 2.28+（Debian 10、Ubuntu 20.04、RHEL 8 或更新）；Alpine 等 musl 发行版需要从源码构建。Windows 版本附在每个 [发行版](https://github.com/youtonghy/TodeX_backend/releases) 中。
 
 ```bash
-./install.sh install                 # 安装或更新到最新 release
-./install.sh update                  # 更新已安装的版本
+./install.sh install                 # 安装或更新到最新版本
 ./install.sh install --version 2.0.2 # 安装指定版本
-./install.sh status                  # 查看已装/最新版本与 daemon 状态
-./install.sh uninstall               # 停止 daemon 并移除二进制
-./install.sh uninstall --purge       # 同时删除 ~/.todex-agent 数据目录
+./install.sh status                  # 已装与最新版本、守护进程状态
+./install.sh uninstall [--purge]     # 删除程序（以及 ~/.todex-agent 数据）
 ```
 
-通过 `curl` 管道运行时，参数经 `bash -s --` 传入，例如 `... | bash -s -- uninstall --purge --yes`（没有终端可供确认时，`--purge` 必须带 `--yes`）。用 `--version` 安装的指定版本需配合 `TODEX_AUTO_UPDATE=0` 才能保持，否则 `serve`、`tui`、`daemon start` 启动时会自动更新到最新 release，运行中的 daemon 发现新 release 后会在连续 5 分钟没有 Agent 运行时自动重启更新。超过 30 天的回滚备份会自动清理。
+通过 `curl` 管道执行时，用 `bash -s --` 传参，例如 `... | bash -s -- uninstall --purge --yes`。设置 `TODEX_AUTO_UPDATE=0` 可停留在指定版本。想在 Docker 中运行 Agent，请使用 [TodeX Container](https://github.com/youtonghy/TodeX_container)；TodeX 桌面端也可以在 **设置 › 本机后端** 中直接在本机部署后端。
 
-### 1. 编译构建
+请在机器上安装并登录至少一个 Agent CLI（`codex`、`claude`、`pi` 等），也可以稍后在客户端的 CLI 管理页面安装。
+
+## 运行
 
 ```bash
-cargo build --release
+todex-agentd tui                      # 交互式控制台（推荐）
+todex-agentd serve --host 127.0.0.1 --port 7345   # 前台运行
+todex-agentd daemon start|stop|restart|status     # 后台守护进程
+todex-agentd daemon autostart enable  # 登录时启动（status / disable）
 ```
 
-### 2. 启动服务
+退出控制台后守护进程继续运行。要接受其他机器的客户端，请监听网络（`--host 0.0.0.0`）或设置 `advertise_url`；需要 TLS 时，请在前面放一个反向代理（Caddy、nginx、Cloudflare Tunnel）。
 
-#### 方式 A：交互式 TUI 控制台（推荐本地开发使用）
+## 配对设备
+
+在控制台中按 `d` 查看配对请求，与客户端核对完整验证码（以及旁边的密钥指纹），按 `a` 批准或 `r` 拒绝；同一面板列出已登记设备，按 `x` 撤销。配对二维码只包含服务器地址；终端放不下时按 `b` 在浏览器中打开。
+
+没有控制台时（服务器、容器），以守护进程的用户身份执行（容器中：`docker exec -u todex <container> todex-agentd ...`）：
 
 ```bash
-cargo run -- tui
+todex-agentd pair list [--format text|json]           # 待处理的配对请求
+todex-agentd pair approve <CODE|REQUEST_ID> [--yes]   # 另有 pair reject
+todex-agentd devices list [--format text|json]        # 另有 devices revoke <deviceId>
+todex-agentd providers install <id>... [--if-missing] # 安装 Agent CLI
 ```
 
-在 TUI 控制台中可以直观启动/停止后台守护进程、查看实时日志，并显示移动端配对二维码（只含服务器地址）。按 `d` 打开设备验证面板，核对完整验证码后按 `a` 批准；验证码旁显示后端传输公钥指纹，客户端只从配对中获取并保存公钥。退出 TUI 不会终止后台守护进程。
+退出码和容器相关细节见 [docs/BUILD_RUN.md](docs/BUILD_RUN.md)。
 
-#### 方式 B：前台运行服务
+## 配置
 
-```bash
-cargo run -- serve --host 127.0.0.1 --port 7345
-```
+配置的优先级依次为：命令行参数、环境变量、`~/.todex-agent/config.toml`、内置默认值。
 
-#### 方式 C：后台守护进程模式
-
-```bash
-# 启动后台守护进程
-cargo run -- daemon start
-
-# 查看状态
-cargo run -- daemon status
-
-# 重启守护进程
-cargo run -- daemon restart
-
-# 停止守护进程
-cargo run -- daemon stop
-
-# 开机自启（登录时自动启动；launchd/systemd 用户服务/注册表 Run 键）
-cargo run -- daemon autostart enable   # status / disable 查询或取消
-```
-
-#### 无 TUI 的本机管理（容器、无头服务器）
-
-以 daemon 的用户运行（容器内 `docker exec -u todex <容器> todex-agentd …`），均接受 `--data-dir`。退出码与细节见 [docs/BUILD_RUN.md](docs/BUILD_RUN.md)「在容器中运行」。
-
-```bash
-todex-agentd pair list [--format text|json]           # 待批准的配对申请
-todex-agentd pair approve <验证码|requestId> [--yes]   # 拒绝用 pair reject
-todex-agentd devices list [--format text|json]        # 吊销用 devices revoke <deviceId>
-todex-agentd providers install <id>... [--if-missing] # 与 App 相同的安装器
-```
-
----
-
-## 配置说明
-
-配置优先级依次为：
-1. **命令行参数**
-2. **环境变量**
-3. **配置文件** (`$TODEX_AGENTD_DATA_DIR/config.toml`)
-4. **内置默认值**
-
-### 常用配置参数
-
-| 配置项 | 命令行参数 | 环境变量 | 默认值 | 描述 |
+| 配置项 | 命令行参数 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| **监听主机** | `--host` | `TODEX_AGENTD_HOST` | `127.0.0.1` | 服务绑定的网络接口地址。 |
-| **监听端口** | `--port` | `TODEX_AGENTD_PORT` | `7345` | HTTP 及 WebSocket 监听端口。 |
-| **数据目录** | `--data-dir` | `TODEX_AGENTD_DATA_DIR` | `~/.todex-agent` | 存储配置文件、会话目录与日志的位置。 |
-| **工作区根目录** | `--workspace-root` | `TODEX_AGENTD_WORKSPACE_ROOT` | `~/projects` | 允许客户端访问的工作区根沙箱路径。 |
-| **默认 Agent** | — | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` | 默认 Provider（`codex`、`acp`、`pi`、`claude-code`）。 |
-| **Codex 可执行文件** | — | `TODEX_AGENTD_CODEX_BIN` | `codex` | Codex CLI 路径或命令名称。 |
-| **Claude 可执行文件**| — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Claude Code CLI 路径或命令名称。 |
-| **Pi 可执行文件**    | — | `TODEX_AGENTD_PI_BIN` | `pi` | Pi CLI 路径或命令名称。 |
-| **启用认证** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | 是否启用 Fail-closed 设备签名认证。 |
-| **公布地址** | — | `TODEX_AGENTD_ADVERTISE_URL`（`server.advertise_url`） | 不设置 | 客户端应使用的 `http(s)` URL（不得带凭据、query、fragment）；启动日志先打印它，TUI 配对链接/二维码使用它。 |
-| **部署类型** | — | `TODEX_AGENTD_DEPLOYMENT`（`server.deployment`） | `host` | `host` 或 `container`，由 `/v2/version` 返回；`container` 时关闭自更新，`update` 不做改动。 |
-| **镜像 CLI 目录** | — | `TODEX_AGENTD_IMAGE_CLI_DIR`（路径列表；`agent.image_cli_dirs`） | 不设置 | 解析到这些目录下的 CLI 随容器镜像提供（`managedBy: "image"`），TodeX 不安装也不升级。 |
-| **路径映射** | — | `TODEX_AGENTD_PATH_MAPPINGS`（JSON；`[[workspace.path_mappings]]`） | 不设置 | `[{"hostPath","backendPath"}]`，经 `/v2/version` 公布给已配对客户端；`backendPath` 须位于某个工作区根目录内。 |
-| **配对加密方式** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | 配对加密算法（`none`、`x25519`、`ml-kem-768`）。监听非回环地址时不能为 `none`。客户端在设备验证时获取对应公钥。 |
-| **历史加密** | — | `TODEX_AGENTD_HISTORY_ENCRYPTION` | 始终 `e2e` | 已作废：会话历史始终端到端加密（见 [docs/history-encryption.md](docs/history-encryption.md)）。该变量或 `config.toml` 中 `history_encryption` 的任何值都只记一条警告后忽略。写入需要至少一台客户端登记设备密钥；旧版本写下的明文会话仍可读取，但只读。 |
+| 监听主机 | `--host` | `TODEX_AGENTD_HOST` | `127.0.0.1` | 监听地址。 |
+| 端口 | `--port` | `TODEX_AGENTD_PORT` | `7345` | HTTP 与 WebSocket 端口。 |
+| 数据目录 | `--data-dir` | `TODEX_AGENTD_DATA_DIR` | `~/.todex-agent` | 配置、对话、密钥和日志。 |
+| 工作区根目录 | `--workspace-root`（可重复） | `TODEX_AGENTD_WORKSPACE_ROOT`、`TODEX_AGENTD_WORKSPACE_ROOTS` | `~/projects` | Agent 可以工作的目录；第一个为主根目录。 |
+| 默认 Agent | — | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` | `codex`、`acp`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode`、`antigravity`、`deepseek-harness` 或 `omp`。 |
+| Agent 可执行文件 | — | `TODEX_AGENTD_CODEX_BIN`、`TODEX_AGENTD_CLAUDE_BIN`、`TODEX_AGENTD_PI_BIN` | `codex`、`claude`、`pi` | 各 CLI 的路径或命令名。 |
+| 设备认证 | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | 要求每个请求都带有已配对设备的签名。 |
+| 公布地址 | — | `TODEX_AGENTD_ADVERTISE_URL`（`server.advertise_url`） | 不设置 | 客户端应使用的 `http(s)` 地址；会最先打印在日志中，并用于配对二维码。 |
+| 配对加密 | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | `x25519` 或 `ml-kem-768`；`none` 仅允许本机客户端明文连接，在网络监听上会被拒绝。 |
+| 部署类型 | — | `TODEX_AGENTD_DEPLOYMENT`（`server.deployment`） | `host` | 设为 `container` 时关闭自动更新。 |
+| 镜像 CLI 目录 | — | `TODEX_AGENTD_IMAGE_CLI_DIR`（`agent.image_cli_dirs`） | 不设置 | 位于这些目录下的 CLI 随容器镜像提供，TodeX 不负责安装或升级。 |
+| 路径映射 | — | `TODEX_AGENTD_PATH_MAPPINGS`（`[[workspace.path_mappings]]`） | 不设置 | `[{"hostPath","backendPath"}]`，告诉客户端宿主机文件夹与后端路径的对应关系。 |
+| 浏览器来源 | — | `TODEX_AGENTD_CORS_ORIGINS`（`security.cors_origins`） | 不设置 | 额外允许连接的网页来源（例如自行部署的 TodeX Web）。 |
 
-### `config.toml` 配置示例
-
-文件位于 `~/.todex-agent/config.toml`：
+`~/.todex-agent/config.toml` 示例：
 
 ```toml
 host = "127.0.0.1"
@@ -225,17 +162,15 @@ port = 7345
 pairing_encryption = "ml-kem-768"
 data_dir = "~/.todex-agent"
 workspace_root = "~/projects"
+# workspace_roots = ["~/projects", "/srv/repos"]
 
 [agent]
 default_agent = "codex"
-codex_bin = "codex"
-claude_bin = "claude"
-pi_bin = "pi"
-# Provider 连续无输出超过该分钟数时停止当前 turn（0 关闭）
+# Agent 连续无输出超过该分钟数时停止当前轮次（0 表示关闭）
 provider_idle_timeout_minutes = 60
-# 常驻 Provider 进程无 turn 超过该秒数后停止（最小 30）
+# 空闲的 Agent 进程在该秒数后停止（30–604800）
 provider_keepalive_seconds = 300
-# 允许客户端在提交 prompt 前预先启动会话的 Provider 进程（conversation.warm）
+# 允许客户端在下一条提示词前预先启动对话的 Agent
 provider_prewarm = true
 
 [agent.acp_profiles.default]
@@ -244,91 +179,47 @@ args = ["--stdio"]
 
 [security]
 enable_auth = true
-enable_tls = false
 
-# 面向脚本与服务的外部 API，使用 API key 鉴权，默认关闭；key 与监听在桌面端/网页端“设置 → Agent 调用”中管理，见 docs/API.md
+# 供脚本和服务使用的外部 API（API Key），默认关闭。
+# 通常在客户端的 设置 › Agent 调用 中管理。
 [api]
 enabled = false
 host = "127.0.0.1"
 port = 7346
 ```
 
-> [!NOTE]
-> 原生监听器禁止配置 `enable_tls = true`，以避免“误以为已经安全”的安全假设。在生产或远程暴露环境中，请使用受信任的反向代理（如 Nginx、Caddy、Cloudflare Tunnel）来终结 TLS。
+内置监听器有意拒绝 `enable_tls = true`；请在反向代理上终止 TLS。
 
----
+## API
 
-## API 与 WebSocket 接口概览
+客户端通过 `/v2` REST API 和一个多路复用的 WebSocket（`/v2/ws`）与后端通信，两者都走加密传输。可选的外部 API 在 `/api/v1` 上以 API Key 认证。完整接口见 [docs/API.md](docs/API.md)，对话运行规则见 [docs/conversation-runtime.md](docs/conversation-runtime.md)，后端组见 [docs/mesh-v1.md](docs/mesh-v1.md)。
 
-### 外部 API（`/api/v1`，API key）
-
-开启外部 API 监听后，daemon 会在 `7346` 端口额外提供 REST + SSE 接口，使用 `Authorization: Bearer tdx_…` 鉴权。API key 与监听（开关和端口）都在桌面端或网页端的“设置 → Agent 调用”中管理；TUI 只显示监听状态。也可以在配置文件中设置 `[api] enabled = true`（或使用 `--enable-api`）开启监听。每把 key 只能访问自己的会话，以及 key 的 scope 与全局“Agent 调用”范围同时允许的 Agent、模型和 workspace；`POST /api/v1/runs` 可以一次完成一个 prompt。返回给调用方的事件已用该 key 解密，磁盘上的历史仍是端到端加密的。详见 [docs/API.md](docs/API.md) 中的“外部 API（API Key）”一章。
-
-### HTTP 接口 (`/v2`)
-
-- `GET /health`：服务健康检查。
-- `GET /v2/version`：获取服务端版本号与支持能力；带设备签名的请求另外返回数据目录与工作区根目录。
-- `GET /v2/workspaces`：获取当前租户已缓存的工作区列表。
-- `PUT /v2/workspaces`：合并当前租户的工作区缓存并返回统一的工作区 ID。后端工作区根目录内的任何目录都可以直接运行 Agent，没有单独的信任步骤。
-- `DELETE /v2/workspaces/{workspaceId}`：取消活动 turn，并从当前租户的目录中移除工作区，但保留其对话历史。
-- `GET /v2/workspace/entries?workspace=...&query=...`：为 `@` 提及提供工作区文件与目录补全。
-- `GET /v2/workspace/directories?path=...`：目录树浏览查询。
-- `GET /v2/workspace/file?path=...`：读取沙箱内指定文件内容。
-- `GET /v2/browser/fetch?url=...`：代理获取网页内容。
-- `GET /v2/providers`：获取已启用的 Agent Provider 列表与可用状态。
-- `GET /v2/providers/models?provider=...&workspace=...`：动态获取指定 Provider 支持的模型列表。
-- `GET /v2/providers/commands?provider=...&workspace=...`：查询斜杠命令与扩展。
-- `GET /v2/conversations`：获取持久化的会话列表。
-- `POST /v2/conversations`：创建新会话目录并锁定指定 Agent Provider。
-- `GET /v2/conversations/{id}`：获取指定会话的元数据清单。
-- `GET /v2/conversations/{id}/events?afterSequence=0&limit=200`：分页拉取事件日志。
-- `POST /v2/conversations/{id}/prompt`：发送 prompt（支持文本、类型化内容、模型覆盖、推理强度及 Skill resourceId）；本地文件只能来自会话所在工作区。
-- `POST /v2/conversations/{id}/cancel`：取消当前正在执行的 turn。
-- `POST /v2/conversations/{id}/permissions/{permissionId}`：响应交互式权限审批请求。
-- `/v2/ssh/hosts*`、`/v2/ssh/keys*`、`/v2/ftp/sites*`、`/v2/remote/connections*`：后端主机上的 SSH 主机、密钥、FTP 站点与 SFTP/FTP 文件会话。
-
-### WebSocket 统一接口 (`/v2/ws`)
-
-统一的 `/v2/ws` 承载：
-1. 实时订阅会话事件流（`conversation.subscribe`）。
-2. 发送 prompt 与取消执行指令。
-3. 响应权限与工具调用审批。
-4. 交互式 PTY 终端会话（`terminal.open`、`terminal.input`、`terminal.resize`、`terminal.close`）。
-5. 本地 Codex 引擎控制。
-
----
-
-## 开发与验证
-
-提交代码前请执行以下标准验证套件：
+## 开发
 
 ```bash
-# 检查编译
-cargo check
-
-# 检查代码格式
+cargo build --release
 cargo fmt --all --check
-
-# 执行 Clippy 静态检查
 cargo clippy --locked --all-targets --all-features
-
-# 运行单元测试
 cargo test
 
-# 运行真实 Codex 端到端测试（需要本机有已登录的 codex CLI）
-TODEX_REAL_E2E=1 cargo test --test e2e_real_codex -- --ignored --test-threads=1
+# 只读检查已安装的 Agent、登录状态与能力发现
+cargo run -- doctor providers --provider codex,pi,opencode,omp --format json
+
+# 针对真实 Codex/Pi 的计费端到端冒烟测试（需显式开启）
+TODEX_REAL_E2E=1 TODEX_REAL_ALLOW_BILLABLE=1 TODEX_REAL_PROVIDERS=codex,pi \
+  cargo test --test e2e_real_codex real_v2_provider_http_ws_roundtrip -- --ignored --test-threads=1
 ```
 
----
+发布流程见 [docs/RELEASING.md](docs/RELEASING.md)，安全审计见 [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md)。
 
 ## 相关仓库
 
-- **[TodeX Desktop](../TodeX_desktop)**：基于 Electron、React 19 与 HeroUI Pro 的 macOS 桌面端客户端。
-- **[TodeX Protocol](../TodeX_protocol)**：桌面端与 Web 客户端共用的 `@todex/protocol` 协议源码。
-- **[Todex Mobile](../Todex_mobile)**：基于 Swift 的移动端应用。
+- [TodeX Desktop](https://github.com/youtonghy/TodeX_desktop)：桌面端应用
+- [TodeX Web](https://github.com/youtonghy/TodeX_web)：官网与浏览器版工作台
+- [TodeX Native](https://github.com/youtonghy/TodeX_native)：移动端应用
+- [TodeX Container](https://github.com/youtonghy/TodeX_container)：把本后端和 Agent CLI 装进 Docker 镜像
+- [TodeX Protocol](https://github.com/youtonghy/TodeX_protocol)：客户端协议库
 
----
+## 许可证
 
-## 开源协议
-
-本项目采用 MIT 许可证 - 详情参见 [LICENSE](LICENSE) 文件。
+MIT，见 [LICENSE](LICENSE)。
