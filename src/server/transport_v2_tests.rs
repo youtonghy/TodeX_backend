@@ -165,7 +165,7 @@ pub(crate) fn ws_offer(keys: &PairingKeys, protocol: EncryptionProtocol) -> WsOf
     }
 }
 
-type ClientSocket =
+pub(crate) type ClientSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 impl WsOffer {
@@ -260,7 +260,7 @@ async fn revoking_a_device_closes_its_open_websocket_with_4401() {
     .expect("the revoked device's websocket closes");
 }
 
-async fn ping(socket: &mut ClientSocket, channel: &mut SecureChannel, id: &str) {
+pub(crate) async fn ping(socket: &mut ClientSocket, channel: &mut SecureChannel, id: &str) {
     let ping = json!({"id": id, "type": "server.ping", "payload": {}}).to_string();
     socket
         .send(Message::Binary(
@@ -489,9 +489,12 @@ pub(crate) fn open_response(down: RestKeys, stream: &[u8]) -> OpenedResponse {
 
 impl SealedRequest {
     pub(crate) async fn send(self, address: SocketAddr) -> (reqwest::Response, RestKeys) {
-        let mut request = reqwest::Client::new()
-            .post(format!("http://{address}/v2/sealed"))
-            .body(self.body);
+        self.send_to(&format!("http://{address}/v2/sealed")).await
+    }
+
+    /// Posts to `url`, e.g. a relay's `…/v2/sealed`.
+    pub(crate) async fn send_to(self, url: &str) -> (reqwest::Response, RestKeys) {
+        let mut request = reqwest::Client::new().post(url).body(self.body);
         for (name, value) in &self.headers {
             request = request.header(*name, value);
         }

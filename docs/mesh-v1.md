@@ -380,11 +380,53 @@ A session keyed for any other node fails at T (`4400`).
   skips it when the answer's `nodeId` is not T; an answer without `nodeId`
   (an older backend) counts when it is a 2xx. At most 64 relayed requests
   and sockets at once (`503 TRANSPORT_BUSY`).
+- **Route order at R:** a direct address that answered in the last
+  minute, else T's uplink when T holds one (below), else the direct
+  addresses in turn.
 - **Device rules:** a device relays only when direct addresses failed and
   its own relay setting is on; it prefers `relay: "preferred"` nodes, never
   uses `denied` ones, and never relays to a `relayTarget: false` node. It
   shows the connection as relayed and checks the direct addresses every
   minute (`/health`), switching back as soon as one answers.
+
+### Uplink
+
+A node behind NAT cannot be dialed by its relays, so it dials them. Every
+node that groups let members reach by relay (no `relayTarget: false`)
+keeps one control connection to every other node of those groups that
+relays (not `denied`), dialing that node's pinned addresses, then its
+node info `urls`, without loopback and its own (as R does above). Clients
+change nothing: they still use R's relay path.
+
+- **Signature:** both uplink requests carry `?node=T&relay=R&ts=<ms>&nonce=<b64u, 16
+  random bytes>&sig=<b64u>`, the signature by T's node key over
+  `"todex.mesh.v1/relay-uplink\0" || T || "\0" || R || "\0" || ts || "\0" ||
+  nonce`, followed by `"\0" || id` for a callback. R accepts it when `relay`
+  is R, `ts` is within 5 minutes of its clock, a control connection's nonce
+  was not seen in the last 10 minutes (a callback is single-use through its
+  id instead), a group lists R (not `denied`) and T as another node
+  without `relayTarget: false`, and T's roster key verifies the signature;
+  otherwise `401`/`403`.
+- **Control connection:** `GET /v2/mesh/uplink` (WebSocket). R keeps one per
+  node; a newer one replaces the older. R pings every 30 s and drops it after
+  two unanswered pings; T drops it after 75 s without a frame. T reconnects
+  2 s after it closes, and while no address takes it, after 2 s doubling up
+  to 60 s (±20 % jitter).
+- **Callback:** when R relays to T, it sends the text frame
+  `{"t":"open","id":"<b64u, 16 random bytes>"}`. T dials
+  `GET /v2/mesh/uplink/{id}` with `Connection: upgrade` and
+  `Upgrade: todex-uplink`; R answers `101` (`404` for an id it does not wait
+  for, `400` without the upgrade) and the connection becomes a raw byte
+  stream. R waits for it at most 10 s (`502` then). Over it, R sends the
+  relayed request as HTTP/1.1 or the `tv=2` WebSocket upgrade, and T serves
+  it as one inbound connection that only reaches `/health`, `/v2/version`,
+  `/v2/transport-policy`, `/v2/sealed` and `/v2/ws?tv=2` (others answer
+  `404`). Those requests count as remote: their peer address is never
+  loopback (`0.0.0.0` for a relay on the same machine) and their `Host` is
+  `todex-uplink.invalid`.
+- Both routes are direct routes for remote peers: they carry only what the
+  relay path would. `TODEX_AGENTD_MESH_UPLINK=false` stops a node from
+  keeping uplinks; it still accepts them as a relay.
 
 ## Version
 

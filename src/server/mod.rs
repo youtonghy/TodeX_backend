@@ -15,6 +15,7 @@ mod history_keys;
 mod local_admin;
 pub(crate) mod mesh;
 mod mesh_relay;
+mod mesh_uplink;
 mod native_history;
 mod omp_plugins;
 mod pi_agent_templates;
@@ -38,6 +39,7 @@ pub(crate) use history_keys::spawn_history_watch;
 pub(crate) use local_admin::LocalAdminInfo;
 #[cfg(test)]
 pub(crate) use mesh_relay::ticket_message as mesh_relay_ticket_message;
+pub(crate) use mesh_uplink::spawn_uplinks as spawn_mesh_uplinks;
 
 use std::time::Duration;
 
@@ -59,6 +61,8 @@ pub fn router(state: AppState) -> Router {
         .merge(device_pairing::routes())
         // Ticket-authorized and end-to-end encrypted for the target node.
         .merge(mesh_relay::routes())
+        // Node-signed; carries relayed ciphertext (docs/mesh-v1.md "Uplink").
+        .merge(mesh_uplink::routes())
         // Loopback + per-conversation token; deliberately outside device auth.
         .merge(crate::agent_mcp::routes(&state))
         .with_state(state.clone());

@@ -30,6 +30,8 @@ pub struct ManagedServer {
     kanban_schedule_task: Option<JoinHandle<()>>,
     /// Device groups: own node info and the LAN beacon.
     mesh_node_task: Option<JoinHandle<()>>,
+    /// Device groups: uplinks to the relays of this node's groups.
+    mesh_uplink_task: Option<JoinHandle<()>>,
     migration_task: Option<JoinHandle<()>>,
     /// Journal segment conversion, v2 migration and backup cleanup.
     maintenance_task: Option<JoinHandle<()>>,
@@ -486,6 +488,7 @@ impl ManagedServer {
         let history_watch_task = Some(server::spawn_history_watch(state.clone()));
         let kanban_schedule_task = Some(crate::kanban_scheduler::spawn(state.clone()));
         let mesh_node_task = server::mesh::spawn_node_watch(state.clone());
+        let mesh_uplink_task = server::spawn_mesh_uplinks(state.clone());
 
         Ok(Self {
             config,
@@ -499,6 +502,7 @@ impl ManagedServer {
             upload_cleanup_task,
             kanban_schedule_task,
             mesh_node_task,
+            mesh_uplink_task,
             migration_task,
             maintenance_task,
             legacy_scan_task,
@@ -589,6 +593,9 @@ impl ManagedServer {
         if let Some(task) = self.mesh_node_task.take() {
             task.abort();
         }
+        if let Some(task) = self.mesh_uplink_task.take() {
+            task.abort();
+        }
         // No new API requests (or turns) while conversations shut down.
         let mut api = self.api.take();
         if let Some(api) = api.as_mut() {
@@ -634,6 +641,9 @@ impl ManagedServer {
             task.abort();
         }
         if let Some(task) = self.mesh_node_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.mesh_uplink_task.take() {
             task.abort();
         }
         if let Some(mut api) = self.api.take() {

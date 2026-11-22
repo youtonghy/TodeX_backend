@@ -676,6 +676,71 @@ impl MeshStore {
         ))
     }
 
+    /// The roster key of `node` when it may hold an uplink to this node
+    /// (docs/mesh-v1.md "Uplink"): a group lists this node as a relay (not
+    /// `denied`) and `node` as another node reachable by relay.
+    pub(crate) fn uplink_key(&self, node: &str) -> Result<String> {
+        let inner = self.lock()?;
+        inner
+            .groups
+            .values()
+            .find_map(|group| {
+                let head = group.chain.head();
+                let this = head.member(&self.node_id)?;
+                let peer = head.member(node)?;
+                (node != self.node_id && this.relays() && peer.reachable_by_relay())
+                    .then(|| peer.public_key.clone())
+            })
+            .ok_or_else(|| {
+                AppError::Unauthorized("that node may not hold an uplink to this node".to_owned())
+            })
+    }
+
+    /// The relays this node keeps an uplink to, with their addresses: when a
+    /// group lets members reach this node by relay, every other node of it
+    /// that relays. Addresses as [`Self::relay_route`] gives them.
+    pub(crate) fn uplink_relays(&self, own: &OwnAddresses) -> Vec<(String, Vec<String>)> {
+        let Ok(inner) = self.lock() else {
+            return Vec::new();
+        };
+        let mut relays: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for group in inner.groups.values() {
+            let head = group.chain.head();
+            if !head
+                .member(&self.node_id)
+                .is_some_and(Member::reachable_by_relay)
+            {
+                continue;
+            }
+            for node in head
+                .members
+                .iter()
+                .filter(|member| member.id != self.node_id && member.relays())
+            {
+                let urls = relays.entry(node.id.clone()).or_default();
+                for url in node_urls(group, node, own) {
+                    if !urls.contains(&url) {
+                        urls.push(url);
+                    }
+                }
+            }
+        }
+        relays.into_iter().collect()
+    }
+
+    /// `b64u(sig)` by this node's key over [`uplink_message`].
+    pub(crate) fn sign_uplink(
+        &self,
+        relay: &str,
+        ts: u64,
+        nonce: &str,
+        id: Option<&str>,
+    ) -> String {
+        use ed25519_dalek::Signer;
+        let message = uplink_message(&self.node_id, relay, ts, nonce, id);
+        URL_SAFE_NO_PAD.encode(self.node_key.sign(&message).to_bytes())
+    }
+
     /// Name, version and members of every group, for status output.
     pub(crate) fn summaries(&self) -> Result<Vec<GroupSummary>> {
         Ok(self
@@ -716,6 +781,36 @@ impl MeshStore {
             .lock()
             .map_err(|_| AppError::InvalidRequest("mesh state is unavailable".to_owned()))
     }
+}
+
+const UPLINK_LABEL: &[u8] = b"todex.mesh.v1/relay-uplink\0";
+
+/// What a node signs to open an uplink to `relay`: `"todex.mesh.v1/relay-uplink\0"
+/// || node || "\0" || relay || "\0" || ts || "\0" || nonce`, plus `"\0" || id`
+/// for a data connection answering `open {id}`.
+pub(crate) fn uplink_message(
+    node: &str,
+    relay: &str,
+    ts: u64,
+    nonce: &str,
+    id: Option<&str>,
+) -> Vec<u8> {
+    let mut message = [
+        UPLINK_LABEL,
+        node.as_bytes(),
+        b"\0",
+        relay.as_bytes(),
+        b"\0",
+        ts.to_string().as_bytes(),
+        b"\0",
+        nonce.as_bytes(),
+    ]
+    .concat();
+    if let Some(id) = id {
+        message.extend_from_slice(b"\0");
+        message.extend_from_slice(id.as_bytes());
+    }
+    message
 }
 
 /// A node's addresses as other nodes dial it: pinned first, then the

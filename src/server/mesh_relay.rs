@@ -15,7 +15,7 @@ use std::{
 use axum::{
     body::Body,
     extract::{ws::Message as AxumMessage, FromRequestParts, Path, State, WebSocketUpgrade},
-    http::{HeaderMap, HeaderName, Request, Response, StatusCode},
+    http::{header, HeaderMap, HeaderName, Request, Response, StatusCode},
     response::IntoResponse,
     routing::any,
     Router,
@@ -23,6 +23,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::Signature;
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
+use hyper_util::rt::TokioIo;
 use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 
@@ -131,11 +132,7 @@ fn authorize(state: &AppState, target: &str, ticket: &str) -> Result<Vec<String>
         &signature,
     )
     .map_err(|_| AppError::Unauthenticated)?;
-    if urls.is_empty() {
-        return Err(AppError::RemoteUnreachable(
-            "this node knows no address of that node".to_owned(),
-        ));
-    }
+    // No address may still mean an uplink; `route` decides.
     Ok(urls)
 }
 
@@ -153,72 +150,168 @@ async fn relay(
         .clone()
         .try_acquire_owned()
         .map_err(|_| AppError::TransportBusy)?;
-    let base = reachable(&target, &urls).await?;
     let query = request
         .uri()
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    if rest == "v2/ws" {
-        let (mut parts, _) = request.into_parts();
-        let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &state)
-            .await
-            .map_err(|_| AppError::InvalidRequest("expected a WebSocket upgrade".to_owned()))?;
-        let url = format!("{}/v2/ws{query}", base.replacen("http", "ws", 1));
-        let upstream = match tokio_tungstenite::connect_async(
-            url.into_client_request()
-                .map_err(|_| AppError::InvalidRequest("bad relay target".to_owned()))?,
+    let (mut parts, body) = request.into_parts();
+    let upgrade = if rest == "v2/ws" {
+        Some(
+            WebSocketUpgrade::from_request_parts(&mut parts, &state)
+                .await
+                .map_err(|_| AppError::InvalidRequest("expected a WebSocket upgrade".to_owned()))?,
         )
-        .await
-        {
-            Ok((stream, _)) => stream,
-            // The target refused the upgrade: hand the client its status.
-            Err(tungstenite::Error::Http(response)) => {
-                let status = StatusCode::from_u16(response.status().as_u16())
-                    .unwrap_or(StatusCode::BAD_GATEWAY);
-                let body = response.into_body().unwrap_or_default();
-                return Ok(Response::builder()
-                    .status(status)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body))
-                    .expect("response"));
+    } else {
+        None
+    };
+    let upstream = route(&target, &urls).await?;
+    if let Some(upgrade) = upgrade {
+        return match upstream {
+            Upstream::Direct(base) => {
+                let url = format!("{}/v2/ws{query}", base.replacen("http", "ws", 1));
+                let request = url
+                    .into_client_request()
+                    .map_err(|_| AppError::InvalidRequest("bad relay target".to_owned()))?;
+                match tokio_tungstenite::connect_async(request).await {
+                    Ok((socket, _)) => Ok(bridge(upgrade, socket, permit)),
+                    Err(error) => refused(error),
+                }
             }
-            Err(error) => {
-                return Err(AppError::RemoteUnreachable(format!(
-                    "relay target: {error}"
-                )))
+            Upstream::Uplink(stream) => {
+                let url = format!("ws://{}/v2/ws{query}", super::mesh_uplink::UPLINK_HOST);
+                let request = url
+                    .into_client_request()
+                    .map_err(|_| AppError::InvalidRequest("bad relay target".to_owned()))?;
+                match tokio_tungstenite::client_async(request, TokioIo::new(stream)).await {
+                    Ok((socket, _)) => Ok(bridge(upgrade, socket, permit)),
+                    Err(error) => refused(error),
+                }
             }
         };
-        return Ok(upgrade
-            .on_upgrade(move |socket| async move {
-                let _permit = permit;
-                pipe(socket, upstream).await;
-            })
-            .into_response());
     }
-    let (parts, body) = request.into_parts();
-    let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
-        .map_err(|_| AppError::InvalidRequest("bad method".to_owned()))?;
-    let mut forwarded = relays()
-        .http
-        .request(method, format!("{base}/{rest}{query}"));
-    for (name, value) in parts.headers.iter() {
-        if kept(name) {
-            forwarded = forwarded.header(name.as_str(), value.as_bytes());
+    match upstream {
+        Upstream::Direct(base) => {
+            let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+                .map_err(|_| AppError::InvalidRequest("bad method".to_owned()))?;
+            let mut forwarded = relays()
+                .http
+                .request(method, format!("{base}/{rest}{query}"));
+            for (name, value) in parts.headers.iter() {
+                if kept(name) {
+                    forwarded = forwarded.header(name.as_str(), value.as_bytes());
+                }
+            }
+            let stream = body.into_data_stream().map_err(std::io::Error::other);
+            let response = forwarded
+                .body(reqwest::Body::wrap_stream(stream))
+                .send()
+                .await
+                .map_err(|error| AppError::RemoteUnreachable(format!("relay target: {error}")))?;
+            let mut builder = Response::builder().status(response.status().as_u16());
+            copy_headers(response.headers(), builder.headers_mut().expect("builder"));
+            let stream = response.bytes_stream().map_err(std::io::Error::other);
+            Ok(builder
+                .body(Body::from_stream(holding(stream, permit)))
+                .expect("relay response"))
+        }
+        Upstream::Uplink(stream) => {
+            let unreachable =
+                |error: hyper::Error| AppError::RemoteUnreachable(format!("relay target: {error}"));
+            let (mut sender, connection) = hyper::client::conn::http1::handshake(stream)
+                .await
+                .map_err(unreachable)?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::debug!(error = %error, "relayed uplink connection ended");
+                }
+            });
+            let mut forwarded = Request::builder()
+                .method(parts.method)
+                .uri(format!("/{rest}{query}"))
+                .header(header::HOST, super::mesh_uplink::UPLINK_HOST);
+            for (name, value) in parts.headers.iter() {
+                if kept(name) {
+                    forwarded = forwarded.header(name, value);
+                }
+            }
+            let forwarded = forwarded
+                .body(body)
+                .map_err(|_| AppError::InvalidRequest("bad relayed request".to_owned()))?;
+            let response = sender.send_request(forwarded).await.map_err(unreachable)?;
+            let mut builder = Response::builder().status(response.status());
+            copy_headers(response.headers(), builder.headers_mut().expect("builder"));
+            let stream = Body::new(response.into_body())
+                .into_data_stream()
+                .map_err(std::io::Error::other);
+            Ok(builder
+                .body(Body::from_stream(holding(stream, permit)))
+                .expect("relay response"))
         }
     }
-    let stream = body.into_data_stream().map_err(std::io::Error::other);
-    let response = forwarded
-        .body(reqwest::Body::wrap_stream(stream))
-        .send()
-        .await
-        .map_err(|error| AppError::RemoteUnreachable(format!("relay target: {error}")))?;
-    let mut builder = Response::builder().status(response.status().as_u16());
-    let headers = builder.headers_mut().expect("builder");
-    copy_headers(response.headers(), headers);
-    let stream = response.bytes_stream().map_err(std::io::Error::other);
-    let body = Body::from_stream(holding(stream, permit));
-    Ok(builder.body(body).expect("relay response"))
+}
+
+/// Where a relayed request goes.
+enum Upstream {
+    /// A direct address of the target.
+    Direct(String),
+    /// A byte stream over the target's uplink to this node.
+    Uplink(hyper::upgrade::Upgraded),
+}
+
+/// A direct address that answered in the last minute, else the target's
+/// uplink when it holds one, else the first direct address that answers.
+async fn route(target: &str, urls: &[String]) -> Result<Upstream, AppError> {
+    if let Some(base) = cached_address(target, urls) {
+        return Ok(Upstream::Direct(base));
+    }
+    match super::mesh_uplink::open(target).await {
+        Some(Ok(stream)) => {
+            tracing::info!(%target, "relaying via the target's uplink");
+            return Ok(Upstream::Uplink(stream));
+        }
+        Some(Err(error)) => {
+            tracing::info!(%target, error = %error, "the target's uplink failed; probing its addresses");
+        }
+        None => {}
+    }
+    probe_addresses(target, urls).await.map(Upstream::Direct)
+}
+
+/// Pipes the client's socket to `upstream` once it upgrades.
+fn bridge<S>(
+    upgrade: WebSocketUpgrade,
+    upstream: tokio_tungstenite::WebSocketStream<S>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response<Body>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    upgrade
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            pipe(socket, upstream).await;
+        })
+        .into_response()
+}
+
+/// The target refused the upgrade: hand the client its status.
+fn refused(error: tungstenite::Error) -> Result<Response<Body>, AppError> {
+    match error {
+        tungstenite::Error::Http(response) => {
+            let status =
+                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = response.into_body().unwrap_or_default();
+            Ok(Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("response"))
+        }
+        error => Err(AppError::RemoteUnreachable(format!(
+            "relay target: {error}"
+        ))),
+    }
 }
 
 /// Keeps the relay permit until the response body is done.
@@ -240,38 +333,41 @@ fn kept(name: &HeaderName) -> bool {
     KEPT_HEADERS.contains(&name) || name.starts_with("x-todex-")
 }
 
-fn copy_headers(from: &reqwest::header::HeaderMap, to: &mut HeaderMap) {
+fn copy_headers(from: &HeaderMap, to: &mut HeaderMap) {
     for (name, value) in from.iter() {
-        let Ok(name) = HeaderName::from_bytes(name.as_str().as_bytes()) else {
-            continue;
-        };
-        if !kept(&name) {
-            continue;
-        }
-        if let Ok(value) = axum::http::HeaderValue::from_bytes(value.as_bytes()) {
-            to.append(name, value);
+        if kept(name) {
+            to.append(name.clone(), value.clone());
         }
     }
 }
 
-/// The first of `urls` where `target` answers `/v2/version`, preferring the
-/// last one that did. An address whose answer names another node (`nodeId`)
-/// is skipped; one without `nodeId` (an older backend) counts when it
-/// answers at all.
-async fn reachable(target: &str, urls: &[String]) -> Result<String, AppError> {
-    let relays = relays();
-    let cached = relays.good.lock().ok().and_then(|good| {
+/// The address of `target` that answered in the last minute, if it is
+/// still one of `urls`.
+fn cached_address(target: &str, urls: &[String]) -> Option<String> {
+    let cached = relays().good.lock().ok().and_then(|good| {
         good.get(target)
             .filter(|(_, at)| at.elapsed() < GOOD_ADDRESS_TTL)
             .map(|(url, _)| url.clone())
     });
-    if let Some(url) = cached.filter(|url| urls.contains(url)) {
-        return Ok(url.trim_end_matches('/').to_owned());
+    cached
+        .filter(|url| urls.contains(url))
+        .map(|url| url.trim_end_matches('/').to_owned())
+}
+
+/// The first of `urls` where `target` answers `/v2/version`, remembered
+/// for a minute. An address whose answer names another node (`nodeId`) is
+/// skipped; one without `nodeId` (an older backend) counts when it answers
+/// at all.
+async fn probe_addresses(target: &str, urls: &[String]) -> Result<String, AppError> {
+    if urls.is_empty() {
+        return Err(AppError::RemoteUnreachable(
+            "this node knows no address of that node".to_owned(),
+        ));
     }
     for url in urls {
         let base = url.trim_end_matches('/').to_owned();
         if answers_as(target, &base).await {
-            if let Ok(mut good) = relays.good.lock() {
+            if let Ok(mut good) = relays().good.lock() {
                 good.insert(target.to_owned(), (url.clone(), Instant::now()));
             }
             return Ok(base);
@@ -312,12 +408,12 @@ async fn answers_as(target: &str, base: &str) -> bool {
 
 /// Copies frames both ways until either side closes; the close code of
 /// one side reaches the other.
-async fn pipe(
+async fn pipe<S>(
     client: axum::extract::ws::WebSocket,
-    upstream: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) {
+    upstream: tokio_tungstenite::WebSocketStream<S>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (mut client_tx, mut client_rx) = client.split();
     let (mut upstream_tx, mut upstream_rx) = upstream.split();
     let up = async {
@@ -402,16 +498,23 @@ mod tests {
         let other = version_server(serde_json::json!({"mesh": 1, "nodeId": "node_other"})).await;
         let right = version_server(serde_json::json!({"mesh": 1, "nodeId": target})).await;
         let urls = vec![other.clone(), right.clone()];
-        assert_eq!(reachable(&target, &urls).await.unwrap(), right);
+        assert_eq!(probe_addresses(&target, &urls).await.unwrap(), right);
+        assert_eq!(cached_address(&target, &urls), Some(right.clone()));
         // Only the wrong node answers: unreachable, nothing cached.
         let lonely = format!("node_{}", uuid::Uuid::new_v4().simple());
         assert!(matches!(
-            reachable(&lonely, &[other]).await,
+            probe_addresses(&lonely, &[other]).await,
             Err(AppError::RemoteUnreachable(_))
         ));
         // An older backend without `nodeId` still counts.
         let older = version_server(serde_json::json!({"name": "todex-agentd"})).await;
         let quiet = format!("node_{}", uuid::Uuid::new_v4().simple());
-        assert_eq!(reachable(&quiet, &[older.clone()]).await.unwrap(), older);
+        assert_eq!(
+            probe_addresses(&quiet, std::slice::from_ref(&older))
+                .await
+                .unwrap(),
+            older
+        );
+        assert!(cached_address(&lonely, &[older]).is_none());
     }
 }

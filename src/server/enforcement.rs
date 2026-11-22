@@ -22,6 +22,11 @@ fn is_direct_route(path: &str, query: Option<&str>) -> bool {
     ) || path.starts_with("/v2/device-pairing/")
         // Carries only the target node's direct routes; see mesh_relay.
         || path.starts_with(super::mesh_relay::RELAY_PREFIX)
+        // Node-signed uplinks that carry the same relayed ciphertext.
+        || path == super::mesh_uplink::UPLINK_PATH
+        || path
+            .strip_prefix(super::mesh_uplink::UPLINK_PATH)
+            .is_some_and(|rest| rest.starts_with('/'))
         || (path == "/v2/ws" && query_value(query, "tv").as_deref() == Some("2"))
 }
 
@@ -114,6 +119,9 @@ mod tests {
             ("/v2/device-pairing/create", None),
             ("/v2/device-pairing/reveal", None),
             ("/v2/ws", Some("tv=2&enc=x25519")),
+            ("/v2/mesh/relay/node_a/ticket/health", None),
+            ("/v2/mesh/uplink", Some("node=node_a")),
+            ("/v2/mesh/uplink/abc", Some("node=node_a")),
         ] {
             assert!(is_direct_route(path, query), "{path}");
         }
@@ -125,6 +133,7 @@ mod tests {
             ("/v2/sealed/x", None),
             ("/v2/device-pairing", None),
             ("/v2/healthz", None),
+            ("/v2/mesh/uplinks", None),
         ] {
             assert!(!is_direct_route(path, query), "{path}");
         }

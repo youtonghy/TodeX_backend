@@ -904,6 +904,7 @@ transcript、HKDF 标签与验证码格式见 [transport-v2.md](transport-v2.md#
 - 组名单新增设备时，后端登记其历史公钥并为其开一个授权（`grant.requested`）；组内其他设备自动完成授权，不再弹窗。
 - 地址与重回组（第 2 阶段）：组名单中的后端条目可带用户固定的 `addresses`；`mesh.presence.get {groupId}` 返回连在本后端上的组内设备与其余设备的最近离开时间，变化以 `presence` 事件广播；后端每 30 秒重读自身地址与传输公钥，签名信息变化时广播 `node-info.updated`；在组内且监听非回环地址的后端每 30 秒向 UDP `255.255.255.255:21047` 发送不含组 id 与密钥的局域网信标（`TODEX_AGENTD_MESH_BEACON=false` 关闭）。
 - 中继（第 3 阶段）：`/v2/mesh/relay/{nodeId}/{ticket}/{path}` 把 `health`、`v2/version`、`v2/transport-policy`、`v2/sealed` 与 `v2/ws` 原样转发给组内另一后端。票据由设备签名，内容始终按目标后端的传输公钥端到端加密，中继只看到双方 id 与流量大小。组名单中后端条目的 `relay`（`preferred`/`allowed`/`denied`）与 `relayTarget` 决定谁可以中继、谁可以被中继访问。中继不拨目标的回环地址与自己的地址，并用 `/v2/version` 的 `nodeId` 确认地址后面是目标后端。该路径对非回环对端直接开放。
+- 反向通道（uplink）：可被中继访问的后端主动向组内每个允许中继的后端保持一条控制连接 `GET /v2/mesh/uplink`（WebSocket），中继需要转发给它时在该连接上发 `{"t":"open","id"}`，它再拨 `GET /v2/mesh/uplink/{id}`（`Upgrade: todex-uplink`，响应 `101`）作为本次转发专用的字节通道。两条路由都带 `node`、`relay`、`ts`、`nonce`、`sig` 查询参数，由节点密钥签名（格式见 mesh-v1.md「Uplink」），对非回环对端直接开放。中继选路顺序：一分钟内直连成功的地址、反向通道、逐个探测直连地址。经通道的请求只到达上述 5 条路由，且一律按远端请求处理。`TODEX_AGENTD_MESH_UPLINK=false` 关闭本后端的反向通道。
 - 状态保存在 `$DATA_DIR/mesh/`（`node-key.json`、`groups/<groupId>.json`、`join-code.json`，均 0600）。命令行：`todex-agentd mesh join-code [--new]`、`todex-agentd mesh status`；未加入任何组的后端启动时在日志中打印加入码。
 
 ### 健康检查
