@@ -35,7 +35,7 @@ pub(crate) use policy::{
 #[allow(unused_imports)]
 pub(crate) use settings::{
     AgentCallingSettings, AgentCallingStore, AgentCallingUpdate, AgentScope, ApiListenerView,
-    McpSettings, McpUpdate,
+    ChildPermission, McpSettings, McpUpdate,
 };
 
 /// Bounds of MCP agent calls, reported to clients with the settings.

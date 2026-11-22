@@ -734,15 +734,16 @@ daemon 按文件修改时间重新加载 key，修改无需重启就会生效。
 ```json
 {
   "scope": { "agents": null, "models": {} },
-  "mcp": { "enabled": false, "approval": "ask" }
+  "mcp": { "enabled": false, "approval": "ask", "childPermission": "full-access" }
 }
 ```
 
 - `scope.agents`：`null` 表示全部 Agent；数组（Agent id，如 `"codex"`、`"claude-code"`）表示只允许这些，可以为空。
 - `scope.models`：Agent id → 允许的模型 id 数组（非空）。不在表中的 Agent 可以使用它的全部模型。空数组会被拒绝（400）。
 - `mcp.enabled` / `mcp.approval`：MCP 入口的开关与审批策略，`approval` 取值与 API key 相同（`ask`、`auto-approve`、`reject`），用于 Agent 调用产生的子会话。
+- `mcp.childPermission`：Agent 调用产生的子会话以什么权限模式运行。`full-access`（默认）：不论父会话当前模式，以被调用 Agent 支持的最高模式（完全访问）运行；`inherit`：不超过父会话当前轮次的模式（见 [Agent 调用（MCP `todex_agents`）](#agent-调用mcp-todex_agents) 的“权限”）。
 - 文件不存在时即为上面的默认值（全部 Agent、全部模型、MCP 关闭），已有的外部 API 用法不受影响；默认值不会写入文件，直到客户端保存。
-- 启动时宽松读取：忽略未知字段，丢弃未知的 Agent id（`scope.agents` 中的项与 `scope.models` 的键），未知的 `mcp.approval` 按 `ask` 处理，因此较新版本写入的文件仍可读取。文件无法使用（无法读取、超过 1 MiB、不是合法 JSON、字段类型不对或范围无效）时不会阻止后端启动：记录一条不含文件内容的警告，按上面的默认值运行（MCP 入口关闭）；内容有问题的文件改名为 `agent-calling.json.invalid-<Unix 秒>` 保留，不会被之后的保存覆盖。客户端的 `PUT` 仍严格校验（见下文）。
+- 启动时宽松读取：忽略未知字段，丢弃未知的 Agent id（`scope.agents` 中的项与 `scope.models` 的键），未知的 `mcp.approval` 按 `ask` 处理，未知的 `mcp.childPermission` 按 `inherit` 处理，因此较新版本写入的文件仍可读取。文件无法使用（无法读取、超过 1 MiB、不是合法 JSON、字段类型不对或范围无效）时不会阻止后端启动：记录一条不含文件内容的警告，按上面的默认值运行（MCP 入口关闭）；内容有问题的文件改名为 `agent-calling.json.invalid-<Unix 秒>` 保留，不会被之后的保存覆盖。客户端的 `PUT` 仍严格校验（见下文）。
 
 外部 API 的有效范围是全局范围与 key 自身 `scopes` 的交集：
 - Agent 必须同时在全局 `scope.agents` 与 key 的 `scopes.agents` 内，否则 403 `UNAUTHORIZED`。`GET /api/v1/agents` 只列出两者都允许的 Agent，每项的 `models` 也只含全局允许的模型；`GET /api/v1/agents/{agent}/models` 同样按全局范围过滤。
@@ -757,7 +758,7 @@ daemon 按文件修改时间重新加载 key，修改无需重启就会生效。
   ```json
   {
     "scope": { "agents": null, "models": {} },
-    "mcp": { "enabled": false, "approval": "ask", "injected": false },
+    "mcp": { "enabled": false, "approval": "ask", "childPermission": "full-access", "injected": false },
     "apiListener": {
       "enabled": true, "host": "127.0.0.1", "port": 7346,
       "listening": true, "baseUrl": "http://127.0.0.1:7346/api/v1",
@@ -768,7 +769,7 @@ daemon 按文件修改时间重新加载 key，修改无需重启就会生效。
   ```
 
   `mcp.injected` 表示按当前设置会注入 MCP 服务（`mcp.enabled` 且至少允许一个 Agent）。`apiListener.listening` 与 `baseUrl` 描述本进程实际运行的监听（未监听时 `baseUrl` 为 `null`）；`enabled`、`port` 是已保存的配置；`pendingRestart` 表示已保存的配置与正在运行的监听不同，需重启后端生效。`limits` 是 MCP 入口的限制：每个父会话最多同时运行的子调用数，以及等待时间的上限与默认值（秒）。
-- `PUT /v2/agent-calling`（需要设备签名，未开启设备认证的本地部署返回 403）：请求体为 `{"scope"?: {"agents"?, "models"?}, "mcp"?: {"enabled"?, "approval"?}}`。给出 `scope` 时整体替换范围（其中省略的字段取默认值）；`mcp` 中省略的字段保持不变。未知字段、未知 Agent id、空模型数组返回 400 `INVALID_REQUEST`。返回与 GET 相同的结构。
+- `PUT /v2/agent-calling`（需要设备签名，未开启设备认证的本地部署返回 403）：请求体为 `{"scope"?: {"agents"?, "models"?}, "mcp"?: {"enabled"?, "approval"?, "childPermission"?}}`。给出 `scope` 时整体替换范围（其中省略的字段取默认值）；`mcp` 中省略的字段保持不变。未知字段、未知 Agent id、空模型数组返回 400 `INVALID_REQUEST`。返回与 GET 相同的结构。
 - `PUT /v2/agent-calling/api-listener`（需要设备签名）：请求体为 `{"enabled"?: bool, "port"?: number}`，写入 `config.toml` 的 `[api]`，下次启动后端时生效。只写入请求中给出的字段：未给出的字段（其当前值可能来自 `--enable-api`、`TODEX_AGENTD_API_ENABLED`/`TODEX_AGENTD_API_PORT` 等命令行或环境变量覆盖）不会写入 `config.toml`；`pendingRestart` 仍与正在运行的监听比较。`port` 必须在 1–65535 之间且不能等于主端口；开启后的配置还须能通过启动检查（例如非回环 `host` 需要 `allow_plaintext_remote`）；否则返回 400 `INVALID_REQUEST`。返回与 GET 相同的结构。
 
 修改设置会写一条审计事件 `agent_calling.settings.audit`。
@@ -1626,7 +1627,7 @@ Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`�
 - 等待语义：`waitSecs` 默认 300，取值限制在 1–1200。到时轮次仍在运行则返回 `status: "running"` 与目前的输出，子会话**继续运行、不会被取消**；之后用 `agent_wait` 取结果（不给 `turnId` 时等最近一次调用的轮次）。已结束轮次的结果（`status`、`output`、`error`）可被 `agent_wait` 重复读取，直到该子会话开始下一轮或轮次结束 30 分钟后 `output` 从内存中丢弃，之后的 `agent_wait` 只返回状态与空 `output`（父会话事件中仍有记录）。Agent 的工具调用被取消时停止等待，子会话不受影响。
 - 限制与错误（工具错误文本为 `CODE: message`）：每个父会话最多 4 个同时运行的调用（`AGENT_CALL_LIMIT`）；Agent、模型不在全局范围内或 `reasoningEffort` 不在模型的 `supportedReasoningEfforts` 中返回 `UNAUTHORIZED`；`agent_turn`/`agent_wait`/`agent_cancel` 只接受调用者自己的子会话，其他会话（包括不存在的）一律 `NOT_FOUND`；子会话仍在运行轮次、或另一调用正在为它启动轮次时 `agent_turn` 返回 `CONFLICT`（同一子会话同时到达的两个 `agent_turn` 只有一个启动）；Plan 模式下 `agent_run`/`agent_turn` 返回 `PLAN_MODE`；创建与 Provider 错误按原错误码透传（如 `PROVIDER_UNAVAILABLE`）。
 - 子会话：`agent_run` 以父会话的 owner、父会话的工作区创建新会话（标题为给定的 `title`，缺省 `Agent call · <Agent 显示名>`），manifest 带 `parentConversationId: <父会话 id>`。模型解析同外部 API：该 Agent 受 `scope.models` 限制时，未指定 `model` 的调用取 Provider 默认模型（若允许），否则取第一个允许的模型，并明确发给 Agent——对已有子会话的 `agent_turn` 也一样，可能在会话中途切换模型；不受限制时由 Agent 使用自己的默认模型。子会话首个 prompt 失败时（例如 Provider 报错），刚创建的子会话随即删除，不留下隐藏会话（外部 API `runs` 的行为不变）。
-- 权限继承：子轮次的权限模式不超过父会话当前轮次的模式：取被调用 Agent 支持的、不高于父模式（`ask` < `accept-edits` < `auto` < `full-access`）的最高模式（例如 Devin 在父模式 `auto` 下以 `ask` 运行，Codex 在父模式 `accept-edits` 下以 `ask` 运行）；父会话的 `auto` 受 OS 沙箱约束（Codex，`enforcement: "sandbox"`）而被调用 Agent 只按自身策略执行时，上限再降为 `accept-edits`（只有 Claude Code 提供该档，其他降为 `ask`），子会话不会在父会话的沙箱之外自由执行；没有这样的模式时（如 Pi 只支持 `full-access`，而父模式更低）返回 `UNAUTHORIZED`。`workMode` 为 `implement`。`agent_run`/`agent_turn` 本身是有副作用的工具：父会话为 `ask` 时每次调用先发出 `permission.requested`（`input` 带 Agent、模型、标题与任务文本的前 4 KiB）。子会话在该模式下发出的权限请求再按 `agent-calling.json` 的 `mcp.approval` 处理：`ask` 照常交给用户（已配对设备，在子会话中作答）、`auto-approve` 自动批准（设备绑定的请求除外，一律拒绝）、`reject` 自动拒绝。因此设为 `auto-approve` 时，即使父会话处于 `ask` 模式，子会话的权限请求也会被自动批准——这是用户在设置中的明确选择。
+- 权限：子轮次的权限模式由 `mcp.childPermission` 决定。`full-access`（默认）时以被调用 Agent 支持的最高模式运行，不受父会话模式限制——即 `full-access`（只提供 `ask` 的 Grok Build 与通用 ACP 仍为 `ask`）；`inherit` 时不超过父会话当前轮次的模式：取被调用 Agent 支持的、不高于父模式（`ask` < `accept-edits` < `auto` < `full-access`）的最高模式（例如 Devin 在父模式 `auto` 下以 `ask` 运行，Codex 在父模式 `accept-edits` 下以 `ask` 运行）；父会话的 `auto` 受 OS 沙箱约束（Codex，`enforcement: "sandbox"`）而被调用 Agent 只按自身策略执行时，上限再降为 `accept-edits`（只有 Claude Code 提供该档，其他降为 `ask`），子会话不会在父会话的沙箱之外自由执行；没有这样的模式时（如 Pi 只支持 `full-access`，而父模式更低）返回 `UNAUTHORIZED`。`workMode` 为 `implement`。`agent_run`/`agent_turn` 本身是有副作用的工具：父会话为 `ask` 时每次调用先发出 `permission.requested`（`input` 带 Agent、模型、标题与任务文本的前 4 KiB）。子会话在该模式下发出的权限请求再按 `agent-calling.json` 的 `mcp.approval` 处理：`ask` 照常交给用户（已配对设备，在子会话中作答）、`auto-approve` 自动批准（设备绑定的请求除外，一律拒绝）、`reject` 自动拒绝。因此设为 `auto-approve` 时，即使父会话处于 `ask` 模式，子会话的权限请求也会被自动批准——这是用户在设置中的明确选择。
 - 父会话事件（写入**父会话**的事件记录，照常加密；`turnId` 由后端填为父会话当时运行中的轮次，子会话一律用 `childConversationId`/`childTurnId`）：
   - `agent.call.started { childConversationId, childTurnId, agent, model?, reasoningEffort?, text, title?, status: "running", startedAt }`（`text` 最多 16 KiB；`title` 只在 `agent_run` 时给出）。
   - `agent.call.updated { childConversationId, childTurnId, status: "running" | "waiting_permission" }`：子轮次发出权限请求时为 `waiting_permission`，请求全部答复后回到 `running`。

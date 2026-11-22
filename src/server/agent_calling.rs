@@ -44,6 +44,7 @@ fn view(state: &AppState) -> Value {
         "mcp": {
             "enabled": settings.mcp.enabled,
             "approval": settings.mcp.approval,
+            "childPermission": settings.mcp.child_permission,
             "injected": settings.mcp_injected(),
         },
         "apiListener": state.agent_calling.api_listener(&state.config),
@@ -75,6 +76,7 @@ async fn update(
             "restrictedModelAgents": settings.scope.models.keys().collect::<Vec<_>>(),
             "mcpEnabled": settings.mcp.enabled,
             "mcpApproval": settings.mcp.approval,
+            "mcpChildPermission": settings.mcp.child_permission,
         }),
     )
     .await?;

@@ -37,7 +37,10 @@ use super::{
     AgentMcp, AGENTS_ROUTE as ROUTE, AGENTS_SERVER as SERVER_NAME,
 };
 use crate::{
-    agent_calls::{self, AgentToolCaller, CallResult, RunInput, StartRefusal, TurnInput, LIMITS},
+    agent_calls::{
+        self, AgentToolCaller, CallResult, ChildPermission, RunInput, StartRefusal, TurnInput,
+        LIMITS,
+    },
     app_state::AppState,
     conversation::{ConversationManifest, ProviderKind},
     error::AppError,
@@ -348,8 +351,9 @@ fn registry_of_tools() -> ToolRegistry<AgentsTools, AgentsCall> {
             tool: Tool::new(
                 "agent_run",
                 "Start another TodeX agent on a task in a new conversation in this workspace and \
-                 wait for its answer. Its permission mode never exceeds this conversation's \
-                 current one; permission requests it raises are answered per the Agent Calling \
+                 wait for its answer. It runs in the permission mode the Agent Calling settings \
+                 give called agents (full access by default, or at most this conversation's \
+                 current mode); permission requests it raises are answered per the Agent Calling \
                  approval setting (ask: the user decides; auto-approve: approved; reject: \
                  rejected). Returns conversationId, turnId, status (running, completed, failed, \
                  cancelled, interrupted), output (the agent's reply text) and error. Continue the \
@@ -564,8 +568,38 @@ fn caller_refusal(manifest: &ConversationManifest) -> Result<(), String> {
 }
 
 /// The permission mode a child of `agent` runs in under a parent turn in
-/// `parent_mode`: the most permissive mode the agent supports that does not
-/// exceed the parent's.
+/// `parent_mode`: with [`ChildPermission::FullAccess`] the agent's most
+/// permissive mode (`full-access`; `ask` for agents that offer only that,
+/// such as Grok Build), else [`inherited_mode`].
+fn child_mode(
+    setting: ChildPermission,
+    parent: ProviderKind,
+    agent: ProviderKind,
+    parent_mode: &str,
+) -> Result<&'static str, AppError> {
+    match setting {
+        ChildPermission::FullAccess => {
+            let rank = |mode: &str| MODE_ORDER.iter().position(|known| *known == mode);
+            profile(agent)
+                .permission_config
+                .modes
+                .iter()
+                .copied()
+                .filter(|mode| rank(mode).is_some())
+                .max_by_key(|mode| rank(mode))
+                .ok_or_else(|| {
+                    AppError::Unauthorized(format!(
+                        "{} offers no permission mode TodeX can run it in",
+                        profile(agent).display_name
+                    ))
+                })
+        }
+        ChildPermission::Inherit => inherited_mode(parent, agent, parent_mode),
+    }
+}
+
+/// The most permissive mode `agent` supports that does not exceed a parent
+/// turn in `parent_mode`.
 fn inherited_mode(
     parent: ProviderKind,
     agent: ProviderKind,
@@ -612,8 +646,8 @@ impl AgentsTools {
         Ok(AgentToolCaller { parent })
     }
 
-    /// The parent turn's permission and work mode, inherited by a child of
-    /// `agent`.
+    /// The child turn of `agent`: its permission mode per the child
+    /// permission setting, refused while the parent turn plans.
     fn turn_input(
         &self,
         caller: &AgentToolCaller,
@@ -633,8 +667,9 @@ impl AgentsTools {
                     .to_owned(),
             );
         }
-        let permission_mode =
-            inherited_mode(caller.parent.provider, agent, &permission_mode).map_err(failure)?;
+        let setting = self.state.agent_calling.settings().mcp.child_permission;
+        let permission_mode = child_mode(setting, caller.parent.provider, agent, &permission_mode)
+            .map_err(failure)?;
         Ok(TurnInput {
             text,
             model,
@@ -1422,6 +1457,53 @@ mod tests {
         assert!(disabled.contains("AGENT_CALLING_DISABLED"), "{disabled}");
         assert!(call_events(state, &harness.parent).await.is_empty());
         client.cancel().await.unwrap();
+    }
+
+    #[test]
+    fn children_run_in_full_access_unless_set_to_inherit() {
+        use ChildPermission::{FullAccess, Inherit};
+        for parent_mode in ["ask", "accept-edits", "auto", "full-access", "unknown"] {
+            for agent in [
+                ProviderKind::Pi,
+                ProviderKind::Codex,
+                ProviderKind::ClaudeCode,
+                ProviderKind::Devin,
+            ] {
+                assert_eq!(
+                    child_mode(FullAccess, ProviderKind::Codex, agent, parent_mode).unwrap(),
+                    "full-access",
+                    "{agent:?} under {parent_mode}"
+                );
+            }
+        }
+        // Agents without full access (Grok Build, generic ACP: ask only) run
+        // in the most permissive mode they have.
+        assert_eq!(
+            child_mode(
+                FullAccess,
+                ProviderKind::Codex,
+                ProviderKind::GrokBuild,
+                "full-access"
+            )
+            .unwrap(),
+            "ask"
+        );
+        assert_eq!(
+            child_mode(
+                Inherit,
+                ProviderKind::ClaudeCode,
+                ProviderKind::Codex,
+                "auto"
+            )
+            .unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            child_mode(Inherit, ProviderKind::ClaudeCode, ProviderKind::Pi, "auto")
+                .unwrap_err()
+                .code(),
+            "UNAUTHORIZED"
+        );
     }
 
     #[test]

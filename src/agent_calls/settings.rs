@@ -1,6 +1,6 @@
 //! `$DATA_DIR/agent-calling.json`: which agents and models agent calls may
 //! use (both entries: the external API and the `todex_agents` MCP server),
-//! and the MCP entry's switch and approval policy. The external API
+//! and the MCP entry's switch, approval policy and child permission mode. The external API
 //! listener itself stays in `config.toml` `[api]`; this store also tracks
 //! the listener running in this process and the `[api]` values saved since,
 //! so clients can tell that a restart is pending.
@@ -146,6 +146,21 @@ pub(crate) struct McpSettings {
     /// answered.
     #[serde(default)]
     pub approval: ApprovalPolicy,
+    /// The permission mode agent-call child conversations run in.
+    #[serde(default)]
+    pub child_permission: ChildPermission,
+}
+
+/// The permission mode of an agent-call child conversation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ChildPermission {
+    /// `full-access`, whatever the calling turn's mode (the default).
+    #[default]
+    FullAccess,
+    /// The most permissive mode the called agent supports that does not
+    /// exceed the calling turn's.
+    Inherit,
 }
 
 /// `agent-calling.json`. A missing file means these defaults: every agent
@@ -185,6 +200,8 @@ pub(crate) struct McpUpdate {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub approval: Option<ApprovalPolicy>,
+    #[serde(default)]
+    pub child_permission: Option<ChildPermission>,
 }
 
 /// `agent-calling.json` as read at startup: unknown fields are ignored and
@@ -215,6 +232,8 @@ struct StoredMcp {
     enabled: bool,
     #[serde(default)]
     approval: Option<String>,
+    #[serde(default)]
+    child_permission: Option<String>,
 }
 
 /// An agent id as the file spells it (`"codex"`, `"claude-code"`), or
@@ -243,6 +262,13 @@ impl StoredSettings {
                 serde_json::from_value(serde_json::Value::String(approval)).unwrap_or_default()
             }
         };
+        // A child permission this TodeX does not know: the more restrictive
+        // `inherit` rather than a guess.
+        let child_permission = match stored.mcp.child_permission {
+            None => ChildPermission::default(),
+            Some(mode) => serde_json::from_value(serde_json::Value::String(mode))
+                .unwrap_or(ChildPermission::Inherit),
+        };
         let scope = AgentScope {
             agents: stored.scope.agents.map(|agents| {
                 agents
@@ -265,6 +291,7 @@ impl StoredSettings {
             mcp: McpSettings {
                 enabled: stored.mcp.enabled,
                 approval,
+                child_permission,
             },
         })
     }
@@ -375,6 +402,7 @@ impl AgentCallingStore {
         if let Some(mcp) = update.mcp {
             next.mcp.enabled = mcp.enabled.unwrap_or(next.mcp.enabled);
             next.mcp.approval = mcp.approval.unwrap_or(next.mcp.approval);
+            next.mcp.child_permission = mcp.child_permission.unwrap_or(next.mcp.child_permission);
         }
         let bytes = serde_json::to_vec_pretty(&next)?;
         let path = self.inner.path.clone();
@@ -575,7 +603,7 @@ mod tests {
             serde_json::to_value(&settings).unwrap(),
             serde_json::json!({
                 "scope": { "agents": null, "models": {} },
-                "mcp": { "enabled": false, "approval": "ask" },
+                "mcp": { "enabled": false, "approval": "ask", "childPermission": "full-access" },
             })
         );
         assert!(ProviderKind::ALL
@@ -629,12 +657,14 @@ mod tests {
                 mcp: Some(McpUpdate {
                     enabled: None,
                     approval: Some(ApprovalPolicy::Reject),
+                    child_permission: Some(ChildPermission::Inherit),
                 }),
             })
             .await
             .unwrap();
         assert!(saved.mcp.enabled);
         assert_eq!(saved.mcp.approval, ApprovalPolicy::Reject);
+        assert_eq!(saved.mcp.child_permission, ChildPermission::Inherit);
 
         #[cfg(unix)]
         {
@@ -847,16 +877,22 @@ mod tests {
         assert_eq!(settings.scope.models.len(), 1);
         assert!(settings.mcp.enabled);
         assert_eq!(settings.mcp.approval, ApprovalPolicy::AutoApprove);
+        // Files written before the setting existed run children in full access.
+        assert_eq!(settings.mcp.child_permission, ChildPermission::FullAccess);
         assert_eq!(
             std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap(),
             contents
         );
         assert_eq!(settings_files(&dir), [SETTINGS_FILE]);
 
-        // An approval this TodeX does not know asks the user.
+        // An approval this TodeX does not know asks the user, and an unknown
+        // child permission inherits the calling turn's mode.
         std::fs::write(
             dir.join(SETTINGS_FILE),
-            serde_json::json!({ "mcp": { "enabled": true, "approval": "ask-twice" } }).to_string(),
+            serde_json::json!({
+                "mcp": { "enabled": true, "approval": "ask-twice", "childPermission": "root" }
+            })
+            .to_string(),
         )
         .unwrap();
         let settings = AgentCallingStore::load(&dir, &ApiConfig::default())
@@ -864,6 +900,7 @@ mod tests {
             .settings();
         assert!(settings.mcp.enabled);
         assert_eq!(settings.mcp.approval, ApprovalPolicy::Ask);
+        assert_eq!(settings.mcp.child_permission, ChildPermission::Inherit);
 
         // Clients' updates stay strict.
         for update in [
