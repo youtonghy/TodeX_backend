@@ -3589,10 +3589,18 @@ async fn read_claude_turn(
             }
             Some("stream_event") => {
                 saw_output = true;
+                if starts_new_invocation(&message, settled.is_some()) {
+                    settled = None;
+                    wait = None;
+                }
                 handle_stream_event(&message, &prompt.turn_id, &mut tools, sink).await?;
             }
             Some("assistant") => {
                 saw_output = true;
+                if starts_new_invocation(&message, settled.is_some()) {
+                    settled = None;
+                    wait = None;
+                }
                 if let Some(until) = claude_frame_limit_reset(&message) {
                     rejected_reset = Some(until);
                 }
@@ -3720,7 +3728,8 @@ async fn read_claude_turn(
                         // prompt): no deadline covers a person's decision.
                         Some("requires_action") => wait = None,
                         // A new invocation began: the previous answer no longer
-                        // ends this turn.
+                        // ends this turn. Follow-ups to background work may
+                        // skip this frame; see [`starts_new_invocation`].
                         Some("running") => {
                             settled = None;
                             wait = None;
@@ -4350,6 +4359,16 @@ impl IdleWait {
             due: Instant::now() + grace,
         }
     }
+}
+
+/// Whether `message` is main-thread output after a settled `result`: Claude
+/// started another invocation (a follow-up to a finished background task
+/// starts inside the same `running` state, with no new `running` frame), so
+/// that `result` no longer answers the turn. Ending on it during a stall of
+/// the new invocation's stream would cut it off and orphan its output.
+/// Subagent frames carry `parent_tool_use_id` and run on their own.
+fn starts_new_invocation(message: &Value, settled: bool) -> bool {
+    settled && message.get("parent_tool_use_id").is_none_or(Value::is_null)
 }
 
 /// The turn's failure when Claude went idle without answering it.

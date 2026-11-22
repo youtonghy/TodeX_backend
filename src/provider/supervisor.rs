@@ -7401,6 +7401,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stalled_follow_up_is_not_ended_on_the_earlier_result() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-followup-stall").await;
+        fs::write(root.join("followup-stall"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "answer it".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let completed = history
+            .iter()
+            .position(|event| {
+                event.event_type == "turn.completed" && event.payload["turnId"] == turn_id
+            })
+            .unwrap_or_else(|| panic!("{history:?}"));
+        // The follow-up's output after the stall belongs to the same turn.
+        let resumed = history
+            .iter()
+            .position(|event| event.payload.to_string().contains("follow-up resumed"))
+            .unwrap_or_else(|| panic!("{history:?}"));
+        assert!(resumed < completed, "{history:?}");
+        // `idle` ended the turn, not the silence after the first `result`.
+        assert!(
+            !history
+                .iter()
+                .any(|event| event.payload.to_string().contains("idle_timeout")),
+            "{history:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_result_whose_idle_never_comes_still_ends_the_turn() {
         let (root, store, supervisor, workspace) =
             control_fixture("todex-claude-withheld-idle").await;
@@ -8914,6 +8952,36 @@ elif [ -f "$(dirname "$0")/dropped-tool-result" ]; then
     printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"done anyway"}}}\n'
     printf '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"claude-native","result":"done anyway"}\n'
     printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+  done
+elif [ -f "$(dirname "$0")/followup-stall" ]; then
+  # Frame order captured from Claude Code 2.1.329: the first answer comes while
+  # a background subagent runs; its notification starts a follow-up invocation
+  # inside the same `running` state, with no new `running` frame. That
+  # invocation's stream then stalls for longer than the idle grace before it
+  # resumes. The stale first `result` must not end the turn during the stall.
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$(dirname "$0")/stdin.log"
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
+        continue
+        ;;
+    esac
+    [ -n "$started" ] && continue
+    started=1
+    (
+      printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+      printf '{"type":"system","subtype":"init"}\n'
+      printf '{"type":"system","subtype":"task_started","task_id":"agent-bg","is_backgrounded":true,"task_type":"local_agent"}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"waiting on the subagent"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"waiting on the subagent"}\n'
+      printf '{"type":"system","subtype":"task_notification","task_id":"agent-bg","status":"completed","task_type":"local_agent"}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"follow-up started"}}}\n'
+      sleep 3
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"follow-up resumed"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"follow-up resumed"}\n'
+      printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+    ) &
   done
 elif [ -f "$(dirname "$0")/withheld-idle" ]; then
   # Frame order captured from Claude Code 2.1.310: the answer is out while
