@@ -33,7 +33,13 @@ use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
 use crate::update;
 use crate::workspace_paths::canonical_workspace_root;
 
-const ACTION_COUNT: usize = 15;
+const ACTION_COUNT: usize = 16;
+/// Key of each action-list entry, in list order.
+const ACTION_SHORTCUTS: [&str; ACTION_COUNT] = [
+    "s", "r", "a", "h", "p", "b", "w", "e", "x", "g", "c", "l", "d", "m", "u", "q",
+];
+/// How often the open "Join a backend group" window rereads the group files.
+const MESH_JOIN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
@@ -75,6 +81,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         app.refresh_daemon_status();
         app.refresh_connect_addresses();
         app.refresh_device_pairing(false);
+        app.refresh_mesh_join();
         while let Ok(result) = app.daemon_op_rx.try_recv() {
             app.apply_daemon_op_result(result);
         }
@@ -195,6 +202,26 @@ struct CredentialsPopup {
     /// Fingerprint of the transport key; `None` when encryption is off.
     fingerprint: Option<String>,
     scroll: u16,
+}
+
+/// "Join a backend group" (docs/mesh-v1.md "A node joins"): the node's join
+/// code and addresses, entered on a device of the group under Settings →
+/// Backend groups → Add backend.
+struct MeshJoinPopup {
+    /// `None` once the code was used or expired.
+    code: Option<crate::mesh::JoinCode>,
+    groups: Vec<MeshGroupLine>,
+    /// Groups this node joined while the window was open.
+    joined: Vec<String>,
+    refreshed_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MeshGroupLine {
+    group_id: String,
+    name: String,
+    nodes: usize,
+    devices: usize,
 }
 
 struct AboutPopup {
@@ -417,6 +444,7 @@ struct TuiApp {
     pairing_qr: Option<PairingQr>,
     pairing_browser_pages: Vec<crate::transport_crypto::pairing_browser::PairingQrBrowserPage>,
     credentials: Option<CredentialsPopup>,
+    mesh_join: Option<MeshJoinPopup>,
     device_pairing: DevicePairingState,
     folder_picker: Option<FolderPicker>,
     roots_picker: Option<usize>,
@@ -480,6 +508,7 @@ impl TuiApp {
             pairing_qr: None,
             pairing_browser_pages: Vec::new(),
             credentials: None,
+            mesh_join: None,
             device_pairing: DevicePairingState::default(),
             folder_picker: None,
             roots_picker: None,
@@ -792,6 +821,157 @@ impl TuiApp {
             self.notice = self
                 .text("About panel closed.", "关于面板已关闭。")
                 .to_owned();
+        }
+    }
+
+    /// Opens "Join a backend group" with the current join code, creating one
+    /// when there is none (`new` replaces it). Reads and writes the same
+    /// `mesh/` files as `todex-agentd mesh join-code`.
+    fn open_mesh_join(&mut self, new: bool) {
+        let loaded = crate::mesh::MeshStore::load(&self.config.data_dir)
+            .and_then(|store| Ok((store.join_code(new)?, mesh_group_lines(&store)?)));
+        match loaded {
+            Ok((code, groups)) => {
+                let joined = self
+                    .mesh_join
+                    .take()
+                    .map(|popup| popup.joined)
+                    .unwrap_or_default();
+                self.mesh_join = Some(MeshJoinPopup {
+                    code: Some(code),
+                    groups,
+                    joined,
+                    refreshed_at: Instant::now(),
+                });
+                self.notice = if new {
+                    self.text(
+                        "New join code created; the previous code no longer works.",
+                        "已生成新的加入码，旧加入码已失效。",
+                    )
+                } else {
+                    self.text(
+                        "Join code is open. Enter it with this backend's address on a device of the group.",
+                        "加入码已打开。请在组内设备上输入它和本后端的地址。",
+                    )
+                }
+                .to_owned();
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.notice = self
+                    .text("Failed to create a join code.", "无法生成加入码。")
+                    .to_owned();
+                self.last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    /// Picks up a used or replaced code and groups joined while the window
+    /// is open.
+    fn refresh_mesh_join(&mut self) {
+        if self
+            .mesh_join
+            .as_ref()
+            .is_none_or(|popup| popup.refreshed_at.elapsed() < MESH_JOIN_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        let loaded = crate::mesh::MeshStore::load(&self.config.data_dir)
+            .and_then(|store| Ok((store.current_join_code()?, mesh_group_lines(&store)?)));
+        let Some(popup) = self.mesh_join.as_mut() else {
+            return;
+        };
+        popup.refreshed_at = Instant::now();
+        let (code, groups) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return;
+            }
+        };
+        let joined = groups
+            .iter()
+            .filter(|group| {
+                !popup
+                    .groups
+                    .iter()
+                    .any(|known| known.group_id == group.group_id)
+            })
+            .map(|group| group.name.clone())
+            .collect::<Vec<_>>();
+        popup.code = code;
+        popup.groups = groups;
+        if joined.is_empty() {
+            return;
+        }
+        popup.joined.extend(joined.iter().cloned());
+        let names = joined.join(", ");
+        self.notice = match self.language {
+            TuiLanguage::English => format!("This backend joined the group {names}."),
+            TuiLanguage::Chinese => format!("本后端已加入组 {names}。"),
+        };
+        self.last_error = None;
+        self.push_log(self.notice.clone());
+    }
+
+    fn close_mesh_join(&mut self) {
+        if self.mesh_join.take().is_some() {
+            self.notice = self
+                .text("Join code window closed.", "加入码窗口已关闭。")
+                .to_owned();
+        }
+    }
+
+    fn copy_mesh_join_code(&mut self) {
+        let Some(code) = self
+            .mesh_join
+            .as_ref()
+            .and_then(|popup| popup.code.as_ref())
+            .map(|code| code.code.clone())
+        else {
+            self.notice = self
+                .text(
+                    "No valid join code; press n for a new one.",
+                    "没有有效的加入码，按 n 生成新的。",
+                )
+                .to_owned();
+            return;
+        };
+        let label = self.text("Join code", "加入码").to_owned();
+        self.copy_to_clipboard(&label, code);
+    }
+
+    fn copy_mesh_join_address(&mut self) {
+        let Some(url) = self.mesh_join_urls().into_iter().next() else {
+            self.notice = self
+                .text(
+                    "This backend has no address other devices can reach.",
+                    "本后端没有其他设备可访问的地址。",
+                )
+                .to_owned();
+            return;
+        };
+        let label = self.text("Backend address", "后端地址").to_owned();
+        self.copy_to_clipboard(&label, url);
+    }
+
+    /// Addresses a device of the group can enter for this backend; loopback
+    /// only reaches this machine, so it is never offered.
+    fn mesh_join_urls(&self) -> Vec<String> {
+        if !self.config.network_enabled {
+            return Vec::new();
+        }
+        let port = self
+            .daemon
+            .as_ref()
+            .map_or(self.config.port, |process| process.port);
+        match &self.connect_addresses {
+            Ok(addresses) => addresses
+                .iter()
+                .filter(|address| !listen_addrs::is_loopback_host(&address.host))
+                .map(|address| format!("http://{}:{port}", address.host))
+                .collect(),
+            Err(_) => Vec::new(),
         }
     }
 
@@ -1485,6 +1665,17 @@ impl TuiApp {
             return Ok(false);
         }
 
+        if self.mesh_join.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.close_mesh_join(),
+                KeyCode::Enter | KeyCode::Char('c') => self.copy_mesh_join_code(),
+                KeyCode::Char('a') => self.copy_mesh_join_address(),
+                KeyCode::Char('n') => self.open_mesh_join(true),
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         if self.pairing_qr.is_some() {
             match key.code {
                 KeyCode::Char('b') => self.open_pairing_qr_browser().await,
@@ -1581,6 +1772,7 @@ impl TuiApp {
             KeyCode::Char('g') => self.show_pairing_qr().await,
             KeyCode::Char('c') => self.show_credentials().await,
             KeyCode::Char('d') => self.open_device_pairing(),
+            KeyCode::Char('m') => self.open_mesh_join(false),
             KeyCode::Char('l') => self.toggle_language(),
             KeyCode::Char('u') => self.open_about(),
             KeyCode::PageUp => self.scroll_logs_up(LOG_SCROLL_STEP),
@@ -1715,8 +1907,9 @@ impl TuiApp {
             10 => self.show_credentials().await,
             11 => self.toggle_language(),
             12 => self.open_device_pairing(),
-            13 => self.open_about(),
-            14 => return Ok(true),
+            13 => self.open_mesh_join(false),
+            14 => self.open_about(),
+            15 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -2745,6 +2938,11 @@ impl TuiApp {
         if self.device_pairing.open {
             self.render_device_pairing(frame);
         }
+        if let Some(popup) = &self.mesh_join {
+            let area = centered_area(frame.area(), 84, 18);
+            frame.render_widget(Clear, area);
+            frame.render_widget(self.mesh_join_widget(popup), area);
+        }
         if let Some(about) = &self.about {
             let area = centered_area(frame.area(), 76, 13);
             frame.render_widget(Clear, area);
@@ -2755,6 +2953,7 @@ impl TuiApp {
     fn dim_popup_background(&self, frame: &mut Frame<'_>) {
         if self.pairing_qr.is_some()
             || self.credentials.is_some()
+            || self.mesh_join.is_some()
             || self.device_pairing.open
             || self.about.is_some()
             || (self.view == TuiView::Control
@@ -3104,11 +3303,9 @@ impl TuiApp {
             self.text("Credentials & copy", "凭据与复制"),
             self.text("Language: English", "语言：中文"),
             self.text("Device verification", "设备验证"),
+            self.text("Join a backend group", "加入后端组"),
             about.as_str(),
             self.text("Quit", "退出"),
-        ];
-        let shortcuts = [
-            "s", "r", "a", "h", "p", "b", "w", "e", "x", "g", "c", "l", "d", "u", "q",
         ];
         let items = actions
             .iter()
@@ -3124,14 +3321,17 @@ impl TuiApp {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else if (idx == 1 && restart_recommended)
-                    || (idx == 13 && self.update_available.is_some())
+                    || (idx == 14 && self.update_available.is_some())
                 {
                     Style::default().fg(Color::Yellow)
                 } else {
                     Style::default()
                 };
-                ListItem::new(Line::from(format!("{marker}[{}] {label}", shortcuts[idx])))
-                    .style(style)
+                ListItem::new(Line::from(format!(
+                    "{marker}[{}] {label}",
+                    ACTION_SHORTCUTS[idx]
+                )))
+                .style(style)
             })
             .collect::<Vec<_>>();
 
@@ -3312,6 +3512,138 @@ impl TuiApp {
                     .title(self.text("Transport Key", "传输密钥"))
                     .borders(Borders::ALL),
             )
+    }
+
+    fn mesh_join_widget(&self, popup: &MeshJoinPopup) -> Paragraph<'static> {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let warning = Style::default().fg(Color::Yellow);
+        let mut lines = Vec::new();
+        for name in &popup.joined {
+            lines.push(Line::from(Span::styled(
+                match self.language {
+                    TuiLanguage::English => format!("Joined the group {name}."),
+                    TuiLanguage::Chinese => format!("已加入组 {name}。"),
+                },
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        if popup.groups.is_empty() {
+            lines.push(Line::from(
+                self.text("This backend is in no group yet.", "本后端尚未加入任何组。")
+                    .to_owned(),
+            ));
+        } else {
+            for group in &popup.groups {
+                lines.push(Line::from(match self.language {
+                    TuiLanguage::English => format!(
+                        "In group {}: {} backends, {} devices",
+                        group.name, group.nodes, group.devices
+                    ),
+                    TuiLanguage::Chinese => format!(
+                        "已在组 {}：{} 个后端，{} 台设备",
+                        group.name, group.nodes, group.devices
+                    ),
+                }));
+            }
+        }
+        lines.push(Line::from(""));
+
+        lines.push(Line::from(Span::styled(
+            self.text("Join code", "加入码").to_owned(),
+            bold,
+        )));
+        match &popup.code {
+            Some(code) => {
+                let remaining_minutes = code
+                    .expires_at
+                    .saturating_sub(Timestamp::now().as_millisecond().max(0) as u64)
+                    / 60_000;
+                let (hours, minutes) = (remaining_minutes / 60, remaining_minutes % 60);
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        code.code.clone(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(match self.language {
+                        TuiLanguage::English => {
+                            format!("   valid {hours}h {minutes}m more, for one join")
+                        }
+                        TuiLanguage::Chinese => {
+                            format!("   剩余 {hours} 小时 {minutes} 分钟有效，仅可使用一次")
+                        }
+                    }),
+                ]));
+            }
+            None => lines.push(Line::from(Span::styled(
+                self.text(
+                    "  Used or expired. Press n for a new code.",
+                    "  已使用或已过期。按 n 生成新的加入码。",
+                )
+                .to_owned(),
+                warning,
+            ))),
+        }
+        lines.push(Line::from(""));
+
+        lines.push(Line::from(Span::styled(
+            self.text("Backend address", "后端地址").to_owned(),
+            bold,
+        )));
+        let urls = self.mesh_join_urls();
+        for url in &urls {
+            lines.push(Line::from(format!("  {url}")));
+        }
+        if !self.config.network_enabled {
+            lines.push(Line::from(Span::styled(
+                self.text(
+                    "  Network listener is off: press b to turn it on so the group can reach this backend.",
+                    "  网络接口已关闭：按 b 开启，组内设备才能访问本后端。",
+                )
+                .to_owned(),
+                warning,
+            )));
+        } else if urls.is_empty() {
+            lines.push(Line::from(Span::styled(
+                self.text(
+                    "  Listening on loopback only: press h and set the listen IP to 0.0.0.0 or a LAN address.",
+                    "  仅监听回环地址：按 h 将监听 IP 改为 0.0.0.0 或局域网地址。",
+                )
+                .to_owned(),
+                warning,
+            )));
+        }
+        if self.daemon.is_none() {
+            lines.push(Line::from(Span::styled(
+                self.text(
+                    "  Daemon is stopped: press s to start it before adding this backend.",
+                    "  Daemon 未运行：添加本后端前请按 s 启动。",
+                )
+                .to_owned(),
+                warning,
+            )));
+        }
+        lines.push(Line::from(""));
+
+        lines.push(Line::from(self.text(
+            "On a device already in the group, open Settings → Backend groups → Add backend → Address and join code, then enter the address and code above.",
+            "在已入组的设备上打开 设置 → 后端组 → 添加后端 → 地址与加入码，输入上面的地址和加入码。",
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(self.text(
+            "c/Enter copy code · a copy address · n new code · Esc close",
+            "c/Enter 复制加入码 · a 复制地址 · n 生成新加入码 · Esc 关闭",
+        )));
+
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            panel_block()
+                .title(self.text("Join a backend group", "加入后端组"))
+                .borders(Borders::ALL),
+        )
     }
 
     fn edit_popup_area(&self, area: Rect, edit: &EditMode) -> Rect {
@@ -4492,6 +4824,27 @@ fn lines_width(lines: &[Line<'_>]) -> u16 {
         .unwrap_or(0)
 }
 
+fn mesh_group_lines(store: &crate::mesh::MeshStore) -> crate::error::Result<Vec<MeshGroupLine>> {
+    Ok(store
+        .summaries()?
+        .into_iter()
+        .map(|group| MeshGroupLine {
+            nodes: group
+                .members
+                .iter()
+                .filter(|member| member.kind == "node")
+                .count(),
+            devices: group
+                .members
+                .iter()
+                .filter(|member| member.kind == "device")
+                .count(),
+            group_id: group.group_id,
+            name: group.name,
+        })
+        .collect())
+}
+
 fn centered_area(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
     let width = desired_width.min(area.width.saturating_sub(2)).max(1);
     let height = desired_height.min(area.height.saturating_sub(2)).max(1);
@@ -4873,9 +5226,7 @@ mod tests {
                         .iter()
                         .map(|cell| cell.symbol())
                         .collect::<String>();
-                    let shortcut = [
-                        "s", "r", "a", "h", "p", "b", "w", "e", "x", "g", "c", "l", "d", "u", "q",
-                    ][selected];
+                    let shortcut = super::ACTION_SHORTCUTS[selected];
                     assert!(
                         contents.contains(&format!("> [{shortcut}]")),
                         "selected {selected} missing at {width}x{height}"
@@ -5648,7 +5999,62 @@ mod tests {
         assert_eq!(TuiLanguage::parse("invalid"), None);
         assert_eq!(TuiLanguage::Chinese.as_str(), "zh-CN");
         assert_eq!(TuiLanguage::English.as_str(), "en");
-        assert_eq!(ACTION_COUNT, 15);
+        assert_eq!(ACTION_COUNT, 16);
+    }
+
+    #[tokio::test]
+    async fn mesh_join_window_shows_copies_and_renews_the_join_code() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let data_dir = std::env::temp_dir().join(format!(
+            "todex-tui-mesh-join-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut app = super::TuiApp::new(crate::config::Config::default());
+        app.language = TuiLanguage::English;
+        app.config.data_dir = data_dir.clone();
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        app.handle_key(press(KeyCode::Char('m'))).await.unwrap();
+        let first = app.mesh_join.as_ref().unwrap().code.clone().unwrap();
+        let store = crate::mesh::MeshStore::load(&data_dir).unwrap();
+        assert_eq!(store.current_join_code().unwrap().unwrap().code, first.code);
+        let contents = render_preview(&app, 100, 30)
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(contents.contains(&first.code));
+        assert!(contents.contains("Join a backend group"));
+        for language in [TuiLanguage::English, TuiLanguage::Chinese] {
+            app.language = language;
+            for (width, height) in [(80, 24), (120, 40)] {
+                write_preview(
+                    &render_preview(&app, width, height),
+                    &format!("{language:?}-mesh-join"),
+                );
+            }
+        }
+        app.language = TuiLanguage::English;
+
+        // Reopening keeps the code; n replaces it.
+        app.handle_key(press(KeyCode::Esc)).await.unwrap();
+        assert!(app.mesh_join.is_none());
+        app.selected_action = 13;
+        app.handle_key(press(KeyCode::Enter)).await.unwrap();
+        assert_eq!(
+            app.mesh_join.as_ref().unwrap().code.as_ref().unwrap().code,
+            first.code
+        );
+        app.handle_key(press(KeyCode::Char('n'))).await.unwrap();
+        let second = app.mesh_join.as_ref().unwrap().code.clone().unwrap();
+        assert_ne!(second.code, first.code);
+
+        // A code used elsewhere disappears on the next refresh.
+        std::fs::remove_file(data_dir.join("mesh/join-code.json")).unwrap();
+        app.mesh_join.as_mut().unwrap().refreshed_at -= super::MESH_JOIN_REFRESH_INTERVAL;
+        app.refresh_mesh_join();
+        assert!(app.mesh_join.as_ref().unwrap().code.is_none());
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]

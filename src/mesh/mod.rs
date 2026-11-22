@@ -511,7 +511,12 @@ impl MeshStore {
 
     /// A join code exists and has not expired.
     pub(crate) fn has_join_code(&self) -> Result<bool> {
-        Ok(read_join_code(&self.directory.join(JOIN_CODE_FILE))?.is_some())
+        Ok(self.current_join_code()?.is_some())
+    }
+
+    /// The unexpired join code, without creating one.
+    pub(crate) fn current_join_code(&self) -> Result<Option<JoinCode>> {
+        read_join_code(&self.directory.join(JOIN_CODE_FILE))
     }
 
     /// Checks a node join's client proof; on success consumes the code and

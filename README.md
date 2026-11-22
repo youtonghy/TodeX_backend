@@ -85,7 +85,7 @@ A client can stay connected to many backends at once. **Backend groups** link de
 
 ### Runs itself
 
-An interactive console (TUI) shows status and logs, starts and stops the background daemon, shows the pairing QR code and lists, approves and revokes devices. The daemon can start at login, and installed releases update themselves: a running daemon restarts into a new release once no agent has worked for 5 minutes.
+An interactive console (TUI) shows status and logs, starts and stops the background daemon, shows the pairing QR code, lists, approves and revokes devices, and shows the join code that adds this backend to a backend group. The daemon can start at login, and installed releases update themselves: a running daemon restarts into a new release once no agent has worked for 5 minutes.
 
 ## Install
 
