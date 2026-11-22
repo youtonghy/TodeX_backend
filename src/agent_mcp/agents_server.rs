@@ -338,8 +338,9 @@ fn registry_of_tools() -> ToolRegistry<AgentsTools, AgentsCall> {
         ToolEntry {
             tool: Tool::new(
                 "agents_list",
-                "List the TodeX agents you may call and their models. Use an agent id and \
-                 model id from here with agent_run.",
+                "List the TodeX agents you may call and their models, read live from each \
+                 available agent. Use an agent id and model id from here with agent_run. An \
+                 agent whose models could not be read has modelsError.",
                 schema(json!({ "type": "object", "properties": {}, "additionalProperties": false })),
             )
             .with_annotations(ToolAnnotations::new().read_only(true).open_world(false)),
@@ -776,29 +777,49 @@ impl AgentsTools {
             .map_err(failure)
     }
 
+    /// The agents the caller may call. An available agent's models are its
+    /// live catalog in the caller's workspace (the one `agent_run` checks
+    /// against); when that cannot be read, the entry keeps the snapshot's
+    /// models and says why in `modelsError`.
     async fn list(&self, invocation: &Invocation<'_>) -> Result<Value, String> {
         let caller = self.caller(invocation).await?;
         let agents = agent_calls::list_agents(&self.state, &caller).await;
-        Ok(json!({
-            "agents": agents.into_iter().map(|agent| json!({
-                "agent": agent.id,
-                "displayName": agent.display_name,
-                "available": agent.available,
-                "models": agent.models.into_iter().map(|model| {
-                    let mut entry = json!({
-                        "id": model.id,
-                        "displayName": model.display_name,
-                        "isDefault": model.is_default,
-                        "supportedReasoningEfforts": model.supported_reasoning_efforts,
-                    });
-                    if let Some(effort) = model.default_reasoning_effort {
-                        entry["defaultReasoningEffort"] = json!(effort);
+        let agents = futures_util::future::join_all(agents.into_iter().map(|agent| {
+            let caller = &caller;
+            async move {
+                let (models, error) = if agent.available {
+                    match agent_calls::models(&self.state, caller, agent.id, None).await {
+                        Ok(models) => (models, None),
+                        Err(error) => (agent.models, Some(failure(error))),
                     }
-                    entry
-                }).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-            "limits": LIMITS,
+                } else {
+                    (agent.models, None)
+                };
+                let mut entry = json!({
+                    "agent": agent.id,
+                    "displayName": agent.display_name,
+                    "available": agent.available,
+                    "models": models.into_iter().map(|model| {
+                        let mut entry = json!({
+                            "id": model.id,
+                            "displayName": model.display_name,
+                            "isDefault": model.is_default,
+                            "supportedReasoningEfforts": model.supported_reasoning_efforts,
+                        });
+                        if let Some(effort) = model.default_reasoning_effort {
+                            entry["defaultReasoningEffort"] = json!(effort);
+                        }
+                        entry
+                    }).collect::<Vec<_>>(),
+                });
+                if let Some(error) = error {
+                    entry["modelsError"] = json!(error);
+                }
+                entry
+            }
         }))
+        .await;
+        Ok(json!({ "agents": agents, "limits": LIMITS }))
     }
 
     async fn run_call(&self, invocation: &Invocation<'_>, call: RunCall) -> Result<Value, String> {
@@ -964,6 +985,19 @@ mod tests {
             workspace_roots: vec![root.join("workspaces")],
             ..Config::default()
         };
+        // No CLI installed on this machine is launched by `agents_list`.
+        let missing = root.join("missing-cli").to_string_lossy().into_owned();
+        for bin in [
+            &mut config.agent.claude_bin,
+            &mut config.agent.pi_bin,
+            &mut config.agent.grok_bin,
+            &mut config.agent.devin_bin,
+            &mut config.agent.opencode_bin,
+            &mut config.agent.dsh_bin,
+            &mut config.agent.omp_bin,
+        ] {
+            bin.clone_from(&missing);
+        }
         config.agent.antigravity_bin = agy.to_string_lossy().into_owned();
         // The Codex parent never runs a turn; it only needs an executable.
         config.agent.codex_bin = std::env::current_exe()
@@ -1096,11 +1130,55 @@ mod tests {
         );
         let agents = ok(&call(&client, "agents_list", json!({})).await);
         assert_eq!(agents["limits"]["maxConcurrentCalls"], 4);
-        assert!(agents["agents"]
+        // The models are the agent's live catalog, not the (empty) snapshot.
+        let agent = |id: &str| {
+            agents["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|agent| agent["agent"] == id)
+                .unwrap_or_else(|| panic!("no {id} in {agents}"))
+                .clone()
+        };
+        let antigravity = agent("antigravity");
+        assert!(antigravity.get("modelsError").is_none(), "{antigravity}");
+        let models = antigravity["models"].as_array().unwrap();
+        let flash = models
+            .iter()
+            .find(|model| model["id"] == "gemini-3.8-flash")
+            .unwrap_or_else(|| panic!("{antigravity}"));
+        assert!(
+            !flash["supportedReasoningEfforts"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{flash}"
+        );
+        // Codex is the test binary here, which answers no `model/list`: the
+        // failure stays on that entry.
+        let codex = agent("codex");
+        assert_eq!(codex["models"], json!([]));
+        assert!(codex["modelsError"].is_string(), "{codex}");
+        // The global scope filters the live list too.
+        update(
+            state,
+            json!({ "scope": { "models": { "antigravity": ["gemini-3.8-flash"] } } }),
+        )
+        .await;
+        let scoped = ok(&call(&client, "agents_list", json!({})).await);
+        let ids: Vec<_> = scoped["agents"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|agent| agent["agent"] == "antigravity"));
+            .find(|agent| agent["agent"] == "antigravity")
+            .unwrap()["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].clone())
+            .collect();
+        assert_eq!(ids, [json!("gemini-3.8-flash")]);
+        update(state, json!({ "scope": { "models": {} } })).await;
 
         let run = ok(&call(
             &client,

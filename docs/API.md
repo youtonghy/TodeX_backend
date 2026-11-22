@@ -1621,7 +1621,7 @@ Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`�
 | `agent_cancel` | `POST /conversations/{id}/cancel` | `{ conversationId, turnId? }` | 否（只停止自己的子会话） |
 
 - 结果（结构化 JSON）：
-  - `agents_list` → `{ agents: [{ agent, displayName, available, models: [{ id, displayName, isDefault, supportedReasoningEfforts, defaultReasoningEffort? }] }], limits: { maxConcurrentCalls, maxWaitSecs, defaultWaitSecs } }`，按全局范围过滤 Agent 与模型（模型来自 Provider 快照目录）。
+  - `agents_list` → `{ agents: [{ agent, displayName, available, models: [{ id, displayName, isDefault, supportedReasoningEfforts, defaultReasoningEffort? }] }], limits: { maxConcurrentCalls, maxWaitSecs, defaultWaitSecs } }`，按全局范围过滤 Agent 与模型。`available` 的 Agent 的 `models` 是在父会话工作区实时查询到的目录（与 `GET /api/v1/agents/{agent}/models` 相同，各 Agent 并行查询并沿用其缓存），也是 `agent_run`/`agent_turn` 校验 `reasoningEffort` 所用的目录；查询失败或超时的 Agent 保留 Provider 快照中的模型（多数 Agent 为空），并带 `modelsError: "CODE: message"`，其他 Agent 不受影响。不可用的 Agent 不查询。
   - `agent_run` / `agent_turn` / `agent_wait` → `{ conversationId, turnId, status, output, error }`。`status` 为 `running`、`completed`、`failed`、`cancelled`、`interrupted` 之一（等待权限时仍报 `running`）；`output` 是被调用 Agent 主代理的回复文本（不含子代理与工具输出，最多 256 KiB，超出截断并附 `[output truncated]`）；`error` 在未完成时为 `{ code?, message }`，否则为 `null`。
   - `agent_cancel` → `{ conversationId, cancelled, turnId }`：`cancelled` 表示是否向正在运行的轮次发出了停止（没有运行中的轮次或 `turnId` 不是运行中的轮次时为 `false`）。
 - 等待语义：`waitSecs` 默认 300，取值限制在 1–1200。到时轮次仍在运行则返回 `status: "running"` 与目前的输出，子会话**继续运行、不会被取消**；之后用 `agent_wait` 取结果（不给 `turnId` 时等最近一次调用的轮次）。已结束轮次的结果（`status`、`output`、`error`）可被 `agent_wait` 重复读取，直到该子会话开始下一轮或轮次结束 30 分钟后 `output` 从内存中丢弃，之后的 `agent_wait` 只返回状态与空 `output`（父会话事件中仍有记录）。Agent 的工具调用被取消时停止等待，子会话不受影响。
