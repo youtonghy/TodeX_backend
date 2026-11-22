@@ -37,7 +37,9 @@ impl fmt::Display for ConnectAddress {
 ///
 /// An unspecified bind host expands to the addresses of every interface that
 /// is up, ordered default-route IPv4 first, then other IPv4, then IPv6, with
-/// loopback last. Any other host is returned unchanged.
+/// loopback last. Virtual bridge and container interfaces (docker, libvirt,
+/// podman, CNI, ...) are skipped, since other machines cannot reach them;
+/// see [`is_virtual_bridge`]. Any other host is returned unchanged.
 pub fn connect_addresses(bind_host: &str) -> io::Result<Vec<ConnectAddress>> {
     let host = bind_host.trim();
     let bind_ip = match host.parse::<IpAddr>() {
@@ -93,6 +95,20 @@ fn select_addresses(
     interfaces: impl IntoIterator<Item = (String, IpAddr)>,
     primary: Option<Ipv4Addr>,
 ) -> Vec<ConnectAddress> {
+    let mut interfaces: Vec<(String, IpAddr)> = interfaces.into_iter().collect();
+    // The interface carrying the default route is kept whatever its name, so
+    // a container's own `eth0` or an unusual host setup still lists it.
+    let primary_interfaces: HashSet<String> = primary
+        .map(IpAddr::V4)
+        .map(|primary| {
+            interfaces
+                .iter()
+                .filter(|(_, ip)| *ip == primary)
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    interfaces.retain(|(name, _)| primary_interfaces.contains(name) || !is_virtual_bridge(name));
     let mut seen = HashSet::new();
     let mut candidates: Vec<(String, IpAddr)> = interfaces
         .into_iter()
@@ -113,6 +129,30 @@ fn select_addresses(
             interface: Some(name),
         })
         .collect()
+}
+
+/// Interface name prefixes of virtual bridges and container links that only
+/// this host (and its containers or VMs) can reach.
+const VIRTUAL_BRIDGE_PREFIXES: [&str; 8] = [
+    "veth", "virbr", "podman", "cni", "flannel", "cali", "lxcbr", "lxdbr",
+];
+
+/// Whether `name` is a virtual bridge or container interface: `docker0`, a
+/// docker user network (`br-` and 12 lowercase hex digits), or one of
+/// [`VIRTUAL_BRIDGE_PREFIXES`]. VPN interfaces (`tailscale0`, `utun*`,
+/// `wg*`) are not: other devices on the VPN reach them.
+fn is_virtual_bridge(name: &str) -> bool {
+    let docker_network = name.strip_prefix("br-").is_some_and(|id| {
+        id.len() == 12
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    name == "docker0"
+        || docker_network
+        || VIRTUAL_BRIDGE_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
 }
 
 fn accepts(bind_ip: IpAddr, ip: IpAddr) -> bool {
@@ -190,7 +230,7 @@ mod tests {
     fn unspecified_ipv4_lists_reachable_ipv4_with_primary_first_and_loopback_last() {
         let interfaces = [
             iface("lo0", "127.0.0.1"),
-            iface("docker0", "172.17.0.1"),
+            iface("en7", "10.0.0.5"),
             iface("en0", "192.168.1.20"),
             iface("en0", "fe80::1"),
             iface("en0", "2001:db8::20"),
@@ -211,8 +251,8 @@ mod tests {
                     interface: Some("en0".to_owned()),
                 },
                 ConnectAddress {
-                    host: "172.17.0.1".to_owned(),
-                    interface: Some("docker0".to_owned()),
+                    host: "10.0.0.5".to_owned(),
+                    interface: Some("en7".to_owned()),
                 },
                 ConnectAddress {
                     host: "127.0.0.1".to_owned(),
@@ -238,6 +278,68 @@ mod tests {
             &["[2001:db8::20]", "[::1]"]
         } else {
             &["192.168.1.20", "[2001:db8::20]", "[::1]"]
+        };
+        assert_eq!(hosts(&addresses), expected);
+    }
+
+    #[test]
+    fn virtual_bridges_are_dropped_but_lan_and_vpn_interfaces_are_kept() {
+        let interfaces = [
+            iface("eth0", "10.1.0.4"),
+            iface("docker0", "172.17.0.1"),
+            iface("br-0123456789ab", "172.18.0.1"),
+            iface("veth1a2b3c", "fe80::10"),
+            iface("virbr0", "192.168.122.1"),
+            iface("podman1", "10.89.0.1"),
+            iface("cni0", "10.88.0.1"),
+            iface("flannel.1", "10.244.0.0"),
+            iface("cali12345", "10.244.0.1"),
+            iface("lxcbr0", "10.0.3.1"),
+            iface("lxdbr0", "10.10.10.1"),
+            iface("tailscale0", "100.64.0.7"),
+            iface("utun4", "10.8.0.2"),
+            iface("wg0", "10.9.0.2"),
+            iface("br0", "192.168.50.2"),
+            iface("br-lan", "192.168.60.2"),
+        ];
+        let addresses = select_addresses(
+            "0.0.0.0".parse().unwrap(),
+            interfaces,
+            Some("10.1.0.4".parse().unwrap()),
+        );
+        assert_eq!(
+            hosts(&addresses),
+            [
+                "10.1.0.4",
+                "100.64.0.7",
+                "10.8.0.2",
+                "10.9.0.2",
+                "192.168.50.2",
+                "192.168.60.2",
+            ]
+        );
+        assert!(is_virtual_bridge("br-0123456789ab"));
+        assert!(!is_virtual_bridge("br-0123456789AB"));
+        assert!(!is_virtual_bridge("br-0123456789a"));
+        assert!(!is_virtual_bridge("br-0123456789abc"));
+    }
+
+    #[test]
+    fn the_default_route_interface_is_kept_even_when_named_like_a_bridge() {
+        let interfaces = [
+            iface("docker0", "172.17.0.1"),
+            iface("docker0", "2001:db8::17"),
+            iface("br-0123456789ab", "172.18.0.1"),
+        ];
+        let addresses = select_addresses(
+            "::".parse().unwrap(),
+            interfaces,
+            Some("172.17.0.1".parse().unwrap()),
+        );
+        let expected: &[&str] = if cfg!(windows) {
+            &["[2001:db8::17]"]
+        } else {
+            &["172.17.0.1", "[2001:db8::17]"]
         };
         assert_eq!(hosts(&addresses), expected);
     }

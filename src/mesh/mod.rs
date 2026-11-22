@@ -722,6 +722,17 @@ impl MeshStore {
     }
 }
 
+/// This node's display name in its group: the computer's host name, or
+/// `TodeX` when that is not a valid device name.
+pub(crate) fn node_display_name() -> String {
+    let name = crate::computer::host_name();
+    if crate::device_pairing::validate_device_name(&name).is_ok() {
+        name
+    } else {
+        "TodeX".to_owned()
+    }
+}
+
 /// `b64u(HMAC(codeKey, server label || transcript hash || node key))`.
 pub(crate) fn node_join_server_proof(
     code_key: &[u8; 32],

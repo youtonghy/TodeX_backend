@@ -898,7 +898,7 @@ transcript、HKDF 标签与验证码格式见 [transport-v2.md](transport-v2.md#
 
 规范见 [mesh-v1.md](mesh-v1.md)。设备组让一组后端与客户端设备互相信任：设备加入一次即可访问组内所有后端并读取历史，加入申请由组内任一已加入的设备批准，不在后端批准。点对点配对保持不变。
 
-- 加入沿用配对 v3：`POST /v2/device-pairing/create` 的请求体多一个 `mesh` 对象（`deviceJoin` 或 `nodeJoin`），`reveal` 可带 `joinCodeProof`，凭据多出 `groupId`（节点加入另有 `nodeId`、`nodePublicKey`、`joinProof`）。带 `mesh` 的申请不出现在 TUI 与 `pair list` 中，也不写 `devices.json`。
+- 加入沿用配对 v3：`POST /v2/device-pairing/create` 的请求体多一个 `mesh` 对象（`deviceJoin` 或 `nodeJoin`），`reveal` 可带 `joinCodeProof`，凭据多出 `groupId`（节点加入另有 `nodeId`、`nodePublicKey`、`joinProof`，以及可选的 `nodeName`：节点显示名，不受 `joinProof` 保护，仅用于展示）。带 `mesh` 的申请不出现在 TUI 与 `pair list` 中，也不写 `devices.json`。
 - WebSocket 命令：`mesh.node.get`、`mesh.presence.get`、`mesh.state.get`、`mesh.state.push`、`mesh.join.list`、`mesh.join.approve`、`mesh.join.reject`；事件 `mesh.updated`（`reason` 为 `join.requested`、`join.decided`、`roster.updated`、`node-info.updated`、`group.left`、`presence`）。
 - 组内设备经设备认证照常签名请求；后端按 `devices.json`、所在设备组的成员、节点加入时的临时准入依次查找设备。被移出组的设备下一个请求即被拒绝，已开的 WebSocket 在 5 秒内以 `4401` 关闭，其历史接收方被吊销并封禁。
 - 组名单新增设备时，后端登记其历史公钥并为其开一个授权（`grant.requested`）；组内其他设备自动完成授权，不再弹窗。

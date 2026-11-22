@@ -444,7 +444,7 @@ cargo run -- tui --host 127.0.0.1 --port 7345
 cargo run -- tui --host 0.0.0.0 --port 7345
 ```
 
-此时服务监听所有网卡，TUI 配对二维码会尽量写入当前局域网 IP，而不是不可访问的 `0.0.0.0`。监听主机为 `0.0.0.0` 或 `::` 时，TUI 的“可连接 IP”、`serve` 启动日志和 `daemon` 命令输出都会展开为各个已启用网卡的实际地址：默认路由对应的 IPv4 排在最前，回环地址排在最后，链路本地地址会被跳过；约每 5 秒刷新一次，切换网络后会自动更新。`::` 在 Linux/macOS 默认是双栈，会同时列出 IPv4；在 Windows 上只列出 IPv6。
+此时服务监听所有网卡，TUI 配对二维码会尽量写入当前局域网 IP，而不是不可访问的 `0.0.0.0`。监听主机为 `0.0.0.0` 或 `::` 时，TUI 的“可连接 IP”、`serve` 启动日志和 `daemon` 命令输出都会展开为各个已启用网卡的实际地址：默认路由对应的 IPv4 排在最前，回环地址排在最后，链路本地地址会被跳过；Docker、libvirt、Podman、CNI 等虚拟网桥和容器网卡（`docker0`、`br-<12 位十六进制>`、`veth*`、`virbr*`、`podman*`、`cni*`、`flannel*`、`cali*`、`lxcbr*`、`lxdbr*`）也会被跳过，但默认路由所在的网卡始终保留，Tailscale、WireGuard 等 VPN 网卡不受影响；约每 5 秒刷新一次，切换网络后会自动更新。`::` 在 Linux/macOS 默认是双栈，会同时列出 IPv4；在 Windows 上只列出 IPv6。
 
 ### 指定数据目录和 workspace 根目录
 

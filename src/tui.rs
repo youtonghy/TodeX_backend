@@ -955,8 +955,9 @@ impl TuiApp {
         self.copy_to_clipboard(&label, url);
     }
 
-    /// Addresses a device of the group can enter for this backend; loopback
-    /// only reaches this machine, so it is never offered.
+    /// Addresses a device of the group can enter for this backend, the
+    /// configured `advertise_url` first (as in the mesh node info); loopback
+    /// interface addresses only reach this machine, so they are never offered.
     fn mesh_join_urls(&self) -> Vec<String> {
         if !self.config.network_enabled {
             return Vec::new();
@@ -965,14 +966,28 @@ impl TuiApp {
             .daemon
             .as_ref()
             .map_or(self.config.port, |process| process.port);
-        match &self.connect_addresses {
+        let advertised = self
+            .config
+            .deployment
+            .advertise_url
+            .as_deref()
+            .map(|url| url.trim().trim_end_matches('/'))
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned);
+        let interfaces = match &self.connect_addresses {
             Ok(addresses) => addresses
                 .iter()
                 .filter(|address| !listen_addrs::is_loopback_host(&address.host))
                 .map(|address| format!("http://{}:{port}", address.host))
                 .collect(),
             Err(_) => Vec::new(),
-        }
+        };
+        let mut seen = std::collections::HashSet::new();
+        advertised
+            .into_iter()
+            .chain(interfaces)
+            .filter(|url| seen.insert(url.clone()))
+            .collect()
     }
 
     async fn open_pairing_qr_browser(&mut self) {
@@ -6000,6 +6015,42 @@ mod tests {
         assert_eq!(TuiLanguage::Chinese.as_str(), "zh-CN");
         assert_eq!(TuiLanguage::English.as_str(), "en");
         assert_eq!(ACTION_COUNT, 16);
+    }
+
+    #[test]
+    fn mesh_join_urls_list_the_advertised_url_first_without_duplicates() {
+        let mut app = super::TuiApp::new(crate::config::Config::default());
+        app.config.network_enabled = true;
+        app.config.port = 7345;
+        let address = |host: &str, interface: &str| crate::listen_addrs::ConnectAddress {
+            host: host.to_owned(),
+            interface: Some(interface.to_owned()),
+        };
+        app.connect_addresses = Ok(vec![
+            address("192.168.1.20", "en0"),
+            address("10.0.0.5", "en1"),
+            address("127.0.0.1", "lo0"),
+        ]);
+        assert_eq!(
+            app.mesh_join_urls(),
+            ["http://192.168.1.20:7345", "http://10.0.0.5:7345"]
+        );
+        app.config.deployment.advertise_url = Some("http://10.0.0.5:7345".to_owned());
+        assert_eq!(
+            app.mesh_join_urls(),
+            ["http://10.0.0.5:7345", "http://192.168.1.20:7345"]
+        );
+        app.config.deployment.advertise_url = Some("https://todex.example:8443".to_owned());
+        assert_eq!(
+            app.mesh_join_urls(),
+            [
+                "https://todex.example:8443",
+                "http://192.168.1.20:7345",
+                "http://10.0.0.5:7345",
+            ]
+        );
+        app.config.network_enabled = false;
+        assert!(app.mesh_join_urls().is_empty());
     }
 
     #[tokio::test]

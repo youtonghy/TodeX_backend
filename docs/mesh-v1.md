@@ -201,8 +201,10 @@ approves the request at once, consumes the code and admits the device's
 key for 10 minutes. The credential adds `"groupId"`, `"nodeId"`,
 `"nodePublicKey"` and
 `"joinProof": b64u(HMAC(codeKey, "todex.mesh.v1/node-join/server\0" || SHA256(transcript) || nodePublicKey bytes))`.
-The device checks `joinProof`; only then does it trust the node key and
-the transport key. Someone in the middle sees neither the code nor a way to
+It may also carry `"nodeName"`, the node's display name, so the device
+can label the node right away; `joinProof` does not cover it, so it is
+cosmetic only. The device checks `joinProof`; only then does it trust the
+node key and the transport key. Someone in the middle sees neither the code nor a way to
 test guesses offline faster than 2^80.
 
 The device then appends a roster version that adds the node

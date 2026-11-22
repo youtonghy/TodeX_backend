@@ -490,6 +490,11 @@ struct CredentialMesh {
     node_public_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     join_proof: Option<String>,
+    /// A node join: the node's display name, so the device can label it
+    /// before reading its signed node info. Cosmetic only: `joinProof` does
+    /// not cover it, so nothing may trust it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_name: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1008,6 +1013,7 @@ impl DevicePairingRegistry {
                     node_id: None,
                     node_public_key: None,
                     join_proof: None,
+                    node_name: None,
                 }),
             ),
             Some(MeshPairing::NodeJoin { group_id }) => {
@@ -1032,6 +1038,7 @@ impl DevicePairingRegistry {
                             &transcript_hash,
                             &node_public,
                         )),
+                        node_name: Some(crate::mesh::node_display_name()),
                     }),
                 )
             }
@@ -2931,6 +2938,7 @@ mod tests {
                 crate::devices::device_id_for(&device_key()).as_str()
             );
             assert!(credential.get("joinProof").is_none());
+            assert!(credential.get("nodeName").is_none());
             assert!(DeviceRegistry::load(&fixture.root)
                 .unwrap()
                 .get(credential["deviceId"].as_str().unwrap())
@@ -3004,6 +3012,10 @@ mod tests {
                 crate::mesh::node_join_server_proof(&code_key, &hash, &node_public)
             );
             assert_eq!(credential["nodePublicKey"], mesh.node_public_key().as_str());
+            assert_eq!(
+                credential["nodeName"].as_str().unwrap(),
+                crate::mesh::node_display_name()
+            );
             // The device may now authenticate until it lists the node.
             assert!(mesh
                 .device_record(credential["deviceId"].as_str().unwrap())

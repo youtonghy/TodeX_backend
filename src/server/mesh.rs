@@ -403,14 +403,8 @@ pub(crate) fn node_info(state: &AppState, mesh: &MeshStore) -> Result<SignedDoc,
     }
     let mut seen = std::collections::HashSet::new();
     urls.retain(|url| seen.insert(url.clone()));
-    let name = crate::computer::host_name();
-    let name = if crate::device_pairing::validate_device_name(&name).is_ok() {
-        name
-    } else {
-        "TodeX".to_owned()
-    };
     mesh.node_info(NodeFacts {
-        name,
+        name: crate::mesh::node_display_name(),
         transport_protocol: protocol.as_str().to_owned(),
         transport_public_key: base64::Engine::encode(
             &base64::engine::general_purpose::URL_SAFE_NO_PAD,
