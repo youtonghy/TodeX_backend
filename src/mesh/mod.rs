@@ -643,10 +643,14 @@ impl MeshStore {
     /// "Relay"): a group lists this node (not `denied`), `target` as another
     /// node reachable by relay, and `device_id` as a device. Returns the
     /// device's key and the target's addresses (pinned first, then announced).
+    ///
+    /// Loopback addresses and `own` ones are left out: they lead back to this
+    /// node, which would then relay T's traffic to itself.
     pub(crate) fn relay_route(
         &self,
         device_id: &str,
         target: &str,
+        own: &OwnAddresses,
     ) -> Result<(String, Vec<String>)> {
         let inner = self.lock()?;
         for group in inner.groups.values() {
@@ -665,15 +669,7 @@ impl MeshStore {
             {
                 continue;
             }
-            let mut urls = node.addresses.clone();
-            if let Some((doc, _)) = group.node_infos.get(target) {
-                if let Ok(info) = verify_node_info(doc, &node.public_key) {
-                    urls.extend(info.urls);
-                }
-            }
-            let mut seen = std::collections::HashSet::new();
-            urls.retain(|url| seen.insert(url.clone()));
-            return Ok((device.public_key.clone(), urls));
+            return Ok((device.public_key.clone(), node_urls(group, node, own)));
         }
         Err(AppError::Unauthorized(
             "this node does not relay to that node for this device".to_owned(),
@@ -720,6 +716,67 @@ impl MeshStore {
             .lock()
             .map_err(|_| AppError::InvalidRequest("mesh state is unavailable".to_owned()))
     }
+}
+
+/// A node's addresses as other nodes dial it: pinned first, then the
+/// `urls` of its node info, without duplicates and without what `own`
+/// rejects.
+fn node_urls(group: &Group, node: &Member, own: &OwnAddresses) -> Vec<String> {
+    let mut urls = node.addresses.clone();
+    if let Some((doc, _)) = group.node_infos.get(&node.id) {
+        if let Ok(info) = verify_node_info(doc, &node.public_key) {
+            urls.extend(info.urls);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    urls.retain(|url| own.dialable(url) && seen.insert(url.clone()));
+    urls
+}
+
+/// Where this node listens (`host`, `port`), so it never dials itself when
+/// it means another node: a node info lists `127.0.0.1` and LAN addresses
+/// that, seen from another machine, may be that machine's own.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OwnAddresses {
+    endpoints: Vec<(String, u16)>,
+}
+
+impl OwnAddresses {
+    /// From this node's own URLs (`http(s)://host[:port][/path]`).
+    pub(crate) fn from_urls<'a>(urls: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            endpoints: urls.into_iter().filter_map(endpoint).collect(),
+        }
+    }
+
+    /// `url` may reach another node: it parses, its host is neither
+    /// loopback (`localhost`, `127.0.0.0/8`, `::1`) nor unspecified, and it
+    /// is not one of this node's own endpoints.
+    pub(crate) fn dialable(&self, url: &str) -> bool {
+        let Some((host, port)) = endpoint(url) else {
+            return false;
+        };
+        let unspecified = host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified());
+        !crate::listen_addrs::is_loopback_host(&host)
+            && !unspecified
+            && !self.endpoints.contains(&(host, port))
+    }
+}
+
+/// `(lowercase host, port)` of an `http(s)` URL, the scheme's port when it
+/// names none.
+fn endpoint(url: &str) -> Option<(String, u16)> {
+    let url = reqwest::Url::parse(url.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    Some((
+        url.host_str()?.to_ascii_lowercase(),
+        url.port_or_known_default()?,
+    ))
 }
 
 /// This node's display name in its group: the computer's host name, or
@@ -1070,12 +1127,13 @@ mod tests {
             vec![me.clone(), this.clone(), target.clone()],
         );
         store.accept_chain(&joined).unwrap();
-        let (key, urls) = store.relay_route(&me.id, &target.id).unwrap();
+        let own = OwnAddresses::default();
+        let (key, urls) = store.relay_route(&me.id, &target.id, &own).unwrap();
         assert_eq!(key, me.public_key);
         assert_eq!(urls, vec!["http://10.0.0.9:7345".to_owned()]);
         // Not to itself, not for strangers.
-        assert!(store.relay_route(&me.id, &this.id).is_err());
-        assert!(store.relay_route("dev_stranger", &target.id).is_err());
+        assert!(store.relay_route(&me.id, &this.id, &own).is_err());
+        assert!(store.relay_route("dev_stranger", &target.id, &own).is_err());
         // A target that refuses relays, then a relay that is denied.
         let closed = Member {
             relay_target: Some(false),
@@ -1083,14 +1141,14 @@ mod tests {
         };
         let joined = append(&joined, &creator, vec![me.clone(), this.clone(), closed]);
         store.accept_chain(&joined).unwrap();
-        assert!(store.relay_route(&me.id, &target.id).is_err());
+        assert!(store.relay_route(&me.id, &target.id, &own).is_err());
         let denied = Member {
             relay: Some(roster::RelayRole::Denied),
             ..this.clone()
         };
         let joined = append(&joined, &creator, vec![me.clone(), denied, target.clone()]);
         store.accept_chain(&joined).unwrap();
-        assert!(store.relay_route(&me.id, &target.id).is_err());
+        assert!(store.relay_route(&me.id, &target.id, &own).is_err());
 
         let group_id = verify_chain(&joined).unwrap().group_id;
         assert!(!store.presence_open("dev_stranger"));
@@ -1100,6 +1158,45 @@ mod tests {
         store.presence_close(&me.id);
         let (connected, last_seen) = store.presence(&group_id).unwrap();
         assert!(connected.is_empty() && last_seen.contains_key(&me.id));
+    }
+
+    #[test]
+    fn relay_routes_skip_loopback_and_this_nodes_own_addresses() {
+        let (_root, store) = store();
+        let creator = device_key(1);
+        let chain = genesis(&creator, 1);
+        let me = verify_chain(&chain).unwrap().head().members[0].clone();
+        let this = node_member(&node_key(&store), &me.id);
+        let mut target = node_member(&device_key(9).verifying_key(), &me.id);
+        target.addresses = [
+            "http://127.0.0.1:7345",
+            "http://127.29.167.214:7345",
+            "http://localhost:7345",
+            "http://[::1]:7345",
+            "http://0.0.0.0:7345",
+            "http://192.168.8.216:7345",
+            "http://10.0.0.5:7345/",
+            "https://Relay.Example.net",
+            "http://10.0.0.5:8000",
+            "https://target.example.net",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let joined = append(&chain, &creator, vec![me.clone(), this, target.clone()]);
+        store.accept_chain(&joined).unwrap();
+        // This node listens on 10.0.0.5:7345 and is advertised at
+        // https://relay.example.net (port 443).
+        let own = OwnAddresses::from_urls(["http://10.0.0.5:7345", "https://relay.example.net/"]);
+        let (_, urls) = store.relay_route(&me.id, &target.id, &own).unwrap();
+        assert_eq!(
+            urls,
+            [
+                "http://192.168.8.216:7345",
+                "http://10.0.0.5:8000",
+                "https://target.example.net"
+            ]
+            .map(str::to_owned)
+        );
     }
 
     #[test]

@@ -118,7 +118,8 @@ fn authorize(state: &AppState, target: &str, ticket: &str) -> Result<Vec<String>
     if expires_at <= now || expires_at > now + MAX_TICKET_LIFETIME.as_millis() as u64 {
         return Err(AppError::Unauthenticated);
     }
-    let (device_key, urls) = mesh.relay_route(device_id, target)?;
+    let own = super::mesh::own_addresses(&state.config);
+    let (device_key, urls) = mesh.relay_route(device_id, target, &own)?;
     let key = parse_signing_public_key(&device_key).map_err(|_| AppError::Unauthenticated)?;
     let signature = URL_SAFE_NO_PAD
         .decode(signature)
@@ -253,8 +254,10 @@ fn copy_headers(from: &reqwest::header::HeaderMap, to: &mut HeaderMap) {
     }
 }
 
-/// The first of `urls` that answers `/health`, preferring the last one
-/// that did.
+/// The first of `urls` where `target` answers `/v2/version`, preferring the
+/// last one that did. An address whose answer names another node (`nodeId`)
+/// is skipped; one without `nodeId` (an older backend) counts when it
+/// answers at all.
 async fn reachable(target: &str, urls: &[String]) -> Result<String, AppError> {
     let relays = relays();
     let cached = relays.good.lock().ok().and_then(|good| {
@@ -267,13 +270,7 @@ async fn reachable(target: &str, urls: &[String]) -> Result<String, AppError> {
     }
     for url in urls {
         let base = url.trim_end_matches('/').to_owned();
-        let probe = relays
-            .http
-            .get(format!("{base}/health"))
-            .timeout(CONNECT_TIMEOUT)
-            .send()
-            .await;
-        if probe.is_ok_and(|response| response.status().is_success()) {
+        if answers_as(target, &base).await {
             if let Ok(mut good) = relays.good.lock() {
                 good.insert(target.to_owned(), (url.clone(), Instant::now()));
             }
@@ -283,6 +280,34 @@ async fn reachable(target: &str, urls: &[String]) -> Result<String, AppError> {
     Err(AppError::RemoteUnreachable(
         "no address of that node answers".to_owned(),
     ))
+}
+
+/// `base/v2/version` answers 2xx and does not name a node other than
+/// `target`.
+async fn answers_as(target: &str, base: &str) -> bool {
+    let response = relays()
+        .http
+        .get(format!("{base}/v2/version"))
+        .timeout(CONNECT_TIMEOUT)
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_default();
+    match body.get("nodeId").and_then(serde_json::Value::as_str) {
+        Some(node_id) if node_id != target => {
+            tracing::debug!(%target, answered = %node_id, "relay address leads to another node");
+            false
+        }
+        _ => true,
+    }
 }
 
 /// Copies frames both ways until either side closes; the close code of
@@ -349,4 +374,44 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::get, Json};
+
+    /// A server answering `/v2/version` with `body`.
+    async fn version_server(body: serde_json::Value) -> String {
+        let app = Router::new().route(
+            "/v2/version",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn addresses_that_answer_as_another_node_are_skipped() {
+        let target = format!("node_{}", uuid::Uuid::new_v4().simple());
+        let other = version_server(serde_json::json!({"mesh": 1, "nodeId": "node_other"})).await;
+        let right = version_server(serde_json::json!({"mesh": 1, "nodeId": target})).await;
+        let urls = vec![other.clone(), right.clone()];
+        assert_eq!(reachable(&target, &urls).await.unwrap(), right);
+        // Only the wrong node answers: unreachable, nothing cached.
+        let lonely = format!("node_{}", uuid::Uuid::new_v4().simple());
+        assert!(matches!(
+            reachable(&lonely, &[other]).await,
+            Err(AppError::RemoteUnreachable(_))
+        ));
+        // An older backend without `nodeId` still counts.
+        let older = version_server(serde_json::json!({"name": "todex-agentd"})).await;
+        let quiet = format!("node_{}", uuid::Uuid::new_v4().simple());
+        assert_eq!(reachable(&quiet, &[older.clone()]).await.unwrap(), older);
+    }
 }

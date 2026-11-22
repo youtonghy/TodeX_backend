@@ -373,7 +373,12 @@ A session keyed for any other node fails at T (`4400`).
 - **Authorization at R:** a group lists R (not `relay: "denied"`), T as
   another node without `relayTarget: false`, and the ticket's device. R
   dials T's pinned addresses, then its node info `urls`, preferring the one
-  that answered `/health` in the last minute. At most 64 relayed requests
+  that answered in the last minute. It skips loopback addresses
+  (`localhost`, `127.0.0.0/8`, `::1`), unspecified ones and its own (its
+  listener's addresses on its port and its `advertise_url`): from R they
+  lead back to R. Before using an address R reads its `/v2/version` and
+  skips it when the answer's `nodeId` is not T; an answer without `nodeId`
+  (an older backend) counts when it is a 2xx. At most 64 relayed requests
   and sockets at once (`503 TRANSPORT_BUSY`).
 - **Device rules:** a device relays only when direct addresses failed and
   its own relay setting is on; it prefers `relay: "preferred"` nodes, never
@@ -383,8 +388,8 @@ A session keyed for any other node fails at T (`4400`).
 
 ## Version
 
-`/v2/version` reports `"mesh": 1`. Clients hide group features for a
-backend that does not.
+`/v2/version` reports `"mesh": 1` and this node's `nodeId`. Clients hide
+group features for a backend that does not report `mesh`.
 
 ## Limits of this version
 

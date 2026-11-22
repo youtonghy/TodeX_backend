@@ -564,6 +564,7 @@ pub(super) async fn version(
         terminal_replay: crate::local_terminal::TERMINAL_REPLAY_VERSION,
         terminal_snapshot: crate::local_terminal::TERMINAL_SNAPSHOT_VERSION,
         mesh: state.mesh.as_ref().map(|_| super::mesh::MESH_VERSION),
+        node_id: state.mesh.as_ref().map(|mesh| mesh.node_id().to_owned()),
     })
 }
 
@@ -4502,6 +4503,10 @@ pub(super) struct VersionResponse {
     /// Device groups (docs/mesh-v1.md); absent without device auth.
     #[serde(skip_serializing_if = "Option::is_none")]
     mesh: Option<u8>,
+    /// This node's group node id, with `mesh`; a relay checks it before
+    /// forwarding to an address (docs/mesh-v1.md "Relay").
+    #[serde(rename = "nodeId", skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

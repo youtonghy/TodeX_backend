@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use crate::app_state::AppState;
 use crate::error::AppError;
 use crate::event::EventRecord;
-use crate::mesh::{roster::SignedDoc, ChainOutcome, MeshStore, NodeFacts};
+use crate::mesh::{roster::SignedDoc, ChainOutcome, MeshStore, NodeFacts, OwnAddresses};
 
 /// `mesh` in `/v2/version`.
 pub(super) const MESH_VERSION: u8 = 1;
@@ -385,21 +385,9 @@ pub(crate) fn node_info(state: &AppState, mesh: &MeshStore) -> Result<SignedDoc,
     let config = &state.config;
     let keys = state.pairing_keys.current()?;
     let protocol = config.pairing_encryption;
-    let mut urls = Vec::new();
-    if let Some(advertised) = config.deployment.advertise_url.as_deref().map(str::trim) {
-        if !advertised.is_empty() {
-            urls.push(advertised.trim_end_matches('/').to_owned());
-        }
-    }
+    let mut urls: Vec<String> = advertised_url(config).into_iter().collect();
     if config.network_enabled {
-        match crate::listen_addrs::connect_addresses(&config.host) {
-            Ok(addresses) => urls.extend(
-                addresses
-                    .into_iter()
-                    .map(|address| format!("http://{}:{}", address.host, config.port)),
-            ),
-            Err(error) => tracing::warn!(error = %error, "listener addresses are unavailable"),
-        }
+        urls.extend(listener_urls(config));
     }
     let mut seen = std::collections::HashSet::new();
     urls.retain(|url| seen.insert(url.clone()));
@@ -412,6 +400,36 @@ pub(crate) fn node_info(state: &AppState, mesh: &MeshStore) -> Result<SignedDoc,
         ),
         urls,
     })
+}
+
+/// `deployment.advertise_url` without a trailing `/`, when set.
+fn advertised_url(config: &crate::config::Config) -> Option<String> {
+    let advertised = config.deployment.advertise_url.as_deref()?.trim();
+    (!advertised.is_empty()).then(|| advertised.trim_end_matches('/').to_owned())
+}
+
+/// `http://<address>:<port>` for every address the listener is reachable at.
+fn listener_urls(config: &crate::config::Config) -> Vec<String> {
+    match crate::listen_addrs::connect_addresses(&config.host) {
+        Ok(addresses) => addresses
+            .into_iter()
+            .map(|address| format!("http://{}:{}", address.host, config.port))
+            .collect(),
+        Err(error) => {
+            tracing::warn!(error = %error, "listener addresses are unavailable");
+            Vec::new()
+        }
+    }
+}
+
+/// Where this node listens, whether or not its node info announces it: a
+/// relay must not take these for another node's addresses.
+pub(crate) fn own_addresses(config: &crate::config::Config) -> OwnAddresses {
+    let urls: Vec<String> = advertised_url(config)
+        .into_iter()
+        .chain(listener_urls(config))
+        .collect();
+    OwnAddresses::from_urls(urls.iter().map(String::as_str))
 }
 
 fn parse<T: serde::de::DeserializeOwned>(payload: &Value) -> Result<T, AppError> {

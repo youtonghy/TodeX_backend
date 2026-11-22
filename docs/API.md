@@ -903,7 +903,7 @@ transcript、HKDF 标签与验证码格式见 [transport-v2.md](transport-v2.md#
 - 组内设备经设备认证照常签名请求；后端按 `devices.json`、所在设备组的成员、节点加入时的临时准入依次查找设备。被移出组的设备下一个请求即被拒绝，已开的 WebSocket 在 5 秒内以 `4401` 关闭，其历史接收方被吊销并封禁。
 - 组名单新增设备时，后端登记其历史公钥并为其开一个授权（`grant.requested`）；组内其他设备自动完成授权，不再弹窗。
 - 地址与重回组（第 2 阶段）：组名单中的后端条目可带用户固定的 `addresses`；`mesh.presence.get {groupId}` 返回连在本后端上的组内设备与其余设备的最近离开时间，变化以 `presence` 事件广播；后端每 30 秒重读自身地址与传输公钥，签名信息变化时广播 `node-info.updated`；在组内且监听非回环地址的后端每 30 秒向 UDP `255.255.255.255:21047` 发送不含组 id 与密钥的局域网信标（`TODEX_AGENTD_MESH_BEACON=false` 关闭）。
-- 中继（第 3 阶段）：`/v2/mesh/relay/{nodeId}/{ticket}/{path}` 把 `health`、`v2/version`、`v2/transport-policy`、`v2/sealed` 与 `v2/ws` 原样转发给组内另一后端。票据由设备签名，内容始终按目标后端的传输公钥端到端加密，中继只看到双方 id 与流量大小。组名单中后端条目的 `relay`（`preferred`/`allowed`/`denied`）与 `relayTarget` 决定谁可以中继、谁可以被中继访问。该路径对非回环对端直接开放。
+- 中继（第 3 阶段）：`/v2/mesh/relay/{nodeId}/{ticket}/{path}` 把 `health`、`v2/version`、`v2/transport-policy`、`v2/sealed` 与 `v2/ws` 原样转发给组内另一后端。票据由设备签名，内容始终按目标后端的传输公钥端到端加密，中继只看到双方 id 与流量大小。组名单中后端条目的 `relay`（`preferred`/`allowed`/`denied`）与 `relayTarget` 决定谁可以中继、谁可以被中继访问。中继不拨目标的回环地址与自己的地址，并用 `/v2/version` 的 `nodeId` 确认地址后面是目标后端。该路径对非回环对端直接开放。
 - 状态保存在 `$DATA_DIR/mesh/`（`node-key.json`、`groups/<groupId>.json`、`join-code.json`，均 0600）。命令行：`todex-agentd mesh join-code [--new]`、`todex-agentd mesh status`；未加入任何组的后端启动时在日志中打印加入码。
 
 ### 健康检查
@@ -943,6 +943,7 @@ GET /v2/version
 | `terminalReplay` | number | 终端输出序号与 `terminal.attach` / `terminal.clear` 的协议版本（当前 `1`），见「终端」；旧后端没有该字段 |
 | `terminalSnapshot` | number | `terminal.attach` 无法衔接时发送屏幕快照（当前 `1`），见「终端」；旧后端没有该字段 |
 | `mesh` | number | 设备组协议版本（当前 `1`），见「设备组」；`enable_auth = false` 或旧后端没有该字段，客户端据此隐藏设备组功能 |
+| `nodeId` | string | 本后端在设备组中的节点 id（`node_…`），与 `mesh` 同时出现；中继据此确认地址后面是目标后端而不是别的后端。旧后端没有该字段 |
 
 ## 本机 IPC 与本地管理 API
 
