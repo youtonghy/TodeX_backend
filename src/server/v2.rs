@@ -13363,7 +13363,12 @@ mod tests {
             settings,
             json!({
                 "scope": { "agents": null, "models": {} },
-                "mcp": { "enabled": false, "approval": "ask", "injected": false },
+                "mcp": {
+                    "enabled": false,
+                    "approval": "ask",
+                    "childPermission": "full-access",
+                    "injected": false
+                },
                 "apiListener": {
                     "enabled": false,
                     "host": "127.0.0.1",
@@ -13404,7 +13409,12 @@ mod tests {
         assert_eq!(saved["scope"]["models"]["claude-code"], json!(["opus"]));
         assert_eq!(
             saved["mcp"],
-            json!({ "enabled": true, "approval": "auto-approve", "injected": true })
+            json!({
+                "enabled": true,
+                "approval": "auto-approve",
+                "childPermission": "full-access",
+                "injected": true
+            })
         );
         assert!(root.join("data/agent-calling.json").exists());
         let (_, partial) = call(signed_request(
