@@ -9,7 +9,8 @@ use crate::error::AppError;
 use crate::event::EventRecord;
 use crate::mesh::{roster::SignedDoc, ChainOutcome, MeshStore, NodeFacts, OwnAddresses};
 
-/// `mesh` in `/v2/version`.
+/// `mesh` in `/v2/version`. Clients test for exactly 1, so hubs are
+/// announced by `meshHub` instead of a new version.
 pub(super) const MESH_VERSION: u8 = 1;
 pub(super) const UPDATED_EVENT: &str = "mesh.updated";
 
@@ -348,7 +349,7 @@ async fn send_beacon(node_id: &str, port: u16) {
 
 /// Stores a pushed chain, then applies what it changed: history for added
 /// devices and the announcements.
-async fn accept_chain(
+pub(super) async fn accept_chain(
     state: &AppState,
     mesh: &MeshStore,
     chain: &[SignedDoc],
@@ -386,6 +387,8 @@ pub(crate) fn node_info(state: &AppState, mesh: &MeshStore) -> Result<SignedDoc,
     let keys = state.pairing_keys.current()?;
     let protocol = config.pairing_encryption;
     let mut urls: Vec<String> = advertised_url(config).into_iter().collect();
+    // Where hubs see this node from the internet (docs/mesh-v1.md "Hub").
+    urls.extend(mesh.observed_urls());
     if config.network_enabled {
         urls.extend(listener_urls(config));
     }

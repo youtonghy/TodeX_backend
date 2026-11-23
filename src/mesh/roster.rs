@@ -140,6 +140,11 @@ pub(crate) struct Member {
     /// Nodes: `false` when no member may reach this node through a relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_target: Option<bool>,
+    /// Nodes: `true` for a hub, which the group's other members reach first
+    /// for state and addresses and relay through first; see "Hub". Never
+    /// `false` and never with `relay: "denied"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +164,11 @@ impl Member {
     /// Members may reach this node through a relay.
     pub(crate) fn reachable_by_relay(&self) -> bool {
         self.kind == MemberKind::Node && self.relay_target != Some(false)
+    }
+
+    /// This node is a hub of its group.
+    pub(crate) fn is_hub(&self) -> bool {
+        self.kind == MemberKind::Node && self.hub == Some(true)
     }
 }
 
@@ -261,9 +271,16 @@ impl RosterBody {
             if member.kind == MemberKind::Device
                 && (!member.addresses.is_empty()
                     || member.relay.is_some()
-                    || member.relay_target.is_some())
+                    || member.relay_target.is_some()
+                    || member.hub.is_some())
             {
                 return Err(invalid("only nodes carry addresses and relay settings"));
+            }
+            if member.hub == Some(false) {
+                return Err(invalid("invalid hub flag"));
+            }
+            if member.hub == Some(true) && member.relay == Some(RelayRole::Denied) {
+                return Err(invalid("a hub relays"));
             }
             if member.addresses.len() > MAX_PINNED_ADDRESSES
                 || !member
@@ -441,6 +458,7 @@ pub(crate) mod test_support {
             addresses: Vec::new(),
             relay: None,
             relay_target: None,
+            hub: None,
         }
     }
 
@@ -456,6 +474,7 @@ pub(crate) mod test_support {
             addresses: Vec::new(),
             relay: None,
             relay_target: None,
+            hub: None,
         }
     }
 
@@ -561,6 +580,10 @@ mod tests {
         );
         assert_eq!(node.relay, Some(RelayRole::Preferred));
         assert!(node.relays() && !node.reachable_by_relay());
+        // The recovery version made the node a hub; the one before did not.
+        assert!(node.is_hub());
+        let earlier = verify_chain(&docs[..3]).unwrap();
+        assert!(earlier.head().members.iter().all(|member| !member.is_hub()));
         let ticket = &fixture["relayTicket"];
         let parts: Vec<&str> = ticket["ticket"].as_str().unwrap().splitn(3, '.').collect();
         let device = parse_signing_public_key(ticket["devicePublicKey"].as_str().unwrap()).unwrap();

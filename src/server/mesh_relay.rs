@@ -380,7 +380,7 @@ async fn probe_addresses(target: &str, urls: &[String]) -> Result<String, AppErr
 
 /// `base/v2/version` answers 2xx and does not name a node other than
 /// `target`.
-async fn answers_as(target: &str, base: &str) -> bool {
+pub(super) async fn answers_as(target: &str, base: &str) -> bool {
     let response = relays()
         .http
         .get(format!("{base}/v2/version"))

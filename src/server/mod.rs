@@ -14,6 +14,7 @@ mod history_cleanup;
 mod history_keys;
 mod local_admin;
 pub(crate) mod mesh;
+mod mesh_hub;
 mod mesh_relay;
 mod mesh_uplink;
 mod native_history;

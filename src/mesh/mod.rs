@@ -102,6 +102,9 @@ struct Inner {
     join_code_failures: u32,
     /// This node's latest signed info and its body.
     node_info: Option<(SignedDoc, NodeInfoBody)>,
+    /// Hub id → the address that hub saw this node at and checked
+    /// (docs/mesh-v1.md "Hub"), while its uplink lasts.
+    observed: BTreeMap<String, String>,
 }
 
 /// What [`MeshStore::accept_chain`] did.
@@ -197,6 +200,7 @@ impl MeshStore {
                 admissions: Vec::new(),
                 join_code_failures: 0,
                 node_info: None,
+                observed: BTreeMap::new(),
             })),
         })
     }
@@ -678,7 +682,8 @@ impl MeshStore {
 
     /// The roster key of `node` when it may hold an uplink to this node
     /// (docs/mesh-v1.md "Uplink"): a group lists this node as a relay (not
-    /// `denied`) and `node` as another node reachable by relay.
+    /// `denied`) and `node` as another node reachable by relay, or this node
+    /// as a hub and `node` as any other node ("Hub").
     pub(crate) fn uplink_key(&self, node: &str) -> Result<String> {
         let inner = self.lock()?;
         inner
@@ -688,8 +693,9 @@ impl MeshStore {
                 let head = group.chain.head();
                 let this = head.member(&self.node_id)?;
                 let peer = head.member(node)?;
-                (node != self.node_id && this.relays() && peer.reachable_by_relay())
-                    .then(|| peer.public_key.clone())
+                let relayed = this.relays() && peer.reachable_by_relay();
+                let hub = this.is_hub() && peer.kind == MemberKind::Node;
+                (node != self.node_id && (relayed || hub)).then(|| peer.public_key.clone())
             })
             .ok_or_else(|| {
                 AppError::Unauthorized("that node may not hold an uplink to this node".to_owned())
@@ -698,7 +704,8 @@ impl MeshStore {
 
     /// The relays this node keeps an uplink to, with their addresses: when a
     /// group lets members reach this node by relay, every other node of it
-    /// that relays. Addresses as [`Self::relay_route`] gives them.
+    /// that relays; and in every group, its hubs. Addresses as
+    /// [`Self::relay_route`] gives them.
     pub(crate) fn uplink_relays(&self, own: &OwnAddresses) -> Vec<(String, Vec<String>)> {
         let Ok(inner) = self.lock() else {
             return Vec::new();
@@ -706,17 +713,13 @@ impl MeshStore {
         let mut relays: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for group in inner.groups.values() {
             let head = group.chain.head();
-            if !head
-                .member(&self.node_id)
-                .is_some_and(Member::reachable_by_relay)
-            {
+            let Some(this) = head.member(&self.node_id) else {
                 continue;
-            }
-            for node in head
-                .members
-                .iter()
-                .filter(|member| member.id != self.node_id && member.relays())
-            {
+            };
+            let relayed = this.reachable_by_relay();
+            for node in head.members.iter().filter(|member| {
+                member.id != self.node_id && (member.is_hub() || (relayed && member.relays()))
+            }) {
                 let urls = relays.entry(node.id.clone()).or_default();
                 for url in node_urls(group, node, own) {
                     if !urls.contains(&url) {
@@ -726,6 +729,127 @@ impl MeshStore {
             }
         }
         relays.into_iter().collect()
+    }
+
+    /// The groups this node and `peer` hand each other over their uplink
+    /// (docs/mesh-v1.md "Hub"): those listing both as nodes where either is
+    /// a hub. Empty without a hub, so plain relays exchange nothing.
+    pub(crate) fn hub_groups(&self, peer: &str) -> Vec<String> {
+        let Ok(inner) = self.lock() else {
+            return Vec::new();
+        };
+        inner
+            .groups
+            .iter()
+            .filter(|(_, group)| {
+                shares_hub(group, &self.node_id, peer) || shares_hub(group, peer, &self.node_id)
+            })
+            .map(|(group_id, _)| group_id.clone())
+            .collect()
+    }
+
+    /// A group lists `node` as a node and `hub` as one of its hubs.
+    pub(crate) fn is_hub_of(&self, hub: &str, node: &str) -> bool {
+        self.lock().is_ok_and(|inner| {
+            inner
+                .groups
+                .values()
+                .any(|group| shares_hub(group, hub, node))
+        })
+    }
+
+    /// [`Self::hub_groups`] with their chains and the node infos this node
+    /// holds, its own included: what it hands `peer`.
+    pub(crate) fn hub_state(&self, peer: &str) -> Vec<GroupDocs> {
+        let groups = self.hub_groups(peer);
+        let Ok(inner) = self.lock() else {
+            return Vec::new();
+        };
+        let own = inner.node_info.as_ref().map(|(doc, _)| doc.clone());
+        groups
+            .iter()
+            .filter_map(|group_id| {
+                let group = inner.groups.get(group_id)?;
+                Some(GroupDocs {
+                    group_id: group_id.clone(),
+                    chain: group.chain.docs.clone(),
+                    node_infos: group
+                        .node_infos
+                        .values()
+                        .map(|(doc, _)| doc.clone())
+                        .chain(own.clone())
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
+    /// What [`Self::hub_state`] carries, in short: each group's head and the
+    /// `seq` of every node info. It changes whenever the state does.
+    pub(crate) fn hub_state_digest(&self, peer: &str) -> String {
+        let groups = self.hub_groups(peer);
+        let Ok(inner) = self.lock() else {
+            return String::new();
+        };
+        let mut digest = inner
+            .node_info
+            .as_ref()
+            .map_or(0, |(_, body)| body.seq)
+            .to_string();
+        for group_id in &groups {
+            let Some(group) = inner.groups.get(group_id) else {
+                continue;
+            };
+            digest.push_str(&format!(" {group_id}:{}", group.chain.head_hash_b64()));
+            for (node_id, (_, seq)) in &group.node_infos {
+                digest.push_str(&format!(",{node_id}={seq}"));
+            }
+        }
+        digest
+    }
+
+    /// The `urls` of `node`'s info as this node holds it.
+    pub(crate) fn node_info_urls(&self, node: &str) -> Vec<String> {
+        let Ok(inner) = self.lock() else {
+            return Vec::new();
+        };
+        inner
+            .groups
+            .values()
+            .find_map(|group| {
+                let member = group.chain.head().member(node)?;
+                let (doc, _) = group.node_infos.get(node)?;
+                verify_node_info(doc, &member.public_key).ok()
+            })
+            .map(|info| info.urls)
+            .unwrap_or_default()
+    }
+
+    /// Records (or with `None` forgets) the address `hub` saw this node at;
+    /// returns whether that changed.
+    pub(crate) fn set_observed(&self, hub: &str, url: Option<&str>) -> bool {
+        let Ok(mut inner) = self.lock() else {
+            return false;
+        };
+        match url {
+            Some(url) if inner.observed.get(hub).map(String::as_str) != Some(url) => {
+                inner.observed.insert(hub.to_owned(), url.to_owned());
+                true
+            }
+            None => inner.observed.remove(hub).is_some(),
+            Some(_) => false,
+        }
+    }
+
+    /// The addresses hubs currently see this node at, without duplicates.
+    pub(crate) fn observed_urls(&self) -> Vec<String> {
+        let Ok(inner) = self.lock() else {
+            return Vec::new();
+        };
+        let mut urls: Vec<String> = inner.observed.values().cloned().collect();
+        urls.sort();
+        urls.dedup();
+        urls
     }
 
     /// `b64u(sig)` by this node's key over [`uplink_message`].
@@ -811,6 +935,16 @@ pub(crate) fn uplink_message(
         message.extend_from_slice(id.as_bytes());
     }
     message
+}
+
+/// `group` lists `node` as another node and `hub` as one of its hubs.
+fn shares_hub(group: &Group, hub: &str, node: &str) -> bool {
+    let head = group.chain.head();
+    hub != node
+        && head.member(hub).is_some_and(Member::is_hub)
+        && head
+            .member(node)
+            .is_some_and(|member| member.kind == MemberKind::Node)
 }
 
 /// A node's addresses as other nodes dial it: pinned first, then the

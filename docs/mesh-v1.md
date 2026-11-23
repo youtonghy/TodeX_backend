@@ -3,7 +3,7 @@
 Status: normative. Phase 1: identity, groups, joining, approval on the
 clients, history in one step. Phase 2: addresses, presence and getting back
 into the group after a network change. Phase 3: relaying through group
-nodes. Implemented by `TodeX_backend` (`src/mesh/`,
+nodes. Hubs: nodes the group marks as the first to reach. Implemented by `TodeX_backend` (`src/mesh/`,
 `src/server/mesh.rs`), `TodeX_protocol` (`src/mesh.ts`, the pairing
 extensions in `src/devicePairing.ts`) and the desktop and web clients. All
 implementations pass `TodeX_protocol/tests/fixtures/mesh-v1.json`
@@ -11,16 +11,20 @@ implementations pass `TodeX_protocol/tests/fixtures/mesh-v1.json`
 backend keeps a verbatim copy in `tests/fixtures/mesh-v1.json`).
 
 A group is a set of backends ("nodes") and client devices that trust each
-other without a central server. A device that joins a group once can reach
+other without needing a central server. A device that joins a group once can reach
 every backend of the group and read its history; joining is approved on any
 device already in the group, never on a backend. Point-to-point pairing
 ([device-verification.md](device-verification.md)) is unchanged and keeps
 working next to groups.
 
-There is no central server: a device gets back into its group with the
+No central server is needed: a device gets back into its group with the
 addresses it saved. When none answers it shows the group as disconnected;
 the user retries or pins a new address. A group with at least one node that
-others can reach (a public address, a port forward) recovers on its own.
+others can reach (a public address, a port forward) recovers on its own, and
+marking that node as a hub ("Hub") makes it the place every member reaches
+first for the group's state, addresses and relaying. A hub only carries
+signed documents and sealed traffic: it cannot change the roster, forge a
+node's info or read what it relays.
 
 ## Encoding and primitives
 
@@ -84,7 +88,8 @@ Bodies are at most 256 KiB. Unknown fields are ignored.
      "addedAt": 1767225600000, "addedBy": "dev_…",
      "addresses": ["https://nas.example.net:7345"],   // optional, pinned by a user
      "relay": "preferred",                             // optional: preferred | allowed | denied
-     "relayTarget": false}                             // optional, default true
+     "relayTarget": false,                             // optional, default true
+     "hub": true}                                      // optional, see "Hub"
   ]
 }
 ```
@@ -106,7 +111,8 @@ valid when:
    Each id matches its kind and public key (prefix and derivation above).
    Device members carry a 1216-byte `historyKey`; node members carry none.
    Only nodes carry `addresses` (at most 16 `http(s)://` URLs, 512 bytes
-   each), `relay` and `relayTarget`.
+   each), `relay`, `relayTarget` and `hub`. `hub` is `true` when present,
+   and a hub never has `relay: "denied"`.
    Names follow the device-name rules of pairing v3 (1–80 scalars, no
    control or bidi formatting characters, no surrounding whitespace).
 4. The chain has at most 4096 documents.
@@ -323,12 +329,13 @@ Broadcast to every `/v2/ws` connection after a change was stored:
 ## Addresses and getting back into the group (phase 2)
 
 A device keeps, per node of its group, the addresses that worked (last
-success first) and tries, in order: those, the node's pinned `addresses`,
+success first), and lists, in order: those, the node's pinned `addresses`,
 the addresses its LAN beacon showed, then the `urls` of its node info. It
-moves to the next address after about 15 s without a connection. Every
-connect reads the node's group state, so a device that was offline catches
-up with the roster and the other nodes' infos, and hands them to nodes that
-are behind.
+probes them all at once, together with the relay paths ("Relay"), and uses
+the first that answers as that node. Every connect reads the node's group
+state, so a device that was offline catches up with the roster and the
+other nodes' infos, and hands them to nodes that are behind; new addresses
+of a node it cannot reach make it probe that node again at once.
 
 - A node re-reads its addresses and transport key every 30 s; when its
   signed info changes it announces `node-info.updated` to its connected
@@ -383,11 +390,16 @@ A session keyed for any other node fails at T (`4400`).
 - **Route order at R:** a direct address that answered in the last
   minute, else T's uplink when T holds one (below), else the direct
   addresses in turn.
-- **Device rules:** a device relays only when direct addresses failed and
-  its own relay setting is on; it prefers `relay: "preferred"` nodes, never
-  uses `denied` ones, and never relays to a `relayTarget: false` node. It
-  shows the connection as relayed and checks the direct addresses every
-  minute (`/health`), switching back as soon as one answers.
+- **Device rules:** a device relays only when its own relay setting is on;
+  it lists hubs first, then `relay: "preferred"` nodes, never uses `denied`
+  ones, and never relays to a `relayTarget: false` node. It probes every
+  path of a node together and uses the first that answers
+  (`/v2/version` with the node's `nodeId`), shows the connection as relayed
+  when that is a relay, and measures every path again each minute. A relay
+  counts as 1.5 times its round trip plus 40 ms: a relayed device moves at
+  once to a direct address that is no slower than that, and leaves a direct
+  address only for a relay that is faster even so (by 30 % and 40 ms, at
+  most every two minutes).
 
 ### Uplink
 
@@ -428,10 +440,45 @@ change nothing: they still use R's relay path.
   relay path would. `TODEX_AGENTD_MESH_UPLINK=false` stops a node from
   keeping uplinks; it still accepts them as a relay.
 
+## Hub
+
+A device of the group marks a node as a hub with `hub: true` in its roster
+entry; a group may have several. A hub is meant for a node with a public
+address that stays up. Hubs change three things:
+
+- **Uplinks to hubs:** every node keeps an uplink ("Uplink") to every hub
+  of its groups, also when it is `relayTarget: false` (a hub accepts such
+  an uplink, and still never relays to that node).
+- **State over the uplink:** when a hub joins the two ends of an uplink
+  (either end is a hub of a group listing both), both ends send
+  `{"t":"state","groups":[{"groupId","chain":[SignedDoc],"nodeInfos":[SignedDoc]}]}`
+  on the control socket when it opens and whenever that state changes
+  (checked every 5 s): those groups only, each with its chain and every
+  node info the sender holds, its own included. The receiver handles each
+  group as `mesh.state.push` (fork rule, signatures, `mesh.updated` to its
+  devices), only for groups it already shares with the sender through a
+  hub; a hub cannot add a node to a group. Nodes therefore learn the
+  roster and each other's addresses from their hub without a device in
+  between.
+- **Observed address:** a hub takes the IP a node's control socket comes
+  from (the TCP peer, or the client a trusted proxy names) when it is a
+  public one, and tries it with each port of that node's info (at most
+  three, `http://<ip>:<port>`). When the node answers there as itself
+  (`/v2/version` `nodeId`), the hub sends `{"t":"observed","url":"…"}`, and
+  `{"t":"observed","url":null}` when it no longer does; it checks again
+  every 10 minutes. The node adds the address after its `advertise_url` in
+  its node info while that uplink lasts, so its new public address reaches
+  the group after a network change without a pinned address.
+
+Clients list hubs first among relays and sync with whatever node connects
+first; a hub, being up and reachable, is usually that node. Nodes and
+clients that do not know hubs ignore the field and the frames.
+
 ## Version
 
-`/v2/version` reports `"mesh": 1` and this node's `nodeId`. Clients hide
-group features for a backend that does not report `mesh`.
+`/v2/version` reports `"mesh": 1`, this node's `nodeId` and `"meshHub":
+true` when it knows hubs. Clients hide group features for a backend that
+does not report `mesh`, and the hub setting for one without `meshHub`.
 
 ## Limits of this version
 

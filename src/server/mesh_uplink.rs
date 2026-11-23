@@ -42,6 +42,7 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
+use super::mesh_hub;
 use crate::{
     app_state::AppState,
     error::AppError,
@@ -171,22 +172,34 @@ fn authorize(mesh: &MeshStore, auth: &Auth, id: Option<&str>, now_ms: u64) -> Re
 async fn control(
     State(state): State<AppState>,
     Query(auth): Query<Auth>,
+    headers: axum::http::HeaderMap,
+    extensions: axum::http::Extensions,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response<Body>, AppError> {
     let mesh = state
         .mesh
-        .as_ref()
+        .clone()
         .ok_or_else(|| AppError::Unsupported("device groups need device auth".to_owned()))?;
-    authorize(mesh, &auth, None, unix_ms())?;
+    authorize(&mesh, &auth, None, unix_ms())?;
+    let from = mesh_hub::connecting_address(&state, &headers, &extensions);
     Ok(upgrade
-        .on_upgrade(move |socket| hold_link(auth.node, socket))
+        .on_upgrade(move |socket| hold_link(state, mesh, auth.node, from, socket))
         .into_response())
 }
 
 /// Registers the socket as `node`'s uplink and sends `open` for every
 /// callback the relay needs, pinging every 30 s, until the node leaves,
-/// misses two pongs or a newer socket replaces this one.
-async fn hold_link(node: String, socket: WebSocket) {
+/// misses two pongs or a newer socket replaces this one. When a hub joins
+/// the two, it also exchanges group state, and as the node's hub tells it
+/// the public address it connected `from` once the node answers there
+/// (docs/mesh-v1.md "Hub").
+async fn hold_link(
+    state: AppState,
+    mesh: MeshStore,
+    node: String,
+    from: Option<std::net::IpAddr>,
+    socket: WebSocket,
+) {
     let registry = registry();
     let (opens_tx, mut opens) = mpsc::channel(MAX_CALLBACKS);
     let generation = registry.generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -207,6 +220,13 @@ async fn hold_link(node: String, socket: WebSocket) {
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     let mut missed = 0;
+    let mut sync = mesh_hub::StateSync::default();
+    let mut sync_tick = tokio::time::interval(mesh_hub::SYNC_INTERVAL);
+    sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let (found_tx, mut found) = mpsc::channel::<Option<String>>(1);
+    let mut observed: Option<String> = None;
+    let mut observed_at: Option<Instant> = None;
+    let mut observing: Option<JoinHandle<()>> = None;
     let reason = loop {
         tokio::select! {
             open = opens.recv() => {
@@ -227,12 +247,50 @@ async fn hold_link(node: String, socket: WebSocket) {
                     break "send failed";
                 }
             }
+            _ = sync_tick.tick() => {
+                if let Some(frame) = sync.next(&mesh, &node) {
+                    if sender.send(AxumMessage::Text(frame.into())).await.is_err() {
+                        break "send failed";
+                    }
+                }
+                let due = observed_at.is_none_or(|at| at.elapsed() >= mesh_hub::OBSERVED_RECHECK);
+                if let Some(ip) = from.filter(|_| due && mesh.is_hub_of(mesh.node_id(), &node)) {
+                    let candidates = mesh_hub::observed_candidates(ip, &mesh.node_info_urls(&node));
+                    // Until the node's info arrives there are no ports to try.
+                    if !candidates.is_empty() || observed.is_some() {
+                        observed_at = Some(Instant::now());
+                        let (tx, node) = (found_tx.clone(), node.clone());
+                        observing = Some(tokio::spawn(async move {
+                            let _ = tx.send(mesh_hub::check_observed(&node, &candidates).await).await;
+                        }));
+                    }
+                }
+            }
+            Some(url) = found.recv() => {
+                if url != observed {
+                    tracing::info!(%node, url = ?url, "mesh hub observed address");
+                    let frame = mesh_hub::observed_frame(url.as_deref());
+                    if sender.send(AxumMessage::Text(frame.into())).await.is_err() {
+                        break "send failed";
+                    }
+                    observed = url;
+                }
+            }
             message = receiver.next() => match message {
                 Some(Ok(AxumMessage::Close(_))) | Some(Err(_)) | None => break "closed by the node",
+                Some(Ok(AxumMessage::Text(text))) => {
+                    missed = 0;
+                    if let Some(mesh_hub::Frame::State(groups)) = mesh_hub::parse_frame(text.as_str()) {
+                        mesh_hub::accept_state(&state, &mesh, &node, groups).await;
+                    }
+                }
                 Some(Ok(_)) => missed = 0,
             },
         }
     };
+    if let Some(task) = observing {
+        task.abort();
+    }
     if let Ok(mut links) = registry.links.lock() {
         if links
             .get(&node)
@@ -382,8 +440,13 @@ pub(crate) fn spawn_uplinks(state: AppState) -> Option<JoinHandle<()>> {
                     continue;
                 }
                 let (sender, receiver) = watch::channel(urls);
-                let task =
-                    tasks.spawn(maintain(mesh.clone(), app.clone(), relay.clone(), receiver));
+                let task = tasks.spawn(maintain(
+                    state.clone(),
+                    mesh.clone(),
+                    app.clone(),
+                    relay.clone(),
+                    receiver,
+                ));
                 links.insert(relay, (sender, task));
             }
         }
@@ -402,7 +465,13 @@ fn uplink_enabled() -> bool {
 /// One relay's uplink: connects to the first of its addresses that takes
 /// it, serves callbacks while it lasts, and reconnects after 2 s, doubling
 /// up to 60 s (with jitter) while no address takes it.
-async fn maintain(mesh: MeshStore, app: Router, relay: String, urls: watch::Receiver<Vec<String>>) {
+async fn maintain(
+    state: AppState,
+    mesh: MeshStore,
+    app: Router,
+    relay: String,
+    urls: watch::Receiver<Vec<String>>,
+) {
     let mut backoff = BACKOFF_MIN;
     let mut callbacks = JoinSet::new();
     loop {
@@ -413,8 +482,18 @@ async fn maintain(mesh: MeshStore, app: Router, relay: String, urls: watch::Rece
                 Ok(socket) => {
                     tracing::info!(%relay, address = %base, "mesh uplink established");
                     connected = true;
-                    let reason =
-                        serve_link(&mesh, &app, &relay, base, socket, &mut callbacks).await;
+                    let link = Uplink {
+                        state: &state,
+                        mesh: &mesh,
+                        app: &app,
+                        relay: &relay,
+                        base,
+                    };
+                    let reason = serve_link(link, socket, &mut callbacks).await;
+                    // The hub saw this node over that link only.
+                    if mesh.set_observed(&relay, None) {
+                        tracing::info!(%relay, "mesh hub address forgotten");
+                    }
                     tracing::info!(%relay, reason, "mesh uplink closed");
                     break;
                 }
@@ -466,14 +545,22 @@ async fn connect(mesh: &MeshStore, relay: &str, base: &str) -> Result<ControlSoc
     Ok(socket)
 }
 
+/// One connected uplink, as the node sees it.
+struct Uplink<'a> {
+    state: &'a AppState,
+    mesh: &'a MeshStore,
+    app: &'a Router,
+    relay: &'a str,
+    base: &'a str,
+}
+
 /// Reads the control socket (pongs go out as it reads) and calls back for
 /// every `open`, until it closes or stays silent for [`SILENCE_TIMEOUT`].
+/// When a hub joins this node and the relay, it also exchanges group state
+/// and, from its hub, takes the address the hub sees it at.
 async fn serve_link(
-    mesh: &MeshStore,
-    app: &Router,
-    relay: &str,
-    base: &str,
-    mut socket: ControlSocket,
+    link: Uplink<'_>,
+    socket: ControlSocket,
     callbacks: &mut JoinSet<()>,
 ) -> &'static str {
     #[derive(Deserialize)]
@@ -481,16 +568,53 @@ async fn serve_link(
         t: String,
         id: String,
     }
+    let Uplink {
+        state,
+        mesh,
+        app,
+        relay,
+        base,
+    } = link;
+    let (mut sink, mut stream) = socket.split();
+    let mut sync = mesh_hub::StateSync::default();
+    let mut sync_tick = tokio::time::interval(mesh_hub::SYNC_INTERVAL);
+    sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let silence = tokio::time::sleep(SILENCE_TIMEOUT);
+    tokio::pin!(silence);
     loop {
         while callbacks.try_join_next().is_some() {}
-        let message = match tokio::time::timeout(SILENCE_TIMEOUT, socket.next()).await {
-            Err(_) => return "the relay went silent",
-            Ok(None) | Ok(Some(Err(_))) => return "connection lost",
-            Ok(Some(Ok(message))) => message,
+        let message = tokio::select! {
+            _ = &mut silence => return "the relay went silent",
+            _ = sync_tick.tick() => {
+                if let Some(frame) = sync.next(mesh, relay) {
+                    if sink.send(Message::Text(frame.into())).await.is_err() {
+                        return "connection lost";
+                    }
+                }
+                continue;
+            }
+            message = stream.next() => match message {
+                None | Some(Err(_)) => return "connection lost",
+                Some(Ok(message)) => message,
+            },
         };
+        silence
+            .as_mut()
+            .reset(tokio::time::Instant::now() + SILENCE_TIMEOUT);
         match message {
             Message::Close(_) => return "closed by the relay",
             Message::Text(text) => {
+                match mesh_hub::parse_frame(text.as_str()) {
+                    Some(mesh_hub::Frame::State(groups)) => {
+                        mesh_hub::accept_state(state, mesh, relay, groups).await;
+                        continue;
+                    }
+                    Some(mesh_hub::Frame::Observed(url)) => {
+                        take_observed(mesh, relay, url);
+                        continue;
+                    }
+                    None => {}
+                }
                 let Ok(open) = serde_json::from_str::<Open>(text.as_str()) else {
                     continue;
                 };
@@ -507,6 +631,18 @@ async fn serve_link(
             }
             _ => {}
         }
+    }
+}
+
+/// Stores the address `relay` saw this node at, when `relay` is one of its
+/// hubs and the address is a plain public one; `None` forgets it.
+fn take_observed(mesh: &MeshStore, relay: &str, url: Option<String>) {
+    if !mesh.is_hub_of(relay, mesh.node_id()) {
+        return;
+    }
+    let url = url.filter(|url| mesh_hub::acceptable_observed(url));
+    if mesh.set_observed(relay, url.as_deref()) {
+        tracing::info!(%relay, url = ?url, "mesh hub address updated");
     }
 }
 
@@ -882,6 +1018,111 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hubs_take_uplinks_from_every_node_of_their_groups() {
+        // Without a hub, a node that refuses relays keeps no uplink and the
+        // two share nothing.
+        let (hub, node) = (store(), store());
+        group(&hub, &node, |_, node| node.relay_target = Some(false));
+        assert!(node.uplink_relays(&Default::default()).is_empty());
+        assert!(hub.hub_groups(node.node_id()).is_empty());
+        assert!(node.hub_state(hub.node_id()).is_empty());
+        // With one, it keeps an uplink to the hub, which accepts it.
+        let (hub, node) = (store(), store());
+        group(&hub, &node, |hub, node| {
+            hub.hub = Some(true);
+            node.relay_target = Some(false);
+        });
+        let (h, n) = (hub.node_id().to_owned(), node.node_id().to_owned());
+        assert_eq!(
+            node.uplink_relays(&Default::default()),
+            vec![(h.clone(), Vec::new())]
+        );
+        let now = unix_ms();
+        assert!(authorize(&hub, &auth(&node, &h, now, None), None, now).is_ok());
+        assert!(hub.is_hub_of(&h, &n) && node.is_hub_of(&h, &n));
+        assert!(!hub.is_hub_of(&n, &h));
+        assert_eq!(hub.hub_groups(&n).len(), 1);
+        assert_eq!(node.hub_state(&h).len(), 1);
+        // The hub still does not relay to a node that refuses relays.
+        let device = TestDevice::new(DEVICE_SEED);
+        assert!(hub
+            .relay_route(&device.device_id, &n, &Default::default())
+            .is_err());
+        // Observed addresses come and go with the hub's link.
+        assert!(node.set_observed(&h, Some("http://8.8.4.4:7345")));
+        assert!(!node.set_observed(&h, Some("http://8.8.4.4:7345")));
+        assert_eq!(node.observed_urls(), vec!["http://8.8.4.4:7345".to_owned()]);
+        assert!(node.set_observed(&h, None));
+        assert!(node.observed_urls().is_empty());
+        // Only a hub's own claim is taken.
+        take_observed(&node, &n, Some("http://8.8.4.4:7345".to_owned()));
+        assert!(node.observed_urls().is_empty());
+        take_observed(&node, &h, Some("http://192.168.1.2:7345".to_owned()));
+        assert!(node.observed_urls().is_empty());
+        take_observed(&node, &h, Some("http://8.8.4.4:7345".to_owned()));
+        assert_eq!(node.observed_urls(), vec!["http://8.8.4.4:7345".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_hub_and_its_node_hand_each_other_the_group_state() {
+        let hub = TestServer::start(PairingEncryption::X25519).await;
+        let node = TestServer::start(PairingEncryption::X25519).await;
+        let (hub_mesh, node_mesh) = (
+            hub.state.mesh.clone().unwrap(),
+            node.state.mesh.clone().unwrap(),
+        );
+        group(&hub_mesh, &node_mesh, |hub, _| hub.hub = Some(true));
+        let h = hub_mesh.node_id().to_owned();
+        // Clients test for `mesh: 1` exactly; hubs are announced apart.
+        let version: serde_json::Value = reqwest::get(format!("http://{}/v2/version", hub.address))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(version["mesh"], 1);
+        assert_eq!(version["meshHub"], true);
+        // The node signed its info; only the hub has the newest roster.
+        super::super::mesh::node_info(&node.state, &node_mesh).unwrap();
+        let current = hub_mesh.groups(None).unwrap().remove(0);
+        let group_id = current.group_id.clone();
+        let members = verify_chain(&current.chain).unwrap().head().members.clone();
+        let creator = ed25519_dalek::SigningKey::from_bytes(&[DEVICE_SEED; 32]);
+        let newer = append(&current.chain, &creator, members);
+        hub_mesh.accept_chain(&newer).unwrap();
+        let version = |mesh: &MeshStore| {
+            let docs = mesh.groups(Some(&group_id)).unwrap().remove(0);
+            verify_chain(&docs.chain).unwrap().version()
+        };
+        assert_eq!((version(&hub_mesh), version(&node_mesh)), (3, 2));
+
+        let (_urls, receiver) = watch::channel(vec![format!("http://{}", hub.address)]);
+        let uplink = tokio::spawn(maintain(
+            node.state.clone(),
+            node_mesh.clone(),
+            served_app(super::super::router(node.state.clone())),
+            h.clone(),
+            receiver,
+        ));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let hub_infos = hub_mesh
+                    .groups(Some(&group_id))
+                    .unwrap()
+                    .remove(0)
+                    .node_infos;
+                if version(&node_mesh) == 3 && !hub_infos.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the hub and the node exchange the group state");
+        uplink.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_relay_gives_up_on_a_callback_after_ten_seconds() {
         let node = format!("node_{}", uuid::Uuid::new_v4().simple());
@@ -1003,6 +1244,7 @@ mod tests {
         // here; the dialer skips loopback relay addresses).
         let (_urls, receiver) = watch::channel(vec![format!("http://{}", relay.address)]);
         let uplink = tokio::spawn(maintain(
+            target.state.clone(),
             target_mesh.clone(),
             served_app(super::super::router(target.state.clone())),
             r.clone(),

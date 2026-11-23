@@ -565,6 +565,7 @@ pub(super) async fn version(
         terminal_snapshot: crate::local_terminal::TERMINAL_SNAPSHOT_VERSION,
         mesh: state.mesh.as_ref().map(|_| super::mesh::MESH_VERSION),
         node_id: state.mesh.as_ref().map(|mesh| mesh.node_id().to_owned()),
+        mesh_hub: state.mesh.as_ref().map(|_| true),
     })
 }
 
@@ -4507,6 +4508,9 @@ pub(super) struct VersionResponse {
     /// forwarding to an address (docs/mesh-v1.md "Relay").
     #[serde(rename = "nodeId", skip_serializing_if = "Option::is_none")]
     node_id: Option<String>,
+    /// With `mesh`: this node can be a group hub (docs/mesh-v1.md "Hub").
+    #[serde(rename = "meshHub", skip_serializing_if = "Option::is_none")]
+    mesh_hub: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
