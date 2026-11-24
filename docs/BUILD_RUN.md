@@ -75,6 +75,7 @@ dsh --version
 | `TODEX_AGENTD_HOST` | 监听地址 |
 | `TODEX_AGENTD_PORT` | 监听端口 |
 | `TODEX_AGENTD_NETWORK_ENABLED` | 是否开启网络监听（`0/1/true/false`，默认开启）；关闭后客户端只能经本机 IPC 连接，见下文「本机 IPC」 |
+| `TODEX_AGENTD_KEEP_AWAKE` | macOS 上是否在接电源时阻止系统闲置睡眠（`0/1/true/false`，默认开启），优先于 `config.toml` 的 `keep_awake`，见下文「保持唤醒」 |
 | `TODEX_AGENTD_DATA_DIR` | 数据目录 |
 | `TODEX_AGENTD_WORKSPACE_ROOT` | workspace 根目录 |
 | `TODEX_AGENTD_WORKSPACE_ROOTS` | 多个 workspace 根目录，按平台路径分隔符分隔（macOS/Linux 为 `:`，Windows 为 `;`） |
@@ -184,12 +185,26 @@ port = 7346
 enabled = true
 # path = "/run/todex-ipc/agentd.sock"
 
+keep_awake = true     # 顶层键：macOS 上网络监听开启且接电源时阻止系统闲置睡眠，见下文「保持唤醒」
+
 [update]
 auto_update = true    # false 关闭启动时与运行中 daemon 的自动更新（TODEX_AUTO_UPDATE=0 同样关闭）；手动 update 不受影响
 
 [tui]
 language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 ```
+
+### 保持唤醒（macOS）
+
+Mac 闲置进入系统睡眠时 daemon 会被暂停：Mesh 中继收不到心跳，断开它的上行连接（中继日志 `missed pongs`，本机醒来后记 `the relay went silent`），经中继访问这台后端的客户端得到 502，直到 Mac 醒来。
+
+因此 `keep_awake`（默认 `true`）开启且网络监听开启时，daemon 持有一个 IOKit `PreventSystemSleep` 电源断言（`pmset -g assertions` 中名为 “TodeX backend is serving remote clients”）：
+
+- 只在接电源时生效；用电池时 Mac 照常按节能设置睡眠。显示器照常关闭。
+- 只阻止闲置睡眠；手动选择“睡眠”仍会睡眠。接电源合上盖子时 macOS 也可能因该断言保持唤醒（取决于机型与系统版本），需要合盖睡眠时请先关闭该选项。
+- 仅限 macOS，且容器部署（`deployment = "container"`）与关闭网络监听时不生效。
+- 进程退出或崩溃时内核自动撤销断言。
+- 修改即时生效：本地管理 API（桌面端「本机 Backend」）立即应用；TUI 按 `z` 或直接改 `config.toml` 后，运行中的 daemon 约 15 秒内重读。`TODEX_AGENTD_KEEP_AWAKE` 优先于 `config.toml`。
 
 ### 本机 IPC
 

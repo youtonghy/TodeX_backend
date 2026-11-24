@@ -30,6 +30,7 @@ mod history_keys;
 mod ipc;
 mod kanban_scheduler;
 mod kanban_store;
+mod keep_awake;
 mod listen_addrs;
 mod local_terminal;
 mod mcp;

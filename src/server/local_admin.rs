@@ -278,6 +278,11 @@ struct ConfigBody {
     pairing_encryption: &'static str,
     workspace_roots: Vec<PathBuf>,
     auto_update: bool,
+    /// Saved `keep_awake`; applies at once (see [`crate::keep_awake`]).
+    keep_awake: bool,
+    /// Whether this daemon can keep its host awake (macOS, not a container);
+    /// clients hide the setting otherwise.
+    keep_awake_supported: bool,
     editable: bool,
     restart_required: bool,
 }
@@ -312,6 +317,8 @@ fn config_body(admin: &LocalAdmin) -> Result<ConfigBody, AdminError> {
         pairing_encryption: saved.pairing_encryption.as_str(),
         workspace_roots: saved.workspace_roots,
         auto_update: saved.update.auto_update,
+        keep_awake: saved.keep_awake,
+        keep_awake_supported: crate::keep_awake::supported(running),
         editable: running.deployment.kind != Deployment::Container,
         restart_required,
     })
@@ -330,6 +337,7 @@ struct ConfigPatch {
     pairing_encryption: Option<String>,
     workspace_roots: Option<Vec<PathBuf>>,
     auto_update: Option<bool>,
+    keep_awake: Option<bool>,
 }
 
 /// Applies `patch` to the saved configuration with the TUI's rules and
@@ -396,6 +404,7 @@ async fn put_config(State(admin): State<LocalAdmin>, body: Bytes) -> AdminResult
         .map_err(|error| AdminError::invalid_config(format!("invalid request body: {error}")))?;
     let saved = Config::load_saved(running.data_dir.clone())?;
     let auto_update = patch.auto_update;
+    let keep_awake = patch.keep_awake;
     let network_enabled = patch.network_enabled;
     if network_enabled == Some(false) && !saved.ipc.enabled {
         return Err(AdminError::invalid_config(
@@ -416,6 +425,11 @@ async fn put_config(State(admin): State<LocalAdmin>, body: Bytes) -> AdminResult
     if let Some(enabled) = auto_update {
         Config::save_update_settings(running.data_dir.clone(), enabled)?;
         crate::config::set_auto_update_configured(enabled);
+    }
+    if let Some(enabled) = keep_awake {
+        Config::save_keep_awake(running.data_dir.clone(), enabled)?;
+        // Reread so `TODEX_AGENTD_KEEP_AWAKE` still wins over the saved value.
+        crate::keep_awake::apply(running, Config::saved_keep_awake(&running.data_dir)?);
     }
     Ok(Json(config_body(&admin)?))
 }

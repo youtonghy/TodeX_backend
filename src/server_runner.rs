@@ -26,6 +26,8 @@ pub struct ManagedServer {
     history_cleanup_task: Option<JoinHandle<()>>,
     /// Removes expired prompt uploads.
     upload_cleanup_task: Option<JoinHandle<()>>,
+    /// Keeps a macOS host awake; see [`crate::keep_awake`].
+    keep_awake_task: Option<JoinHandle<()>>,
     /// Runs due kanban task schedules.
     kanban_schedule_task: Option<JoinHandle<()>>,
     /// Device groups: own node info and the LAN beacon.
@@ -408,6 +410,7 @@ impl ManagedServer {
         });
         let history_cleanup_task = Some(crate::history_cleanup::spawn(state.clone()));
         let upload_cleanup_task = Some(crate::prompt_uploads::spawn_cleanup());
+        let keep_awake_task = crate::keep_awake::spawn(&config);
         let app = if config.network_enabled {
             server::router(state.clone())
         } else {
@@ -499,6 +502,7 @@ impl ManagedServer {
             exited,
             retention_task,
             history_cleanup_task,
+            keep_awake_task,
             upload_cleanup_task,
             kanban_schedule_task,
             mesh_node_task,
@@ -587,6 +591,7 @@ impl ManagedServer {
         if let Some(task) = self.upload_cleanup_task.take() {
             task.abort();
         }
+        crate::keep_awake::stop(self.keep_awake_task.take());
         if let Some(task) = self.kanban_schedule_task.take() {
             task.abort();
         }
@@ -637,6 +642,7 @@ impl ManagedServer {
         if let Some(task) = self.upload_cleanup_task.take() {
             task.abort();
         }
+        crate::keep_awake::stop(self.keep_awake_task.take());
         if let Some(task) = self.kanban_schedule_task.take() {
             task.abort();
         }
@@ -1371,6 +1377,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
@@ -1460,6 +1467,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
@@ -1547,6 +1555,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),

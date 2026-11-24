@@ -117,7 +117,7 @@ todex-agentd daemon start|stop|restart|status     # background daemon
 todex-agentd daemon autostart enable  # start at login (status / disable)
 ```
 
-Quitting the console leaves the daemon running. To accept clients from other machines, listen on the network (`--host 0.0.0.0`) or set `advertise_url`; for TLS, put a reverse proxy (Caddy, nginx, Cloudflare Tunnel) in front.
+Quitting the console leaves the daemon running. On macOS the daemon keeps the Mac from idle-sleeping on AC power while it listens on the network, so remote clients and mesh relays stay connected; press `z` in the console (or set `keep_awake = false`) to turn that off. To accept clients from other machines, listen on the network (`--host 0.0.0.0`) or set `advertise_url`; for TLS, put a reverse proxy (Caddy, nginx, Cloudflare Tunnel) in front.
 
 ## Pair devices
 

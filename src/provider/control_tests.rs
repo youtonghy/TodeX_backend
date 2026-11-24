@@ -56,6 +56,7 @@ impl Harness {
             workspace_roots: vec![root.clone()],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "pi".to_owned(),
                 pi_bin: executable.clone(),

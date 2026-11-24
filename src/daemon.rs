@@ -1773,6 +1773,7 @@ mod tests {
             workspace_roots: vec![root.join("workspace")],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),

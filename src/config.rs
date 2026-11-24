@@ -42,6 +42,11 @@ pub struct Config {
     /// are not bound, and a loopback port on a random number serves just the
     /// agent MCP routes. Needs `[ipc]` enabled.
     pub network_enabled: bool,
+    /// `keep_awake` (default on): while the network listener is on, hold a
+    /// macOS power assertion that stops idle system sleep on AC power, so
+    /// remote clients and mesh relays keep reaching this host. See
+    /// [`crate::keep_awake`].
+    pub keep_awake: bool,
     pub pairing_encryption: PairingEncryption,
     pub data_dir: PathBuf,
     pub workspace_roots: Vec<PathBuf>,
@@ -155,6 +160,9 @@ static CONTAINER_DEPLOYMENT: AtomicBool = AtomicBool::new(false);
 pub fn container_deployment() -> bool {
     CONTAINER_DEPLOYMENT.load(Ordering::Relaxed)
 }
+
+/// Overrides `keep_awake` from the environment.
+const KEEP_AWAKE_ENV: &str = "TODEX_AGENTD_KEEP_AWAKE";
 
 /// `[update] auto_update` of the configuration this process loaded last
 /// (`true` before any load); see [`auto_update_configured`].
@@ -377,6 +385,7 @@ struct FileConfig {
     host: Option<String>,
     port: Option<u16>,
     network_enabled: Option<bool>,
+    keep_awake: Option<bool>,
     pairing_encryption: Option<PairingEncryption>,
     /// Retired: history is always end-to-end encrypted. Any value (even an
     /// invalid one) is accepted and only logged; see
@@ -560,6 +569,12 @@ impl Config {
             file_config.network_enabled,
             defaults.network_enabled,
         );
+        let keep_awake = coalesce(
+            None,
+            env_bool(KEEP_AWAKE_ENV),
+            file_config.keep_awake,
+            defaults.keep_awake,
+        );
         let pairing_encryption = coalesce(
             None,
             env::var("TODEX_AGENTD_PAIRING_ENCRYPTION")
@@ -665,6 +680,7 @@ impl Config {
             host,
             port,
             network_enabled,
+            keep_awake,
             pairing_encryption,
             data_dir,
             workspace_roots,
@@ -865,6 +881,27 @@ impl Config {
         write_config_document(&data_dir, &document)
     }
 
+    /// Saves top-level `keep_awake`; the rest of the file is kept.
+    pub fn save_keep_awake(data_dir: PathBuf, enabled: bool) -> anyhow::Result<()> {
+        let data_dir = expand_home(data_dir);
+        let mut document = load_config_document(&data_dir)?;
+        document["keep_awake"] = value(enabled);
+        write_config_document(&data_dir, &document)
+    }
+
+    /// The `keep_awake` saved in `data_dir`'s `config.toml` right now, with
+    /// `TODEX_AGENTD_KEEP_AWAKE` taking precedence. A running daemon rereads
+    /// it so a change saved by the TUI applies without a restart; unlike
+    /// [`Config::load_saved`] it reads only this key.
+    pub fn saved_keep_awake(data_dir: &Path) -> anyhow::Result<bool> {
+        if let Some(enabled) = env_bool(KEEP_AWAKE_ENV) {
+            return Ok(enabled);
+        }
+        Ok(read_config_file(data_dir.join("config.toml"))?
+            .keep_awake
+            .unwrap_or(true))
+    }
+
     /// Saves the external API listener's `[api]` `enabled` and `port`,
     /// each only when given; the rest of the file is kept.
     pub fn save_api_settings(
@@ -1055,6 +1092,7 @@ impl Default for Config {
             host: "127.0.0.1".to_owned(),
             port: 7345,
             network_enabled: true,
+            keep_awake: true,
             pairing_encryption: PairingEncryption::default(),
             data_dir,
             workspace_roots: vec![workspace_root],
@@ -2022,6 +2060,31 @@ mod tests {
         assert!(!config.update.auto_update);
         // The rest of the file is kept.
         assert_eq!(config.port, 7400);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn keep_awake_defaults_on_and_round_trips() {
+        let root = env::temp_dir().join(format!(
+            "todex-config-keep-awake-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(Config::load_saved(root.clone()).unwrap().keep_awake);
+        assert!(Config::saved_keep_awake(&root).unwrap());
+
+        fs::write(root.join("config.toml"), "port = 7400\n").unwrap();
+        Config::save_keep_awake(root.clone(), false).unwrap();
+        let config = Config::load_saved(root.clone()).unwrap();
+        assert!(!config.keep_awake);
+        assert!(!Config::saved_keep_awake(&root).unwrap());
+        assert_eq!(config.port, 7400, "the rest of the file is kept");
+
+        fs::write(root.join("config.toml"), "keep_awake = \"yes\"\n").unwrap();
+        assert!(
+            Config::saved_keep_awake(&root).is_err(),
+            "an invalid value is an error, not a silent default"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

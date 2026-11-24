@@ -5367,6 +5367,7 @@ mod tests {
             workspace_roots: vec![root.join("workspaces")],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".into(),
                 codex_bin: executable.clone(),
@@ -5620,6 +5621,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -6110,6 +6112,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -6235,6 +6238,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -6405,6 +6409,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -6581,6 +6586,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -6732,6 +6738,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -6882,6 +6889,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -7109,6 +7117,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -7310,6 +7319,7 @@ mod tests {
             workspace_roots: vec![workspace_root.clone()],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -7448,6 +7458,7 @@ mod tests {
             workspace_roots: vec![primary.clone(), secondary.clone(), extra.clone()],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -7959,6 +7970,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -8850,6 +8862,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -9079,6 +9092,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -9411,6 +9425,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -9506,6 +9521,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -9665,6 +9681,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -9852,6 +9869,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -10288,6 +10306,7 @@ mod tests {
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
             history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),

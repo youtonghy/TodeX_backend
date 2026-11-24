@@ -33,10 +33,10 @@ use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
 use crate::update;
 use crate::workspace_paths::canonical_workspace_root;
 
-const ACTION_COUNT: usize = 16;
+const ACTION_COUNT: usize = 17;
 /// Key of each action-list entry, in list order.
 const ACTION_SHORTCUTS: [&str; ACTION_COUNT] = [
-    "s", "r", "a", "h", "p", "b", "w", "e", "x", "g", "c", "l", "d", "m", "u", "q",
+    "s", "r", "a", "h", "p", "b", "z", "w", "e", "x", "g", "c", "l", "d", "m", "u", "q",
 ];
 /// How often the open "Join a backend group" window rereads the group files.
 const MESH_JOIN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -1781,6 +1781,7 @@ impl TuiApp {
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
             KeyCode::Char('b') => self.toggle_network(),
+            KeyCode::Char('z') => self.toggle_keep_awake(),
             KeyCode::Char('w') => self.start_workspace_roots_manager(),
             KeyCode::Char('e') => self.start_pairing_encryption_edit(),
             KeyCode::Char('x') => self.start_reset_edit(),
@@ -1915,16 +1916,17 @@ impl TuiApp {
             3 => self.start_host_edit(),
             4 => self.start_port_edit(),
             5 => self.toggle_network(),
-            6 => self.start_workspace_roots_manager(),
-            7 => self.start_pairing_encryption_edit(),
-            8 => self.start_reset_edit(),
-            9 => self.show_pairing_qr().await,
-            10 => self.show_credentials().await,
-            11 => self.toggle_language(),
-            12 => self.open_device_pairing(),
-            13 => self.open_mesh_join(false),
-            14 => self.open_about(),
-            15 => return Ok(true),
+            6 => self.toggle_keep_awake(),
+            7 => self.start_workspace_roots_manager(),
+            8 => self.start_pairing_encryption_edit(),
+            9 => self.start_reset_edit(),
+            10 => self.show_pairing_qr().await,
+            11 => self.show_credentials().await,
+            12 => self.toggle_language(),
+            13 => self.open_device_pairing(),
+            14 => self.open_mesh_join(false),
+            15 => self.open_about(),
+            16 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -1979,6 +1981,49 @@ impl TuiApp {
                     .text(
                         "Failed to save the network setting.",
                         "保存网络接口设置失败。",
+                    )
+                    .to_owned();
+            }
+        }
+    }
+
+    /// Turns `keep_awake` on or off; a running daemon rereads it within
+    /// about 15 seconds (see [`crate::keep_awake`]).
+    fn toggle_keep_awake(&mut self) {
+        if !crate::keep_awake::supported(&self.config) {
+            self.notice = self
+                .text(
+                    "Keeping the host awake is available on macOS only.",
+                    "保持唤醒仅支持 macOS。",
+                )
+                .to_owned();
+            return;
+        }
+        let enabled = !self.config.keep_awake;
+        match Config::save_keep_awake(self.config.data_dir.clone(), enabled) {
+            Ok(()) => {
+                self.config.keep_awake = enabled;
+                self.last_error = None;
+                self.notice = if enabled {
+                    self.text(
+                        "Keep awake on: while the network listener is on, the Mac does not idle-sleep on AC power.",
+                        "已开启保持唤醒：网络接口开启且接电源时，Mac 不会闲置睡眠。",
+                    )
+                } else {
+                    self.text(
+                        "Keep awake off: the Mac sleeps per its energy settings.",
+                        "已关闭保持唤醒：Mac 按系统节能设置睡眠。",
+                    )
+                }
+                .to_owned();
+                self.push_log(self.notice.clone());
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                self.notice = self
+                    .text(
+                        "Failed to save the keep awake setting.",
+                        "保存保持唤醒设置失败。",
                     )
                     .to_owned();
             }
@@ -3304,6 +3349,13 @@ impl TuiApp {
         } else {
             self.text("Network listener: off (IPC only)", "网络接口：关（仅 IPC）")
         };
+        let keep_awake = if !crate::keep_awake::supported(&self.config) {
+            self.text("Keep awake: macOS only", "保持唤醒：仅 macOS")
+        } else if self.config.keep_awake {
+            self.text("Keep awake on AC power: on", "接电源时保持唤醒：开")
+        } else {
+            self.text("Keep awake on AC power: off", "接电源时保持唤醒：关")
+        };
         let actions = [
             start_stop,
             restart,
@@ -3311,6 +3363,7 @@ impl TuiApp {
             self.text("Edit listen IP", "编辑监听 IP"),
             self.text("Edit listen port", "编辑监听端口"),
             network,
+            keep_awake,
             self.text("Manage workspace roots", "管理工作区根目录"),
             self.text("Edit required encryption", "编辑强制加密"),
             self.text("Reset", "重置"),
@@ -3336,7 +3389,7 @@ impl TuiApp {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else if (idx == 1 && restart_recommended)
-                    || (idx == 14 && self.update_available.is_some())
+                    || (idx == 15 && self.update_available.is_some())
                 {
                     Style::default().fg(Color::Yellow)
                 } else {
@@ -6014,7 +6067,7 @@ mod tests {
         assert_eq!(TuiLanguage::parse("invalid"), None);
         assert_eq!(TuiLanguage::Chinese.as_str(), "zh-CN");
         assert_eq!(TuiLanguage::English.as_str(), "en");
-        assert_eq!(ACTION_COUNT, 16);
+        assert_eq!(ACTION_COUNT, 17);
     }
 
     #[test]
@@ -6090,7 +6143,7 @@ mod tests {
         // Reopening keeps the code; n replaces it.
         app.handle_key(press(KeyCode::Esc)).await.unwrap();
         assert!(app.mesh_join.is_none());
-        app.selected_action = 13;
+        app.selected_action = 14;
         app.handle_key(press(KeyCode::Enter)).await.unwrap();
         assert_eq!(
             app.mesh_join.as_ref().unwrap().code.as_ref().unwrap().code,
