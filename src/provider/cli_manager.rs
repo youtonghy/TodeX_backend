@@ -27,6 +27,12 @@ const LATEST_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const LATEST_FAILURE_TTL: Duration = Duration::from_secs(2 * 60);
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// `installUnavailableReason` values: why a missing CLI cannot be installed.
+const INSTALL_UNSUPPORTED_PLATFORM: &str = "unsupportedPlatform";
+const INSTALL_AUTH_DISABLED: &str = "authDisabled";
+const INSTALL_NPM_MISSING: &str = "npmMissing";
+const INSTALL_NODE_MISSING: &str = "nodeMissing";
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum ManagedCli {
@@ -145,10 +151,37 @@ impl ManagedCli {
     /// Whether TodeX can install this CLI here: a vendor script on Unix, or
     /// npm on PATH for npm-distributed CLIs.
     fn install_available(self) -> bool {
-        if self.npm_package().is_some() {
-            return cfg!(unix) && executable_available("npm");
+        self.install_blocker(cfg!(unix), executable_available)
+            .is_none()
+    }
+
+    /// Why a missing CLI cannot be installed from TodeX, as the
+    /// `installUnavailableReason` wire value, or `None` when it can.
+    fn install_unavailable_reason(self, config: &Config) -> Option<&'static str> {
+        if cfg!(unix) && !config.security.enable_auth {
+            return Some(INSTALL_AUTH_DISABLED);
         }
-        self.install_script().is_some()
+        self.install_blocker(cfg!(unix), executable_available)
+    }
+
+    /// What the host lacks to install this CLI: Unix (installers are
+    /// shell scripts or `npm -g`), npm for npm-distributed CLIs, and Node.js
+    /// for Pi, whose installer needs it.
+    fn install_blocker(
+        self,
+        unix: bool,
+        has_executable: impl Fn(&str) -> bool,
+    ) -> Option<&'static str> {
+        if !unix {
+            return Some(INSTALL_UNSUPPORTED_PLATFORM);
+        }
+        if self.npm_package().is_some() && !has_executable("npm") {
+            return Some(INSTALL_NPM_MISSING);
+        }
+        if self == Self::Pi && !has_executable("node") {
+            return Some(INSTALL_NODE_MISSING);
+        }
+        None
     }
 
     /// The vendor's documented `curl | bash` installer. Each script installs
@@ -295,6 +328,10 @@ pub struct CliVersionInfo {
     pub status: String,
     pub upgrade_supported: bool,
     pub install_supported: bool,
+    /// Why a missing CLI cannot be installed (`unsupportedPlatform`,
+    /// `authDisabled`, `npmMissing`, `nodeMissing`); omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_unavailable_reason: Option<&'static str>,
     /// `"image"` when the binary ships with the container image; such a CLI
     /// is neither installed nor upgraded by TodeX.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -479,6 +516,7 @@ impl CliManager {
             status: "external".to_owned(),
             upgrade_supported: false,
             install_supported: false,
+            install_unavailable_reason: None,
             managed_by: None,
             error: None,
         }));
@@ -588,6 +626,7 @@ impl CliManager {
             status: if upgrading { "unknown" } else { "notInstalled" }.to_owned(),
             upgrade_supported: false,
             install_supported: false,
+            install_unavailable_reason: None,
             managed_by: None,
             error: None,
         }
@@ -739,6 +778,12 @@ pub async fn run_install(
                 .ok_or_else(|| not_found_after_install(config, provider))
         });
     }
+    if provider.install_blocker(cfg!(unix), executable_available) == Some(INSTALL_NODE_MISSING) {
+        return Err(AppError::Unsupported(format!(
+            "{} needs Node.js on PATH to install from TodeX",
+            provider.name()
+        )));
+    }
     let script = provider.install_script().ok_or_else(|| {
         AppError::Unsupported(format!(
             "{} cannot be installed from TodeX on this platform",
@@ -873,6 +918,7 @@ async fn inspect_cli(
 ) -> CliVersionInfo {
     // A missing binary is a normal state with an Install action, not an error.
     if !executable_available(provider.binary(config)) {
+        let install_unavailable_reason = provider.install_unavailable_reason(config);
         let latest_version = latest.await.ok().flatten();
         return CliVersionInfo {
             id: provider.id().to_owned(),
@@ -883,7 +929,8 @@ async fn inspect_cli(
             latest_version,
             status: "notInstalled".to_owned(),
             upgrade_supported: false,
-            install_supported: config.security.enable_auth && provider.install_available(),
+            install_supported: install_unavailable_reason.is_none(),
+            install_unavailable_reason,
             managed_by: None,
             error: None,
         };
@@ -919,6 +966,7 @@ async fn inspect_cli(
             && config.security.enable_auth
             && (provider.npm_package().is_none() || provider.install_available()),
         install_supported: false,
+        install_unavailable_reason: None,
         managed_by: managed_by_image.then(|| MANAGED_BY_IMAGE.to_owned()),
         error,
     }
@@ -1231,6 +1279,41 @@ mod tests {
     }
 
     #[test]
+    fn install_blocker_names_what_the_host_lacks() {
+        let has =
+            |available: &'static [&'static str]| move |program: &str| available.contains(&program);
+        assert_eq!(
+            ManagedCli::Codex.install_blocker(false, has(&["npm", "node"])),
+            Some("unsupportedPlatform")
+        );
+        assert_eq!(
+            ManagedCli::DeepseekHarness.install_blocker(true, has(&["node"])),
+            Some("npmMissing")
+        );
+        assert_eq!(
+            ManagedCli::DeepseekHarness.install_blocker(true, has(&["npm"])),
+            None
+        );
+        assert_eq!(
+            ManagedCli::Pi.install_blocker(true, has(&["npm"])),
+            Some("nodeMissing")
+        );
+        assert_eq!(ManagedCli::Pi.install_blocker(true, has(&["node"])), None);
+        assert_eq!(ManagedCli::Codex.install_blocker(true, has(&[])), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_is_unavailable_without_device_auth() {
+        let mut config = crate::config::Config::default();
+        config.security.enable_auth = false;
+        assert_eq!(
+            ManagedCli::Codex.install_unavailable_reason(&config),
+            Some("authDisabled")
+        );
+    }
+
+    #[test]
     fn deepseek_harness_installs_and_upgrades_through_fixed_npm_command() {
         let cli = ManagedCli::DeepseekHarness;
         assert_eq!(cli.provider_kind(), ProviderKind::DeepseekHarness);
@@ -1474,6 +1557,7 @@ mod tests {
             status: "unknown".to_owned(),
             upgrade_supported: true,
             install_supported: false,
+            install_unavailable_reason: None,
             managed_by: None,
             error: None,
         };
