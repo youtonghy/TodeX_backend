@@ -1470,7 +1470,10 @@ async fn a_schedule_can_be_moved_and_cancelled() {
         .await
         .unwrap();
     assert_eq!(snapshot["pauseReason"], "scheduled");
-    assert_eq!(snapshot["resumeAt"], json!(later));
+    // Compare instants: the daemon's RFC 3339 keeps trailing zeros in the
+    // fraction ("…684370Z") that `Timestamp`'s own Display drops ("…68437Z").
+    let resume_at = snapshot["resumeAt"].as_str().expect("resumeAt");
+    assert_eq!(resume_at.parse::<Timestamp>().unwrap(), later);
     sleep(Duration::from_millis(500)).await;
     assert!(gate.prompts().is_empty());
     assert_eq!(
