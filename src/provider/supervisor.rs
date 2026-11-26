@@ -796,7 +796,8 @@ impl ConversationSupervisor {
             self.hub.clone(),
             self.permissions.clone(),
             conversation_id,
-        );
+        )
+        .for_agent_call();
         // Either the turn or the caller cancelling ends the request.
         let (merged_tx, mut merged_rx) = watch::channel(false);
         let forward = tokio::spawn({

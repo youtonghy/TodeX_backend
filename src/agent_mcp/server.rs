@@ -2236,6 +2236,8 @@ exit 3
         }
         let asked = asked.expect("ssh_exec on Local asks in auto mode");
         assert_eq!(asked["details"]["tool_name"], "mcp__todex_ssh__ssh_exec");
+        // It lives as long as the call, which can outlast the turn.
+        assert_eq!(asked["lifetime"], "call");
         harness
             .state
             .conversations

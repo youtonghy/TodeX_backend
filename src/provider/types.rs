@@ -990,6 +990,9 @@ pub struct DriverEventSink {
     emitted_once: Arc<Mutex<HashSet<String>>>,
     /// Set for a provider prewarm (see [`Self::muted`]); shared by clones.
     muted: Option<Arc<tokio::sync::Mutex<MutedState>>>,
+    /// Set by [`Self::for_agent_call`]: permission prompts live as long as
+    /// the agent tool call that asks them, not the turn.
+    agent_call: bool,
 }
 
 /// What a prewarm's muted sink holds, shared by all of its clones.
@@ -1033,7 +1036,17 @@ impl DriverEventSink {
             snapshots: Arc::default(),
             emitted_once: Arc::default(),
             muted: None,
+            agent_call: false,
         }
+    }
+
+    /// For prompts asked from inside an agent tool call (outside the
+    /// provider stream): such a call can outlast the turn (a background
+    /// subagent), so `permission.requested` says `lifetime: "call"` and
+    /// clients keep the prompt past the turn's end until it is resolved.
+    pub fn for_agent_call(mut self) -> Self {
+        self.agent_call = true;
+        self
     }
 
     /// A sink for [`ProviderDriver::prewarm`]. Until a turn takes it over
@@ -1904,6 +1917,9 @@ impl PermissionBroker {
         });
         if let Some(allowed_devices) = &allowed_devices {
             requested["allowedDeviceIds"] = json!(allowed_devices);
+        }
+        if sink.agent_call {
+            requested["lifetime"] = json!("call");
         }
         if let Err(error) = sink.emit("permission.requested", requested).await {
             return Err(error);
