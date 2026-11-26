@@ -832,7 +832,7 @@ fn create_directory_error(error: std::io::Error, name: &str, target: &Path) -> A
 /// `Json` whose rejections (malformed or mistyped body, missing or wrong
 /// content type) answer with the API error envelope (400 INVALID_REQUEST)
 /// instead of axum's plain-text 4xx.
-pub(super) struct ApiJson<T>(T);
+pub(super) struct ApiJson<T>(pub(super) T);
 
 impl<S, T> axum::extract::FromRequest<S> for ApiJson<T>
 where

@@ -9,6 +9,14 @@
 //!
 //! Uploads stay until [`cleanup_expired`] removes them a week later, so a
 //! retried or queued prompt still finds its files.
+//!
+//! A client on the daemon's own machine need not copy a file it already has
+//! on disk: `POST /v2/uploads/link` registers the file's canonical path
+//! instead ([`register_link`]). The registration is a `.link` marker in an
+//! upload-shaped folder named after the path ([`link_id`]), so it shares the
+//! directory's permissions, survives restarts for queued prompts and expires
+//! with the same cleanup. Prompt content may then name that exact path
+//! ([`is_linked`]); nothing else outside the workspace becomes reachable.
 
 use std::{
     io,
@@ -16,6 +24,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -28,6 +37,12 @@ pub(crate) const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 pub(crate) const UPLOAD_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub(crate) const CLEANUP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_NAME_BYTES: usize = 200;
+/// The marker naming a linked file. [`sanitize_name`] strips leading dots,
+/// so an upload chunk can never write to it.
+const LINK_MARKER: &str = ".link";
+/// How much of a linked file the client hashes to prove it names the same
+/// file on this machine (the whole file when it is smaller).
+pub(crate) const LINK_FINGERPRINT_BYTES: u64 = 64 * 1024;
 
 /// `/tmp/todex/file` on Unix; `%TEMP%\todex\file` elsewhere.
 pub(crate) fn upload_root() -> PathBuf {
@@ -210,6 +225,154 @@ pub(crate) async fn contains(canonical: &Path) -> bool {
     }
 }
 
+/// The upload id a linked file is registered under: the first 32 hex digits
+/// of the SHA-256 of its canonical path, so linking the same file again
+/// reuses (and refreshes) one registration.
+pub(crate) fn link_id(canonical: &Path) -> String {
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let mut id = format!("{digest:x}");
+    id.truncate(32);
+    id
+}
+
+/// Registers `canonical`, an already canonicalized regular file, as linked
+/// under `root` (the shared upload directory or a private conversation's
+/// uploads folder). Returns the registration's upload id.
+pub(crate) async fn register_link(root: &Path, canonical: &Path) -> Result<String, AppError> {
+    let root = ensure_root(root).await.map_err(|error| {
+        AppError::Io(io::Error::other(format!(
+            "the upload directory is unavailable: {error}"
+        )))
+    })?;
+    let id = link_id(canonical);
+    let dir = root.join(&id);
+    let target = canonical.as_os_str().as_encoded_bytes().to_vec();
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        ensure_private_dir(&dir)?;
+        // Written aside and renamed over the marker, so a concurrent check
+        // never reads a partial path.
+        let temp = dir.join(format!("{LINK_MARKER}.{}", Uuid::new_v4().simple()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let written = options.open(&temp).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(&target)?;
+            file.flush()
+        });
+        let result = written.and_then(|()| std::fs::rename(&temp, dir.join(LINK_MARKER)));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    })
+    .await
+    .map_err(io::Error::other)??;
+    Ok(id)
+}
+
+/// `path` canonicalized, when it is an absolute path to a regular file of
+/// `size_bytes` bytes whose first [`LINK_FINGERPRINT_BYTES`] hash to
+/// `head_sha256` (lowercase hex). The client computed both from the file it
+/// holds, so a match shows the path names that same file on this machine;
+/// a client elsewhere (an SSH tunnel, a container) gets `CONFLICT` or
+/// `NOT_FOUND` and uploads the file instead.
+pub(crate) async fn verify_link_candidate(
+    path: &Path,
+    size_bytes: u64,
+    head_sha256: &str,
+) -> Result<PathBuf, AppError> {
+    if !path.is_absolute() {
+        return Err(AppError::InvalidRequest(
+            "linked files need an absolute path".to_owned(),
+        ));
+    }
+    let canonical = match tokio::fs::canonicalize(path).await {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(AppError::NotFound(
+                "the file is not on this machine".to_owned(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let expected = head_sha256.trim().to_ascii_lowercase();
+    let checked = canonical.clone();
+    let actual = tokio::task::spawn_blocking(move || -> Result<Option<String>, AppError> {
+        use std::io::Read;
+        let file = std::fs::File::open(&checked)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(AppError::InvalidRequest(
+                "linked paths must be regular files".to_owned(),
+            ));
+        }
+        if metadata.len() != size_bytes {
+            return Ok(None);
+        }
+        let mut head = Vec::new();
+        file.take(LINK_FINGERPRINT_BYTES).read_to_end(&mut head)?;
+        Ok(Some(format!("{:x}", Sha256::digest(&head))))
+    })
+    .await
+    .map_err(io::Error::other)??;
+    if actual.as_deref() != Some(expected.as_str()) {
+        return Err(AppError::Conflict(
+            "the file on this machine differs from the client's".to_owned(),
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Whether `canonical` (already canonicalized) was registered under `root`
+/// by [`register_link`]. Every folder on the way and the marker itself must
+/// be this user's and not a symlink, as for uploads: `/tmp` is shared, and
+/// another user's marker must not open a path to the agents.
+pub(crate) async fn is_linked(root: &Path, canonical: &Path) -> bool {
+    let dir = root.join(link_id(canonical));
+    let expected = canonical.as_os_str().as_encoded_bytes().to_vec();
+    tokio::task::spawn_blocking(move || {
+        let folders = [
+            dir.parent().and_then(Path::parent),
+            dir.parent(),
+            Some(&*dir),
+        ];
+        if !folders
+            .into_iter()
+            .all(|folder| folder.is_some_and(|folder| is_private(folder, true)))
+        {
+            return false;
+        }
+        let marker = dir.join(LINK_MARKER);
+        is_private(&marker, false) && std::fs::read(&marker).is_ok_and(|bytes| bytes == expected)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Whether `path` is a directory (`dir`) or regular file of this user that
+/// is not a symlink.
+fn is_private(path: &Path, dir: bool) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || metadata.is_dir() != dir {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return false;
+        }
+    }
+    true
+}
+
 /// The upload directory, created if needed, for the provider drivers to
 /// grant read access to; `None` when it cannot be used safely.
 pub(crate) async fn readable_root() -> Option<PathBuf> {
@@ -348,6 +511,102 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, base.join("file")).unwrap();
         assert!(ensure_root(&base.join("file")).await.is_err());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[tokio::test]
+    async fn links_name_exactly_the_registered_file() {
+        let root = temp_root();
+        let base = root.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(base.join("home")).unwrap();
+        let file = std::fs::canonicalize(base.join("home"))
+            .unwrap()
+            .join("a.txt");
+        std::fs::write(&file, b"a").unwrap();
+        let other = file.with_file_name("b.txt");
+        std::fs::write(&other, b"b").unwrap();
+
+        assert!(!is_linked(&root, &file).await);
+        let id = register_link(&root, &file).await.unwrap();
+        assert!(valid_upload_id(&id));
+        assert_eq!(id, link_id(&file));
+        assert!(is_linked(&root, &file).await);
+        assert!(!is_linked(&root, &other).await);
+        // Linking again reuses the registration.
+        assert_eq!(register_link(&root, &file).await.unwrap(), id);
+        let dir = root.join(&id);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        // An upload chunk cannot reach the marker: its name loses the dot.
+        let chunk = write_chunk(&root, Some(&id), LINK_MARKER, 0, b"x").await;
+        assert!(matches!(chunk, Err(AppError::NotFound(_))));
+        assert!(is_linked(&root, &file).await);
+
+        // A marker naming another path is not this file's registration.
+        std::fs::write(dir.join(LINK_MARKER), other.as_os_str().as_encoded_bytes()).unwrap();
+        assert!(!is_linked(&root, &file).await);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            register_link(&root, &file).await.unwrap();
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir), 0o700);
+            assert_eq!(mode(&dir.join(LINK_MARKER)), 0o600);
+            // A symlinked marker is refused even when it points at a valid one.
+            let elsewhere = base.join("marker");
+            std::fs::rename(dir.join(LINK_MARKER), &elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, dir.join(LINK_MARKER)).unwrap();
+            assert!(!is_linked(&root, &file).await);
+        }
+
+        // Registrations expire with the uploads.
+        let future = SystemTime::now() + Duration::from_secs(60);
+        assert_eq!(cleanup_expired(&root, future).await.unwrap(), 1);
+        assert!(!is_linked(&root, &file).await);
+        assert!(file.exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn link_candidates_must_match_the_clients_file() {
+        let base = std::env::temp_dir().join(format!("todex-link-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let small = base.join("small.txt");
+        std::fs::write(&small, b"hello").unwrap();
+        let large = base.join("large.bin");
+        let mut bytes = vec![7u8; LINK_FINGERPRINT_BYTES as usize];
+        bytes.extend_from_slice(b"tail");
+        std::fs::write(&large, &bytes).unwrap();
+
+        let canonical = verify_link_candidate(&small, 5, &sha256_hex(b"hello"))
+            .await
+            .unwrap();
+        assert_eq!(canonical, std::fs::canonicalize(&small).unwrap());
+        // Only the head is hashed; the size covers the rest.
+        let head = sha256_hex(&bytes[..LINK_FINGERPRINT_BYTES as usize]);
+        let size = bytes.len() as u64;
+        assert!(verify_link_candidate(&large, size, &head.to_uppercase())
+            .await
+            .is_ok());
+
+        let wrong_hash = verify_link_candidate(&small, 5, &sha256_hex(b"other")).await;
+        assert!(matches!(wrong_hash, Err(AppError::Conflict(_))));
+        let wrong_size = verify_link_candidate(&small, 6, &sha256_hex(b"hello")).await;
+        assert!(matches!(wrong_size, Err(AppError::Conflict(_))));
+        let missing = verify_link_candidate(&base.join("gone"), 1, "00").await;
+        assert!(matches!(missing, Err(AppError::NotFound(_))));
+        let relative = verify_link_candidate(Path::new("small.txt"), 5, "00").await;
+        assert!(matches!(relative, Err(AppError::InvalidRequest(_))));
+        #[cfg(unix)]
+        {
+            let directory = verify_link_candidate(&base, 0, &sha256_hex(b"")).await;
+            assert!(matches!(directory, Err(AppError::InvalidRequest(_))));
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]

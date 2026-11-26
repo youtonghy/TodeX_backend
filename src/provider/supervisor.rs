@@ -3890,15 +3890,29 @@ async fn prepare_prompt_content_hashed(
 }
 
 /// Whether `canonical` is a prompt upload: in the shared upload directory or
-/// in the private upload folder of `private_conversation`.
+/// in the private upload folder of `private_conversation`, or a file on this
+/// machine linked into either (`POST /v2/uploads/link`).
 async fn is_uploaded(private_conversation: Option<&str>, canonical: &Path) -> bool {
-    private_conversation
+    if private_conversation
         .is_some_and(|id| crate::private_dirs::root().contains_upload(id, canonical))
         || crate::prompt_uploads::contains(canonical).await
+    {
+        return true;
+    }
+    if let Some(id) = private_conversation {
+        let uploads = crate::private_dirs::root()
+            .conversation_path(id)
+            .join(crate::private_dirs::UPLOADS_DIR);
+        if crate::prompt_uploads::is_linked(&uploads, canonical).await {
+            return true;
+        }
+    }
+    crate::prompt_uploads::is_linked(&crate::prompt_uploads::upload_root(), canonical).await
 }
 
 /// `path` canonicalized, when it is a regular file inside `workspace` or
-/// the prompt upload directory (or `private_conversation`'s private one).
+/// the prompt upload directory (or `private_conversation`'s private one),
+/// or a linked file.
 async fn canonical_workspace_file(
     workspace: &Path,
     private_conversation: Option<&str>,
@@ -9524,6 +9538,80 @@ done
 
         let _ = fs::remove_dir_all(uploads.join(&file.upload_id));
         let _ = fs::remove_dir_all(uploads.join(&image.upload_id));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn prompt_content_may_name_linked_files_only() {
+        let root = temp_dir("todex-prompt-links");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let linked = root.join("Downloads").join("report.pdf");
+        let image = root.join("Downloads").join("shot.png");
+        let unlinked = root.join("Downloads").join("other.txt");
+        fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        fs::write(&linked, b"%PDF").unwrap();
+        fs::write(&image, b"png").unwrap();
+        fs::write(&unlinked, b"other").unwrap();
+        let uploads = crate::prompt_uploads::upload_root();
+        let linked = fs::canonicalize(&linked).unwrap();
+        let image = fs::canonicalize(&image).unwrap();
+        let mut ids = Vec::new();
+        for path in [&linked, &image] {
+            ids.push(
+                crate::prompt_uploads::register_link(&uploads, path)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let (text, content) = prepare_prompt_content(
+            &workspace,
+            None,
+            vec![
+                PromptContentRef::File {
+                    path: linked.clone(),
+                    name: None,
+                },
+                PromptContentRef::LocalImage {
+                    path: image.clone(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "Attached file: @{}\n\nAttached image: {}",
+                linked.display(),
+                image.display()
+            )
+        );
+        assert!(matches!(
+            content.as_slice(),
+            [
+                DriverPromptContent::File { .. },
+                DriverPromptContent::Image { path: Some(_), .. }
+            ]
+        ));
+
+        // A sibling of a linked file stays out of reach.
+        let error = prepare_prompt_content(
+            &workspace,
+            None,
+            vec![PromptContentRef::File {
+                path: unlinked,
+                name: None,
+            }],
+        )
+        .await
+        .expect_err("files nobody linked must stay outside");
+        assert!(error.to_string().contains("trusted workspace"));
+
+        for id in ids {
+            let _ = fs::remove_dir_all(uploads.join(id));
+        }
         let _ = fs::remove_dir_all(root);
     }
 
