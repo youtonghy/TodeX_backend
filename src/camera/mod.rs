@@ -88,6 +88,8 @@ pub(crate) struct CameraDevice {
 /// The OS permission for the daemon to use cameras.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+// Only the macOS host reports every state; other hosts are unsupported.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum CameraPermission {
     Granted,
     Denied,
