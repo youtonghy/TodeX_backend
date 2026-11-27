@@ -29,6 +29,7 @@ mod desktop_computer;
 mod desktop_server;
 mod registry;
 mod server;
+mod ssh_transfer;
 
 use std::{
     collections::HashMap,

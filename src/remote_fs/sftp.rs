@@ -39,6 +39,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 const STDERR_LIMIT: usize = 8 * 1024;
 const EXIT_GRACE: Duration = Duration::from_secs(2);
+/// Read size when copying whole files; the SFTP client pipelines the writes.
+const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 
 pub(crate) struct SftpFs {
     sftp: SftpSession,
@@ -467,6 +469,122 @@ impl RemoteFs for SftpFs {
 }
 
 impl SftpFs {
+    /// Creates `path`, which must not exist yet, with permission bits `mode`
+    /// and copies all of `source` into it, at most `limit` bytes (more fails
+    /// with [`too_large`] and leaves the partial file for the caller to
+    /// remove). `seen` gets every chunk as it is sent. Returns the size.
+    pub(crate) async fn create_from<R>(
+        &mut self,
+        path: &str,
+        mode: u32,
+        source: &mut R,
+        limit: u64,
+        seen: &mut (dyn FnMut(&[u8]) + Send),
+    ) -> Result<u64, AppError>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        let attributes = FileAttributes {
+            permissions: Some(mode & 0o7777),
+            ..FileAttributes::empty()
+        };
+        let mut file = self
+            .sftp
+            .open_with_flags_and_attributes(
+                path,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                attributes,
+            )
+            .await
+            .map_err(|error| map_error(path, error))?;
+        let mut buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+        let mut written = 0_u64;
+        let copied = async {
+            loop {
+                let read = source.read(&mut buffer).await?;
+                if read == 0 {
+                    return Ok(());
+                }
+                written += read as u64;
+                if written > limit {
+                    return Err(too_large(limit));
+                }
+                seen(&buffer[..read]);
+                file.write_all(&buffer[..read])
+                    .await
+                    .map_err(|error| io_error(path, error))?;
+            }
+        }
+        .await;
+        // Waits for the pipelined writes, so their errors count too.
+        let closed = file.shutdown().await.map_err(|error| io_error(path, error));
+        copied?;
+        closed?;
+        Ok(written)
+    }
+
+    /// Copies the file at `path` into `sink`, at most `limit` bytes (a larger
+    /// file fails with [`too_large`] once the limit is passed). `seen` gets
+    /// every chunk. Returns the size.
+    pub(crate) async fn copy_to<W>(
+        &mut self,
+        path: &str,
+        sink: &mut W,
+        limit: u64,
+        seen: &mut (dyn FnMut(&[u8]) + Send),
+    ) -> Result<u64, AppError>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
+        let file = self
+            .sftp
+            .open(path)
+            .await
+            .map_err(|error| map_error(path, error))?;
+        let mut reader = file.take(limit + 1);
+        let mut buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+        let mut copied = 0_u64;
+        let result = async {
+            loop {
+                let read = reader
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|error| io_error(path, error))?;
+                if read == 0 {
+                    return Ok(copied);
+                }
+                copied += read as u64;
+                if copied > limit {
+                    return Err(too_large(limit));
+                }
+                seen(&buffer[..read]);
+                sink.write_all(&buffer[..read]).await?;
+            }
+        }
+        .await;
+        let _ = reader.into_inner().close().await;
+        result
+    }
+
+    /// Moves `from` to `to`, replacing `to` when `replace` is set (see
+    /// [`Self::rename_over`]); otherwise an existing `to` is a conflict.
+    pub(crate) async fn move_into_place(
+        &mut self,
+        from: &str,
+        to: &str,
+        replace: bool,
+    ) -> Result<(), AppError> {
+        if replace {
+            return self.rename_over(from, to).await;
+        }
+        if self.stat(to).await?.is_some() {
+            return Err(AppError::Conflict(format!("{to} already exists")));
+        }
+        // OpenSSH's SFTP v3 rename never replaces, so a file created since
+        // the check above is not clobbered either.
+        self.rename(from, to).await
+    }
+
     /// SFTP v3 `rename` refuses existing targets on OpenSSH. Move the old
     /// file aside first and put it back if the second rename fails.
     async fn rename_over(&mut self, from: &str, to: &str) -> Result<(), AppError> {

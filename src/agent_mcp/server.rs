@@ -42,6 +42,7 @@ use super::{
         self, parse, schema, tool_error, BoxFuture, Caller, Gate, Invocation, Prepared, ToolEntry,
         ToolHost, ToolRegistry,
     },
+    ssh_transfer::{self, TransferRequest},
     AgentMcp, SSH_ROUTE as ROUTE, SSH_SERVER as SERVER_NAME,
 };
 use crate::{
@@ -188,6 +189,28 @@ struct ExecArgs {
 enum SshCall {
     ListHosts,
     Exec(ExecRequest),
+    Transfer(TransferRequest),
+}
+
+impl SshCall {
+    /// The host a call reaches, when it reaches one.
+    fn host(&self) -> Option<&str> {
+        match self {
+            Self::ListHosts => None,
+            Self::Exec(request) => Some(&request.host),
+            Self::Transfer(request) => Some(&request.host),
+        }
+    }
+}
+
+fn prepare_upload(arguments: Value) -> Result<Prepared<SshCall>, String> {
+    ssh_transfer::validate_upload(arguments)
+        .map(|request| ssh_transfer::prepared(request, SshCall::Transfer))
+}
+
+fn prepare_download(arguments: Value) -> Result<Prepared<SshCall>, String> {
+    ssh_transfer::validate_download(arguments)
+        .map(|request| ssh_transfer::prepared(request, SshCall::Transfer))
 }
 
 fn prepare_list_hosts(arguments: Value) -> Result<Prepared<SshCall>, String> {
@@ -284,8 +307,8 @@ fn ask_mode_exec_refusal(arguments: Option<&rmcp::model::JsonObject>) -> Option<
     };
     Some(format!(
         "ssh_exec {field} is limited to {limit} bytes while the user approves each call \
-         (this one is {bytes} bytes). Upload the script to the host as a file first (for \
-         example ask the user to copy it there), then run it with a short command."
+         (this one is {bytes} bytes). Upload the script to the host with ssh_upload first, \
+         then run it with a short command."
     ))
 }
 
@@ -298,6 +321,7 @@ fn run<'a>(
         match call {
             SshCall::ListHosts => tools.list_hosts().await,
             SshCall::Exec(request) => tools.exec(&invocation, request).await,
+            SshCall::Transfer(request) => tools.transfer(&invocation, request).await,
         }
     })
 }
@@ -323,8 +347,9 @@ fn registry_of_tools() -> ToolRegistry<SshTools, SshCall> {
                  stdout and stderr are each capped at 256 KiB (truncated=true when cut). Unavailable \
                  in Plan mode. Depending on the user's settings, the user approves the first connection to \
                  each host or every call; when every call is approved (also in ask mode), command and stdin \
-                 are each limited to 4096 bytes (upload a longer script to the host as a file first, then \
-                 run it). A declined approval is final for now: do not retry it right away. \
+                 are each limited to 4096 bytes (upload a longer script with ssh_upload first, then \
+                 run it). To copy files to or from a host, use ssh_upload / ssh_download instead of \
+                 stdin. A declined approval is final for now: do not retry it right away. \
                  The user's privacy filter may replace keys, passwords, tokens, proxy credentials, \
                  card and ID numbers (and other values the user chose) in the output with \
                  [REDACTED:<kind>] placeholders (redacted=true). The host `Local`, when \
@@ -353,6 +378,77 @@ fn registry_of_tools() -> ToolRegistry<SshTools, SshCall> {
             prepare: prepare_exec,
             run,
         },
+        ToolEntry {
+            tool: Tool::new(
+                "ssh_upload",
+                "Copy one file from the machine running TodeX to an allowed SSH host over SFTP \
+                 (like `scp localPath host:remotePath`), for example a compiled binary. The file \
+                 is read from disk by TodeX, never passed through this call, up to 100 MiB. It \
+                 is written under a temporary name and moved into place only after its size and \
+                 SHA-256 match (the hash is checked when the host has sha256sum or shasum), so \
+                 replacing a running binary is safe; restart its service afterwards with ssh_exec. \
+                 remotePath may be a directory (or end in `/`) to keep the local file name; \
+                 relative and `~/` paths start in the remote home. An existing file is replaced \
+                 only with overwrite: true. Permissions are copied from the local file unless \
+                 mode is given. Not for the host `Local`. Approved like ssh_exec, and in auto \
+                 mode on every call, since it reads files outside your sandbox.",
+                schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string", "description": "Host alias from ssh_list_hosts." },
+                        "localPath": { "type": "string", "description": "File on the TodeX machine; relative paths start in the conversation workspace." },
+                        "remotePath": { "type": "string", "description": "Destination file or directory on the host." },
+                        "mode": { "type": "string", "description": "Octal permission bits for the remote file, e.g. \"755\"." },
+                        "overwrite": { "type": "boolean", "description": "Replace an existing remote file (default false)." },
+                        "sha256": { "type": "string", "description": "Expected SHA-256 of the local file; nothing is replaced when it differs." },
+                        "timeoutSec": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECONDS, "description": "Give up after this many seconds (default 300)." }
+                    },
+                    "required": ["host", "localPath", "remotePath"],
+                    "additionalProperties": false
+                })),
+            )
+            .with_annotations(
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(true)
+                    .open_world(true),
+            ),
+            side_effect: true,
+            prepare: prepare_upload,
+            run,
+        },
+        ToolEntry {
+            tool: Tool::new(
+                "ssh_download",
+                "Copy one file from an allowed SSH host into the conversation workspace over SFTP \
+                 (like `scp host:remotePath localPath`), up to 100 MiB. localPath must be inside \
+                 the workspace (relative paths start there; a directory or a path ending in `/` \
+                 keeps the remote file name). The file appears only once complete and its \
+                 SHA-256 matches the host's (when it has sha256sum or shasum). An existing file \
+                 is replaced only with overwrite: true. Not for the host `Local`.",
+                schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string", "description": "Host alias from ssh_list_hosts." },
+                        "remotePath": { "type": "string", "description": "File on the host; relative and `~/` paths start in the remote home." },
+                        "localPath": { "type": "string", "description": "Destination file or directory inside the conversation workspace." },
+                        "overwrite": { "type": "boolean", "description": "Replace an existing local file (default false)." },
+                        "timeoutSec": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECONDS, "description": "Give up after this many seconds (default 300)." }
+                    },
+                    "required": ["host", "remotePath", "localPath"],
+                    "additionalProperties": false
+                })),
+            )
+            .with_annotations(
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(true)
+                    .open_world(true),
+            ),
+            side_effect: true,
+            prepare: prepare_download,
+            run,
+        },
     ])
 }
 
@@ -374,12 +470,12 @@ impl ToolHost for SshTools {
 
     async fn approve(
         &self,
-        _tool: &str,
+        tool: &str,
         prepared: &Prepared<SshCall>,
         caller: &Caller,
         cancel: &CancelSignal,
     ) -> Result<Gate, String> {
-        let SshCall::Exec(request) = &prepared.call else {
+        let Some(host) = prepared.call.host() else {
             return Ok(Gate::PermissionMode);
         };
         let conversation_id = &caller.conversation_id;
@@ -392,7 +488,7 @@ impl ToolHost for SshTools {
             return Ok(Gate::PermissionMode);
         }
         // Nothing to approve for a host the agent cannot use.
-        if let Some(message) = self.unavailable(&request.host).await {
+        if let Some(message) = self.unavailable(host).await {
             return Err(message);
         }
         let authorizer = self.mcp.authorizer(&self.conversations);
@@ -401,7 +497,7 @@ impl ToolHost for SshTools {
                 .allow_this_call(
                     conversation_id,
                     SERVER_NAME,
-                    "ssh_exec",
+                    tool,
                     &prepared.summary,
                     prepared.input.clone(),
                     cancel,
@@ -410,7 +506,7 @@ impl ToolHost for SshTools {
                 .map(Gate::Approved)
                 .map_err(|denied| denied.to_string());
         }
-        self.grant_host(conversation_id, &request.host, cancel)
+        self.grant_host(conversation_id, host, cancel)
             .await
             .map(|()| Gate::PermissionMode)
     }
@@ -421,7 +517,8 @@ impl ServerHandler for SshTools {
         registry::server_info(
             SERVER_NAME,
             "Runs commands on the user's SSH hosts (and, when listed as `Local`, on the machine \
-             running TodeX). Call ssh_list_hosts first; only hosts listed there can be used.",
+             running TodeX) and copies files between them and the TodeX machine. Call \
+             ssh_list_hosts first; only hosts listed there can be used.",
         )
     }
 
@@ -694,6 +791,183 @@ impl SshTools {
                 "failed to record an SSH command result"
             );
         }
+        result
+    }
+
+    /// `ssh_upload` / `ssh_download`, journaled as an `ssh.exec.*` run with
+    /// a `transfer` object, so clients list it with the host's commands.
+    async fn transfer(
+        &self,
+        invocation: &Invocation<'_>,
+        request: TransferRequest,
+    ) -> CallToolResult {
+        let caller = &invocation.caller;
+        let context = invocation.context;
+        if let Some(message) = self.unavailable(&request.host).await {
+            return tool_error(message);
+        }
+        let workspace = match self.conversations.get(&caller.conversation_id).await {
+            Ok(manifest) => manifest.workspace,
+            Err(error) => return tool_error(format!("cannot read the conversation: {error}")),
+        };
+        let local = ssh_transfer::local_path(&workspace, &request.local_path);
+        let slots = self
+            .host_slots
+            .entry(request.host.clone())
+            .or_insert_with(|| Arc::new(Semaphore::new(PER_HOST_CONCURRENCY)))
+            .clone();
+        let _slot = tokio::select! {
+            slot = slots.acquire_owned() => match slot {
+                Ok(slot) => slot,
+                Err(_) => return tool_error("SSH host is shutting down".to_owned()),
+            },
+            () = context.ct.cancelled() => return tool_error("cancelled".to_owned()),
+        };
+
+        let exec_id = format!("sshx_{}", Uuid::new_v4().simple());
+        let mut started = json!({
+            "execId": exec_id,
+            "host": request.host,
+            "command": bounded_text(request.display().as_bytes(), EVENT_COMMAND_LIMIT),
+            "transfer": request.started_payload(&local),
+        });
+        if let Some(device) = &invocation.approved_by {
+            started["approvedBy"] = json!(device);
+        }
+        if let Err(error) = self
+            .conversations
+            .append_agent_event(&caller.conversation_id, "ssh.exec.started", started)
+            .await
+        {
+            return tool_error(format!("cannot record the SSH transfer: {error}"));
+        }
+
+        let begun = Instant::now();
+        let outcome = tokio::select! {
+            outcome = tokio::time::timeout(
+                request.timeout,
+                self.run_transfer(&caller.conversation_id, &exec_id, &request, &workspace, &local),
+            ) => Some(outcome),
+            // Dropping the transfer ends its ssh process; a partial
+            // `.todex-part-*` file may stay behind on the far side.
+            () = context.ct.cancelled() => None,
+        };
+        let duration_ms = u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut completed = json!({
+            "execId": exec_id,
+            "host": request.host,
+            "durationMs": duration_ms,
+            "truncated": false,
+            "outputTruncated": false,
+        });
+        let failed = |failure: Value, message: String| {
+            (
+                CallToolResult::structured_error(json!({
+                    "failure": failure,
+                    "message": message,
+                    "durationMs": duration_ms,
+                })),
+                Some((failure, message)),
+            )
+        };
+        let (result, failure) = match outcome {
+            Some(Ok(Ok(report))) => {
+                let transfer = report.payload(request.direction);
+                completed["transfer"] = transfer.clone();
+                let mut body = transfer;
+                body["host"] = json!(request.host);
+                body["durationMs"] = json!(duration_ms);
+                (CallToolResult::structured(body), None)
+            }
+            Some(Ok(Err(error))) => failed(
+                json!(ssh_transfer::failure_kind(&error)),
+                ssh_transfer::failure_message(&error),
+            ),
+            Some(Err(_elapsed)) => failed(
+                json!(SshFailureKind::TimedOut),
+                format!(
+                    "the transfer with {} did not finish within {}s and was stopped",
+                    request.host,
+                    request.timeout.as_secs()
+                ),
+            ),
+            None => (
+                tool_error("cancelled".to_owned()),
+                Some((json!("cancelled"), String::new())),
+            ),
+        };
+        if let Some((failure, message)) = failure {
+            completed["failure"] = failure;
+            completed["transfer"] = request.started_payload(&local);
+            // The reason shows in the run's output, as ssh's own stderr would.
+            if !message.is_empty() {
+                let output = json!({
+                    "execId": exec_id,
+                    "stream": "stderr",
+                    "data": format!("{message}\n"),
+                });
+                if let Err(error) = self
+                    .conversations
+                    .append_agent_event(&caller.conversation_id, "ssh.exec.output", output)
+                    .await
+                {
+                    tracing::warn!(
+                        conversation_id = caller.conversation_id,
+                        %error,
+                        "failed to record an SSH transfer error"
+                    );
+                }
+            }
+        }
+        if let Err(error) = self
+            .conversations
+            .append_agent_event(&caller.conversation_id, "ssh.exec.completed", completed)
+            .await
+        {
+            tracing::warn!(
+                conversation_id = caller.conversation_id,
+                %error,
+                "failed to record an SSH transfer result"
+            );
+        }
+        result
+    }
+
+    /// Connects (asking for a login when ssh cannot authenticate on its
+    /// own, as [`Self::run_logged_in`] does) and runs the transfer.
+    async fn run_transfer(
+        &self,
+        conversation_id: &str,
+        exec_id: &str,
+        request: &TransferRequest,
+        workspace: &std::path::Path,
+        local: &std::path::Path,
+    ) -> Result<ssh_transfer::TransferReport, crate::error::AppError> {
+        let ssh = self.mcp.ssh();
+        let source = match request.direction {
+            ssh_transfer::Direction::Upload => Some(ssh_transfer::open_upload(local).await?),
+            ssh_transfer::Direction::Download => None,
+        };
+        let mut fs = match ssh_transfer::connect(ssh, &request.host).await {
+            Err(crate::error::AppError::RemoteAuthFailed(detail))
+                if ssh.password_login_supported(&request.host).await =>
+            {
+                match self.log_in(conversation_id, exec_id, &request.host).await {
+                    Ok(()) => ssh_transfer::connect(ssh, &request.host).await?,
+                    Err(hint) => {
+                        return Err(crate::error::AppError::RemoteAuthFailed(format!(
+                            "{detail}. {hint}"
+                        )))
+                    }
+                }
+            }
+            other => other?,
+        };
+        let result = match source {
+            Some(source) => ssh_transfer::upload(ssh, &mut fs, request, source).await,
+            None => ssh_transfer::download(ssh, &mut fs, request, workspace, local).await,
+        };
+        crate::remote_fs::RemoteFs::close(&mut fs).await;
         result
     }
 
@@ -1647,6 +1921,85 @@ exit 3
             .unwrap()
     }
 
+    /// Transfers are journaled as `ssh.exec.*` runs with a `transfer`
+    /// object; a failed one says why in its output. The fake ssh speaks no
+    /// SFTP (see `ssh_transfer`'s real-host test for the happy path).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transfers_check_paths_first_and_journal_failures() {
+        let harness = harness().await;
+        let client = bridged_client(&harness).await;
+        let workspace = harness.root.join("workspaces/project");
+        std::fs::write(workspace.join("app"), b"binary").unwrap();
+
+        // A missing local file fails before anything connects.
+        let missing = call(
+            &client,
+            "ssh_upload",
+            json!({ "host": "web", "localPath": "nope", "remotePath": "/opt/" }),
+        )
+        .await;
+        assert_eq!(missing.is_error, Some(true));
+        assert!(structured(&missing)["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot open"));
+        let log = std::fs::read_to_string(harness.root.join("ssh.log")).unwrap_or_default();
+        assert!(!log.contains(" sftp"), "{log}");
+
+        let failed = call(
+            &client,
+            "ssh_upload",
+            json!({ "host": "bad1", "localPath": "app", "remotePath": "/opt/app" }),
+        )
+        .await;
+        assert_eq!(failed.is_error, Some(true));
+        assert_eq!(structured(&failed)["failure"], "hostKeyUnverified");
+
+        for (tool, arguments) in [
+            (
+                "ssh_upload",
+                json!({ "host": "Local", "localPath": "app", "remotePath": "/tmp/x" }),
+            ),
+            (
+                "ssh_download",
+                json!({ "host": "off", "remotePath": "/x", "localPath": "x" }),
+            ),
+        ] {
+            let refused = call(&client, tool, arguments).await;
+            assert_eq!(refused.is_error, Some(true), "{tool}");
+        }
+
+        let history = harness
+            .state
+            .conversations
+            .history_for_tests(&harness.conversation_id)
+            .await;
+        let of = |kind: &str| -> Vec<Value> {
+            history
+                .iter()
+                .filter(|event| event.event_type == kind)
+                .map(|event| event.payload.clone())
+                .collect()
+        };
+        let (started, output, completed) = (
+            of("ssh.exec.started"),
+            of("ssh.exec.output"),
+            of("ssh.exec.completed"),
+        );
+        assert_eq!(started.len(), 2, "{started:?}");
+        assert_eq!(completed.len(), 2);
+        let local = std::fs::canonicalize(&workspace).unwrap().join("app");
+        assert_eq!(started[1]["command"], "upload app → bad1:/opt/app");
+        assert_eq!(
+            started[1]["transfer"],
+            json!({ "direction": "upload", "localPath": local.display().to_string(), "remotePath": "/opt/app" })
+        );
+        assert_eq!(completed[1]["failure"], "hostKeyUnverified");
+        assert_eq!(completed[1]["transfer"]["direction"], "upload");
+        assert!(output.iter().all(|chunk| chunk["stream"] == "stderr"));
+        assert_eq!(output.len(), 2, "each failure says why: {output:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn bridge_exposes_tools_and_exec_records_events() {
         let harness = harness().await;
@@ -1657,7 +2010,10 @@ exit 3
         assert_eq!(listed.ttl_ms, Some(0));
         assert_eq!(listed.cache_scope, Some(CacheScope::Private));
         let names: Vec<_> = listed.tools.iter().map(|tool| tool.name.as_ref()).collect();
-        assert_eq!(names, ["ssh_list_hosts", "ssh_exec"]);
+        assert_eq!(
+            names,
+            ["ssh_list_hosts", "ssh_exec", "ssh_upload", "ssh_download"]
+        );
 
         let hosts = call(&client, "ssh_list_hosts", json!({})).await;
         let hosts = structured(&hosts)["hosts"].as_array().unwrap().clone();
