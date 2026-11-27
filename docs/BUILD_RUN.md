@@ -29,6 +29,9 @@ cd TodeX_backend && cargo run -- tui
 # 并警告、列出可选的身份。以 ad-hoc 签名运行的后端在启动日志、Computer Use
 # 的 `computer.reason`（权限缺失时）和因权限被拒的截图错误里说明授权不会
 # 持久；固定证书后需重新授权，并重启后端让屏幕录制生效。
+# 签名同时带上 macos/entitlements.plist（摄像头授权项），build.rs 把
+# macos/Info.plist（含 NSCameraUsageDescription）嵌入可执行文件，
+# Agent 摄像头才能在 macOS 上申请摄像头权限；重新编译后 macOS 可能会再问一次。
 
 # Desktop（三栏）
 cd TodeX_desktop && pnpm run dev

@@ -2125,6 +2125,14 @@ fn validate_permission_decision(
                 .as_ref()
                 .and_then(|data| data.get("feedback"))
                 .is_some_and(Value::is_string))
+        // The camera card's choices (camera, capture settings); the camera
+        // tool checks them against what the card offered.
+        && !(kind == "desktop_camera"
+            && matches!(
+                decision.outcome,
+                PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways
+            )
+            && decision.data.as_ref().is_some_and(Value::is_object))
     {
         return Err(invalid());
     }

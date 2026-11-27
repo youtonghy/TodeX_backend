@@ -25,6 +25,7 @@
 mod agents_server;
 mod authorizer;
 mod bridge;
+mod desktop_camera;
 mod desktop_computer;
 mod desktop_server;
 mod registry;
@@ -283,9 +284,14 @@ impl AgentMcp {
 
     /// The conversation's turn ended (completed, failed or cancelled): its
     /// side-effect tools ask again until the next turn records its mode.
+    /// A camera session still recording ends with it.
     pub(crate) fn end_turn_mode(&self, conversation_id: &str) {
         self.inner.authorizer.clear_mode(conversation_id);
         self.turn_modes().remove(conversation_id);
+        self.inner
+            .desktop
+            .camera()
+            .stop_conversation(conversation_id, crate::camera::SessionEnd::TurnEnded);
     }
 
     #[cfg(test)]

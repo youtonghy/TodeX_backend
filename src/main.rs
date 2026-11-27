@@ -7,6 +7,7 @@ mod agent_providers;
 mod api_keys;
 mod app_state;
 mod autostart;
+mod camera;
 mod catalog;
 mod cli_instructions;
 mod cli_settings;

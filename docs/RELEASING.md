@@ -56,7 +56,13 @@ contain the signed binary.
   without quarantine.
 
 **Keep the same certificate.** The daemon performs Computer Use itself, which
-needs Screen Recording and Accessibility permissions. macOS (TCC) records those
+needs Screen Recording and Accessibility permissions. It also records the agent
+camera, so the binary embeds an Info.plist with `NSCameraUsageDescription`
+(`build.rs`, `macos/Info.plist`) and the signature carries
+`macos/entitlements.plist` (`com.apple.security.device.camera`); the signing
+step fails without either. In testing with a self-signed certificate, the camera
+grant did not survive a rebuild (macOS asked again), so users may have to allow
+the camera again after an update. macOS (TCC) records those
 grants for a bare executable by its path and its signature's designated
 requirement (`identifier "com.unbaked0692.todex.agentd" and certificate leaf =
 …` for a self-signed certificate; identifier plus team ID for Developer ID). As

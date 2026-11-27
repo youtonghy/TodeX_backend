@@ -10,6 +10,9 @@
 //! at the host confirms there. The screen is leased to one conversation at
 //! a time; the lease ends with `computer_done`, a stop, a revoke, or
 //! [`SCREEN_IDLE`].
+//!
+//! The agent camera (`camera_*`, [`crate::camera`]) has its own switch and
+//! settings file, and asks any paired device for each use.
 
 mod keyed;
 mod shots;
@@ -29,6 +32,7 @@ use tokio::sync::{watch, RwLock};
 
 use crate::{
     agent_browser::{AgentBrowser, CloseReason},
+    camera::{AgentCamera, Session as CameraSession},
     computer::{
         agent_desktop_engine::{AgentDesktopEngineStatus, EngineChoice, EngineKind},
         Computer, ComputerError,
@@ -85,12 +89,13 @@ pub(crate) struct Revoked {
 }
 
 /// What changed when the switches were set.
-#[derive(Debug)]
 pub(crate) struct SettingsChange {
     /// Conversations whose screen session ended.
     pub screen_ended: Vec<String>,
     /// Conversations whose Computer Use grant was revoked.
     pub computer_revoked: Vec<String>,
+    /// Camera sessions that are ending (desktop tools turned off).
+    pub camera_ended: Vec<Arc<CameraSession>>,
 }
 
 /// How a conversation got the host's screen.
@@ -194,6 +199,7 @@ struct Inner {
     engine: Arc<EngineChoice>,
     /// The latest live frame (and its lease), shared by concurrent viewers.
     frame: tokio::sync::Mutex<Option<LiveFrame>>,
+    camera: AgentCamera,
 }
 
 impl AgentDesktop {
@@ -244,6 +250,7 @@ impl AgentDesktop {
                 engine_path,
                 engine,
                 frame: tokio::sync::Mutex::new(None),
+                camera: AgentCamera::load(data_dir).await?,
             }),
         })
     }
@@ -254,6 +261,15 @@ impl AgentDesktop {
 
     pub(crate) fn shots(&self) -> &ShotStore {
         &self.inner.shots
+    }
+
+    pub(crate) fn camera(&self) -> &AgentCamera {
+        &self.inner.camera
+    }
+
+    /// The agent camera is on: desktop tools and the camera switch.
+    pub(crate) async fn camera_enabled(&self) -> bool {
+        self.enabled().await && self.inner.camera.settings().await.enabled
     }
 
     pub(crate) fn computer(&self) -> Computer {
@@ -354,7 +370,9 @@ impl AgentDesktop {
         }
         let mut screen_ended = Vec::new();
         let mut computer_revoked = Vec::new();
+        let mut camera_ended = Vec::new();
         if !next.enabled {
+            camera_ended = self.inner.camera.revoke_all();
             let mut conversations: HashSet<String> = self
                 .inner
                 .grants
@@ -387,6 +405,7 @@ impl AgentDesktop {
         Ok(SettingsChange {
             screen_ended,
             computer_revoked,
+            camera_ended,
         })
     }
 
@@ -701,16 +720,22 @@ impl AgentDesktop {
     pub(crate) fn revoke(&self, conversation_id: &str) -> Revoked {
         self.revoke_browser(conversation_id);
         let (computer, screen_ended) = self.revoke_computer(conversation_id);
+        // A camera session journals its own end once saved.
+        self.inner
+            .camera
+            .revoke(conversation_id, crate::camera::SessionEnd::Revoked);
         Revoked {
             computer,
             screen_ended,
         }
     }
 
-    /// Conversation deleted or expired: forget its grant and screenshots.
+    /// Conversation deleted or expired: forget its grant, screenshots and
+    /// camera frames.
     pub(crate) async fn forget(&self, conversation_id: &str) {
         self.revoke(conversation_id);
         self.inner.shots.remove_conversation(conversation_id).await;
+        self.inner.camera.forget(conversation_id).await;
     }
 }
 

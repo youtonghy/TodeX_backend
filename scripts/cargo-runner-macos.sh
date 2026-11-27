@@ -4,7 +4,9 @@
 # runs it. A plain `cargo run` leaves only a linker ad-hoc signature whose hash
 # changes on every build, so macOS drops the Screen Recording and Accessibility
 # grants Computer Use needs each time. Signed with one stable certificate, the
-# grants stay valid for target/debug/todex-agentd across rebuilds.
+# grants stay valid for target/debug/todex-agentd across rebuilds. The
+# signature carries macos/entitlements.plist (the agent camera); build.rs
+# embeds the Info.plist macOS needs before it lets the daemon ask for it.
 #
 # Identity: $TODEX_DEV_SIGN_IDENTITY (certificate name or SHA-1), otherwise the
 # only valid code signing identity in the keychains. With none to pick, the
@@ -42,6 +44,7 @@ if [[ "$(basename "${binary}")" == "todex-agentd" ]]; then
     details="$(codesign -dv "${binary}" 2>&1 || true)"
     if ! grep -qx "Identifier=${identifier}" <<<"${details}" || grep -qE '^Signature=adhoc|linker-signed' <<<"${details}"; then
       codesign --force --options runtime --identifier "${identifier}" \
+        --entitlements "$(dirname "$0")/../macos/entitlements.plist" \
         --timestamp=none --sign "${identity}" "${binary}" >&2
     fi
   fi

@@ -277,6 +277,7 @@ jobs:
         run: |
           sign() {
             codesign --force --options runtime "$1" --identifier "${SIGNING_IDENTIFIER}" \
+              --entitlements macos/entitlements.plist \
               --keychain "${KEYCHAIN_PATH}" --sign "${SIGNING_IDENTITY}" "${BINARY_PATH}"
           }
           # A secure timestamp needs Apple's timestamp server and is mandatory for
@@ -296,8 +297,10 @@ jobs:
           echo "${details}"
           if ! grep -qx "Identifier=${SIGNING_IDENTIFIER}" <<<"${details}" \
             || ! grep -q '(runtime)' <<<"${details}" \
-            || grep -q '^Signature=adhoc' <<<"${details}"; then
-            echo "Signed binary lacks the expected identifier, hardened runtime, or certificate." >&2
+            || grep -q '^Signature=adhoc' <<<"${details}" \
+            || ! codesign -d --entitlements - "${BINARY_PATH}" 2>/dev/null | grep -q 'com.apple.security.device.camera' \
+            || ! grep -q '^Info.plist entries=' <<<"${details}"; then
+            echo "Signed binary lacks the expected identifier, hardened runtime, certificate, camera entitlement or embedded Info.plist." >&2
             exit 1
           fi
 

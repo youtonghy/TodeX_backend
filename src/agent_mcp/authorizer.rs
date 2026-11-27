@@ -119,6 +119,10 @@ pub(super) struct Approval {
     pub device_id: String,
     /// "Allow for this conversation" rather than once.
     pub always: bool,
+    /// What the answering device sent with the answer (choices made on the
+    /// prompt, e.g. the camera card's camera and capture settings); never
+    /// from the host. Validate before use.
+    pub data: Option<Value>,
 }
 
 /// One question.
@@ -419,10 +423,12 @@ impl Authorizer<'_> {
                 PermissionOutcome::AllowOnce => Ok(Approval {
                     device_id,
                     always: false,
+                    data: decision.data,
                 }),
                 PermissionOutcome::AllowAlways => Ok(Approval {
                     device_id,
                     always: true,
+                    data: decision.data,
                 }),
                 _ => Err(Denied::new("DECLINED", "the user declined")),
             },
@@ -474,6 +480,7 @@ impl Authorizer<'_> {
             HostAnswer::Allowed => Ok(Approval {
                 device_id: HOST_DEVICE_ID.to_owned(),
                 always: false,
+                data: None,
             }),
             HostAnswer::Declined => Err(Denied::new(
                 "DECLINED",
