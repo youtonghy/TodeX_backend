@@ -374,9 +374,53 @@ async fn fixed_sessions_are_evenly_spaced_and_stop_at_the_frame_limit() {
         .unwrap();
     assert_eq!(summary.reason, SessionEnd::FrameLimit);
     assert_eq!(summary.frames.len(), 10);
+    // Few frames: sent as they are, no sheet.
+    assert_eq!(summary.overview.len(), 10);
+    assert!(summary.overview.iter().all(|image| image.file.is_none()));
     assert!(summary.frames[1..]
         .iter()
         .all(|frame| frame.reason == engine::KeepReason::Interval));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_with_many_frames_get_overview_sheets() {
+    let dir = temp_dir("sheets");
+    let (camera, _host) = camera(&dir).await;
+    let capture = CaptureSettings {
+        mode: CaptureMode::Fixed,
+        fps: 5.0,
+        ..CaptureSettings::default()
+    };
+    let session = start(&camera, &dir, capture, 20).await;
+    let summary = tokio::time::timeout(Duration::from_secs(15), session.ended())
+        .await
+        .unwrap();
+    assert_eq!(summary.frames.len(), 20);
+    // Every frame on two sheets (16 cells each), saved beside them and
+    // listed in the manifest.
+    let files: Vec<Option<&str>> = summary
+        .overview
+        .iter()
+        .map(|image| image.file.as_deref())
+        .collect();
+    assert_eq!(files, vec![Some("overview_1.jpg"), Some("overview_2.jpg")]);
+    let shown: Vec<usize> = summary
+        .overview
+        .iter()
+        .flat_map(|image| image.frames.clone())
+        .collect();
+    assert_eq!(shown, (1..=20).collect::<Vec<_>>());
+    assert_eq!(summary.overview[0].frames.len(), 16);
+    let bytes = std::fs::read(session.dir.join("overview_2.jpg")).unwrap();
+    assert_eq!(bytes, summary.overview[1].jpeg);
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(&summary.manifest).unwrap()).unwrap();
+    assert_eq!(manifest["overview"][1]["file"], "overview_2.jpg");
+    assert_eq!(
+        manifest["overview"][1]["frames"].as_array().unwrap().len(),
+        4
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

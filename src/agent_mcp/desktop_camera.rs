@@ -6,9 +6,11 @@
 //! captured) unless the conversation was allowed a camera for the rest of
 //! it. Plan mode refuses it; every other mode still asks, as a camera is
 //! never something an agent turns on unasked. The session records until
-//! `camera_stop`, a limit, the end of the turn or a revoke. Results are
-//! paths: frames are files the agent reads (best through sub-agents), not
-//! images in its context.
+//! `camera_stop`, a limit, the end of the turn or a revoke. Its result
+//! shows an overview inline ([`crate::camera::overview`]): the frames
+//! themselves when few, else labelled overview sheets. The full-size frames
+//! are files the agent opens only where it needs detail; long sessions are
+//! best handed to sub-agents.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -22,8 +24,11 @@ use super::{
     desktop_server::{DesktopCall, DesktopTools},
     registry::{parse, schema, tool_error, Handler, Invocation, Prepared, ToolEntry},
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
 use crate::camera::{
     engine::{self, CaptureMode, CaptureSettings},
+    overview::{INLINE_FRAMES_MAX, SHEETS_MAX, SUBAGENT_FRAMES_MIN},
     CameraDevice, CameraGrant, CameraPermission, Session, SessionEnd, Summary, MAX_SECONDS_RANGE,
 };
 
@@ -35,14 +40,27 @@ pub(super) const MAX_WAIT_SECONDS: u64 = 600;
 /// How long the end of a session (last frame, manifest) may take.
 const END_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The guidance every result that hands over frames repeats.
-pub(super) const FRAMES_GUIDANCE: &str = "How to look at the frames: there can be hundreds, so do not \
-     open them all yourself, it would fill your context. Read manifest.json first (frame times, \
-     change bitrate, activity ranges), then hand the frames to sub-agents in batches (for example \
-     one activity range or 10 to 20 frames each), asking each to look at its frames and report back \
-     in text what happens and when (use the time in the file names). Combine their reports. If you \
-     cannot start sub-agents, open only a few frames yourself: the first, the last and one or two \
-     per activity range.";
+/// How to read the frames once the overview is in view, by how many
+/// there are.
+pub(super) fn frames_guidance(frames: usize) -> &'static str {
+    if frames <= INLINE_FRAMES_MAX {
+        "Every frame is attached below in order (512 px wide). Open a file only when you need \
+         more detail than that."
+    } else if frames <= SUBAGENT_FRAMES_MIN {
+        "The overview sheets attached below show the session at a glance: each cell is labelled \
+         #<frame number> <mm:ss.s since the start>, and frame #n is the file whose name starts \
+         with frame_<n, 4 digits>. Use them to find the moments that matter, then open only those \
+         frame files (1280 px) for detail. Do not open every frame."
+    } else {
+        "The overview sheets attached below show the session at a glance: each cell is labelled \
+         #<frame number> <mm:ss.s since the start>, and frame #n is the file whose name starts \
+         with frame_<n, 4 digits>. There are too many frames to open yourself without filling \
+         your context: use the sheets and manifest.json (times, change bitrate, activity ranges) \
+         to pick ranges, and hand those frames to sub-agents in batches (for example one activity \
+         range or 10 to 20 frames each), asking each to report in text what happens and when. \
+         Combine their reports. Without sub-agents, open only a few frames per range yourself."
+    }
+}
 
 pub(super) enum CameraCall {
     List,
@@ -208,11 +226,13 @@ pub(super) fn tools(
                     "End the camera session (this conversation's newest one unless sessionId is given) \
                      and get its frames: a directory of JPEG files named \
                      frame_<n>_t<MM>m<SS>s<mmm>.jpg (the time since the session started) plus \
-                     manifest.json. waitSeconds (max {MAX_WAIT_SECONDS}) keeps recording that much \
+                     manifest.json, and inline an overview: the frames themselves when there are \
+                     at most {INLINE_FRAMES_MAX}, else up to {SHEETS_MAX} sheets of labelled \
+                     thumbnails. waitSeconds (max {MAX_WAIT_SECONDS}) keeps recording that much \
                      longer first, e.g. while the user demonstrates something; the call returns \
                      early if the session ends on its own. Also collects a session that already \
-                     ended. Frames are files, not images in this result: delegate looking at them \
-                     to sub-agents."
+                     ended. Open full frames only where the overview leaves a question; for long \
+                     sessions have sub-agents look at them."
                 ),
                 schema(json!({
                     "type": "object",
@@ -292,9 +312,49 @@ pub(super) fn summary_text(session: &Session, summary: &Summary) -> String {
             text.push('\n');
         }
     }
+    let sheets: Vec<&str> = summary
+        .overview
+        .iter()
+        .filter_map(|image| image.file.as_deref())
+        .collect();
+    if !sheets.is_empty() {
+        let shown: usize = summary
+            .overview
+            .iter()
+            .map(|image| image.frames.len())
+            .sum();
+        text.push_str(&format!(
+            "Overview: {} sheet(s) ({}) showing {} of the {} frames, evenly spread.\n",
+            sheets.len(),
+            sheets.join(", "),
+            shown,
+            summary.frames.len(),
+        ));
+    }
     text.push('\n');
-    text.push_str(FRAMES_GUIDANCE);
+    if summary.overview.is_empty() {
+        // No overview (making it failed): the files are all there is.
+        text.push_str(
+            "No overview could be attached. Read manifest.json (times, change bitrate, activity \
+             ranges) and open only the frames you need; with many frames, have sub-agents look \
+             at them in batches and report in text what happens and when.",
+        );
+    } else {
+        text.push_str(frames_guidance(summary.frames.len()));
+    }
     text
+}
+
+/// `camera_stop`'s result: the text, then the overview images.
+pub(super) fn summary_result(session: &Session, summary: &Summary) -> CallToolResult {
+    let mut content = vec![ContentBlock::text(summary_text(session, summary))];
+    for image in &summary.overview {
+        content.push(ContentBlock::image(
+            BASE64.encode(&image.jpeg),
+            "image/jpeg",
+        ));
+    }
+    CallToolResult::success(content)
 }
 
 impl DesktopTools {
@@ -714,8 +774,21 @@ impl DesktopTools {
         let summary = tokio::time::timeout(END_TIMEOUT, session.ended())
             .await
             .map_err(|_| "FAILED: the camera session did not finish saving in time".to_owned())?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            summary_text(&session, &summary),
-        )]))
+        Ok(summary_result(&session, &summary))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guidance_follows_the_number_of_frames() {
+        assert!(frames_guidance(1).contains("Every frame is attached"));
+        assert!(frames_guidance(INLINE_FRAMES_MAX).contains("Every frame is attached"));
+        let middle = frames_guidance(INLINE_FRAMES_MAX + 1);
+        assert!(middle.contains("overview sheets") && !middle.contains("sub-agents"));
+        assert_eq!(frames_guidance(SUBAGENT_FRAMES_MIN), middle);
+        assert!(frames_guidance(SUBAGENT_FRAMES_MIN + 1).contains("sub-agents"));
     }
 }

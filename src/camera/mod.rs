@@ -16,6 +16,7 @@
 //! Grants and sessions live in memory: a daemon restart asks again.
 
 pub(crate) mod engine;
+pub(crate) mod overview;
 mod platform;
 mod session;
 

@@ -17,6 +17,7 @@ use uuid::Uuid;
 use super::{
     encode_jpeg,
     engine::{self, ActivityLog, CaptureSettings, ChangeMeter, KeepReason, Pacer},
+    overview::{self, Collector, OverviewImage},
     CameraDevice, Frame, StreamUse, FRAME_MAX_WIDTH, FRAME_QUALITY,
 };
 use crate::{provider::ConversationSupervisor, secure_fs};
@@ -108,6 +109,8 @@ pub(crate) struct Summary {
     pub manifest: PathBuf,
     pub activity: Vec<engine::Activity>,
     pub threshold_kbps: f64,
+    /// What `camera_stop` shows inline (see [`overview`]).
+    pub overview: Vec<OverviewImage>,
     pub error: Option<String>,
     pub ended: Instant,
 }
@@ -243,6 +246,7 @@ pub(super) async fn record(
     let mut pacer = Pacer::new(session.capture);
     let mut activity = ActivityLog::default();
     let mut frames: Vec<FrameRecord> = Vec::new();
+    let mut collector = Collector::default();
     let mut newest: Option<Newest> = None;
     let mut seq = 0u64;
     let mut last_new = Instant::now();
@@ -319,7 +323,10 @@ pub(super) async fn record(
         )
         .await
         {
-            Ok(record) => frames.push(record),
+            Ok((record, extras)) => {
+                collector.add(frames.len() + 1, record.offset_ms, extras);
+                frames.push(record);
+            }
             Err(failure) => {
                 error = Some(failure);
                 break SessionEnd::Failed;
@@ -343,11 +350,15 @@ pub(super) async fn record(
         )
         .await
         {
-            Ok(record) => frames.push(record),
+            Ok((record, extras)) => {
+                collector.add(frames.len() + 1, record.offset_ms, extras);
+                frames.push(record);
+            }
             Err(failure) => error = Some(failure),
         }
     }
     drop(camera);
+    let overview = write_overview(&session, collector).await;
     let duration_ms = session
         .started
         .elapsed()
@@ -360,6 +371,7 @@ pub(super) async fn record(
         manifest: manifest.clone(),
         activity: activity.spans().to_vec(),
         threshold_kbps: pacer.threshold(),
+        overview,
         frames,
         error,
         ended: Instant::now(),
@@ -405,6 +417,30 @@ pub(super) async fn record(
     }
 }
 
+/// Builds the overview and saves its sheets beside the frames. A failure
+/// only costs the overview: the frames and the manifest still go out.
+async fn write_overview(session: &Session, collector: Collector) -> Vec<OverviewImage> {
+    let dir = session.dir.clone();
+    let built = tokio::task::spawn_blocking(move || -> Result<Vec<OverviewImage>, String> {
+        let images = collector.finish().map_err(|error| error.to_string())?;
+        for image in &images {
+            if let Some(file) = &image.file {
+                secure_fs::write_owner_only_atomic(&dir.join(file), &image.jpeg)
+                    .map_err(|error| format!("cannot save {file}: {error}"))?;
+            }
+        }
+        Ok(images)
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|built| built);
+    built.unwrap_or_else(|error| {
+        tracing::warn!(%error, "camera session overview failed");
+        Vec::new()
+    })
+}
+
+/// Saves frame `number` and returns its record and its overview share.
 async fn save(
     session: &Session,
     number: usize,
@@ -413,25 +449,34 @@ async fn save(
     change_kbps: f64,
     rate_fps: f64,
     reason: KeepReason,
-) -> Result<FrameRecord, String> {
+) -> Result<(FrameRecord, overview::Extras), String> {
     let file = engine::frame_name(number, at_ms);
     let path = session.dir.join(&file);
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
+    let extras = tokio::task::spawn_blocking(move || -> Result<overview::Extras, String> {
         let jpeg = encode_jpeg(&frame, FRAME_MAX_WIDTH, FRAME_QUALITY)
             .map_err(|error| error.to_string())?;
         secure_fs::write_owner_only_atomic(&path, &jpeg)
-            .map_err(|error| format!("cannot save a frame: {error}"))
+            .map_err(|error| format!("cannot save a frame: {error}"))?;
+        let small = number <= overview::INLINE_FRAMES_MAX;
+        Ok(overview::extras(&frame, small).unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot shrink a camera frame for the overview");
+            overview::Extras {
+                cell: overview::fit(&frame, overview::CELL_WIDTH, overview::CELL_HEIGHT),
+                small: None,
+            }
+        }))
     })
     .await
     .map_err(|error| error.to_string())??;
-    Ok(FrameRecord {
+    let record = FrameRecord {
         file,
         offset_ms: at_ms,
         at: session.timestamp(at_ms),
         change_kbps: round1(change_kbps),
         rate_fps,
         reason,
-    })
+    };
+    Ok((record, extras))
 }
 
 fn manifest_json(session: &Session, summary: &Summary) -> serde_json::Value {
@@ -447,8 +492,15 @@ fn manifest_json(session: &Session, summary: &Summary) -> serde_json::Value {
         "frameCount": summary.frames.len(),
         "frames": summary.frames,
         "activity": summary.activity,
+        "overview": summary
+            .overview
+            .iter()
+            .filter(|image| image.file.is_some())
+            .map(|image| json!({ "file": image.file, "frames": image.frames }))
+            .collect::<Vec<_>>(),
         "notes": "offsetMs (also the tNNmNNsNNN part of each file name) is the time since the session started. \
                   Frames are unevenly spaced: dynamic capture keeps more while the picture changes. \
-                  changeKbps is how much the picture changed around that frame.",
+                  changeKbps is how much the picture changed around that frame. \
+                  Each overview sheet is a grid of frames labelled #<frame number> <mm:ss.s>.",
     })
 }
