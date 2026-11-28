@@ -2025,6 +2025,15 @@ impl PermissionBroker {
             .any(|entry| entry.value().conversation_id == conversation_id)
     }
 
+    /// Whether `permission_id` still waits on the user in `conversation_id`
+    /// and can be answered there. The journal may hold requests that cannot:
+    /// copied into a fork, or left by a request its caller dropped.
+    pub fn is_waiting(&self, conversation_id: &str, permission_id: &str) -> bool {
+        self.pending
+            .get(permission_id)
+            .is_some_and(|entry| entry.value().conversation_id == conversation_id)
+    }
+
     pub fn expire_all(&self) {
         self.pending.clear();
     }
@@ -2726,6 +2735,9 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
         assert!(!request.is_finished());
         assert!(broker.has_pending(&manifest.id));
+        assert!(broker.is_waiting(&manifest.id, &permission_id));
+        // A fork's copy of the request is not answerable in the fork.
+        assert!(!broker.is_waiting("conv_fork", &permission_id));
         broker
             .resolve(
                 &manifest.id,
@@ -2741,6 +2753,7 @@ mod tests {
             .unwrap();
         let decision = request.await.unwrap().unwrap();
         assert!(matches!(decision.outcome, PermissionOutcome::AllowOnce));
+        assert!(!broker.is_waiting(&manifest.id, &permission_id));
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

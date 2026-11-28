@@ -3461,6 +3461,28 @@ struct BackfillProgress {
     high_water: u64,
 }
 
+/// Adds `pendingPermissions` (always, on a daemon that keeps them) and
+/// `goalSequence` (when the journal holds a goal) to a subscribe result. A
+/// failed read leaves them out, as an older daemon would: the client then
+/// shows only what its window holds.
+async fn add_control_state(
+    result: &mut Value,
+    conversations: &ConversationSupervisor,
+    conversation_id: &str,
+) {
+    match conversations.subscribe_control_state(conversation_id).await {
+        Ok((pending, goal)) => {
+            result["pendingPermissions"] = json!(pending);
+            if let Some(sequence) = goal {
+                result["goalSequence"] = json!(sequence);
+            }
+        }
+        Err(error) => {
+            warn!(conversation_id, %error, "subscribe control state unavailable");
+        }
+    }
+}
+
 /// Runs one `conversation.subscribe` off the read loop: backfill, then the
 /// ack carrying the request id, then live events.
 struct SubscriptionWorker {
@@ -3503,6 +3525,12 @@ impl SubscriptionWorker {
                 if self.legacy_plaintext {
                     ack["payload"]["legacyPlaintext"] = json!(true);
                 }
+                add_control_state(
+                    &mut ack["payload"],
+                    &self.conversations,
+                    &self.conversation_id,
+                )
+                .await;
                 let delivered = queue_frame(&self.outgoing, ack).await.is_ok();
                 self.answered
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -3861,11 +3889,15 @@ async fn start_subscription(
     {
         let mut active = subscriptions.active.lock().await;
         if active.contains(&request.conversation_id) {
-            return Ok(Some(json!({
+            drop(active);
+            let mut result = json!({
                 "conversationId": request.conversation_id,
                 "subscribed": true,
                 "alreadySubscribed": true,
-            })));
+            });
+            // A client that rebuilt its window (new history keys) asks again.
+            add_control_state(&mut result, &state.conversations, &request.conversation_id).await;
+            return Ok(Some(result));
         }
         if active.len() >= MAX_WS_SUBSCRIPTIONS {
             return Err(AppError::InvalidRequest(
@@ -9930,6 +9962,80 @@ mod tests {
         (root, state, store, hub, manifest)
     }
 
+    /// A client that loads only the journal's tail learns which dialogs still
+    /// wait below it (with their requests' sequences) and where the newest
+    /// goal update is, on a first subscribe and on an already-active one.
+    #[tokio::test]
+    async fn v2_subscribe_reports_pending_permissions_and_the_goal() {
+        let (root, state, store, _hub, manifest) = subscription_fixture("control-state").await;
+        let append = |event_type: &'static str, payload: Value| {
+            let store = store.clone();
+            let id = manifest.id.clone();
+            async move {
+                store
+                    .append(&id, event_type, payload)
+                    .await
+                    .unwrap()
+                    .sequence
+            }
+        };
+        append(
+            "permission.requested",
+            json!({ "permissionId": "p1", "turnId": "t1" }),
+        )
+        .await;
+        let waiting = append(
+            "permission.requested",
+            json!({ "permissionId": "p2", "turnId": "t1", "scope": "session", "lifetime": "call" }),
+        )
+        .await;
+        append(
+            "permission.resolved",
+            json!({ "permissionId": "p1", "outcome": "allow_once" }),
+        )
+        .await;
+        append(
+            "goal.updated",
+            json!({ "provider": "codex", "goal": { "objective": "ship" } }),
+        )
+        .await;
+        let goal = append("goal.updated", json!({ "provider": "codex", "goal": null })).await;
+        for index in 0..5 {
+            append("fixture.event", json!({ "index": index })).await;
+        }
+
+        let (outgoing, mut events) = mpsc::channel(64);
+        let mut subscriptions = WsSubscriptions::declared();
+        let payload =
+            json!({ "conversationId": manifest.id, "afterSequence": goal + 5, "backfillLimit": 0 });
+        let (_, ack) = subscribe_and_collect(
+            &state,
+            &outgoing,
+            &mut events,
+            &mut subscriptions,
+            "first",
+            payload.clone(),
+        )
+        .await;
+        let expected = json!([{ "permissionId": "p2", "sequence": waiting, "scope": "session", "answerable": false }]);
+        assert_eq!(ack["payload"]["pendingPermissions"], expected);
+        assert_eq!(ack["payload"]["goalSequence"], goal);
+
+        let (_, again) = subscribe_and_collect(
+            &state,
+            &outgoing,
+            &mut events,
+            &mut subscriptions,
+            "again",
+            payload,
+        )
+        .await;
+        assert_eq!(again["payload"]["alreadySubscribed"], true);
+        assert_eq!(again["payload"]["pendingPermissions"], expected);
+        assert_eq!(again["payload"]["goalSequence"], goal);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn v2_subscribe_backfill_does_not_block_later_commands() {
         let (root, state, store, hub, manifest) = subscription_fixture("backfill-bg").await;
@@ -10036,6 +10142,7 @@ mod tests {
                 "nextSequence": 21,
                 "hasMore": false,
                 "lastSequence": 21,
+                "pendingPermissions": [],
             })
         );
         let live = store

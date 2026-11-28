@@ -703,6 +703,39 @@ impl ConversationSupervisor {
             .await
     }
 
+    /// What a client whose window starts above them needs to show dialogs
+    /// still waiting and the current goal: each permission the journal
+    /// requested and never resolved, with its request's sequence and whether
+    /// it can still be answered here, and the newest `goal.updated`'s
+    /// sequence (`conversation.subscribe`'s `pendingPermissions` and
+    /// `goalSequence`; docs/API.md).
+    pub(crate) async fn subscribe_control_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(Vec<Value>, Option<u64>), AppError> {
+        let (pending, goal) = self
+            .store
+            .digest(conversation_id, |digest| {
+                (digest.pending_permissions(), digest.goal_updated())
+            })
+            .await?;
+        let pending = pending
+            .into_iter()
+            .map(|(permission_id, context)| {
+                let answerable = self.permissions.is_waiting(conversation_id, &permission_id);
+                let mut entry = json!({ "permissionId": permission_id, "answerable": answerable });
+                if let Some(sequence) = context.sequence {
+                    entry["sequence"] = json!(sequence);
+                }
+                if let Some(scope) = context.scope.filter(|scope| !scope.is_null()) {
+                    entry["scope"] = scope;
+                }
+                entry
+            })
+            .collect();
+        Ok((pending, goal))
+    }
+
     /// The conversation's running turn, if any.
     pub(crate) fn active_turn_id(&self, conversation_id: &str) -> Option<String> {
         self.active

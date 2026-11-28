@@ -92,11 +92,15 @@ pub struct ControlFacts {
 
 /// What restart recovery needs to close a cancelled permission dialog.
 /// `scope` and `runtimeId` are short routing values echoed back on the
-/// synthetic `permission.resolved`.
+/// synthetic `permission.resolved`; `sequence` is the request's own record,
+/// which a client that loaded only the journal's tail reads back to show a
+/// dialog still waiting below it (absent in digests sealed before it was kept).
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct PermissionContext {
     pub scope: Option<Value>,
     pub runtime_id: Option<Value>,
+    #[serde(default)]
+    pub sequence: Option<u64>,
 }
 
 /// Inputs restart recovery folds out of a journal; see
@@ -255,6 +259,9 @@ pub struct JournalDigest {
     /// settles one (see [`background_pending_after`]).
     #[serde(default)]
     background_pending: Option<bool>,
+    /// Newest `goal.updated` (which may clear the goal: its content says).
+    #[serde(default)]
+    goal_updated: Option<u64>,
 }
 
 /// How `event` changes whether background tasks a turn left behind are
@@ -343,6 +350,7 @@ impl JournalDigest {
                         .or_insert(event.sequence);
                 }
             }
+            "goal.updated" => self.goal_updated = Some(event.sequence),
             "provider.runtime" => {
                 if let Some(runtime_id) = text("runtimeId") {
                     match text("status") {
@@ -382,6 +390,7 @@ impl JournalDigest {
                         Some(PermissionContext {
                             scope: payload.get("scope").cloned(),
                             runtime_id: payload.get("runtimeId").cloned(),
+                            sequence: Some(event.sequence),
                         }),
                     );
                 }
@@ -426,6 +435,7 @@ impl JournalDigest {
         self.runtimes.extend(later.runtimes);
         self.permissions.extend(later.permissions);
         self.background_pending = later.background_pending.or(self.background_pending);
+        self.goal_updated = later.goal_updated.or(self.goal_updated);
     }
 
     pub fn last_sequence(&self) -> u64 {
@@ -479,6 +489,19 @@ impl JournalDigest {
         self.open_turn.open_turn()
     }
 
+    /// Sequence of the newest `goal.updated`.
+    pub fn goal_updated(&self) -> Option<u64> {
+        self.goal_updated
+    }
+
+    /// Permission dialogs requested and never resolved, by id.
+    pub fn pending_permissions(&self) -> Vec<(String, PermissionContext)> {
+        self.permissions
+            .iter()
+            .filter_map(|(id, context)| Some((id.clone(), context.clone()?)))
+            .collect()
+    }
+
     pub fn recovery(&self) -> RecoveryFacts {
         RecoveryFacts {
             status: self.status_from(ConversationStatus::Idle),
@@ -489,11 +512,7 @@ impl JournalDigest {
                 .filter(|(_, ready)| **ready)
                 .map(|(id, _)| id.clone())
                 .collect(),
-            pending_permissions: self
-                .permissions
-                .iter()
-                .filter_map(|(id, context)| Some((id.clone(), context.clone()?)))
-                .collect(),
+            pending_permissions: self.pending_permissions(),
             background_pending: self.background_pending == Some(true),
         }
     }
@@ -549,7 +568,7 @@ pub(crate) mod tests {
             if let Some(id) = event.payload.get("permissionId").and_then(Value::as_str) {
                 match event.event_type.as_str() {
                     "permission.requested" | "tool.awaitingApproval" => {
-                        expired.insert(id.to_owned(), json!({"scope":event.payload.get("scope"),"runtimeId":event.payload.get("runtimeId")}));
+                        expired.insert(id.to_owned(), json!({"scope":event.payload.get("scope"),"runtimeId":event.payload.get("runtimeId"),"sequence":event.sequence}));
                     }
                     "permission.resolved" => {
                         expired.remove(id);
@@ -716,11 +735,19 @@ pub(crate) mod tests {
             .map(|(id, context)| {
                 (
                     id,
-                    json!({"scope": context.scope, "runtimeId": context.runtime_id}),
+                    json!({"scope": context.scope, "runtimeId": context.runtime_id, "sequence": context.sequence}),
                 )
             })
             .collect();
         assert_eq!(pending, expired);
+        assert_eq!(
+            digest.goal_updated(),
+            history
+                .iter()
+                .rev()
+                .find(|event| event.event_type == "goal.updated")
+                .map(|event| event.sequence)
+        );
         for id in IDS {
             let request = digest.client_request(id);
             assert_eq!(
@@ -847,6 +874,11 @@ pub(crate) mod tests {
                         "background_tasks_pending", "background_tasks_ended", "task_progress",
                     ]) }),
                 ),
+                14 => (
+                    "goal.updated",
+                    json!({ "provider": "codex", "goal": rng.maybe(&["ship", "test"])
+                        .map(|objective| json!({ "objective": objective, "status": "active" })) }),
+                ),
                 // A permissionId on an unrelated event must not count.
                 12 => (
                     "tool.started",
@@ -870,6 +902,37 @@ pub(crate) mod tests {
                 ConversationEvent::new("conversation", index as u64 + 1, event_type, payload)
             })
             .collect()
+    }
+
+    /// Segment indexes sealed before the request and goal sequences were
+    /// kept still load (the new fields read as absent), and an older daemon
+    /// reading a new index ignores them.
+    #[test]
+    fn digests_sealed_without_the_control_sequences_still_load() {
+        let history = vec![
+            ConversationEvent::new(
+                "conversation",
+                1,
+                "permission.requested",
+                json!({ "permissionId": "p1", "scope": "session" }),
+            ),
+            ConversationEvent::new("conversation", 2, "goal.updated", json!({ "goal": null })),
+        ];
+        let digest = JournalDigest::from_events(&history);
+        assert_eq!(digest.goal_updated(), Some(2));
+        assert_eq!(digest.pending_permissions()[0].1.sequence, Some(1));
+        let mut old = serde_json::to_value(&digest).unwrap();
+        old.as_object_mut().unwrap().remove("goal_updated");
+        old["permissions"]["p1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sequence");
+        let loaded: JournalDigest = serde_json::from_value(old).unwrap();
+        assert_eq!(loaded.goal_updated(), None);
+        let pending = loaded.pending_permissions();
+        assert_eq!(pending[0].0, "p1");
+        assert_eq!(pending[0].1.sequence, None);
+        assert_eq!(pending[0].1.scope, Some(json!("session")));
     }
 
     #[test]
