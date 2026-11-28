@@ -127,6 +127,11 @@ const TAIL_CACHE_ENTRIES: usize = 256;
 /// Whole-journal digests kept; a miss rebuilds from the segment `.idx`
 /// files and the plaintext files.
 const DIGEST_CACHE_ENTRIES: usize = 256;
+/// User-message scans of journals with segments sealed before digests
+/// recorded them (see [`ConversationStore::user_messages`]).
+const USER_MESSAGE_SCAN_ENTRIES: usize = 64;
+/// User-message events one turn outline page returns at most.
+pub const MAX_USER_MESSAGE_PAGE: usize = 200;
 /// Journal file listings kept (see [`ConversationStore::files_locked`]); a
 /// miss lists the conversation directory again.
 const FILE_LIST_CACHE_ENTRIES: usize = 256;
@@ -228,6 +233,9 @@ pub struct ConversationStore {
     /// lock. Like the replay index it is a rebuildable cache keyed by the
     /// journal file fingerprint.
     digests: Arc<LruMap<CachedDigest>>,
+    /// User-message sequences found by paging through a journal whose
+    /// digest cannot list them, keyed by the journal file fingerprint.
+    user_message_scans: Arc<LruMap<CachedUserMessages>>,
     /// Decompressed sealed frames shared by every conversation.
     frames: Arc<FrameCache>,
     /// Conversations whose directory went through crash reconciliation
@@ -259,6 +267,24 @@ struct CachedDigest {
     /// outside it; appends fold in place (`Arc::make_mut`, no copy once the
     /// readers are done).
     digest: Arc<JournalDigest>,
+}
+
+struct CachedUserMessages {
+    files: Vec<JournalFile>,
+    sequences: Arc<Vec<u64>>,
+}
+
+/// One turn outline page: every user `message.created` sequence of the
+/// conversation, plus the newest of those events at or before the requested
+/// bound (ascending) with the sealed frames they refer to.
+#[derive(Debug)]
+pub struct UserMessagePage {
+    pub sequences: Arc<Vec<u64>>,
+    pub events: Vec<ConversationEvent>,
+    pub frames: serde_json::Map<String, Value>,
+    /// Earlier user messages remain; continue with `before_sequence`.
+    pub has_more: bool,
+    pub before_sequence: u64,
 }
 
 pub(super) struct CachedManifest {
@@ -565,6 +591,7 @@ impl ConversationStore {
             manifests: Arc::new(DashMap::new()),
             ephemeral: Arc::default(),
             digests: Arc::new(LruMap::new(DIGEST_CACHE_ENTRIES)),
+            user_message_scans: Arc::new(LruMap::new(USER_MESSAGE_SCAN_ENTRIES)),
             frames: Arc::new(FrameCache::new(FRAME_CACHE_BYTES)),
             reconciled: Arc::new(DashMap::new()),
             sealing: Arc::new(DashMap::new()),
@@ -1365,6 +1392,7 @@ impl ConversationStore {
         self.pending_deltas.remove(conversation_id);
         self.manifests.remove(conversation_id);
         self.digests.remove(conversation_id);
+        self.user_message_scans.remove(conversation_id);
         self.reconciled.remove(conversation_id);
     }
 
@@ -2171,6 +2199,176 @@ impl ConversationStore {
             .into_iter()
             .next()
             .filter(|event| event.sequence == sequence))
+    }
+
+    /// Turn outline page: every user `message.created` sequence (from the
+    /// digest, or one paged scan when segments sealed by an older version
+    /// cannot list theirs) and, newest first under the replay page byte
+    /// budget, at most `limit` of those events with `after_sequence <
+    /// sequence <= before_sequence` in `detail`. Point reads only: the
+    /// history between prompts is never loaded.
+    pub async fn user_messages(
+        &self,
+        conversation_id: &str,
+        after_sequence: u64,
+        before_sequence: Option<u64>,
+        limit: usize,
+        detail: ReplayDetail,
+    ) -> Result<UserMessagePage, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        self.flush_pending_delta_logged(conversation_id).await;
+        let known = self
+            .ensure_digest_locked(conversation_id, |digest| {
+                digest
+                    .user_messages()
+                    .map(|sequences| Arc::new(sequences.to_vec()))
+            })
+            .await?;
+        let sequences = match known {
+            Some(sequences) => sequences,
+            None => self.scan_user_messages_locked(conversation_id).await?,
+        };
+        let end =
+            sequences.partition_point(|sequence| *sequence <= before_sequence.unwrap_or(u64::MAX));
+        let floor = sequences
+            .partition_point(|sequence| *sequence <= after_sequence)
+            .min(end);
+        let start = end
+            .saturating_sub(limit.clamp(1, MAX_USER_MESSAGE_PAGE))
+            .max(floor);
+        let ephemeral = self.is_ephemeral(conversation_id);
+        let directory = if ephemeral {
+            None
+        } else {
+            Some(self.replay_journal(conversation_id).await?)
+        };
+        let mut budget = PageBudget::new(MAX_REPLAY_PAGE_BYTES);
+        let mut events = Vec::new();
+        let mut frames = serde_json::Map::new();
+        let mut first_read = end;
+        for index in (start..end).rev() {
+            let sequence = sequences[index];
+            let position = usize::try_from(sequence - 1).unwrap_or(usize::MAX);
+            let (read, read_frames) = match &directory {
+                None => (
+                    self.ephemeral_replay(conversation_id, sequence - 1, 1)?
+                        .events,
+                    serde_json::Map::new(),
+                ),
+                Some(directory) => {
+                    let page = self
+                        .read_indexed_page(
+                            conversation_id,
+                            directory,
+                            PageAnchor::Start,
+                            detail,
+                            |total| (position.min(total), position.saturating_add(1).min(total)),
+                        )
+                        .await?;
+                    (page.events, page.frames)
+                }
+            };
+            // A salvaged record may no longer be the prompt the digest named.
+            let Some(event) = read
+                .into_iter()
+                .find(|event| event.sequence == sequence && super::digest::is_user_message(event))
+            else {
+                first_read = index;
+                continue;
+            };
+            let new_frames: Vec<(String, Value)> = read_frames
+                .into_iter()
+                .filter(|(id, _)| !frames.contains_key(id))
+                .collect();
+            let bytes = serde_json::to_vec(&event).map_or(0, |bytes| bytes.len() as u64)
+                + new_frames
+                    .iter()
+                    .map(|(_, frame)| {
+                        serde_json::to_vec(frame).map_or(0, |bytes| bytes.len() as u64)
+                    })
+                    .sum::<u64>();
+            if !budget.admit(bytes) {
+                break;
+            }
+            events.push(event);
+            frames.extend(new_frames);
+            first_read = index;
+        }
+        events.reverse();
+        let has_more = first_read > floor;
+        Ok(UserMessagePage {
+            before_sequence: if has_more {
+                sequences[first_read] - 1
+            } else {
+                0
+            },
+            sequences,
+            events,
+            frames,
+            has_more,
+        })
+    }
+
+    /// User-message sequences of a journal whose digest cannot list them,
+    /// by paging through it once per journal file fingerprint. Callers hold
+    /// the conversation lock.
+    async fn scan_user_messages_locked(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Arc<Vec<u64>>, AppError> {
+        let directory = self.replay_journal(conversation_id).await?;
+        let files = self.files_locked(conversation_id, &directory).await?;
+        if let Some(sequences) = self
+            .user_message_scans
+            .with(conversation_id, |cached| {
+                (cached.files == files).then(|| Arc::clone(&cached.sequences))
+            })
+            .flatten()
+        {
+            return Ok(sequences);
+        }
+        let mut sequences = Vec::new();
+        let mut from = 0usize;
+        loop {
+            let page = self
+                .read_indexed_page(
+                    conversation_id,
+                    &directory,
+                    PageAnchor::Start,
+                    ReplayDetail::Summary,
+                    |total| {
+                        (
+                            from.min(total),
+                            from.saturating_add(MAX_REPLAY_LIMIT).min(total),
+                        )
+                    },
+                )
+                .await?;
+            sequences.extend(
+                page.events
+                    .iter()
+                    .filter(|event| super::digest::is_user_message(event))
+                    .map(|event| event.sequence),
+            );
+            if page.events.is_empty() || page.to >= page.total {
+                break;
+            }
+            from = page.to;
+        }
+        sequences.sort_unstable();
+        sequences.dedup();
+        let sequences = Arc::new(sequences);
+        // A salvage during the scan rewrote files; the next call scans again.
+        if self.files_locked(conversation_id, &directory).await? == files {
+            self.user_message_scans.insert(
+                conversation_id,
+                CachedUserMessages {
+                    files,
+                    sequences: Arc::clone(&sequences),
+                },
+            );
+        }
+        Ok(sequences)
     }
 
     /// Make the cached digest match the journal files on disk. A miss
@@ -7568,6 +7766,86 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_messages_page_newest_first_and_match_a_full_scan() {
+        let root = temp_dir("todex-user-messages");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let id = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap()
+            .id;
+        let mut prompts = Vec::new();
+        for index in 0..240u64 {
+            let event = if index % 4 == 0 {
+                store
+                    .append(&id, "message.created", json!({ "role": "user", "content": format!("prompt {index}"), "pad": "p".repeat(1200) }))
+                    .await
+                    .unwrap()
+            } else {
+                store
+                    .append(
+                        &id,
+                        "tool.completed",
+                        json!({ "toolCallId": format!("t{index}"), "pad": "p".repeat(1200) }),
+                    )
+                    .await
+                    .unwrap()
+            };
+            if index % 4 == 0 {
+                prompts.push(event.sequence);
+            }
+        }
+        // The journal rolled over into several files.
+        assert!(
+            journal_files(&root.join("conversations").join(&id))
+                .await
+                .unwrap()
+                .len()
+                > 2
+        );
+
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        let page = restarted
+            .user_messages(&id, 0, None, 25, ReplayDetail::Summary)
+            .await
+            .unwrap();
+        assert_eq!(page.sequences.as_slice(), prompts.as_slice());
+        let read: Vec<u64> = page.events.iter().map(|event| event.sequence).collect();
+        assert_eq!(read, prompts[prompts.len() - 25..]);
+        assert!(page.has_more);
+        assert_eq!(page.before_sequence, read[0] - 1);
+
+        let mut all = read;
+        let mut before = page.before_sequence;
+        loop {
+            let page = restarted
+                .user_messages(&id, 0, Some(before), 25, ReplayDetail::Summary)
+                .await
+                .unwrap();
+            all.splice(0..0, page.events.iter().map(|event| event.sequence));
+            if !page.has_more {
+                break;
+            }
+            before = page.before_sequence;
+        }
+        assert_eq!(all, prompts);
+
+        // The fallback for journals sealed before digests listed prompts
+        // finds the same sequences.
+        let scanned = {
+            let _guard = restarted.lock(&id).await;
+            restarted.scan_user_messages_locked(&id).await.unwrap()
+        };
+        assert_eq!(scanned.as_slice(), prompts.as_slice());
         fs::remove_dir_all(root).unwrap();
     }
 

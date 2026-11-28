@@ -262,6 +262,39 @@ pub struct JournalDigest {
     /// Newest `goal.updated` (which may clear the goal: its content says).
     #[serde(default)]
     goal_updated: Option<u64>,
+    /// Every user `message.created`, ascending: the turn outline clients
+    /// jump through. Digests sealed before it was kept lack it (`None`).
+    #[serde(default = "UserMessages::unknown")]
+    user_messages: UserMessages,
+}
+
+/// Sequences of a range's user `message.created` records; `None` when the
+/// range was sealed by a version that did not record them, which makes any
+/// merge including it unknown too.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+struct UserMessages(Option<Vec<u64>>);
+
+impl Default for UserMessages {
+    fn default() -> Self {
+        Self(Some(Vec::new()))
+    }
+}
+
+impl UserMessages {
+    fn unknown() -> Self {
+        Self(None)
+    }
+}
+
+/// Whether `event` is a user prompt as clients show it (`role` is an
+/// envelope field, readable without decrypting).
+pub fn is_user_message(event: &ConversationEvent) -> bool {
+    event.event_type == "message.created"
+        && matches!(
+            event.payload.get("role").and_then(Value::as_str),
+            Some("user" | "human")
+        )
 }
 
 /// How `event` changes whether background tasks a turn left behind are
@@ -305,6 +338,11 @@ impl JournalDigest {
         self.open_turn.apply(event_type, turn_id);
         if let Some(pending) = background_pending_after(event) {
             self.background_pending = Some(pending);
+        }
+        if is_user_message(event) {
+            if let Some(sequences) = &mut self.user_messages.0 {
+                sequences.push(event.sequence);
+            }
         }
         match event_type {
             "message.created" => {
@@ -436,6 +474,10 @@ impl JournalDigest {
         self.permissions.extend(later.permissions);
         self.background_pending = later.background_pending.or(self.background_pending);
         self.goal_updated = later.goal_updated.or(self.goal_updated);
+        match (&mut self.user_messages.0, later.user_messages.0) {
+            (Some(earlier), Some(later)) => earlier.extend(later),
+            (known, _) => *known = None,
+        }
     }
 
     pub fn last_sequence(&self) -> u64 {
@@ -487,6 +529,12 @@ impl JournalDigest {
 
     pub fn open_turn(&self) -> Option<&str> {
         self.open_turn.open_turn()
+    }
+
+    /// Every user `message.created` sequence, ascending; `None` when part
+    /// of the journal was sealed before digests recorded them.
+    pub fn user_messages(&self) -> Option<&[u64]> {
+        self.user_messages.0.as_deref()
     }
 
     /// Sequence of the newest `goal.updated`.
@@ -711,6 +759,17 @@ pub(crate) mod tests {
         assert_eq!(
             digest.last_user_message(),
             reference_last_user_message(history)
+        );
+        assert_eq!(
+            digest.user_messages(),
+            Some(
+                history
+                    .iter()
+                    .filter(|event| is_user_message(event))
+                    .map(|event| event.sequence)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            )
         );
         for start in STATUSES {
             assert_eq!(
@@ -1007,5 +1066,34 @@ pub(crate) mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn user_messages_are_unknown_once_a_range_sealed_without_them_is_merged() {
+        let event = |sequence: u64, role: &str| {
+            ConversationEvent::new(
+                "conversation",
+                sequence,
+                "message.created",
+                json!({ "role": role }),
+            )
+        };
+        let early = JournalDigest::from_events(&[event(1, "user"), event(2, "assistant")]);
+        assert_eq!(early.user_messages(), Some([1].as_slice()));
+        let mut merged = early.clone();
+        merged.merge(JournalDigest::from_events(&[event(3, "human")]));
+        assert_eq!(merged.user_messages(), Some([1, 3].as_slice()));
+
+        // A segment `.idx` written before the field existed.
+        let mut sealed =
+            serde_json::to_value(JournalDigest::from_events(&[event(3, "user")])).unwrap();
+        sealed.as_object_mut().unwrap().remove("user_messages");
+        let sealed: JournalDigest = serde_json::from_value(sealed).unwrap();
+        assert_eq!(sealed.user_messages(), None);
+        let mut merged = early;
+        merged.merge(sealed);
+        assert_eq!(merged.user_messages(), None);
+        merged.merge(JournalDigest::from_events(&[event(4, "user")]));
+        assert_eq!(merged.user_messages(), None);
     }
 }

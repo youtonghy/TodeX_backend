@@ -25,7 +25,7 @@ pub use model::{
     ProviderKind, ProviderState, CONVERSATION_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES,
 };
 pub(crate) use record::{control_mac, encrypted_content};
-pub use store::{seal_request_snapshot, ConversationStore, ReplayDetail};
+pub use store::{seal_request_snapshot, ConversationStore, ReplayDetail, UserMessagePage};
 pub use summary::{
     event_frames, full_presentation_changes, present_event, summarize_event, RETRY_REQUEST_KEY,
 };

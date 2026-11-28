@@ -21,7 +21,8 @@ use crate::config::Config;
 use crate::conversation::{
     control_mac, encrypted_content, seal_request_snapshot, ControlOutcome, ConversationEventHub,
     ConversationManifest, ConversationReplay, ConversationStatus, ConversationStore, ProviderKind,
-    ProviderState, ReplayDetail, CONVERSATION_TERMINAL_EVENTS, TURN_TERMINAL_EVENTS,
+    ProviderState, ReplayDetail, UserMessagePage, CONVERSATION_TERMINAL_EVENTS,
+    TURN_TERMINAL_EVENTS,
 };
 use crate::error::AppError;
 use crate::history_keys::FingerprintKey;
@@ -1729,6 +1730,29 @@ impl ConversationSupervisor {
         self.get_owned(owner_id, conversation_id).await?;
         self.store
             .replay_before_detail(conversation_id, before_sequence, limit, detail)
+            .await
+    }
+
+    /// Turn outline page of an owned conversation; see
+    /// [`ConversationStore::user_messages`].
+    pub async fn user_messages_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        after_sequence: u64,
+        before_sequence: Option<u64>,
+        limit: usize,
+        detail: ReplayDetail,
+    ) -> Result<UserMessagePage, AppError> {
+        self.get_owned(owner_id, conversation_id).await?;
+        self.store
+            .user_messages(
+                conversation_id,
+                after_sequence,
+                before_sequence,
+                limit,
+                detail,
+            )
             .await
     }
 

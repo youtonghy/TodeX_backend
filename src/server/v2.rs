@@ -494,6 +494,10 @@ fn authenticated_routes() -> Router<AppState> {
             get(replay_conversation),
         )
         .route(
+            "/v2/conversations/{conversation_id}/turns",
+            get(conversation_turns),
+        )
+        .route(
             "/v2/conversations/{conversation_id}/prompt",
             post(prompt_conversation),
         )
@@ -2607,6 +2611,70 @@ async fn replay_conversation(
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(serde_json::to_value(replay)?),
     ))
+}
+
+/// Turn outline: every user prompt's sequence, plus a page of those
+/// `message.created` events (newest first, returned ascending) so a client
+/// can label and jump to turns it has not loaded. Summary detail by default.
+async fn conversation_turns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(conversation_id): AxumPath<String>,
+    Query(query): Query<TurnsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    ensure_history_client(
+        query
+            .history_encryption
+            .is_some_and(|version| version >= HISTORY_ENCRYPTION_VERSION),
+    )?;
+    let summary = summary_detail(Some(query.detail.as_deref().unwrap_or("summary")))?;
+    let mut page = state
+        .conversations
+        .user_messages_owned(
+            &auth.tenant_id,
+            &conversation_id,
+            query.after_sequence.unwrap_or(0),
+            query.before_sequence,
+            query.limit.unwrap_or(100),
+            replay_detail(summary),
+        )
+        .await?;
+    for event in &mut page.events {
+        crate::conversation::present_event(event, summary);
+    }
+    let mut body = json!({
+        "conversationId": conversation_id,
+        "sequences": page.sequences.as_slice(),
+        "events": page.events,
+        "hasMore": page.has_more,
+        "beforeSequence": page.before_sequence,
+    });
+    if !page.frames.is_empty() {
+        body["frames"] = Value::Object(page.frames);
+    }
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(body),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnsQuery {
+    /// Exclusive lower bound of the page's user messages.
+    #[serde(default)]
+    after_sequence: Option<u64>,
+    /// Newest user message of the page: `sequence <= beforeSequence`.
+    #[serde(default)]
+    before_sequence: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// `summary` (default) or `full`.
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    history_encryption: Option<u8>,
 }
 
 fn replay_detail(summary: bool) -> ReplayDetail {
@@ -6148,6 +6216,169 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay.status(), StatusCode::OK);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_turns_list_user_messages_and_page_their_events() {
+        let root = std::env::temp_dir().join(format!("todex-v2-turns-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new_for_tests(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            network_enabled: true,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root],
+            history_retention_days: None,
+            history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            keep_awake: false,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                dsh_bin: "dsh".to_owned(),
+                dsh_env_allowlist: Vec::new(),
+                omp_bin: "omp".to_owned(),
+                omp_env_allowlist: Vec::new(),
+                antigravity_bin: "agy".to_owned(),
+                antigravity_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+                ssh_bin: "ssh".to_owned(),
+                provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
+                provider_prewarm: true,
+                legacy_codex_gateway: false,
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+                ..Default::default()
+            },
+            api: Default::default(),
+            deployment: Default::default(),
+            ipc: Default::default(),
+            update: Default::default(),
+        })
+        .await
+        .unwrap();
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state.clone());
+        let manifest = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::Codex,
+                workspace,
+                Some("Reverse replay fixture".to_owned()),
+                None,
+            )
+            .await
+            .unwrap();
+        let store = ConversationStore::new(state.config.data_dir.clone())
+            .await
+            .unwrap();
+        for index in 1..=8 {
+            store
+                .append(&manifest.id, "fixture.event", json!({ "index": index }))
+                .await
+                .unwrap();
+        }
+
+        let mut prompts = Vec::new();
+        for index in 1..=9u64 {
+            let (event_type, payload) = if index % 3 == 1 {
+                (
+                    "message.created",
+                    json!({ "role": "user", "content": format!("prompt {index}") }),
+                )
+            } else {
+                ("fixture.event", json!({ "index": index }))
+            };
+            let event = store
+                .append(&manifest.id, event_type, payload)
+                .await
+                .unwrap();
+            if event_type == "message.created" {
+                prompts.push(event.sequence);
+            }
+        }
+        let [first, second, third] = prompts[..] else {
+            panic!("three prompts")
+        };
+        let get = |query: String| {
+            let app = app.clone();
+            let device = &device;
+            let path = format!(
+                "/v2/conversations/{}/turns?historyEncryption=1{query}",
+                manifest.id
+            );
+            async move {
+                let response = app
+                    .oneshot(signed_request(device, "GET", &path, ""))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                serde_json::from_slice::<Value>(
+                    &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+                )
+                .unwrap()
+            }
+        };
+        let sequences_of = |body: &Value| {
+            body["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["sequence"].as_u64().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let newest = get("&limit=2".to_owned()).await;
+        assert_eq!(newest["sequences"], json!(prompts));
+        assert_eq!(sequences_of(&newest), vec![second, third]);
+        assert_eq!(newest["events"][1]["type"], "message.created");
+        assert_eq!(newest["hasMore"], true);
+        assert_eq!(newest["beforeSequence"], second - 1);
+
+        let rest = get(format!("&beforeSequence={}&limit=2", second - 1)).await;
+        assert_eq!(sequences_of(&rest), vec![first]);
+        assert_eq!(rest["hasMore"], false);
+
+        // Only prompts after the ones a client already holds.
+        let since = get(format!("&afterSequence={second}")).await;
+        assert_eq!(sequences_of(&since), vec![third]);
+        assert_eq!(since["hasMore"], false);
+        assert_eq!(since["sequences"], json!(prompts));
+
+        let response = app
+            .clone()
+            .oneshot(signed_request(
+                &device,
+                "GET",
+                &format!("/v2/conversations/{}/turns", manifest.id),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
 
         let _ = fs::remove_dir_all(root);
     }

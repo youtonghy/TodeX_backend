@@ -163,6 +163,7 @@ PUT /v2/history/cleanup-policy
 POST /v2/history/cleanup-policy/run
 GET /v2/conversations/{conversationId}/events?afterSequence=0&limit=200&detail=full
 GET /v2/conversations/{conversationId}/events?beforeSequence=500&limit=200&detail=summary
+GET /v2/conversations/{conversationId}/turns?afterSequence=0&beforeSequence=500&limit=100
 POST /v2/conversations/{conversationId}/prompt
 POST /v2/conversations/{conversationId}/cancel
 POST /v2/conversations/{conversationId}/runtime/stop
@@ -285,6 +286,8 @@ journal 不设总容量上限：追加永不因体积被拒绝，进行中的 tu
 HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB 时使用 gzip 压缩（图片、gRPC 与 SSE 除外）；压缩只作用于响应体，设备签名覆盖的请求方法、路径、查询与请求体不受影响，WebSocket 升级不压缩。
 
 `beforeSequence=N` 提供反向翻页（与 `afterSequence` 互斥，优先生效）：返回 `sequence <= N` 的最后 `limit` 条（升序），`hasMore` 表示是否还有更早的事件，下一页游标为本页首条 `sequence - 1`。用于长对话自下向上懒加载：首屏用 manifest 的 `lastSequence` 拉取尾页，滚动到顶部再继续向前翻页。
+
+`GET /v2/conversations/{conversationId}/turns` 返回会话的轮次目录，供客户端在只加载了尾部历史时也能列出并跳转到每一轮。和回放一样，它要求 `historyEncryption=1`，并带 `Cache-Control: no-store`。响应为 `{ conversationId, sequences, events, frames?, hasMore, beforeSequence }`：`sequences` 是全部用户消息（`type` 为 `message.created` 且信封明文 `role` 为 `user` 或 `human`）的 sequence，升序，每次都完整返回。`events` 是其中满足 `afterSequence < sequence <= beforeSequence` 的最新 `limit` 条（默认 100，上限 200，升序），`detail` 默认 `summary`，`frames` 与回放页同义，可直接交给客户端现有的解密流程。`hasMore` 为 `true` 时，用响应里的 `beforeSequence`（本页最早一条的 sequence 减 1）继续往前翻。页同样受约 8 MiB 字节限制，至少返回一条。daemon 读取用户消息时只做点读，不加载两条提示之间的历史：sequence 列表来自 journal 摘要（封存分片的 `.idx` 持久化了各自范围的列表）；旧版本封存、`.idx` 里没有该列表的会话，会在首次请求时按 summary 回放整段扫描一次，结果按 journal 文件指纹缓存。
 
 两个方向的回放页（以及 WebSocket 订阅补放的每一页）都同时受 `limit`（上限 1000）与约 8 MiB journal 字节限制，先到先止，但每页至少返回一条事件；因此一页可能少于 `limit` 条，客户端应在 `hasMore` 为 `true` 时继续翻页，而不是按条数判断是否结束。
 
