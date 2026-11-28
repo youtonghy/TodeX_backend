@@ -24,6 +24,7 @@ mod pi_mcp;
 mod pi_plugins;
 pub mod protocol;
 mod quota;
+mod read_positions;
 mod remote;
 mod routes;
 mod sealed;

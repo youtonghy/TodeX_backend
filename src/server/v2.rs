@@ -105,6 +105,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.queue.resume"
             | "conversation.queue.list"
             | "conversation.schedule"
+            | "conversation.read"
             | "conversation.retry"
             | "conversation.resume"
             | "conversation.fork"
@@ -566,6 +567,7 @@ pub(super) async fn version(
         mesh: state.mesh.as_ref().map(|_| super::mesh::MESH_VERSION),
         node_id: state.mesh.as_ref().map(|mesh| mesh.node_id().to_owned()),
         mesh_hub: state.mesh.as_ref().map(|_| true),
+        read_sync: super::read_positions::READ_SYNC_VERSION,
     })
 }
 
@@ -2700,6 +2702,9 @@ async fn prompt_conversation(
     Json(request): Json<PromptRequest>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
+    let seen =
+        super::read_positions::sequence_before_send(&state, &auth.tenant_id, &conversation_id)
+            .await;
     let turn_id = state
         .conversations
         .prompt_owned(
@@ -2722,6 +2727,7 @@ async fn prompt_conversation(
             },
         )
         .await?;
+    super::read_positions::mark_sent(&state, &auth.tenant_id, &conversation_id, seen).await;
     Ok(Json(
         json!({ "conversationId": conversation_id, "turnId": turn_id }),
     ))
@@ -4036,6 +4042,12 @@ async fn dispatch_lane_command(
                     "conversation.prompt requires text, content, or skills".to_owned(),
                 ));
             }
+            let seen = super::read_positions::sequence_before_send(
+                state,
+                owner_id,
+                &request.conversation_id,
+            )
+            .await;
             let turn_id = state
                 .conversations
                 .prompt_owned(
@@ -4058,6 +4070,7 @@ async fn dispatch_lane_command(
                     },
                 )
                 .await?;
+            super::read_positions::mark_sent(state, owner_id, &request.conversation_id, seen).await;
             Ok(json!({ "conversationId": request.conversation_id, "turnId": turn_id }))
         }
         "conversation.queue.add" => {
@@ -4066,6 +4079,12 @@ async fn dispatch_lane_command(
                 .item_id
                 .clone()
                 .unwrap_or_else(|| command.id.clone());
+            let seen = super::read_positions::sequence_before_send(
+                state,
+                owner_id,
+                &request.conversation_id,
+            )
+            .await;
             let outcome = state
                 .conversations
                 .queue_add_owned(
@@ -4091,6 +4110,7 @@ async fn dispatch_lane_command(
                     request.paused,
                 )
                 .await?;
+            super::read_positions::mark_sent(state, owner_id, &request.conversation_id, seen).await;
             Ok(match outcome {
                 FollowUpAddOutcome::Queued => json!({
                     "conversationId": request.conversation_id, "itemId": item_id, "status": "queued",
@@ -4154,6 +4174,9 @@ async fn dispatch_lane_command(
                 }
             };
             Ok(json!({ "conversationId": request.conversation_id, "queue": snapshot }))
+        }
+        "conversation.read" => {
+            super::read_positions::command(state, owner_id, &command.payload).await
         }
         "conversation.schedule" => {
             let request: ScheduleRequest = Deserialize::deserialize(&command.payload)?;
@@ -4543,6 +4566,10 @@ pub(super) struct VersionResponse {
     /// With `mesh`: this node can be a group hub (docs/mesh-v1.md "Hub").
     #[serde(rename = "meshHub", skip_serializing_if = "Option::is_none")]
     mesh_hub: Option<bool>,
+    /// Conversations carry a shared `readSequence` moved by
+    /// `conversation.read` and announced by the `conversation.read` event.
+    #[serde(rename = "readSync")]
+    read_sync: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -7082,6 +7109,78 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(taken_again.code(), "NOT_FOUND");
+
+        // Read positions: the add above marked the conversation read up to
+        // where it stood, and its queue events came after.
+        let last = state
+            .conversations
+            .get(&manifest.id)
+            .await
+            .unwrap()
+            .last_sequence;
+        let mut announcements = state.events.subscribe();
+        let read = run!(
+            "read",
+            "conversation.read",
+            json!({ "conversationId": manifest.id, "sequence": last + 10 }),
+        )
+        .unwrap();
+        assert_eq!(read["conversationId"], manifest.id);
+        assert_eq!(read["readSequence"], last);
+        let stored = state.conversations.get(&manifest.id).await.unwrap();
+        assert_eq!(stored.read_sequence, Some(last));
+        assert_eq!(serde_json::to_value(&stored).unwrap()["readSequence"], last);
+        let mut read_events = || {
+            let mut found = Vec::new();
+            while let Ok(event) = announcements.try_recv() {
+                if event.event_type == "conversation.read" {
+                    found.push(event.payload.clone());
+                }
+            }
+            found
+        };
+        assert_eq!(
+            read_events(),
+            vec![json!({ "conversationId": manifest.id, "readSequence": last })]
+        );
+        // Already there: nothing is written or announced.
+        run!(
+            "read-again",
+            "conversation.read",
+            json!({ "conversationId": manifest.id }),
+        )
+        .unwrap();
+        assert!(read_events().is_empty());
+        let fresh = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::ClaudeCode,
+                root.join("workspaces").join("project"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh.read_sequence, None);
+        let first = run!(
+            "read-fresh",
+            "conversation.read",
+            json!({ "conversationId": fresh.id }),
+        )
+        .unwrap();
+        assert_eq!(first["readSequence"], fresh.last_sequence);
+        assert_eq!(
+            read_events(),
+            vec![json!({ "conversationId": fresh.id, "readSequence": fresh.last_sequence })]
+        );
+        let unknown = run!(
+            "read-unknown",
+            "conversation.read",
+            json!({ "conversationId": Uuid::new_v4().to_string() }),
+        )
+        .unwrap_err();
+        assert_eq!(unknown.code(), "NOT_FOUND");
 
         let at = (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_rfc3339();
         let scheduled = run!(

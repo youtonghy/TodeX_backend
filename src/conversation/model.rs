@@ -153,6 +153,13 @@ pub struct ConversationManifest {
     /// Omitted while `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
+    /// Sequence of the newest event a device of the owner has seen
+    /// (`conversation.read`); shared by every device, so a reply read on one
+    /// no longer waits on the others. Only moves forward, never past
+    /// `lastSequence`. Omitted until first set: clients treat such a
+    /// conversation (one from before read positions) as read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_sequence: Option<u64>,
 }
 
 /// `manifest.schedule`. The held prompts live in daemon memory only, so a
@@ -213,6 +220,7 @@ impl ConversationManifest {
             schedule: None,
             parent_conversation_id: None,
             ephemeral: false,
+            read_sequence: None,
         }
     }
 }

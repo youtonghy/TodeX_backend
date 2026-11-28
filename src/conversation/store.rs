@@ -1268,6 +1268,28 @@ impl ConversationStore {
         Ok(manifest)
     }
 
+    /// Moves `manifest.readSequence` forward to `sequence`, capped at
+    /// `lastSequence` (`conversation.read`). `updatedAt` stays: reading is
+    /// not conversation activity and must not reorder the list. Returns the
+    /// read position now in effect and whether this call moved it; a
+    /// position at or behind the stored one writes nothing.
+    pub async fn advance_read(
+        &self,
+        conversation_id: &str,
+        sequence: u64,
+    ) -> Result<(u64, bool), AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let mut manifest = self.get_unlocked(conversation_id).await?;
+        let target = sequence.min(manifest.last_sequence);
+        match manifest.read_sequence {
+            Some(current) if current >= target => return Ok((current, false)),
+            _ => {}
+        }
+        manifest.read_sequence = Some(target);
+        self.persist_manifest_locked(&manifest).await?;
+        Ok((target, true))
+    }
+
     pub async fn delete(&self, conversation_id: &str) -> Result<(), AppError> {
         let _guard = self.lock(conversation_id).await;
         if self.remove_ephemeral_locked(conversation_id) {

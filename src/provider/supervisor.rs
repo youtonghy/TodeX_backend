@@ -1514,6 +1514,22 @@ impl ConversationSupervisor {
         Ok(manifest)
     }
 
+    /// `conversation.read`: the owner's devices have seen the conversation
+    /// up to `sequence` (its newest event when absent). Reading needs no
+    /// write access to history, so legacy read-only conversations take it
+    /// too. Returns the read position in effect and whether it moved.
+    pub async fn mark_read_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        sequence: Option<u64>,
+    ) -> Result<(u64, bool), AppError> {
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        self.store
+            .advance_read(conversation_id, sequence.unwrap_or(manifest.last_sequence))
+            .await
+    }
+
     /// [`Self::get_owned`] for an operation that writes history: legacy
     /// plaintext conversations are read-only (`HISTORY_READ_ONLY`,
     /// docs/history-encryption.md §8).

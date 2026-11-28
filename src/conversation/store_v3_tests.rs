@@ -684,3 +684,69 @@ async fn evicted_indexes_rebuild_on_demand() {
     assert_eq!(store.replay(&ids[1], 0, 10).await.unwrap().events.len(), 2);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn read_position_only_moves_forward_and_keeps_the_list_order() {
+    let root = temp_dir("todex-v3-read");
+    let store = ConversationStore::new(root.clone()).await.unwrap();
+    let manifest = store
+        .create(ConversationManifest::new(
+            ProviderKind::Codex,
+            root.clone(),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(manifest.read_sequence, None);
+    for index in 0..4 {
+        store
+            .append(&manifest.id, "fixture.event", json!({ "index": index }))
+            .await
+            .unwrap();
+    }
+    let before = store.get(&manifest.id).await.unwrap();
+    let last = before.last_sequence;
+    assert!(last >= 4);
+
+    assert_eq!(
+        store.advance_read(&manifest.id, 2).await.unwrap(),
+        (2, true)
+    );
+    // Behind or at the stored position: nothing moves.
+    assert_eq!(
+        store.advance_read(&manifest.id, 1).await.unwrap(),
+        (2, false)
+    );
+    assert_eq!(
+        store.advance_read(&manifest.id, 2).await.unwrap(),
+        (2, false)
+    );
+    // Never past the newest event.
+    assert_eq!(
+        store.advance_read(&manifest.id, last + 50).await.unwrap(),
+        (last, true)
+    );
+    let read = store.get(&manifest.id).await.unwrap();
+    assert_eq!(read.read_sequence, Some(last));
+    assert_eq!(
+        read.updated_at, before.updated_at,
+        "reading must not reorder the list"
+    );
+
+    // Written at once: a reopened store reads it back, and new events keep it.
+    drop(store);
+    let reopened = ConversationStore::new(root.clone()).await.unwrap();
+    assert_eq!(
+        reopened.get(&manifest.id).await.unwrap().read_sequence,
+        Some(last)
+    );
+    reopened
+        .append(&manifest.id, "fixture.event", json!({ "index": 9 }))
+        .await
+        .unwrap();
+    let stored = reopened.get(&manifest.id).await.unwrap();
+    assert_eq!(stored.read_sequence, Some(last));
+    assert!(stored.last_sequence > last);
+    let _ = std::fs::remove_dir_all(root);
+}

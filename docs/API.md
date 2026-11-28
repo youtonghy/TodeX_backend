@@ -507,6 +507,15 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 - manifest 字段 `schedule: { "at": <RFC 3339>, "interrupted"?: true }`（未定时时省略，`interrupted` 为 `false` 时省略）出现在会话列表、详情、创建/更新结果中，客户端据此在侧栏显示倒计时；它与标题、归档一样随会话列表刷新获得，不产生单独的事件。队列的变化（含到点发送）照常以 `followups.updated` 推送给订阅者。
 - 重启：daemon 启动时把所有仍生效的 `schedule` 标记为 `interrupted: true` 并写回（队列已随重启丢失）。中断的定时不扣留任何消息、没有计时器、不拒绝直接 prompt；客户端显示后由用户重新设定（`conversation.schedule` 给出新的 `at`，同时清除 `interrupted`）或取消。
 
+### 已读位置（`conversation.read`）
+
+`GET /v2/version` 返回 `readSync: 1` 表示会话带有所有设备共享的已读位置：manifest 字段 `readSequence` 是该所有者的任一设备已看到的最新事件序号。客户端据此判断「等待回复」：`lastSequence > readSequence` 即有未看过的事件（回复或失败），在一台设备上看过后其他设备随之清除。
+
+- 命令：`conversation.read`，payload 为 `{ "conversationId", "sequence"?: <事件序号> }`（省略 `sequence` 表示会话当前最新事件），结果为 `{ "conversationId", "readSequence" }`，即此后生效的位置。位置只前进：不超过 `lastSequence`，不晚于已存位置时不写入也不推送。读取不需要写历史的权限，旧版明文会话（`legacyPlaintext`）同样接受；会话不存在或不属于该所有者时返回 `NOT_FOUND`。
+- 发送消息即视为已看过之前的内容：`conversation.prompt` / `conversation.followUp`、HTTP `POST /v2/conversations/{id}/prompt` 与 `conversation.queue.add` 成功后，daemon 把位置推进到发送前的 `lastSequence`（尽力而为：保存失败只记日志，不影响发送）。
+- 事件：位置前进时向每个 `/v2/ws` 连接推送 `conversation.read`，payload `{ "conversationId", "readSequence" }`，与 `mesh.updated` 一样不需要订阅该会话。断线期间错过的推送由下一次会话列表刷新补上。
+- manifest：`readSequence` 出现在会话列表、详情与创建/更新结果中，从未设置时省略；客户端把没有该字段的会话（早于已读同步）视为已读，避免升级后全部显示为未读。设置它不改 `updatedAt`，不影响列表顺序。旧后端没有 `readSync`，客户端继续使用本机记录的已读位置。
+
 ### 隐私对话（`ephemeral`）
 
 隐私对话只存在于 daemon 内存：manifest、事件、摘要、provider state 和最近一次请求都保存在进程内的表中，不写会话目录、journal、keyring，不生成 DEK，也没有 `titleEnc`（标题、事件均为明文，只在内存中）。daemon 重启后它们全部消失，列表中不再出现。客户端只能在 manifest 回显 `ephemeral: true` 时把会话视为隐私对话（旧 daemon 会忽略创建字段）。
@@ -930,7 +939,7 @@ ok
 GET /v2/version
 ```
 
-该端点与 `/health` 一样不需要认证，供 daemon 自检、客户端连接卡片轮询和客户端版本一致性检测（开发构建 `DEV0.0.0`/`0.0.0` 不参与比较）。匿名调用只返回 `name`、`version`、`deployment`、`historyEncryption`、`terminalReplay`、`terminalSnapshot`；`data_dir`、`workspace_root`、`workspace_roots`、`pathMappings` 仅在请求带有效设备签名（与其他接口相同的签名方式）时返回，`enable_auth = false` 时仅在请求满足上述本地 `Host`/`Origin` 条件时返回。签名无效或 nonce 重放不会报错，只按匿名处理，便于配对前探测。
+该端点与 `/health` 一样不需要认证，供 daemon 自检、客户端连接卡片轮询和客户端版本一致性检测（开发构建 `DEV0.0.0`/`0.0.0` 不参与比较）。匿名调用只返回 `name`、`version`、`deployment`、`historyEncryption`、`terminalReplay`、`terminalSnapshot`、`readSync`；`data_dir`、`workspace_root`、`workspace_roots`、`pathMappings` 仅在请求带有效设备签名（与其他接口相同的签名方式）时返回，`enable_auth = false` 时仅在请求满足上述本地 `Host`/`Origin` 条件时返回。签名无效或 nonce 重放不会报错，只按匿名处理，便于配对前探测。
 
 响应字段：
 
@@ -951,6 +960,7 @@ GET /v2/version
 | `mesh` | number | 设备组协议版本（当前 `1`），见「设备组」；`enable_auth = false` 或旧后端没有该字段，客户端据此隐藏设备组功能 |
 | `nodeId` | string | 本后端在设备组中的节点 id（`node_…`），与 `mesh` 同时出现；中继据此确认地址后面是目标后端而不是别的后端。旧后端没有该字段 |
 | `meshHub` | boolean | 与 `mesh` 同时出现，值为 `true`：本后端支持中心节点（mesh-v1.md「Hub」）。旧后端没有该字段，客户端据此禁用中心节点设置 |
+| `readSync` | number | 会话带共享已读位置 `readSequence`、命令与事件 `conversation.read`（当前 `1`），见「已读位置」；旧后端没有该字段 |
 
 ## 本机 IPC 与本地管理 API
 
